@@ -1,6 +1,8 @@
-add_swift_library(swiftOption
+add_swift_host_library(swiftOption STATIC
   Options.cpp
-  DEPENDS SwiftOptions
-  LINK_LIBRARIES swiftBasic
-  FILE_DEPENDS SwiftOptions)
+  SanitizerOptions.cpp)
+add_dependencies(swiftOption
+  SwiftOptions)
+target_link_libraries(swiftOption PRIVATE
+  swiftBasic)
 

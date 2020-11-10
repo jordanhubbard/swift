@@ -1,17 +1,17 @@
-//===-- TypeMatcher.h - Recursive Type Matcher------- -----------*- C++ -*-===//
+//===--- TypeMatcher.h - Recursive Type Matcher -----------------*- C++ -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines CanTypeVisitor, a specialized version of
-// TypeVisitor for visiting fully type-checked canonical types.
+// This file defines TypeMatcher, which performs a structural match between
+// two types, calling out differences for subclasses to process specifically.
 //
 //===----------------------------------------------------------------------===//
 
@@ -33,7 +33,8 @@ namespace swift {
 /// takes two \c TypeBase pointers:
 ///
 /// \code
-/// bool mismatch(TypeBase *firstType, TypeBase *secondType);
+/// bool mismatch(TypeBase *firstType, TypeBase *secondType,
+///               Type sugaredFirstType);
 /// /\endcode
 ///
 /// \c mismatch will be called with the most specific types. Thus, a client that
@@ -41,7 +42,8 @@ namespace swift {
 /// type could isolate that case with a 'mismatch' overload:
 ///
 /// \code
-/// bool mismatch(TypeVariableType *firstTypeVar, TypeBase *secondType);
+/// bool mismatch(TypeVariableType *firstTypeVar, TypeBase *secondType,
+///               Type sugaredFirstType);
 /// \endcode
 ///
 /// While having other mismatches fall to the original case. The 'mismatch'
@@ -49,60 +51,79 @@ namespace swift {
 /// or false to indicate that matching should exit early.
 template<typename ImplClass>
 class TypeMatcher {
-  class MatchVisitor : public CanTypeVisitor<MatchVisitor, bool, Type> {
+  class MatchVisitor : public CanTypeVisitor<MatchVisitor, bool, Type, Type> {
     TypeMatcher &Matcher;
 
     /// Dispatch to the derived class when we've destructured the second type.
     template<typename FirstType, typename SecondType>
-    bool mismatch(FirstType *firstType, SecondType *secondType) {
-      return Matcher.asDerived().mismatch(firstType, secondType);
+    bool mismatch(FirstType *firstType, SecondType *secondType,
+                  Type sugaredFirstType) {
+      return Matcher.asDerived().mismatch(firstType, secondType,
+                                          sugaredFirstType);
     }
 
     /// Dispatch to the most-derived class when we have not yet destructured the
     /// second type.
     template<typename FirstType>
-    bool mismatch(FirstType *firstType, Type secondType) {
+    bool mismatch(FirstType *firstType, Type secondType,
+                  Type sugaredFirstType) {
       switch (secondType->getKind()) {
 #define TYPE(CLASS, PARENT)                                         \
       case TypeKind::CLASS:                                         \
         return mismatch(firstType,                                  \
-                        cast<CLASS##Type>(secondType.getPointer()));
+                        cast<CLASS##Type>(secondType.getPointer()), \
+                        sugaredFirstType);
 #include "swift/AST/TypeNodes.def"
       }
+
+      llvm_unreachable("Unhandled TypeKind in switch.");
     }
 
     /// Honeypot to catch cases where we should redispatch the second type, but
     /// we have a stray ".getPointer()" in the dispatch call.
     template<typename FirstType>
-    bool mismatch(FirstType *firstType, TypeBase *secondType) = delete;
+    bool mismatch(FirstType *firstType, TypeBase *secondType,
+                  Type sugaredFirstType) = delete;
 
   public:
     MatchVisitor(TypeMatcher &matcher) : Matcher(matcher) { }
 
-#define TRIVIAL_CASE(TheType)                                             \
-      bool visit##TheType(Can##TheType firstType, Type secondType) {      \
-        /* If the types match, continue. */                               \
-        if (firstType->isEqual(secondType))                               \
-          return true;                                                    \
-                                                                          \
-        /* Otherwise, let the derived class deal with the mismatch. */    \
-        return mismatch(firstType.getPointer(), secondType);              \
+#define TRIVIAL_CASE(TheType)                                              \
+      bool visit##TheType(Can##TheType firstType, Type secondType,         \
+                          Type sugaredFirstType) {                         \
+        /* If the types match, continue. */                                \
+        if (firstType->isEqual(secondType))                                \
+          return true;                                                     \
+                                                                           \
+        /* Otherwise, let the derived class deal with the mismatch. */     \
+        return mismatch(firstType.getPointer(), secondType,                \
+                        sugaredFirstType);                                 \
       }
 
     TRIVIAL_CASE(ErrorType)
     TRIVIAL_CASE(BuiltinIntegerType)
+    TRIVIAL_CASE(BuiltinIntegerLiteralType)
     TRIVIAL_CASE(BuiltinFloatType)
     TRIVIAL_CASE(BuiltinRawPointerType)
     TRIVIAL_CASE(BuiltinNativeObjectType)
     TRIVIAL_CASE(BuiltinBridgeObjectType)
-    TRIVIAL_CASE(BuiltinUnknownObjectType)
     TRIVIAL_CASE(BuiltinUnsafeValueBufferType)
     TRIVIAL_CASE(BuiltinVectorType)
+    TRIVIAL_CASE(SILTokenType)
 
-    bool visitTupleType(CanTupleType firstTuple, Type secondType) {
+    bool visitUnresolvedType(CanUnresolvedType firstType, Type secondType,
+                             Type sugaredFirstType) {
+      // Unresolved types never match.
+      return mismatch(firstType.getPointer(), secondType, sugaredFirstType);
+    }
+
+    bool visitTupleType(CanTupleType firstTuple, Type secondType,
+                        Type sugaredFirstType) {
       if (auto secondTuple = secondType->getAs<TupleType>()) {
+        auto sugaredFirstTuple = sugaredFirstType->getAs<TupleType>();
         if (firstTuple->getNumElements() != secondTuple->getNumElements())
-          return mismatch(firstTuple.getPointer(), secondTuple);
+          return mismatch(firstTuple.getPointer(), secondTuple,
+                          sugaredFirstType);
 
         for (unsigned i = 0, n = firstTuple->getNumElements(); i != n; ++i) {
           const auto &firstElt = firstTuple->getElements()[i];
@@ -110,10 +131,12 @@ class TypeMatcher {
 
           if (firstElt.getName() != secondElt.getName() ||
               firstElt.isVararg() != secondElt.isVararg())
-            return mismatch(firstTuple.getPointer(), secondTuple);
+            return mismatch(firstTuple.getPointer(), secondTuple,
+                            sugaredFirstType);
 
           // Recurse on the tuple elements.
-          if (!this->visit(firstTuple.getElementType(i), secondElt.getType()))
+          if (!this->visit(firstTuple.getElementType(i), secondElt.getType(),
+                           sugaredFirstTuple->getElementType(i)))
             return false;
         }
 
@@ -121,120 +144,101 @@ class TypeMatcher {
       }
 
       // Tuple/non-tuple mismatch.
-      return mismatch(firstTuple.getPointer(), secondType);
+      return mismatch(firstTuple.getPointer(), secondType, sugaredFirstType);
     }
 
-    template<typename FirstReferenceStorageType>
-    bool handleReferenceStorageType(
-           CanTypeWrapper<FirstReferenceStorageType> firstStorage,
-           Type secondType) {
-      if (auto secondStorage = secondType->getAs<FirstReferenceStorageType>()) {
+    bool visitReferenceStorageType(CanReferenceStorageType firstStorage,
+                                   Type secondType, Type sugaredFirstType) {
+      auto _secondStorage = secondType->getCanonicalType();
+      if (firstStorage->getKind() == _secondStorage->getKind()) {
+        auto secondStorage = cast<ReferenceStorageType>(_secondStorage);
         return this->visit(firstStorage.getReferentType(),
-                           secondStorage->getReferentType());
+                           secondStorage->getReferentType(),
+                           sugaredFirstType->castTo<ReferenceStorageType>()
+                             ->getReferentType());
       }
 
-      return mismatch(firstStorage.getPointer(), secondType);
+      return mismatch(firstStorage.getPointer(), secondType, sugaredFirstType);
     }
 
-    bool visitUnownedStorageType(CanUnownedStorageType firstStorage,
-                                 Type secondType) {
-      return handleReferenceStorageType(firstStorage, secondType);
-    }
-
-    bool visitUnmanagedStorageType(CanUnmanagedStorageType firstStorage,
-                                   Type secondType) {
-      return handleReferenceStorageType(firstStorage, secondType);
-    }
-
-    bool visitWeakStorageType(CanWeakStorageType firstStorage,
-                              Type secondType) {
-      return handleReferenceStorageType(firstStorage, secondType);
-    }
-
-    template<typename FirstNominalType>
-    bool handleNominalType(CanTypeWrapper<FirstNominalType> firstNominal,
-                           Type secondType) {
-      if (auto secondNominal = secondType->getAs<FirstNominalType>()) {
+    bool visitNominalType(CanNominalType firstNominal,
+                          Type secondType, Type sugaredFirstType) {
+      auto _secondNominal = secondType->getCanonicalType();
+      if (firstNominal->getKind() == _secondNominal->getKind()) {
+        auto secondNominal = cast<NominalType>(_secondNominal);
         if (firstNominal->getDecl() != secondNominal->getDecl())
-          return mismatch(firstNominal.getPointer(), secondNominal);
+          return mismatch(firstNominal.getPointer(), secondNominal,
+                          sugaredFirstType);
 
         if (firstNominal.getParent())
           return this->visit(firstNominal.getParent(),
-                             secondNominal->getParent());
+                             secondNominal->getParent(),
+                             sugaredFirstType->castTo<NominalType>()
+                               ->getParent());
 
         return true;
       }
 
-      return mismatch(firstNominal.getPointer(), secondType);
+      return mismatch(firstNominal.getPointer(), secondType, sugaredFirstType);
     }
 
-    bool visitEnumType(CanEnumType firstEnum, Type secondType) {
-      return handleNominalType(firstEnum, secondType);
-    }
-
-    bool visitStructType(CanStructType firstStruct, Type secondType) {
-      return handleNominalType(firstStruct, secondType);
-    }
-
-    bool visitClassType(CanClassType firstClass, Type secondType) {
-      return handleNominalType(firstClass, secondType);
-    }
-
-    bool visitProtocolType(CanProtocolType firstProtocol, Type secondType) {
-      return handleNominalType(firstProtocol, secondType);
-    }
-
-    template<typename FirstMetatypeType>
-    bool handleAnyMetatypeType(CanTypeWrapper<FirstMetatypeType> firstMeta,
-                               Type secondType){
-      if (auto secondMeta = secondType->getAs<FirstMetatypeType>()) {
-        if (firstMeta->getKind() != secondMeta->getKind())
-          return mismatch(firstMeta.getPointer(), secondMeta);
-
+    bool visitAnyMetatypeType(CanAnyMetatypeType firstMeta,
+                              Type secondType, Type sugaredFirstType) {
+      auto _secondMeta = secondType->getCanonicalType();
+      if (firstMeta->getKind() == _secondMeta->getKind()) {
+        auto secondMeta = cast<AnyMetatypeType>(_secondMeta);
         return this->visit(firstMeta.getInstanceType(),
-                           secondMeta->getInstanceType());
+                           secondMeta->getInstanceType(),
+                           sugaredFirstType->castTo<AnyMetatypeType>()
+                             ->getInstanceType());
       }
 
-      return mismatch(firstMeta.getPointer(), secondType);
-    }
-
-    bool visitMetatypeType(CanMetatypeType firstMeta, Type secondType) {
-      return handleAnyMetatypeType(firstMeta, secondType);
-    }
-
-    bool visitExistentialMetatypeType(CanExistentialMetatypeType firstMeta,
-                                      Type secondType) {
-      return handleAnyMetatypeType(firstMeta, secondType);
+      return mismatch(firstMeta.getPointer(), secondType, sugaredFirstType);
     }
 
     TRIVIAL_CASE(ModuleType)
     TRIVIAL_CASE(DynamicSelfType)
     TRIVIAL_CASE(ArchetypeType)
     TRIVIAL_CASE(GenericTypeParamType)
-    TRIVIAL_CASE(AssociatedTypeType)
-
-    bool visitDependentMemberType(CanDependentMemberType firstDepMember,
-                                  Type secondType) {
-      if (auto secondDepMember = secondType->getAs<DependentMemberType>()) {
-        if (firstDepMember->getAssocType() != secondDepMember->getAssocType() ||
-            firstDepMember->getName() != secondDepMember->getName())
-          return mismatch(firstDepMember.getPointer(), secondDepMember);
-
-        return this->visit(firstDepMember.getBase(),
-                           secondDepMember->getBase());
-      }
-
-      return mismatch(firstDepMember.getPointer(), secondType);
-    }
+    TRIVIAL_CASE(DependentMemberType)
 
     /// FIXME: Split this out into cases?
-    bool visitAnyFunctionType(CanAnyFunctionType firstFunc, Type secondType) {
+    bool visitAnyFunctionType(CanAnyFunctionType firstFunc, Type secondType,
+                              Type sugaredFirstType) {
       if (auto secondFunc = secondType->getAs<AnyFunctionType>()) {
-        return this->visit(firstFunc.getInput(), secondFunc->getInput()) &&
-               this->visit(firstFunc.getResult(), secondFunc->getResult());
+        // FIXME: Compare throws()? Both existing subclasses would prefer
+        // to mismatch on (!firstFunc->throws() && secondFunc->throws()), but
+        // embedding that non-commutativity in this general matcher is icky.
+        if (firstFunc->isNoEscape() != secondFunc->isNoEscape())
+          return mismatch(firstFunc.getPointer(), secondFunc, sugaredFirstType);
+
+        auto sugaredFirstFunc = sugaredFirstType->castTo<AnyFunctionType>();
+        if (firstFunc->getParams().size() != secondFunc->getParams().size())
+          return mismatch(firstFunc.getPointer(), secondFunc, sugaredFirstFunc);
+
+        for (unsigned i = 0, n = firstFunc->getParams().size(); i != n; ++i) {
+          const auto &firstElt = firstFunc->getParams()[i];
+          const auto &secondElt = secondFunc->getParams()[i];
+
+          if (firstElt.getLabel() != secondElt.getLabel() ||
+              firstElt.isVariadic() != secondElt.isVariadic() ||
+              firstElt.isInOut() != secondElt.isInOut())
+            return mismatch(firstElt.getOldType().getPointer(),
+                            secondElt.getOldType(),
+                            sugaredFirstFunc->getParams()[i].getOldType());
+
+          // Recurse on parameter components.
+          if (!this->visit(firstElt.getOldType()->getCanonicalType(),
+                           secondElt.getOldType(),
+                           sugaredFirstFunc->getParams()[i].getOldType()))
+            return false;
+        }
+
+        return this->visit(firstFunc.getResult(), secondFunc->getResult(),
+                           sugaredFirstFunc->getResult());
       }
 
-      return mismatch(firstFunc.getPointer(), secondType);
+      return mismatch(firstFunc.getPointer(), secondType, sugaredFirstType);
     }
 
     TRIVIAL_CASE(SILFunctionType)
@@ -242,78 +246,57 @@ class TypeMatcher {
     TRIVIAL_CASE(SILBoxType)
     TRIVIAL_CASE(ProtocolCompositionType)
 
-    bool visitLValueType(CanLValueType firstLValue, Type secondType) {
+    bool visitLValueType(CanLValueType firstLValue, Type secondType,
+                         Type sugaredFirstType) {
       if (auto secondLValue = secondType->getAs<LValueType>()) {
         return this->visit(firstLValue.getObjectType(),
-                           secondLValue->getObjectType());
+                           secondLValue->getObjectType(),
+                           sugaredFirstType->castTo<LValueType>()
+                            ->getObjectType());
       }
 
-      return mismatch(firstLValue.getPointer(), secondType);
+      return mismatch(firstLValue.getPointer(), secondType, sugaredFirstType);
     }
 
-    bool visitInOutType(CanInOutType firstInOut, Type secondType) {
+    bool visitInOutType(CanInOutType firstInOut, Type secondType,
+                        Type sugaredFirstType) {
       if (auto secondInOut = secondType->getAs<InOutType>()) {
         return this->visit(firstInOut.getObjectType(),
-                           secondInOut->getObjectType());
+                           secondInOut->getObjectType(),
+                           sugaredFirstType->castTo<InOutType>()
+                             ->getObjectType());
       }
 
-      return mismatch(firstInOut.getPointer(), secondType);
+      return mismatch(firstInOut.getPointer(), secondType, sugaredFirstType);
     }
 
-    bool visitUnboundBoundGenericType(CanUnboundGenericType firstUBGT,
-                                      Type secondType) {
-      if (auto secondUBGT = secondType->getAs<UnboundGenericType>()) {
-        if (firstUBGT->getDecl() != secondUBGT->getDecl())
-          return mismatch(firstUBGT.getPointer(), secondUBGT);
-
-        if (firstUBGT.getParent())
-          return this->visit(firstUBGT.getParent(), secondUBGT->getParent());
-
-        return true;
-      }
-
-      return mismatch(firstUBGT.getPointer(), secondType);
-    }
-
-    template<typename FirstBoundGenericType>
-    bool handleBoundGenericType(CanTypeWrapper<FirstBoundGenericType> firstBGT,
-                                Type secondType) {
-      if (auto secondBGT = secondType->getAs<FirstBoundGenericType>()) {
+    bool visitBoundGenericType(CanBoundGenericType firstBGT,
+                               Type secondType, Type sugaredFirstType) {
+      auto _secondBGT = secondType->getCanonicalType();
+      if (firstBGT->getKind() == _secondBGT->getKind()) {
+        auto secondBGT = cast<BoundGenericType>(_secondBGT);
         if (firstBGT->getDecl() != secondBGT->getDecl())
-          return mismatch(firstBGT.getPointer(), secondBGT);
+          return mismatch(firstBGT.getPointer(), secondBGT, sugaredFirstType);
 
+        auto sugaredFirstBGT = sugaredFirstType->castTo<BoundGenericType>();
         if (firstBGT->getParent() &&
-            !this->visit(firstBGT.getParent(), secondBGT->getParent()))
+            !this->visit(firstBGT.getParent(), secondBGT->getParent(),
+                         sugaredFirstBGT->getParent()))
           return false;
 
-        for (unsigned i = 0, n = firstBGT->getGenericArgs().size(); i != n; ++i) {
+        for (unsigned i = 0, n = firstBGT->getGenericArgs().size();
+             i != n; ++i) {
           if (!this->visit(firstBGT.getGenericArgs()[i],
-                           secondBGT->getGenericArgs()[i]))
+                           secondBGT->getGenericArgs()[i],
+                           sugaredFirstBGT->getGenericArgs()[i]))
             return false;
         }
 
         return true;
       }
 
-      return mismatch(firstBGT.getPointer(), secondType);
+      return mismatch(firstBGT.getPointer(), secondType, sugaredFirstType);
     }
-
-    bool visitBoundGenericClassType(CanBoundGenericClassType firstBGT,
-                                    Type secondType) {
-      return handleBoundGenericType(firstBGT, secondType);
-    }
-
-    bool visitBoundGenericEnumType(CanBoundGenericEnumType firstBGT,
-                                   Type secondType) {
-      return handleBoundGenericType(firstBGT, secondType);
-    }
-
-    bool visitBoundGenericStructType(CanBoundGenericStructType firstBGT,
-                                     Type secondType) {
-      return handleBoundGenericType(firstBGT, secondType);
-    }
-
-    TRIVIAL_CASE(TypeVariableType)
 
 #undef TRIVIAL_CASE
   };
@@ -326,7 +309,8 @@ class TypeMatcher {
 
 public:
   bool match(Type first, Type second) {
-    return MatchVisitor(*this).visit(first->getCanonicalType(), second);
+    return MatchVisitor(*this).visit(first->getCanonicalType(), second,
+                                     first);
   }
 };
 

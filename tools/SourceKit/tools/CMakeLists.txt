@@ -4,7 +4,9 @@ include_directories(
   ${SOURCEKITD_SOURCE_DIR}/include
 )
 
-add_subdirectory(sourcekitd)
-add_subdirectory(sourcekitd-test)
-add_subdirectory(sourcekitd-repl)
-add_subdirectory(complete-test)
+add_swift_lib_subdirectory(sourcekitd)
+add_swift_tool_subdirectory(sourcekitd-test)
+if(LibEdit_FOUND AND LibEdit_HAS_UNICODE)
+  add_swift_tool_subdirectory(sourcekitd-repl)
+endif()
+add_swift_tool_subdirectory(complete-test)

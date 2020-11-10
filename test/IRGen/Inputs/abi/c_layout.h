@@ -27,6 +27,9 @@ struct A {
 };
 struct A createA(void);
 
+enum CrappyColor {
+  Red, Green, Blue
+};
 
 struct BitfieldSeparatorReference {
   unsigned char a;
@@ -65,6 +68,13 @@ struct HasRecursivePointers {
   void (*getNext)(struct HasRecursivePointers);
 };
 
+struct HasNestedUnion {
+  struct {
+    int x;
+    float f;
+  } s;
+};
+
 // Test sign extension behavior
 
 char chareth(char a);
@@ -86,3 +96,9 @@ static const char * const staticString = "abc";
 static inline void doubleTrouble(void) {
   staticFloat *= 2.0;
 }
+
+#define SWIFT_ENUM(_type, _name) enum _name
+
+typedef SWIFT_ENUM(int, AmazingColor) {
+  Cyan, Magenta, Yellow
+} AmazingColor;

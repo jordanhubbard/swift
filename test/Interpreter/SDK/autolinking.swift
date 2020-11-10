@@ -1,5 +1,5 @@
-// RUN: rm -rf %t && mkdir %t
-// RUN: echo "int global() { return 42; }" | %clang -dynamiclib -o %t/libLinkMe.dylib -x c -
+// RUN: %empty-directory(%t)
+// RUN: echo "int global() { return 42; }" | %clang -dynamiclib -o %t/libLinkMe.dylib -x c -L %sdk/usr/lib -
 // RUN: %target-swift-frontend -emit-module -parse-stdlib -o %t -module-name LinkMe -module-link-name LinkMe %S/../../Inputs/empty.swift
 
 // RUN: %target-jit-run -DIMPORT %s -I %t -L %t 2>&1
@@ -14,6 +14,7 @@
 // This is specifically testing autolinking for immediate mode. Please do not
 // change it to use %target-build/%target-run
 // REQUIRES: swift_interpreter
+// REQUIRES: OS=macosx
 
 
 import Darwin
@@ -33,9 +34,13 @@ if global() != 42 {
 
 #else
 
-let RTLD_DEFAULT = UnsafeMutablePointer<Void>(bitPattern: -2)
+let RTLD_DEFAULT = UnsafeMutableRawPointer(bitPattern: -2)
 if dlsym(RTLD_DEFAULT, "global") == nil {
-  print(String.fromCString(dlerror())!)
+  if let err = dlerror() {
+    print(String(cString: err))
+  } else {
+    print("Unknown dlsym error")
+  }
   exit(EXIT_FAILURE)
 }
 #endif

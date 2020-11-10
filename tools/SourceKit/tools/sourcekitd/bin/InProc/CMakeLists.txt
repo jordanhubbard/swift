@@ -1,26 +1,56 @@
 set(EXPORTED_SYMBOL_FILE "${SOURCEKITD_SOURCE_DIR}/bin/sourcekitd.exports")
 
+option(SOURCEKITD_BUILD_STATIC_INPROC
+  "Build sourcekitdInProc as a static library (in addition to a shared one)" OFF)
+
+set(sourcekitdInProc_args
+  sourcekitdInProc.cpp
+  LLVM_LINK_COMPONENTS support coverage
+)
+
 if (SOURCEKIT_INSTALLING_INPROC)
-  add_sourcekit_framework(sourcekitdInProc
-    ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
-    sourcekitdInProc.cpp
-    DEPENDS SourceKitSwiftLang sourcekitdAPI
-    COMPONENT_DEPENDS support
-    MODULEMAP module.modulemap
-    INSTALL_IN_COMPONENT sourcekit-inproc
-  )
-  set_property(TARGET sourcekitdInProc APPEND_STRING PROPERTY LINK_FLAGS " -fapplication-extension")
+  if("${CMAKE_SYSTEM_NAME}" STREQUAL "Darwin")
+    add_sourcekit_framework(sourcekitdInProc
+      ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
+      ${sourcekitdInProc_args}
+      MODULEMAP module.modulemap
+      INSTALL_IN_COMPONENT sourcekit-inproc
+    )
+    set_property(TARGET sourcekitdInProc APPEND_STRING PROPERTY LINK_FLAGS " -fapplication-extension")
+  else()
+    add_sourcekit_library(sourcekitdInProc
+      ${sourcekitdInProc_args}
+      HEADERS
+        ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
+      INSTALL_IN_COMPONENT sourcekit-inproc
+      SHARED
+    )
+  endif()
 else()
   add_sourcekit_library(sourcekitdInProc
-    sourcekitdInProc.cpp
-    DEPENDS SourceKitSwiftLang sourcekitdAPI
-    COMPONENT_DEPENDS support
+    ${sourcekitdInProc_args}
+    HEADERS
+      ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
     INSTALL_IN_COMPONENT sourcekit-inproc
-
-    # Note that this cannot be a static library due to the way it looks for the
-    # shared library path in order to get at the runtime lib path.
     SHARED
   )
+endif()
+target_link_libraries(sourcekitdInProc PRIVATE
+  SourceKitSwiftLang
+  sourcekitdAPI)
+
+# While it is possible to build this as a static library,
+# to get the runtime paths correct, it must be linked into a binary
+# that is in the same directory as the swift library directory.
+if (SOURCEKITD_BUILD_STATIC_INPROC)
+  add_sourcekit_library(sourcekitdInProc_Static
+    HEADERS
+      ${SOURCEKITD_SOURCE_DIR}/include/sourcekitd/sourcekitd.h
+    ${sourcekitdInProc_args}
+  )
+  target_link_libraries(sourcekitdInProc_Static PRIVATE
+    SourceKitSwiftLang
+    sourcekitdAPI)
 endif()
 
 if (SOURCEKIT_BUILT_STANDALONE)

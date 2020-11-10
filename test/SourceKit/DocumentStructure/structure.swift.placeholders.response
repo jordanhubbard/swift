@@ -9,7 +9,6 @@
       key.name: "<#MyCls#>",
       key.offset: 0,
       key.length: 35,
-      key.runtime_name: "_TtC8__main__9<#MyCls#>",
       key.nameoffset: 6,
       key.namelength: 9,
       key.bodyoffset: 34,
@@ -58,6 +57,14 @@
           ],
           key.substructure: [
             {
+              key.kind: source.lang.swift.decl.var.local,
+              key.name: "<#name#>",
+              key.offset: 63,
+              key.length: 8,
+              key.nameoffset: 63,
+              key.namelength: 8
+            },
+            {
               key.kind: source.lang.swift.stmt.brace,
               key.offset: 85,
               key.length: 2,
@@ -76,14 +83,8 @@
       key.name: "myArray",
       key.offset: 225,
       key.length: 36,
-      key.typename: "myArray",
       key.nameoffset: 229,
-      key.namelength: 7,
-      key.attributes: [
-        {
-          key.attribute: source.decl.attribute.__raw_doc_comment
-        }
-      ]
+      key.namelength: 7
     },
     {
       key.kind: source.lang.swift.expr.array,

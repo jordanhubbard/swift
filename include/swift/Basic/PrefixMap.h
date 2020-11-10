@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -34,13 +34,14 @@
 #ifndef SWIFT_BASIC_PREFIXMAP_H
 #define SWIFT_BASIC_PREFIXMAP_H
 
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/Basic/type_traits.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <iterator>
-#include "swift/Basic/type_traits.h"
 
 namespace swift {
 
@@ -48,15 +49,11 @@ void printOpaquePrefixMap(raw_ostream &out, void *root,
                           void (*printNode)(raw_ostream &, void*));
 template <class KeyElementType> class PrefixMapKeyPrinter;
 
-inline constexpr size_t const_max_size(size_t x, size_t y) {
-  return (x < y ? y : x);
-}
-
 /// A map whose keys are sequences of comparable values, optimized for
 /// finding a mapped value for the longest matching initial subsequence.
 template <class KeyElementType, class ValueType,
-          size_t InlineKeyCapacity
-             = const_max_size((sizeof(void*) - 1) / sizeof(KeyElementType), 1)>
+          size_t InlineKeyCapacity = std::max(
+              (sizeof(void *) - 1) / sizeof(KeyElementType), size_t(1))>
 class PrefixMap {
 public:
   using KeyType = ArrayRef<KeyElementType>;
@@ -69,17 +66,15 @@ public:
 private:
   template <typename T>
   union UninitializedStorage {
-    T Storage;
-    UninitializedStorage() = default;
-    UninitializedStorage(const UninitializedStorage &other) = default;
-    UninitializedStorage &operator=(const UninitializedStorage &other)
-      = default;
-    ~UninitializedStorage() = default;
+    alignas(T) char Storage[sizeof(T)];
 
     template <typename... A>
-    void initializeFrom(A && ...value) {
+    void emplace(A && ...value) {
       ::new((void*) &Storage) T(std::forward<A>(value)...);
     }
+
+    T &get() { return *reinterpret_cast<T*>(Storage); }
+    const T &get() const { return *reinterpret_cast<T*>(Storage); }
   };
 
   // We expect to see a lot of entries for keys like:
@@ -122,16 +117,34 @@ private:
     KeyType getLocalKey() const { return { Key, KeyLength }; }
   };
   struct Node : NodeBase {
+  private:
     UninitializedStorage<ValueType> Value;
 
+  public:
     Node() { /* leave Value uninitialized */ }
 
     // We split NodeBase out so that we can just delegate to something that
     // copies all the other fields.
     Node(const Node &other) : NodeBase(other) {
       if (this->HasValue) {
-        Value.initializeFrom(other.Value.Storage);
+        Value.emplace(other.Value.get());
       }
+    }
+
+    ValueType &get() {
+      assert(this->HasValue);
+      return Value.get();
+    }
+    const ValueType &get() const {
+      assert(this->HasValue);
+      return Value.get();
+    }
+
+    template <typename... A>
+    void emplace(A && ...value) {
+      assert(!this->HasValue);
+      Value.emplace(std::forward<A>(value)...);
+      this->HasValue = true;
     }
   };
 
@@ -308,16 +321,16 @@ private:
   static void deleteTree(Node *root) {
     if (!root) return;
 
-    SmallVector<Node *, 8> queue; // actually a stack
-    auto enqueueChildrenAndDelete = [&](Node *node) {
-      if (node->Left) queue.push_back(node->Left);
-      if (node->Right) queue.push_back(node->Right);
-      if (node->Further) queue.push_back(node->Further);
+    SmallVector<Node *, 8> stack;
+    auto pushChildrenAndDelete = [&](Node *node) {
+      if (node->Left) stack.push_back(node->Left);
+      if (node->Right) stack.push_back(node->Right);
+      if (node->Further) stack.push_back(node->Further);
       delete node;
     };
-    enqueueChildrenAndDelete(root);
-    while (!queue.empty()) {
-      enqueueChildrenAndDelete(queue.pop_back_val());
+    pushChildrenAndDelete(root);
+    while (!stack.empty()) {
+      pushChildrenAndDelete(stack.pop_back_val());
     }
   }
 
@@ -325,18 +338,18 @@ private:
   static Node *cloneTree(Node *root) {
     if (!root) return nullptr;
 
-    SmallVector<Node **, 8> queue; // actually a stack.
-    auto copyAndEnqueueChildren = [&](Node **ptr) {
+    SmallVector<Node **, 8> stack;
+    auto copyAndPushChildren = [&](Node **ptr) {
       assert(*ptr);
       Node *copy = new Node(**ptr);
       *ptr = copy;
-      if (copy->Left) queue.push_back(&copy->Left);
-      if (copy->Right) queue.push_back(&copy->Right);
-      if (copy->Further) queue.push_back(&copy->Further);
+      if (copy->Left) stack.push_back(&copy->Left);
+      if (copy->Right) stack.push_back(&copy->Right);
+      if (copy->Further) stack.push_back(&copy->Further);
     };
     copyAndEnqueueChildren(&root);
-    while (!queue.empty()) {
-      copyAndEnqueueChildren(queue.pop_back_val());
+    while (!stack.empty()) {
+      copyAndEnqueueChildren(stack.pop_back_val());
     }
     return root;
   }
@@ -424,8 +437,7 @@ public:
       /// Return the value of the entry.  The returned reference is valid
       /// as long as the entry remains in the map.
       const ValueType &getValue() const {
-        assert(Path.back().getPointer()->HasValue);
-        return Path.back().getPointer()->Value.Storage;
+        return Path.back().getPointer()->get();
       }
 
       /// Read the value's key into the given buffer.
@@ -556,8 +568,7 @@ public:
 
     explicit operator bool() const { return Ptr != nullptr; }
     ValueType &operator*() const {
-      assert(Ptr->HasValue);
-      return Ptr->Value.Storage;
+      return Ptr->get();
     }
   };
 
@@ -593,8 +604,7 @@ public:
     if (node->HasValue) {
       return { Handle(node), false };
     } else {
-      node->Value.initializeFrom(create());
-      node->HasValue = true;
+      node->emplace(create());
       return { Handle(node), true };
     }
   }
@@ -617,9 +627,7 @@ public:
   Handle insertNewLazy(KeyType key, const Fn &create) {
     auto node = getOrCreatePrefixNode(key, nullptr);
     assert(node);
-    assert(!node->HasValue);
-    node->Value.initializeFrom(create());
-    node->HasValue = true;
+    node->emplace(create());
     return Handle(node);
   }
 
@@ -633,14 +641,14 @@ public:
                          [&]() -> const ValueType & { return value; });
   }
 
-  void dump() const { print(llvm::errs()); }
+  SWIFT_DEBUG_DUMP { print(llvm::errs()); }
   void print(raw_ostream &out) const {
     printOpaquePrefixMap(out, Root,
                          [](raw_ostream &out, void *_node) {
       Node *node = reinterpret_cast<Node*>(_node);
       PrefixMapKeyPrinter<KeyElementType>::print(out, node->getLocalKey());
       if (node->HasValue) {
-        out << " (" << node->Value.Storage << ')';
+        out << " (" << node->get() << ')';
       }
     });
   }
@@ -679,4 +687,4 @@ public:
 
 } // end namespace swift
 
-#endif
+#endif // SWIFT_BASIC_PREFIXMAP_H

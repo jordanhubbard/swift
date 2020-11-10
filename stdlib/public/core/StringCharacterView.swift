@@ -2,339 +2,259 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
-//  String is-not-a SequenceType or CollectionType, but it exposes a
+//  String is-not-a Sequence or Collection, but it exposes a
 //  collection of characters.
 //
 //===----------------------------------------------------------------------===//
 
-extension String {
-  /// A `String`'s collection of `Character`s ([extended grapheme
-  /// clusters](http://www.unicode.org/glossary/#extended_grapheme_cluster))
-  /// elements.
-  public struct CharacterView {
-    internal var _core: _StringCore
+// FIXME(ABI)#70 : The character string view should have a custom iterator type
+// to allow performance optimizations of linear traversals.
 
-    /// Create a view of the `Character`s in `text`.
-    public init(_ text: String) {
-      self._core = text._core
-    }
-    
-    public // @testable
-    init(_ _core: _StringCore) {
-      self._core = _core
-    }
-  }
+import SwiftShims
 
-  /// A collection of `Characters` representing the `String`'s
-  /// [extended grapheme
-  /// clusters](http://www.unicode.org/glossary/#extended_grapheme_cluster).
-  public var characters: CharacterView {
-    return CharacterView(self)
-  }
-
-  /// Efficiently mutate `self` by applying `body` to its `characters`.
+extension String: BidirectionalCollection {
+  /// A type that represents the number of steps between two `String.Index`
+  /// values, where one value is reachable from the other.
   ///
-  /// - Warning: Do not rely on anything about `self` (the `String`
-  ///   that is the target of this method) during the execution of
-  ///   `body`: it may not appear to have its correct value.  Instead,
-  ///   use only the `String.CharacterView` argument to `body`.
-  public mutating func withMutableCharacters<R>(body: (inout CharacterView)->R) -> R {
-    // Naively mutating self.characters forces multiple references to
-    // exist at the point of mutation. Instead, temporarily move the
-    // core of this string into a CharacterView.
-    var tmp = CharacterView("")
-    swap(&_core, &tmp._core)
-    let r = body(&tmp)
-    swap(&_core, &tmp._core)
-    return r
-  }
+  /// In Swift, *reachability* refers to the ability to produce one value from
+  /// the other through zero or more applications of `index(after:)`.
+  public typealias IndexDistance = Int
 
-  /// Construct the `String` corresponding to the given sequence of
-  /// Unicode scalars.
-  public init(_ characters: CharacterView) {
-    self.init(characters._core)
-  }
-}
+  public typealias SubSequence = Substring
 
-/// `String.CharacterView` is a collection of `Character`.
-extension String.CharacterView : CollectionType {
-  internal typealias UnicodeScalarView = String.UnicodeScalarView
-  internal var unicodeScalars: UnicodeScalarView {
-    return UnicodeScalarView(_core)
-  }
-  
-  /// A character position.
-  public struct Index : BidirectionalIndexType, Comparable, _Reflectable {
-    public // SPI(Foundation)    
-    init(_base: String.UnicodeScalarView.Index) {
-      self._base = _base
-      self._lengthUTF16 = Index._measureExtendedGraphemeClusterForward(_base)
-    }
+  public typealias Element = Character
 
-    internal init(_base: UnicodeScalarView.Index, _lengthUTF16: Int) {
-      self._base = _base
-      self._lengthUTF16 = _lengthUTF16
-    }
-
-    /// Returns the next consecutive value after `self`.
-    ///
-    /// - Requires: The next value is representable.
-    public func successor() -> Index {
-      _precondition(_base != _base._viewEndIndex, "can not increment endIndex")
-      return Index(_base: _endBase)
-    }
-
-    /// Returns the previous consecutive value before `self`.
-    ///
-    /// - Requires: The previous value is representable.
-    public func predecessor() -> Index {
-      _precondition(_base != _base._viewStartIndex,
-          "can not decrement startIndex")
-      let predecessorLengthUTF16 =
-          Index._measureExtendedGraphemeClusterBackward(_base)
-      return Index(
-        _base: UnicodeScalarView.Index(
-          _utf16Index - predecessorLengthUTF16, _base._core))
-    }
-
-    internal let _base: UnicodeScalarView.Index
-
-    /// The length of this extended grapheme cluster in UTF-16 code units.
-    internal let _lengthUTF16: Int
-
-    /// The integer offset of this index in UTF-16 code units.
-    public // SPI(Foundation)
-    var _utf16Index: Int {
-      return _base._position
-    }
-
-    /// The one past end index for this extended grapheme cluster in Unicode
-    /// scalars.
-    internal var _endBase: UnicodeScalarView.Index {
-      return UnicodeScalarView.Index(
-          _utf16Index + _lengthUTF16, _base._core)
-    }
-
-    /// Returns the length of the first extended grapheme cluster in UTF-16
-    /// code units.
-    @warn_unused_result
-    internal static func _measureExtendedGraphemeClusterForward(
-        start: UnicodeScalarView.Index
-    ) -> Int {
-      var start = start
-      let end = start._viewEndIndex
-      if start == end {
-        return 0
-      }
-
-      let startIndexUTF16 = start._position
-      let unicodeScalars = UnicodeScalarView(start._core)
-      let graphemeClusterBreakProperty =
-          _UnicodeGraphemeClusterBreakPropertyTrie()
-      let segmenter = _UnicodeExtendedGraphemeClusterSegmenter()
-
-      var gcb0 = graphemeClusterBreakProperty.getPropertyRawValue(
-          unicodeScalars[start].value)
-      ++start
-
-      for ; start != end; ++start {
-        // FIXME(performance): consider removing this "fast path".  A branch
-        // that is hard to predict could be worse for performance than a few
-        // loads from cache to fetch the property 'gcb1'.
-        if segmenter.isBoundaryAfter(gcb0) {
-          break
-        }
-        let gcb1 = graphemeClusterBreakProperty.getPropertyRawValue(
-            unicodeScalars[start].value)
-        if segmenter.isBoundary(gcb0, gcb1) {
-          break
-        }
-        gcb0 = gcb1
-      }
-
-      return start._position - startIndexUTF16
-    }
-
-    /// Returns the length of the previous extended grapheme cluster in UTF-16
-    /// code units.
-    @warn_unused_result
-    internal static func _measureExtendedGraphemeClusterBackward(
-        end: UnicodeScalarView.Index
-    ) -> Int {
-      let start = end._viewStartIndex
-      if start == end {
-        return 0
-      }
-
-      let endIndexUTF16 = end._position
-      let unicodeScalars = UnicodeScalarView(start._core)
-      let graphemeClusterBreakProperty =
-          _UnicodeGraphemeClusterBreakPropertyTrie()
-      let segmenter = _UnicodeExtendedGraphemeClusterSegmenter()
-
-      var graphemeClusterStart = end
-
-      --graphemeClusterStart
-      var gcb0 = graphemeClusterBreakProperty.getPropertyRawValue(
-          unicodeScalars[graphemeClusterStart].value)
-
-      var graphemeClusterStartUTF16 = graphemeClusterStart._position
-
-      while graphemeClusterStart != start {
-        --graphemeClusterStart
-        let gcb1 = graphemeClusterBreakProperty.getPropertyRawValue(
-            unicodeScalars[graphemeClusterStart].value)
-        if segmenter.isBoundary(gcb1, gcb0) {
-          break
-        }
-        gcb0 = gcb1
-        graphemeClusterStartUTF16 = graphemeClusterStart._position
-      }
-
-      return endIndexUTF16 - graphemeClusterStartUTF16
-    }
-
-    /// Returns a mirror that reflects `self`.
-    public func _getMirror() -> _MirrorType {
-      return _IndexMirror(self)
-    }
-  }
-
-  /// The position of the first `Character` if `self` is
-  /// non-empty; identical to `endIndex` otherwise.
-  public var startIndex: Index {
-    return Index(_base: unicodeScalars.startIndex)
-  }
-
-  /// The "past the end" position.
+  /// The position of the first character in a nonempty string.
   ///
-  /// `endIndex` is not a valid argument to `subscript`, and is always
-  /// reachable from `startIndex` by zero or more applications of
-  /// `successor()`.
-  public var endIndex: Index {
-    return Index(_base: unicodeScalars.endIndex)
+  /// In an empty string, `startIndex` is equal to `endIndex`.
+  @inlinable @inline(__always)
+  public var startIndex: Index { return _guts.startIndex }
+
+  /// A string's "past the end" position---that is, the position one greater
+  /// than the last valid subscript argument.
+  ///
+  /// In an empty string, `endIndex` is equal to `startIndex`.
+  @inlinable @inline(__always)
+  public var endIndex: Index { return _guts.endIndex }
+
+  /// The number of characters in a string.
+  @inline(__always)
+  public var count: Int {
+    return distance(from: startIndex, to: endIndex)
   }
 
-  /// Access the `Character` at `position`.
+  /// Returns the position immediately after the given index.
   ///
-  /// - Requires: `position` is a valid position in `self` and
-  ///   `position != endIndex`.
+  /// - Parameter i: A valid index of the collection. `i` must be less than
+  ///   `endIndex`.
+  /// - Returns: The index value immediately after `i`.
+  public func index(after i: Index) -> Index {
+    _precondition(i < endIndex, "String index is out of bounds")
+
+    // TODO: known-ASCII fast path, single-scalar-grapheme fast path, etc.
+    let i = _guts.scalarAlign(i)
+    let stride = _characterStride(startingAt: i)
+    let nextOffset = i._encodedOffset &+ stride
+    let nextStride = _characterStride(
+      startingAt: Index(_encodedOffset: nextOffset)._scalarAligned)
+
+    return Index(
+      encodedOffset: nextOffset, characterStride: nextStride)._scalarAligned
+  }
+
+  /// Returns the position immediately before the given index.
+  ///
+  /// - Parameter i: A valid index of the collection. `i` must be greater than
+  ///   `startIndex`.
+  /// - Returns: The index value immediately before `i`.
+  public func index(before i: Index) -> Index {
+    _precondition(i > startIndex, "String index is out of bounds")
+
+    // TODO: known-ASCII fast path, single-scalar-grapheme fast path, etc.
+    let i = _guts.scalarAlign(i)
+    let stride = _characterStride(endingAt: i)
+    let priorOffset = i._encodedOffset &- stride
+    return Index(
+      encodedOffset: priorOffset, characterStride: stride)._scalarAligned
+  }
+  /// Returns an index that is the specified distance from the given index.
+  ///
+  /// The following example obtains an index advanced four positions from a
+  /// string's starting index and then prints the character at that position.
+  ///
+  ///     let s = "Swift"
+  ///     let i = s.index(s.startIndex, offsetBy: 4)
+  ///     print(s[i])
+  ///     // Prints "t"
+  ///
+  /// The value passed as `n` must not offset `i` beyond the bounds of the
+  /// collection.
+  ///
+  /// - Parameters:
+  ///   - i: A valid index of the collection.
+  ///   - n: The distance to offset `i`.
+  /// - Returns: An index offset by `n` from the index `i`. If `n` is positive,
+  ///   this is the same value as the result of `n` calls to `index(after:)`.
+  ///   If `n` is negative, this is the same value as the result of `-n` calls
+  ///   to `index(before:)`.
+  ///
+  /// - Complexity: O(*n*), where *n* is the absolute value of `n`.
+  @inlinable @inline(__always)
+  public func index(_ i: Index, offsetBy n: IndexDistance) -> Index {
+    // TODO: known-ASCII and single-scalar-grapheme fast path, etc.
+    return _index(i, offsetBy: n)
+  }
+
+  /// Returns an index that is the specified distance from the given index,
+  /// unless that distance is beyond a given limiting index.
+  ///
+  /// The following example obtains an index advanced four positions from a
+  /// string's starting index and then prints the character at that position.
+  /// The operation doesn't require going beyond the limiting `s.endIndex`
+  /// value, so it succeeds.
+  ///
+  ///     let s = "Swift"
+  ///     if let i = s.index(s.startIndex, offsetBy: 4, limitedBy: s.endIndex) {
+  ///         print(s[i])
+  ///     }
+  ///     // Prints "t"
+  ///
+  /// The next example attempts to retrieve an index six positions from
+  /// `s.startIndex` but fails, because that distance is beyond the index
+  /// passed as `limit`.
+  ///
+  ///     let j = s.index(s.startIndex, offsetBy: 6, limitedBy: s.endIndex)
+  ///     print(j)
+  ///     // Prints "nil"
+  ///
+  /// The value passed as `n` must not offset `i` beyond the bounds of the
+  /// collection, unless the index passed as `limit` prevents offsetting
+  /// beyond those bounds.
+  ///
+  /// - Parameters:
+  ///   - i: A valid index of the collection.
+  ///   - n: The distance to offset `i`.
+  ///   - limit: A valid index of the collection to use as a limit. If `n > 0`,
+  ///     a limit that is less than `i` has no effect. Likewise, if `n < 0`, a
+  ///     limit that is greater than `i` has no effect.
+  /// - Returns: An index offset by `n` from the index `i`, unless that index
+  ///   would be beyond `limit` in the direction of movement. In that case,
+  ///   the method returns `nil`.
+  ///
+  /// - Complexity: O(*n*), where *n* is the absolute value of `n`.
+  @inlinable @inline(__always)
+  public func index(
+    _ i: Index, offsetBy n: IndexDistance, limitedBy limit: Index
+  ) -> Index? {
+    // TODO: known-ASCII and single-scalar-grapheme fast path, etc.
+    return _index(i, offsetBy: n, limitedBy: limit)
+  }
+
+  /// Returns the distance between two indices.
+  ///
+  /// - Parameters:
+  ///   - start: A valid index of the collection.
+  ///   - end: Another valid index of the collection. If `end` is equal to
+  ///     `start`, the result is zero.
+  /// - Returns: The distance between `start` and `end`.
+  ///
+  /// - Complexity: O(*n*), where *n* is the resulting distance.
+  @inlinable @inline(__always)
+  public func distance(from start: Index, to end: Index) -> IndexDistance {
+    // TODO: known-ASCII and single-scalar-grapheme fast path, etc.
+    return _distance(from: _guts.scalarAlign(start), to: _guts.scalarAlign(end))
+  }
+
+  /// Accesses the character at the given position.
+  ///
+  /// You can use the same indices for subscripting a string and its substring.
+  /// For example, this code finds the first letter after the first space:
+  ///
+  ///     let str = "Greetings, friend! How are you?"
+  ///     let firstSpace = str.firstIndex(of: " ") ?? str.endIndex
+  ///     let substr = str[firstSpace...]
+  ///     if let nextCapital = substr.firstIndex(where: { $0 >= "A" && $0 <= "Z" }) {
+  ///         print("Capital after a space: \(str[nextCapital])")
+  ///     }
+  ///     // Prints "Capital after a space: H"
+  ///
+  /// - Parameter i: A valid index of the string. `i` must be less than the
+  ///   string's end index.
+  @inlinable @inline(__always)
   public subscript(i: Index) -> Character {
-    return Character(String(unicodeScalars[i._base..<i._endBase]))
+    _boundsCheck(i)
+
+    let i = _guts.scalarAlign(i)
+    let distance = _characterStride(startingAt: i)
+
+    return _guts.errorCorrectedCharacter(
+      startingAt: i._encodedOffset, endingAt: i._encodedOffset &+ distance)
   }
 
-  internal struct _IndexMirror : _MirrorType {
-    var _value: Index
+  @inlinable @inline(__always)
+  internal func _characterStride(startingAt i: Index) -> Int {
+    _internalInvariant_5_1(i._isScalarAligned)
 
-    init(_ x: Index) {
-      _value = x
-    }
+    // Fast check if it's already been measured, otherwise check resiliently
+    if let d = i.characterStride { return d }
 
-    var value: Any { return _value }
+    if i == endIndex { return 0 }
 
-    var valueType: Any.Type { return (_value as Any).dynamicType }
-
-    var objectIdentifier: ObjectIdentifier? { return .None }
-
-    var disposition: _MirrorDisposition { return .Aggregate }
-
-    var count: Int { return 0 }
-
-    subscript(i: Int) -> (String, _MirrorType) {
-      _preconditionFailure("_MirrorType access out of bounds")
-    }
-
-    var summary: String { return "\(_value._utf16Index)" }
-
-    var quickLookObject: PlaygroundQuickLook? {
-      return .Some(.Int(Int64(_value._utf16Index)))
-    }
-  }
-}
-
-extension String.CharacterView : RangeReplaceableCollectionType {
-  /// Create an empty instance.
-  public init() {
-    self.init("")
+    return _guts._opaqueCharacterStride(startingAt: i._encodedOffset)
   }
 
-  /// Replace the given `subRange` of elements with `newElements`.
-  ///
-  /// Invalidates all indices with respect to `self`.
-  ///
-  /// - Complexity: O(`subRange.count`) if `subRange.endIndex
-  ///   == self.endIndex` and `newElements.isEmpty`, O(N) otherwise.
-  public mutating func replaceRange<
-    C: CollectionType where C.Generator.Element == Character
-  >(
-    subRange: Range<Index>, with newElements: C
-  ) {
-    let rawSubRange = subRange.startIndex._base._position
-      ..< subRange.endIndex._base._position
-    let lazyUTF16 = newElements.lazy.flatMap { $0.utf16 }
-    _core.replaceRange(rawSubRange, with: lazyUTF16)
-  }
+  @inlinable @inline(__always)
+  internal func _characterStride(endingAt i: Index) -> Int {
+    _internalInvariant_5_1(i._isScalarAligned)
 
-  /// Reserve enough space to store `n` ASCII characters.
-  ///
-  /// - Complexity: O(`n`).
-  public mutating func reserveCapacity(n: Int) {
-    _core.reserveCapacity(n)
-  }
+    if i == startIndex { return 0 }
 
-  /// Append `c` to `self`.
-  ///
-  /// - Complexity: Amortized O(1).
-  public mutating func append(c: Character) {
-    switch c._representation {
-    case .Small(let _63bits):
-      let bytes = Character._smallValue(_63bits)
-      _core.appendContentsOf(Character._SmallUTF16(bytes))
-    case .Large(_):
-      _core.append(String(c)._core)
-    }
-  }
-
-  /// Append the elements of `newElements` to `self`.
-  public mutating func appendContentsOf<
-      S : SequenceType
-      where S.Generator.Element == Character
-  >(newElements: S) {
-    reserveCapacity(_core.count + newElements.underestimateCount())
-    for c in newElements {
-      self.append(c)
-    }
-  }
-
-  /// Create an instance containing `characters`.
-  public init<
-      S : SequenceType
-      where S.Generator.Element == Character
-  >(_ characters: S) {
-    self = String.CharacterView()
-    self.appendContentsOf(characters)
+    return _guts._opaqueCharacterStride(endingAt: i._encodedOffset)
   }
 }
 
-// Algorithms
-extension String.CharacterView {
-  /// Access the characters in the given `subRange`.
-  ///
-  /// - Complexity: O(1) unless bridging from Objective-C requires an
-  ///   O(N) conversion.
-  public subscript(subRange: Range<Index>) -> String.CharacterView {
-    let unicodeScalarRange =
-      subRange.startIndex._base..<subRange.endIndex._base
-    return String.CharacterView(
-      String(_core).unicodeScalars[unicodeScalarRange]._core)
+extension String {
+  @frozen
+  public struct Iterator: IteratorProtocol {
+    @usableFromInline
+    internal var _guts: _StringGuts
+
+    @usableFromInline
+    internal var _position: Int = 0
+
+    @usableFromInline
+    internal var _end: Int
+
+    @inlinable
+    internal init(_ guts: _StringGuts) {
+      self._end = guts.count
+      self._guts = guts
+    }
+
+    @inlinable
+    public mutating func next() -> Character? {
+      guard _fastPath(_position < _end) else { return nil }
+
+      let len = _guts._opaqueCharacterStride(startingAt: _position)
+      let nextPosition = _position &+ len
+      let result = _guts.errorCorrectedCharacter(
+        startingAt: _position, endingAt: nextPosition)
+      _position = nextPosition
+      return result
+    }
+  }
+
+  @inlinable
+  public __consuming func makeIterator() -> Iterator {
+    return Iterator(_guts)
   }
 }
 

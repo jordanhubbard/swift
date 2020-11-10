@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,13 +20,35 @@ namespace swift {
 
 class Decl;
 class Expr;
+class ClosureExpr;
 class ModuleDecl;
 class Stmt;
 class Pattern;
 class TypeRepr;
-struct TypeLoc;
+class ParameterList;
+enum class AccessKind: unsigned char;
 
-/// \brief An abstract class used to traverse an AST.
+enum class SemaReferenceKind : uint8_t {
+  ModuleRef = 0,
+  DeclRef,
+  DeclMemberRef,
+  DeclConstructorRef,
+  TypeRef,
+  EnumElementRef,
+  SubscriptRef,
+  DynamicMemberRef,
+};
+
+struct ReferenceMetaData {
+  SemaReferenceKind Kind;
+  llvm::Optional<AccessKind> AccKind;
+  bool isImplicit = false;
+  ReferenceMetaData(SemaReferenceKind Kind, llvm::Optional<AccessKind> AccKind,
+                    bool isImplicit = false)
+      : Kind(Kind), AccKind(AccKind), isImplicit(isImplicit) {}
+};
+
+/// An abstract class used to traverse an AST.
 class ASTWalker {
 public:
   enum class ParentKind {
@@ -44,7 +66,7 @@ public:
     ParentTy(Expr *E) : Kind(ParentKind::Expr), Ptr(E) {}
     ParentTy(Pattern *P) : Kind(ParentKind::Pattern), Ptr(P) {}
     ParentTy(TypeRepr *T) : Kind(ParentKind::TypeRepr), Ptr(T) {}
-    ParentTy() = default;
+    ParentTy() : Kind(ParentKind::Module), Ptr(nullptr) { }
 
     bool isNull() const { return Ptr == nullptr; }
     ParentKind getKind() const {
@@ -73,7 +95,7 @@ public:
     }
   };
 
-  /// \brief The parent of the node we are visiting.
+  /// The parent of the node we are visiting.
   ParentTy Parent;
 
   /// This method is called when first visiting an expression
@@ -154,39 +176,76 @@ public:
   /// returns failure.
   virtual bool walkToDeclPost(Decl *D) { return true; }
 
-  /// \brief This method is called when first visiting a TypeLoc, before
-  /// walking into its TypeRepr children.  If it returns false, the subtree is
-  /// skipped.
-  ///
-  /// \param TL The TypeLoc to check.
-  virtual bool walkToTypeLocPre(TypeLoc &TL) { return true; }
-
-  /// \brief This method is called after visiting the children of a TypeLoc.
-  /// If it returns false, the remaining traversal is terminated and returns
-  /// failure.
-  virtual bool walkToTypeLocPost(TypeLoc &TL) { return true; }
-
-
-  /// \brief This method is called when first visiting a TypeRepr, before
+  /// This method is called when first visiting a TypeRepr, before
   /// walking into its children.  If it returns false, the subtree is skipped.
   ///
   /// \param T The TypeRepr to check.
   virtual bool walkToTypeReprPre(TypeRepr *T) { return true; }
 
-  /// \brief This method is called after visiting the children of a TypeRepr.
+  /// This method is called after visiting the children of a TypeRepr.
   /// If it returns false, the remaining traversal is terminated and returns
   /// failure.
   virtual bool walkToTypeReprPost(TypeRepr *T) { return true; }
 
   /// This method configures whether the walker should explore into the generic
-  /// params in an AbstractFunctionDecl.
-  virtual bool shouldWalkIntoFunctionGenericParams() { return false; }
+  /// params in AbstractFunctionDecl and NominalTypeDecl.
+  virtual bool shouldWalkIntoGenericParams() { return false; }
+
+  /// This method configures whether the walker should walk into the
+  /// initializers of lazy variables.  These initializers are semantically
+  /// different from other initializers in their context and so sometimes
+  /// should not be visited.
+  ///
+  /// Note that visiting the body of the lazy getter will find a
+  /// LazyInitializerExpr with the initializer as its sub-expression.
+  /// However, ASTWalker does not walk into LazyInitializerExprs on its own.
+  virtual bool shouldWalkIntoLazyInitializers() { return true; }
+
+  /// This method configures whether the walker should visit the body of a
+  /// closure that was checked separately from its enclosing expression.
+  ///
+  /// For work that is performed for every top-level expression, this should
+  /// be overridden to return false, to avoid duplicating work or visiting
+  /// bodies of closures that have not yet been type checked.
+  virtual bool shouldWalkIntoSeparatelyCheckedClosure(ClosureExpr *) {
+    return true;
+  }
+
+  /// This method configures whether the walker should visit the body of a
+  /// TapExpr.
+  virtual bool shouldWalkIntoTapExpression() { return true; }
+
+  /// This method configures whether the walker should visit the capture
+  /// initializer expressions within a capture list directly, rather than
+  /// walking the declarations.
+  virtual bool shouldWalkCaptureInitializerExpressions() { return false; }
+
+  /// This method configures whether the walker should exhibit the legacy
+  /// behavior where accessors appear as peers of their storage, rather
+  /// than children nested inside of it.
+  ///
+  /// Please don't write new ASTWalker implementations that override this
+  /// method to return true; instead, refactor existing code as needed
+  /// until eventually we can remove this altogether.
+  virtual bool shouldWalkAccessorsTheOldWay() { return false; }
+
+  /// walkToParameterListPre - This method is called when first visiting a
+  /// ParameterList, before walking into its parameters.  If it returns false,
+  /// the subtree is skipped.
+  ///
+  virtual bool walkToParameterListPre(ParameterList *PL) { return true; }
+
+  /// walkToParameterListPost - This method is called after visiting the
+  /// children of a parameter list.  If it returns false, the remaining
+  /// traversal is terminated and returns failure.
+  virtual bool walkToParameterListPost(ParameterList *PL) { return true; }
+
 
 protected:
   ASTWalker() = default;
   ASTWalker(const ASTWalker &) = default;
   virtual ~ASTWalker() = default;
-  
+
   virtual void anchor();
 };
 

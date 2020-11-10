@@ -1,7 +1,5 @@
 :orphan:
 
-.. @raise litre.TestsAreMissing
-
 Declaration Type Checker
 ========================
 
@@ -15,13 +13,13 @@ This document describes some of the problems with our current "declaration" type
 Problems with the Current Approach
 ----------------------------------
 
-The current declaration type checker---in particular, ``validateDecl``, which assigns a type to a given declaration---is the source of a large number of Swift bugs, including crashes on both well-formed and ill-formed code, different behavior depending on the order of declarations within a file or across multiple files, infinite recursion, and broken ASTs. The main issues are:
+The current declaration type checker is the source of a large number of Swift bugs, including crashes on both well-formed and ill-formed code, different behavior depending on the order of declarations within a file or across multiple files, infinite recursion, and broken ASTs. The main issues are:
 
 **Conceptual phases are tangled together**: We have a vague notion that there are phases within the compiler, e.g., extension binding occurs before name binding, which occurs before type checking. However, the implementations in the compiler don't respect phases: extension binding goes through type validation, which does both name binding and type checking. Name lookup attempts to do type checking so that it can establish whether one declaration shadows another.
 
 **Unprincipled recursion**: Whenever type checking some particular declaration requires information about another declaration, it recurses to type-check that declaration. There are dozens of these recursion points scattered throughout the compiler, which makes it impossible to reason about the recursion or deal with, e.g., recursion that is too deep for the program stack.
 
-**Ad hoc recursion breaking**: When we do encounter circular dependencies, we have scattered checks for recursion based on a number of separate bits stashed in the AST: ``BeingTypeChecked``, ``EarlyAttrValidation``,  ``ValidatingGenericSignature``, etc. Adding these checks is unprincipled: adding a new check in the wrong place tends to break working code (because the dependency is something the compiler should be able to handle), while missing a check permits infinite recursion to continue.
+**Ad hoc recursion breaking**: When we do encounter circular dependencies, we have scattered checks for recursion based on a number of separate bits stashed in the AST: ``isComputingRequirementSignature()``, ``isComputingPatternBindingEntry()``,  ``isComputingGenericSignature()/hasComputedGenericSignature()``, etc. Adding these checks is unprincipled: adding a new check in the wrong place tends to break working code (because the dependency is something the compiler should be able to handle), while missing a check permits infinite recursion to continue.
 
 **Type checker does too much work**: validating a declaration is all-or-nothing. It includes computing its type, but also checking redeclarations and overrides, as well as numerous other aspects that a user of that declaration might not care about. Aside from the performance impact of checking too much, this can introduce false circularities in type-checking, because the user might only need some very basic information to continue.
 
@@ -68,7 +66,7 @@ There are a few aspects of the language that make it challenging to implement th
   extension C { }
   extension B { struct Inner { } }
 
-Here, the name lookup used for the first extension needs to resolve the typealias, which depends on the second extension having already been bound. There is a similar dependency on resolving superclasses beforing binding extensions::
+Here, the name lookup used for the first extension needs to resolve the typealias, which depends on the second extension having already been bound. There is a similar dependency on resolving superclasses before binding extensions::
 
   class X { struct Inner { } }
   class Y : X { }
@@ -80,7 +78,7 @@ We can address this problem by restricting the language to disallow extensions v
 
   protocol SequenceType {
     typealias Element
-    mutating func generate() -> Element?
+    mutating func makeIterator() -> Element?
   }
 
   struct IntRangeGenerator : SequenceType {
@@ -88,7 +86,7 @@ We can address this problem by restricting the language to disallow extensions v
     let limit: Int
 
     // infers SequenceType's Element == Int
-    mutating func generate() -> Int? {
+    mutating func makeIterator() -> Int? {
       if current == limit { return nil }
       return current++
     }
@@ -119,10 +117,10 @@ To address the problems with the current declaration type checker, we propose a 
   }
 
   struct X<T> : P {
-    
+
   }
 
-  func foo(x: X<Int>.Assoc) { }
+  func foo(_ x: X<Int>.Assoc) { }
 
 To bring the ``TypeRepr`` for ``X<Int>.Assoc`` to the "primary name binding" phase, we need to bring ``X`` up to the "primary name binding" phase. Once all dependencies for a phase transition have been resolved, we can perform the phase transition. As noted earlier, it's important to make the dependencies minimal: for example, note that we do not introduce any dependencies on the type argument (``Int``) because it does not affect name lookup. It could, however, affect declaration type validation.
 
@@ -154,18 +152,18 @@ The proposed architecture is significantly different from the current type check
 
 **Make name lookup phase-aware**: Name lookup is currently one of the worst offenders when violating phase ordering. Parameterize name lookup based on the phase at which it's operating. For example, asking for name lookup at the "extension binding" phase might not resolve type aliases, look into superclasses, or look into protocols.
 
-**Make type resolution phase-aware**: Type resolution effectively brings a given ``TypeRepr`` up to the "declaration type validation`` phase in one shot. Parameterize type resolution based on the target phase, and start minimizing the among of work that the type checking does. Use extension binding as a testbed for these more-minimal dependencies.
+**Make type resolution phase-aware**: Type resolution effectively brings a given ``TypeRepr`` up to the "declaration type validation`` phase in one shot. Parameterize type resolution based on the target phase, and start minimizing the amount of work that the type checking does. Use extension binding as a testbed for these more-minimal dependencies.
 
 **Dependency graph and priority queue**: Extend the current-phase trait with an operation that enumerates the dependencies that need to be satisfied to bring a given AST node up to a particular phase. Start with ``TypeRepr`` nodes, and use the dependency graph and priority queue to satisfy all dependencies ahead of time, eliminating direct recursion from the type-resolution code path. Build circular-dependency detection within this test-bed.
 
-**Incremental adoption of dependency graph**: Make other AST nodes (``Pattern``, ``VarDecl``, etc.) implement the phase-awareness trait, enumerating dependencies and updating their logic to perform minimal updates. Certain entry points that are used for ad hoc recursion (such as ``validateDecl``) can push/pop dependency graph and priority-queue instances, which leaves the existing ad hoc recursion checking in place but allows isolated subproblems to use the newer mechanisms.
+**Incremental adoption of dependency graph**: Make other AST nodes (``Pattern``, ``VarDecl``, etc.) implement the phase-awareness trait, enumerating dependencies and updating their logic to perform minimal updates. Certain entry points that are used for ad hoc recursion can push/pop dependency graph and priority-queue instances, which leaves the existing ad hoc recursion checking in place but allows isolated subproblems to use the newer mechanisms.
 
 **Strengthen accessor assertions**: As ad hoc recursion gets eliminated from the type checker, strengthen assertions on the various AST nodes to make sure the AST node has been brought to the appropriate phase.
 
 How do we test it?
 ~~~~~~~~~~~~~~~~~~
 
-**Existing code continues to work**: As we move various parts of the type checker over to the dependency graph, existing Swift code should continue to work, since we'll have fallbacks to the existing logic and the new type checker should be strictly more lazy than the existing type checker.
+**Existing code continues to work**: As we move various parts of the type checker over to the dependency graph, existing Swift code should continue to work, since we'll have fallbacks to the existing logic and the new type checker should be strictly lazier than the existing type checker.
 
 **Order-independence testing**: One of the intended improvements from this type checker architecture is that we should get more predictable order-independent behavior. To check this, we can randomly scramble the order in which we type-check declarations in the primary source file of a well-formed module and verify that we get the same results.
 
@@ -176,8 +174,8 @@ How do we measure progress?
 
 The proposed change is a major architectural shift, and it's only complete when we have eliminated all ad hoc recursion from the front end. There are a few ways in which we can measure progress along the way:
 
-**AST nodes that implement the phase-aware trait**: Eventually, all of our AST nodes will implement the phase-aware trait. The number of AST nodes that do properly implement that trait (reporting current phase, enumerating dependencies for a phase transition) and become part of the dependency graph and priorty queue gives an indication of how far we've gotten.
+**AST nodes that implement the phase-aware trait**: Eventually, all of our AST nodes will implement the phase-aware trait. The number of AST nodes that do properly implement that trait (reporting current phase, enumerating dependencies for a phase transition) and become part of the dependency graph and priority queue gives an indication of how far we've gotten.
 
 **Accessors that check the current phase**: When we're finished, each of the AST's accessors should assert that the AST node is in the appropriate phase. The number of such assertions that have been enabled is an indication of how well the type checker is respecting the dependencies.
 
-**Phases of AST nodes in non-primary files**: With the current type checker, every AST node in a non-primary file that gets touched when type-checking the primary file will end up being fully validated (currently, the "attribute checking" phase). As the type checker gets more lazy, the AST nodes in non-primary files will trend toward earlier phases. Tracking the number of nodes in non-primary files at each phase over time will help us establish how lazy the type checker is becoming.
+**Phases of AST nodes in non-primary files**: With the current type checker, every AST node in a non-primary file that gets touched when type-checking the primary file will end up being fully validated (currently, the "attribute checking" phase). As the type checker gets lazier, the AST nodes in non-primary files will trend toward earlier phases. Tracking the number of nodes in non-primary files at each phase over time will help us establish how lazy the type checker is becoming.

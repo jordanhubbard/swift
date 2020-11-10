@@ -6,26 +6,43 @@ handle_gyb_sources(
     ${SWIFT_HOST_VARIANT_ARCH})
 
 add_swift_unittest(SwiftBasicTests
-  ADTTests.cpp
+  BlotMapVectorTest.cpp
+  CacheTest.cpp
   ClusteredBitVectorTest.cpp
-  Demangle.cpp
+  DemangleTest.cpp
+  DiverseStackTest.cpp
   EditorPlaceholderTest.cpp
   EncodedSequenceTest.cpp
-  FileSystemTests.cpp
-  SourceManager.cpp
-  TreeScopedHashTableTests.cpp
+  ExponentialGrowthAppendingBinaryByteStreamTests.cpp
+  FileSystemTest.cpp
+  FrozenMultiMapTest.cpp
+  ImmutablePointerSetTest.cpp
+  JSONSerialization.cpp
+  OptionSetTest.cpp
+  OwnedStringTest.cpp
+  MultiMapCacheTest.cpp
+  PointerIntEnumTest.cpp
   PrefixMapTest.cpp
+  RangeTest.cpp
+  SourceManagerTest.cpp
+  STLExtrasTest.cpp
   StringExtrasTest.cpp
   SuccessorMapTest.cpp
-  Unicode.cpp
-  BlotMapVectorTest.cpp
-
+  TaggedUnionTest.cpp
+  ThreadSafeRefCntPointerTest.cpp
+  TransformRangeTest.cpp
+  TreeScopedHashTableTest.cpp
+  TypeLookupError.cpp
+  UnicodeTest.cpp
+  ValueEnumeratorTest.cpp
   ${generated_tests}
   )
 
 add_dependencies(SwiftBasicTests "${gyb_dependency_targets}")
 
 target_link_libraries(SwiftBasicTests
+  PRIVATE
   swiftBasic
   clangBasic
+  LLVMTestingSupport
   )

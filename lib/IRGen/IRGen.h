@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,6 +19,8 @@
 #define SWIFT_IRGEN_IRGEN_H
 
 #include "llvm/Support/DataTypes.h"
+#include "clang/AST/CharUnits.h"
+#include "clang/CodeGen/ConstantInitFuture.h"
 #include "swift/AST/ResilienceExpansion.h"
 #include "swift/SIL/AbstractionPattern.h"
 #include <cassert>
@@ -31,9 +33,11 @@ namespace swift {
   class CanType;
   class ClusteredBitVector;
   enum ForDefinition_t : bool;
-  
+
 namespace irgen {
   using Lowering::AbstractionPattern;
+  using clang::CodeGen::ConstantInitFuture;
+  class IRGenFunction;
 
 /// In IRGen, we use Swift's ClusteredBitVector data structure to
 /// store vectors of spare bits.
@@ -73,6 +77,19 @@ inline IsBitwiseTakable_t &operator&=(IsBitwiseTakable_t &l, IsBitwiseTakable_t 
   return (l = (l & r));
 }
 
+enum IsABIAccessible_t : bool {
+  IsNotABIAccessible = false,
+  IsABIAccessible = true  
+};
+
+/// The atomicity of a reference counting operation to be used.
+enum class Atomicity : bool {
+  /// Atomic reference counting operations should be used.
+  Atomic,
+  /// Non-atomic reference counting operations can be used.
+  NonAtomic,
+};
+
 /// Whether or not an object should be emitted on the heap.
 enum OnHeap_t : unsigned char {
   NotOnHeap,
@@ -80,103 +97,198 @@ enum OnHeap_t : unsigned char {
 };
 
 /// Whether a function requires extra data.
-enum class ExtraData : unsigned char {
+enum class ExtraData : uint8_t {
   /// The function requires no extra data.
   None,
 
   /// The function requires a retainable object pointer of extra data.
   Retainable,
-  
+
   /// The function takes its block object as extra data.
   Block,
-  
+
   Last_ExtraData = Block
 };
 
-/// ResilienceScope - The compiler is often able to pursue
-/// optimizations based on its knowledge of the implementation of some
-/// language structure.  However, optimizations which affect
-/// cross-component interfaces are not necessarily sound in the face
-/// of differing compiler versions and API changes that make types
-/// fragile.  The "resilience scope" is the breadth of the code
-/// affected by the answer to a question being asked.
+/// Given that we have metadata for a type, is it for exactly the
+/// specified type, or might it be a subtype?
+enum IsExact_t : bool {
+  IsInexact = false,
+  IsExact = true
+};
+
+/// Ways in which an object can be referenced.
 ///
-/// TODO: maybe deployment versions should factor in here.  If a
-/// question is being asked vis-a-vis the implementation of a subject
-/// structure that is unavailable in any revision for which the object
-/// structure is resilient, is there any reason not to answer as if
-/// the subject structure were universally fragile?
-enum class ResilienceScope {
-  /// Component scope means the decision has to be consistent within
-  /// the current component only.
-  Component,
+/// See the comment in RelativePointer.h.
 
-  /// Universal scope means that the decision has to be consistent
-  /// across all possible clients who could see this declaration.
-  Universal
+enum class SymbolReferenceKind : uint8_t {
+  /// An absolute reference to the object, i.e. an ordinary pointer.
+  ///
+  /// Generally well-suited for when C compatibility is a must, dynamic
+  /// initialization is the dominant case, or the runtime performance
+  /// of accesses is an overriding concern.
+  Absolute,
+
+  /// A direct relative reference to the object, i.e. the offset of the
+  /// object from the address at which the relative reference is stored.
+  ///
+  /// Generally well-suited for when the reference is always statically
+  /// initialized and will always refer to another object within the
+  /// same linkage unit.
+  Relative_Direct,
+
+  /// A direct relative reference that is guaranteed to be as wide as a
+  /// pointer.
+  ///
+  /// Generally well-suited for when the reference may be dynamically
+  /// initialized, but will only refer to objects within the linkage unit
+  /// when statically initialized.
+  Far_Relative_Direct,
+
+  /// A relative reference that may be indirect: the direct reference is
+  /// either directly to the object or to a variable holding an absolute
+  /// reference to the object.
+  ///
+  /// The low bit of the target offset is used to mark an indirect reference,
+  /// and so the low bit of the target address must be zero.  This means that,
+  /// in general, it is not possible to form this kind of reference to a
+  /// function (due to the THUMB bit) or unaligned data (such as a C string).
+  ///
+  /// Generally well-suited for when the reference is always statically
+  /// initialized but may refer to something outside of the linkage unit.
+  Relative_Indirectable,
+
+  /// An indirectable reference to the object; guaranteed to be as wide
+  /// as a pointer.
+  ///
+  /// Generally well-suited for when the reference may be dynamically
+  /// initialized but may also statically refer outside of the linkage unit.
+  Far_Relative_Indirectable,
 };
 
-/// Destructor variants.
-enum class DestructorKind : uint8_t {
-  /// A deallocating destructor destroys the object and deallocates
-  /// the memory associated with it.
-  Deallocating,
+/// An initial value for a definition of an llvm::GlobalVariable.
+class ConstantInit {
+  llvm::PointerUnion<ConstantInitFuture, llvm::Type*> Data;
+public:
+  /// No initializer is given.  When this is used as an argument to
+  /// a getAddrOf... API, it means that only a declaration is being
+  /// requested.
+  ConstantInit() {}
 
-  /// A destroying destructor destroys the object but does not
-  /// deallocate the memory associated with it.
-  Destroying
+  /// Use a concrete value as a concrete initializer.
+  ConstantInit(llvm::Constant *initializer)
+    : Data(ConstantInitFuture(initializer)) {}
+
+  /// Use a ConstantInitBuilder future as a concrete initializer.
+  /*implicit*/ ConstantInit(ConstantInitFuture future) : Data(future) {
+    assert(future && "don't pass around null futures");
+  }
+
+  /// There will be a definition (with the given type), but we don't
+  /// have it yet.
+  static ConstantInit getDelayed(llvm::Type *type) {
+    auto result = ConstantInit();
+    result.Data = type;
+    return result;
+  }
+
+  explicit operator bool() const { return bool(Data); }
+
+  inline llvm::Type *getType() const {
+    assert(Data && "not a definition");
+    if (auto type = Data.dyn_cast<llvm::Type*>()) {
+      return type;
+    } else {
+      return Data.get<ConstantInitFuture>().getType();
+    }
+  }
+
+  bool hasInit() const {
+    return Data.is<ConstantInitFuture>();
+  }
+  ConstantInitFuture getInit() const {
+    return Data.get<ConstantInitFuture>();
+  }
 };
 
-/// Constructor variants.
-enum class ConstructorKind : uint8_t {
-  /// An allocating constructor allocates an object and initializes it.
-  Allocating,
-
-  /// An initializing constructor just initializes an existing object.
-  Initializing
+/// An abstraction for computing the cost of an operation.
+enum class OperationCost : unsigned {
+  Free = 0,
+  Arithmetic = 1,
+  Load = 3, // TODO: split into static- and dynamic-offset cases?
+  Call = 10
 };
+inline OperationCost operator+(OperationCost l, OperationCost r) {
+  return OperationCost(unsigned(l) + unsigned(r));
+}
+inline OperationCost &operator+=(OperationCost &l, OperationCost r) {
+  l = l + r;
+  return l;
+}
+inline bool operator<(OperationCost l, OperationCost r) {
+  return unsigned(l) < unsigned(r);
+}
+inline bool operator<=(OperationCost l, OperationCost r) {
+  return unsigned(l) <= unsigned(r);
+}
 
 /// An alignment value, in eight-bit units.
 class Alignment {
 public:
-  typedef uint32_t int_type;
+  using int_type = uint64_t;
 
-  Alignment() : Value(0) {}
-  explicit Alignment(int_type Value) : Value(Value) {}
+  constexpr Alignment() : Shift(0) {}
+  explicit Alignment(int_type Value) : Shift(llvm::Log2_64(Value)) {
+    assert(llvm::isPowerOf2_64(Value));
+  }
+  explicit Alignment(clang::CharUnits value) : Alignment(value.getQuantity()) {}
 
-  int_type getValue() const { return Value; }
-  int_type getMaskValue() const { return Value - 1; }
-
-  bool isOne() const { return Value == 1; }
-  bool isZero() const { return Value == 0; }
+  constexpr int_type getValue() const { return int_type(1) << Shift; }
+  constexpr int_type getMaskValue() const { return getValue() - 1; }
 
   Alignment alignmentAtOffset(Size S) const;
   Size asSize() const;
 
-  unsigned log2() const {
-    return llvm::Log2_64(Value);
+  unsigned log2() const { return Shift; }
+
+  operator clang::CharUnits() const {
+    return asCharUnits();
+  }
+  clang::CharUnits asCharUnits() const {
+    return clang::CharUnits::fromQuantity(getValue());
   }
 
-  explicit operator bool() const { return Value != 0; }
+  explicit operator llvm::MaybeAlign() const { return llvm::MaybeAlign(getValue()); }
 
-  friend bool operator< (Alignment L, Alignment R){ return L.Value <  R.Value; }
-  friend bool operator<=(Alignment L, Alignment R){ return L.Value <= R.Value; }
-  friend bool operator> (Alignment L, Alignment R){ return L.Value >  R.Value; }
-  friend bool operator>=(Alignment L, Alignment R){ return L.Value >= R.Value; }
-  friend bool operator==(Alignment L, Alignment R){ return L.Value == R.Value; }
-  friend bool operator!=(Alignment L, Alignment R){ return L.Value != R.Value; }
+  friend bool operator< (Alignment L, Alignment R){ return L.Shift <  R.Shift; }
+  friend bool operator<=(Alignment L, Alignment R){ return L.Shift <= R.Shift; }
+  friend bool operator> (Alignment L, Alignment R){ return L.Shift >  R.Shift; }
+  friend bool operator>=(Alignment L, Alignment R){ return L.Shift >= R.Shift; }
+  friend bool operator==(Alignment L, Alignment R){ return L.Shift == R.Shift; }
+  friend bool operator!=(Alignment L, Alignment R){ return L.Shift != R.Shift; }
+
+  template<unsigned Value>
+  static constexpr Alignment create() {
+    Alignment result;
+    result.Shift = llvm::CTLog2<Value>();
+    return result;
+  }
 
 private:
-  int_type Value;
+  unsigned char Shift;
 };
 
 /// A size value, in eight-bit units.
 class Size {
 public:
-  typedef uint64_t int_type;
+  using int_type = uint64_t;
 
   constexpr Size() : Value(0) {}
   explicit constexpr Size(int_type Value) : Value(Value) {}
+  
+  static constexpr Size forBits(int_type bitSize) {
+    return Size((bitSize + 7U) / 8U);
+  }
 
   /// An "invalid" size, equal to the maximum possible size.
   static constexpr Size invalid() { return Size(~int_type(0)); }
@@ -184,7 +296,7 @@ public:
   /// Is this the "invalid" size value?
   bool isInvalid() const { return *this == Size::invalid(); }
 
-  int_type getValue() const { return Value; }
+  constexpr int_type getValue() const { return Value; }
   
   int_type getValueInBits() const { return Value * 8; }
 
@@ -241,6 +353,13 @@ public:
     return llvm::Log2_64(Value);
   }
 
+  operator clang::CharUnits() const {
+    return asCharUnits();
+  }
+  clang::CharUnits asCharUnits() const {
+    return clang::CharUnits::fromQuantity(getValue());
+  }
+
   friend bool operator< (Size L, Size R) { return L.Value <  R.Value; }
   friend bool operator<=(Size L, Size R) { return L.Value <= R.Value; }
   friend bool operator> (Size L, Size R) { return L.Value >  R.Value; }
@@ -274,10 +393,46 @@ inline Alignment Alignment::alignmentAtOffset(Size S) const {
   return *this;
 }
 
-/// Get this alignment asx a Size value.
+/// Get this alignment as a Size value.
 inline Size Alignment::asSize() const {
   return Size(getValue());
 }
+
+/// A static or dynamic offset.
+class Offset {
+  enum Kind {
+    Static,
+    Dynamic,
+  };
+  enum : uint64_t {
+    KindBits = 1,
+    KindMask = (1 << KindBits) - 1,
+    PayloadMask = ~uint64_t(KindMask)
+  };
+  uint64_t Data;
+
+public:
+  explicit Offset(llvm::Value *offset)
+    : Data(reinterpret_cast<uintptr_t>(offset) | Dynamic) {}
+  explicit Offset(Size offset)
+    : Data((static_cast<uint64_t>(offset.getValue()) << KindBits) | Static) {
+    assert(getStatic() == offset && "overflow");
+  }
+
+  bool isStatic() const { return (Data & KindMask) == Static; }
+  bool isDynamic() const { return (Data & KindMask) == Dynamic; }
+  Size getStatic() const {
+    assert(isStatic());
+    return Size(static_cast<int64_t>(Data) >> KindBits);
+  }
+  llvm::Value *getDynamic() const {
+    assert(isDynamic());
+    return reinterpret_cast<llvm::Value*>(Data & PayloadMask);
+  }
+
+  llvm::Value *getAsValue(IRGenFunction &IGF) const;
+  Offset offsetBy(IRGenFunction &IGF, Size other) const;
+};
 
 } // end namespace irgen
 } // end namespace swift

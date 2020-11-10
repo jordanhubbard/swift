@@ -1,3 +1,15 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift.org open source project
+//
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Licensed under Apache License v2.0 with Runtime Library Exception
+//
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+//
+//===----------------------------------------------------------------------===//
+
 #include "swift/IDE/CodeCompletionCache.h"
 #include "swift/Basic/Cache.h"
 #include "llvm/ADT/APInt.h"
@@ -65,7 +77,7 @@ void CodeCompletionCache::setImpl(const Key &K, ValueRefCntPtr V,
 
     llvm::sys::fs::file_status ModuleStatus;
     if (llvm::sys::fs::status(K.ModuleFilename, ModuleStatus)) {
-      V->ModuleModificationTime = llvm::sys::TimeValue::now();
+      V->ModuleModificationTime = std::chrono::system_clock::now();
       return;
     } else {
       V->ModuleModificationTime = ModuleStatus.getLastModificationTime();
@@ -88,29 +100,7 @@ CodeCompletionCache::~CodeCompletionCache() {}
 ///
 /// This should be incremented any time we commit a change to the format of the
 /// cached results. This isn't expected to change very often.
-static constexpr uint32_t onDiskCompletionCacheVersion = 0;
-
-static StringRef copyString(llvm::BumpPtrAllocator &Allocator, StringRef Str) {
-  char *Mem = Allocator.Allocate<char>(Str.size());
-  std::copy(Str.begin(), Str.end(), Mem);
-  return StringRef(Mem, Str.size());
-}
-
-static ArrayRef<StringRef> copyStringArray(llvm::BumpPtrAllocator &Allocator,
-                                           ArrayRef<StringRef> Arr) {
-  StringRef *Buff = Allocator.Allocate<StringRef>(Arr.size());
-  std::copy(Arr.begin(), Arr.end(), Buff);
-  return llvm::makeArrayRef(Buff, Arr.size());
-}
-
-static ArrayRef<std::pair<StringRef, StringRef>> copyStringPairArray(
-    llvm::BumpPtrAllocator &Allocator,
-    ArrayRef<std::pair<StringRef, StringRef>> Arr) {
-  std::pair<StringRef, StringRef> *Buff = Allocator.Allocate<std::pair<StringRef,
-    StringRef>>(Arr.size());
-  std::copy(Arr.begin(), Arr.end(), Buff);
-  return llvm::makeArrayRef(Buff, Arr.size());
-}
+static constexpr uint32_t onDiskCompletionCacheVersion = 1;
 
 /// Deserializes CodeCompletionResults from \p in and stores them in \p V.
 /// \see writeCacheModule.
@@ -125,6 +115,7 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
     auto result = llvm::support::endian::read32le(cursor);
     cursor += sizeof(result);
     assert(cursor <= end);
+    (void)end;
     return result;
   };
 
@@ -141,7 +132,8 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
     if (!allowOutOfDate) {
       llvm::sys::fs::file_status status;
       if (llvm::sys::fs::status(K.ModuleFilename, status) ||
-          status.getLastModificationTime().toEpochTime() != mtime) {
+          status.getLastModificationTime().time_since_epoch().count() !=
+          std::chrono::nanoseconds(mtime).count()) {
         return false; // Out of date, or doesn't exist.
       }
     }
@@ -198,8 +190,10 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
   while (cursor != resultEnd) {
     auto kind = static_cast<CodeCompletionResult::ResultKind>(*cursor++);
     auto declKind = static_cast<CodeCompletionDeclKind>(*cursor++);
+    auto opKind = static_cast<CodeCompletionOperatorKind>(*cursor++);
     auto context = static_cast<SemanticContextKind>(*cursor++);
     auto notRecommended = static_cast<bool>(*cursor++);
+    auto isSystem = static_cast<bool>(*cursor++);
     auto numBytesToErase = static_cast<unsigned>(*cursor++);
     auto oldCursor = cursor;
     auto chunkIndex = read32le(cursor);
@@ -232,14 +226,16 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
 
     CodeCompletionResult *result = nullptr;
     if (kind == CodeCompletionResult::Declaration) {
-      result = new (*V.Sink.Allocator)
-          CodeCompletionResult(context, numBytesToErase, string, declKind,
-                               moduleName, notRecommended, briefDocComment,
-                               copyStringArray(*V.Sink.Allocator, assocUSRs),
-                               copyStringPairArray(*V.Sink.Allocator, declKeywords));
+      result = new (*V.Sink.Allocator) CodeCompletionResult(
+          context, numBytesToErase, string, declKind, isSystem, moduleName,
+          notRecommended, CodeCompletionResult::NotRecommendedReason::NoReason,
+          briefDocComment, copyArray(*V.Sink.Allocator, ArrayRef<StringRef>(assocUSRs)),
+          copyArray(*V.Sink.Allocator, ArrayRef<std::pair<StringRef, StringRef>>(declKeywords)),
+          CodeCompletionResult::Unknown, opKind);
     } else {
       result = new (*V.Sink.Allocator)
-          CodeCompletionResult(kind, context, numBytesToErase, string);
+          CodeCompletionResult(kind, context, numBytesToErase, string,
+                               CodeCompletionResult::NotApplicable, opKind);
     }
 
     V.Sink.Results.push_back(result);
@@ -274,12 +270,13 @@ static void writeCachedModule(llvm::raw_ostream &out,
                               const CodeCompletionCache::Key &K,
                               CodeCompletionCache::Value &V) {
   using namespace llvm::support;
-  endian::Writer<little> LE(out);
+  endian::Writer LE(out, little);
 
   // HEADER
   // Metadata required for reading the completions.
   LE.write(onDiskCompletionCacheVersion);           // Version
-  LE.write(V.ModuleModificationTime.toEpochTime()); // Mtime for module file
+  auto mtime = V.ModuleModificationTime.time_since_epoch().count();
+  LE.write(mtime);                                  // Mtime for module file
 
   // KEY
   // We don't need the stored key to load the results, but it is useful if we
@@ -289,12 +286,15 @@ static void writeCachedModule(llvm::raw_ostream &out,
     llvm::raw_svector_ostream OSS(scratch);
     OSS << K.ModuleFilename << "\0";
     OSS << K.ModuleName << "\0";
-    endian::Writer<little> OSSLE(OSS);
+    endian::Writer OSSLE(OSS, little);
     OSSLE.write(K.AccessPath.size());
     for (StringRef p : K.AccessPath)
       OSS << p << "\0";
     OSSLE.write(K.ResultsHaveLeadingDot);
     OSSLE.write(K.ForTestableLookup);
+    OSSLE.write(K.ForPrivateImportLookup);
+    OSSLE.write(K.CodeCompleteInitsInPostfixExpr);
+    OSSLE.write(K.Annotated);
     LE.write(static_cast<uint32_t>(OSS.tell()));   // Size of debug info
     out.write(OSS.str().data(), OSS.str().size()); // Debug info blob
   }
@@ -304,7 +304,7 @@ static void writeCachedModule(llvm::raw_ostream &out,
   llvm::raw_string_ostream results(results_);
   std::string chunks_;
   llvm::raw_string_ostream chunks(chunks_);
-  endian::Writer<little> chunksLE(chunks);
+  endian::Writer chunksLE(chunks, little);
   std::string strings_;
   llvm::raw_string_ostream strings(strings_);
 
@@ -312,7 +312,7 @@ static void writeCachedModule(llvm::raw_ostream &out,
     if (str.empty())
       return ~0u;
     auto size = strings.tell();
-    endian::Writer<little> LE(strings);
+    endian::Writer LE(strings, little);
     LE.write(static_cast<uint32_t>(str.size()));
     strings << str;
     return static_cast<uint32_t>(size);
@@ -336,7 +336,7 @@ static void writeCachedModule(llvm::raw_ostream &out,
 
   // RESULTS
   {
-    endian::Writer<little> LE(results);
+    endian::Writer LE(results, little);
     for (CodeCompletionResult *R : V.Sink.Results) {
       // FIXME: compress bitfield
       LE.write(static_cast<uint8_t>(R->getKind()));
@@ -344,8 +344,13 @@ static void writeCachedModule(llvm::raw_ostream &out,
         LE.write(static_cast<uint8_t>(R->getAssociatedDeclKind()));
       else
         LE.write(static_cast<uint8_t>(~0u));
+      if (R->isOperator())
+        LE.write(static_cast<uint8_t>(R->getOperatorKind()));
+      else
+        LE.write(static_cast<uint8_t>(CodeCompletionOperatorKind::None));
       LE.write(static_cast<uint8_t>(R->getSemanticContext()));
       LE.write(static_cast<uint8_t>(R->isNotRecommended()));
+      LE.write(static_cast<uint8_t>(R->isSystem()));
       LE.write(static_cast<uint8_t>(R->getNumBytesToErase()));
       LE.write(
           static_cast<uint32_t>(addCompletionString(R->getCompletionString())));
@@ -398,9 +403,12 @@ static std::string getName(StringRef cacheDirectory,
   llvm::sys::path::append(name, K.ModuleName);
   llvm::raw_svector_ostream OSS(name);
 
-  // name[-dot][-testable]
+  // name[-dot][-testable][-inits]
   OSS << (K.ResultsHaveLeadingDot ? "-dot" : "")
-      << (K.ForTestableLookup ? "-testable" : "");
+      << (K.ForTestableLookup ? "-testable" : "")
+      << (K.ForPrivateImportLookup ? "-private" : "")
+      << (K.CodeCompleteInitsInPostfixExpr ? "-inits" : "")
+      << (K.Annotated ? "-annotated" : "");
 
   // name[-access-path-components]
   for (StringRef component : K.AccessPath)
@@ -412,7 +420,7 @@ static std::string getName(StringRef cacheDirectory,
   llvm::APInt(64, uint64_t(hash)).toStringUnsigned(hashStr, /*Radix*/ 36);
   OSS << "-" << hashStr << ".completions";
 
-  return name.str();
+  return std::string(name.str());
 }
 
 Optional<CodeCompletionCache::ValueRefCntPtr>
@@ -465,7 +473,8 @@ OnDiskCodeCompletionCache::getFromFile(StringRef filename) {
     return None;
 
   // Make up a key for readCachedModule.
-  CodeCompletionCache::Key K{filename, "<module-name>", {}, false, false};
+  CodeCompletionCache::Key K{filename.str(), "<module-name>", {},   false,
+                             false,          false,           false, false};
 
   // Read the cached results.
   auto V = CodeCompletionCache::createValue();

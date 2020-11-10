@@ -2,17 +2,18 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
 #include "swift/Basic/PrefixMap.h"
 #include "swift/Basic/QuotedString.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/Support/Compiler.h"
 
 using namespace swift;
 
@@ -33,8 +34,8 @@ enum class ChildKind { Left, Right, Further, Root };
 // that's technically instantiation-specific.  Redefining the struct here
 // is technically an aliasing violation, but we can just tell the compilers
 // that actually use TBAA that this is okay.
-typedef struct _Node Node LLVM_MAY_ALIAS;
-struct _Node {
+typedef struct _Node Node;
+struct LLVM_MAY_ALIAS _Node {
   // If you change the layout in the header, you'll need to change it here.
   // (This comment is repeated there.)
   Node *Left, *Right, *Further;

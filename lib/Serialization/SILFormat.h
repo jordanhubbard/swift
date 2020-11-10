@@ -1,12 +1,12 @@
-//===--- SILFormat.h - The internals of serialized SILs --------*- C++ -*-===//
+//===--- SILFormat.h - The internals of serialized SILs ---------*- C++ -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -18,7 +18,7 @@
 #ifndef SWIFT_SERIALIZATION_SILFORMAT_H
 #define SWIFT_SERIALIZATION_SILFORMAT_H
 
-#include "swift/Serialization/ModuleFormat.h"
+#include "ModuleFormat.h"
 
 namespace swift {
 namespace serialization {
@@ -28,15 +28,16 @@ using ValueIDField = DeclIDField;
 
 using SILInstOpCodeField = BCFixed<8>;
 using SILTypeCategoryField = BCFixed<2>;
-using SILValueResultField = BCFixed<8>;
 
 enum SILStringEncoding : uint8_t {
   SIL_UTF8,
-  SIL_UTF16
+  SIL_OBJC_SELECTOR,
+  SIL_BYTES
 };
 
 enum SILLinkageEncoding : uint8_t {
   SIL_LINKAGE_PUBLIC,
+  SIL_LINKAGE_PUBLIC_NON_ABI,
   SIL_LINKAGE_HIDDEN,
   SIL_LINKAGE_SHARED,
   SIL_LINKAGE_PRIVATE,
@@ -45,37 +46,36 @@ enum SILLinkageEncoding : uint8_t {
   SIL_LINKAGE_SHARED_EXTERNAL,
   SIL_LINKAGE_PRIVATE_EXTERNAL,
 };
-using SILLinkageField = BCFixed<3>;
+using SILLinkageField = BCFixed<4>;
 
-enum CheckedCastKindEncoding : uint8_t {
-  SIL_CHECKED_CAST_ARCHETYPE_TO_ARCHETYPE,
-  SIL_CHECKED_CAST_ARCHETYPE_TO_CONCRETE,
-  SIL_CHECKED_CAST_ARRAY_DOWNCAST,
-  SIL_CHECKED_CAST_ARRAY_DOWNCAST_BRIDGED,
-  SIL_CHECKED_CAST_DICTIONARY_DOWNCAST,
-  SIL_CHECKED_CAST_DICTIONARY_DOWNCAST_BRIDGED,
-  SIL_CHECKED_CAST_DOWNCAST,
-  SIL_CHECKED_CAST_IDENTICAL,
-  SIL_CHECKED_CAST_EXISTENTIAL_TO_ARCHETYPE,
-  SIL_CHECKED_CAST_EXISTENTIAL_TO_CONCRETE,
-  SIL_CHECKED_CAST_SUPER_TO_ARCHETYPE,
-  SIL_CHECKED_CAST_CONCRETE_TO_ARCHETYPE,
-  SIL_CHECKED_CAST_CONCRETE_TO_UNRELATED_EXISTENTIAL,
+enum SILVTableEntryKindEncoding : uint8_t {
+  SIL_VTABLE_ENTRY_NORMAL,
+  SIL_VTABLE_ENTRY_INHERITED,
+  SIL_VTABLE_ENTRY_OVERRIDE,
 };
+using SILVTableEntryKindField = BCFixed<2>;
 
 enum CastConsumptionKindEncoding : uint8_t {
   SIL_CAST_CONSUMPTION_TAKE_ALWAYS,
   SIL_CAST_CONSUMPTION_TAKE_ON_SUCCESS,
   SIL_CAST_CONSUMPTION_COPY_ON_SUCCESS,
+  SIL_CAST_CONSUMPTION_BORROW_ALWAYS,
 };
 
-// Constants for packing an encoded CheckedCastKind and
-// CastConsumptionKind together.
-enum {
-  // Must be large enough to store all the CheckedCastKindEncodings
-  SIL_CAST_CONSUMPTION_BIT_OFFSET = 4,
-  SIL_CHECKED_CAST_MASK =
-    (1 << SIL_CAST_CONSUMPTION_BIT_OFFSET) - 1
+enum class KeyPathComponentKindEncoding : uint8_t {
+  StoredProperty,
+  TupleElement,
+  GettableProperty,
+  SettableProperty,
+  OptionalChain,
+  OptionalForce,
+  OptionalWrap,
+  Trivial,
+};
+enum class KeyPathComputedComponentIdKindEncoding : uint8_t {
+  Property,
+  Function,
+  DeclRef,
 };
 
 /// The record types within the "sil-index" block.
@@ -83,7 +83,7 @@ enum {
 /// \sa SIL_INDEX_BLOCK_ID
 namespace sil_index_block {
   // These IDs must \em not be renumbered or reordered without incrementing
-  // VERSION_MAJOR.
+  // the module version.
   enum RecordKind {
     SIL_FUNC_NAMES = 1,
     SIL_FUNC_OFFSETS,
@@ -91,8 +91,13 @@ namespace sil_index_block {
     SIL_VTABLE_OFFSETS,
     SIL_GLOBALVAR_NAMES,
     SIL_GLOBALVAR_OFFSETS,
-    SIL_WITNESSTABLE_NAMES,
-    SIL_WITNESSTABLE_OFFSETS
+    SIL_WITNESS_TABLE_NAMES,
+    SIL_WITNESS_TABLE_OFFSETS,
+    SIL_DEFAULT_WITNESS_TABLE_NAMES,
+    SIL_DEFAULT_WITNESS_TABLE_OFFSETS,
+    SIL_PROPERTY_OFFSETS,
+    SIL_DIFFERENTIABILITY_WITNESS_NAMES,
+    SIL_DIFFERENTIABILITY_WITNESS_OFFSETS,
   };
 
   using ListLayout = BCGenericRecordLayout<
@@ -112,7 +117,7 @@ namespace sil_index_block {
 /// \sa SIL_BLOCK_ID
 namespace sil_block {
   // These IDs must \em not be renumbered or reordered without incrementing
-  // VERSION_MAJOR.
+  // the module version.
   enum RecordKind : uint8_t {
     SIL_FUNCTION = 1,
     SIL_BASIC_BLOCK,
@@ -122,36 +127,43 @@ namespace sil_block {
     SIL_ONE_TYPE_ONE_OPERAND,
     SIL_ONE_TYPE_VALUES,
     SIL_TWO_OPERANDS,
+    SIL_TAIL_ADDR,
     SIL_INST_APPLY,
     SIL_INST_NO_OPERAND,
     SIL_VTABLE,
     SIL_VTABLE_ENTRY,
     SIL_GLOBALVAR,
-    SIL_INST_CAST, // It has a cast kind instead of an attribute.
     SIL_INIT_EXISTENTIAL,
-    SIL_WITNESSTABLE,
+    SIL_WITNESS_TABLE,
     SIL_WITNESS_METHOD_ENTRY,
-    // To avoid overlapping with BOUND_GENERIC_SUBSTITUTION, we start from +1.
-    // FIXME: another option is to start SIL_FUNCTION at a large number.
-    SIL_WITNESS_BASE_ENTRY = decls_block::BOUND_GENERIC_SUBSTITUTION + 1,
+    SIL_WITNESS_BASE_ENTRY,
     SIL_WITNESS_ASSOC_PROTOCOL,
     SIL_WITNESS_ASSOC_ENTRY,
-    SIL_GENERIC_OUTER_PARAMS,
+    SIL_WITNESS_CONDITIONAL_CONFORMANCE,
+    SIL_DEFAULT_WITNESS_TABLE,
+    SIL_DEFAULT_WITNESS_TABLE_NO_ENTRY,
+    SIL_DIFFERENTIABILITY_WITNESS,
     SIL_INST_WITNESS_METHOD,
+    SIL_SPECIALIZE_ATTR,
+    SIL_PROPERTY,
+    SIL_ONE_OPERAND_EXTRA_ATTR,
+    SIL_TWO_OPERANDS_EXTRA_ATTR,
+    SIL_INST_DIFFERENTIABLE_FUNCTION,
+    SIL_INST_LINEAR_FUNCTION,
+    SIL_INST_DIFFERENTIABLE_FUNCTION_EXTRACT,
+    SIL_INST_LINEAR_FUNCTION_EXTRACT,
 
     // We also share these layouts from the decls block. Their enumerators must
     // not overlap with ours.
-    BOUND_GENERIC_SUBSTITUTION = decls_block::BOUND_GENERIC_SUBSTITUTION,
-    NO_CONFORMANCE = decls_block::NO_CONFORMANCE,
+    ABSTRACT_PROTOCOL_CONFORMANCE = decls_block::ABSTRACT_PROTOCOL_CONFORMANCE,
     NORMAL_PROTOCOL_CONFORMANCE = decls_block::NORMAL_PROTOCOL_CONFORMANCE,
     SPECIALIZED_PROTOCOL_CONFORMANCE
       = decls_block::SPECIALIZED_PROTOCOL_CONFORMANCE,
     INHERITED_PROTOCOL_CONFORMANCE
       = decls_block::INHERITED_PROTOCOL_CONFORMANCE,
-    GENERIC_PARAM_LIST = decls_block::GENERIC_PARAM_LIST,
-    GENERIC_PARAM = decls_block::GENERIC_PARAM,
+    INVALID_PROTOCOL_CONFORMANCE = decls_block::INVALID_PROTOCOL_CONFORMANCE,
     GENERIC_REQUIREMENT = decls_block::GENERIC_REQUIREMENT,
-    LAST_GENERIC_REQUIREMENT = decls_block::LAST_GENERIC_REQUIREMENT,
+    LAYOUT_REQUIREMENT = decls_block::LAYOUT_REQUIREMENT,
   };
 
   using SILInstNoOperandLayout = BCRecordLayout<
@@ -161,22 +173,34 @@ namespace sil_block {
 
   using VTableLayout = BCRecordLayout<
     SIL_VTABLE,
-    DeclIDField   // Class Decl
+    DeclIDField,   // Class Decl
+    BCFixed<1>     // IsSerialized.
   >;
 
   using VTableEntryLayout = BCRecordLayout<
     SIL_VTABLE_ENTRY,
     DeclIDField,  // SILFunction name
+    SILVTableEntryKindField,  // Kind
+    BCFixed<1>, // NonOverridden
     BCArray<ValueIDField> // SILDeclRef
+  >;
+  
+  using PropertyLayout = BCRecordLayout<
+    SIL_PROPERTY,
+    DeclIDField,          // Property decl
+    BCFixed<1>,           // Is serialized
+    BCArray<ValueIDField> // Encoded key path component
+    // Any substitutions or conformances required for the key path component
+    // follow.
   >;
 
   using WitnessTableLayout = BCRecordLayout<
-    SIL_WITNESSTABLE,
+    SIL_WITNESS_TABLE,
     SILLinkageField,     // Linkage
     BCFixed<1>,          // Is this a declaration. We represent this separately
                          // from whether or not we have entries since we can
                          // have empty witness tables.
-    BCFixed<1>           // IsFragile.
+    BCFixed<1>           // IsSerialized.
     // Conformance follows
     // Witness table entries will be serialized after.
   >;
@@ -195,7 +219,7 @@ namespace sil_block {
 
   using WitnessAssocProtocolLayout = BCRecordLayout<
     SIL_WITNESS_ASSOC_PROTOCOL,
-    DeclIDField, // ID of AssociatedTypeDecl
+    TypeIDField, // ID of associated type
     DeclIDField  // ID of ProtocolDecl
     // Trailed by the conformance itself if appropriate.
   >;
@@ -206,29 +230,83 @@ namespace sil_block {
     TypeIDField
   >;
 
-  using GlobalVarLayout = BCRecordLayout<
-    SIL_GLOBALVAR,
-    SILLinkageField,
-    BCFixed<1>,        // fragile
-    TypeIDField,
-    DeclIDField,
-    BCFixed<1>,          // Is this a declaration.
-    BCFixed<1>           // Is this a let variable.
+  using WitnessConditionalConformanceLayout = BCRecordLayout<
+    SIL_WITNESS_CONDITIONAL_CONFORMANCE,
+    TypeIDField // ID of associated type
+    // Trailed by the conformance itself if appropriate.
   >;
 
-  using SILFunctionLayout = BCRecordLayout<
-    SIL_FUNCTION,
-    SILLinkageField,
-    BCFixed<1>,        // transparent
-    BCFixed<1>,        // fragile
-    BCFixed<2>,        // thunk/reabstraction_thunk
-    BCFixed<1>,        // global_init
-    BCFixed<2>,        // inlineStrategy
-    BCFixed<2>,        // side effect info.
-    TypeIDField,
-    IdentifierIDField  // Semantics Attribute
-                       // followed by generic param list, if any
+  using DefaultWitnessTableLayout = BCRecordLayout<
+    SIL_DEFAULT_WITNESS_TABLE,
+    DeclIDField,  // ID of ProtocolDecl
+    SILLinkageField  // Linkage
+    // Default witness table entries will be serialized after.
   >;
+
+  using DefaultWitnessTableNoEntryLayout = BCRecordLayout<
+    SIL_DEFAULT_WITNESS_TABLE_NO_ENTRY
+  >;
+
+  using SILGlobalVarLayout = BCRecordLayout<
+    SIL_GLOBALVAR,
+    SILLinkageField,
+    BCFixed<1>,          // serialized
+    BCFixed<1>,          // Is this a declaration.
+    BCFixed<1>,          // Is this a let variable.
+    TypeIDField,
+    DeclIDField
+  >;
+
+  using DifferentiabilityWitnessLayout = BCRecordLayout<
+    SIL_DIFFERENTIABILITY_WITNESS,
+    DeclIDField,             // Original function name
+    SILLinkageField,         // Linkage
+    BCFixed<1>,              // Is declaration?
+    BCFixed<1>,              // Is serialized?
+    GenericSignatureIDField, // Derivative function generic signature
+    DeclIDField,             // JVP function name
+    DeclIDField,             // VJP function name
+    BCVBR<8>,                // Number of parameter indices
+    BCVBR<8>,                // Number of result indices
+    BCArray<ValueIDField>    // Parameter and result indices
+  >;
+
+  using SILFunctionLayout =
+      BCRecordLayout<SIL_FUNCTION, SILLinkageField,
+                     BCFixed<1>,  // transparent
+                     BCFixed<2>,  // serialized
+                     BCFixed<2>,  // thunks: signature optimized/reabstraction
+                     BCFixed<1>,  // without_actually_escaping
+                     BCFixed<3>,  // specialPurpose
+                     BCFixed<2>,  // inlineStrategy
+                     BCFixed<2>,  // optimizationMode
+                     BCFixed<2>,  // classSubclassScope
+                     BCFixed<1>,  // hasCReferences
+                     BCFixed<3>,  // side effect info.
+                     BCVBR<8>,    // number of specialize attributes
+                     BCFixed<1>,  // has qualified ownership
+                     BCFixed<1>,  // force weak linking
+                     BC_AVAIL_TUPLE, // availability for weak linking
+                     BCFixed<1>,  // is dynamically replacable
+                     BCFixed<1>,  // exact self class
+                     TypeIDField, // SILFunctionType
+                     DeclIDField,  // SILFunction name or 0 (replaced function)
+                     GenericSignatureIDField,
+                     DeclIDField, // ClangNode owner
+                     BCArray<IdentifierIDField> // Semantics Attribute
+                     // followed by specialize attributes
+                     // followed by generic param list, if any
+                     >;
+
+  using SILSpecializeAttrLayout =
+      BCRecordLayout<SIL_SPECIALIZE_ATTR,
+                     BCFixed<1>, // exported
+                     BCFixed<1>, // specialization kind
+                     GenericSignatureIDField, // specialized signature
+                     DeclIDField, // Target SILFunction name or 0.
+                     DeclIDField,  // SPIGroup or 0.
+                     DeclIDField // SPIGroup Module name id.
+                     >;
 
   // Has an optional argument list where each argument is a typed valueref.
   using SILBasicBlockLayout = BCRecordLayout<
@@ -243,11 +321,9 @@ namespace sil_block {
     SILInstOpCodeField,
     BCFixed<2>,          // Optional attributes
     ValueIDField,
-    SILValueResultField,
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
   >;
 
   // SIL instructions with one type and one typed valueref.
@@ -259,8 +335,7 @@ namespace sil_block {
     SILTypeCategoryField,
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
   >;
 
   // SIL instructions that construct existential values.
@@ -272,23 +347,9 @@ namespace sil_block {
     TypeIDField,          // operand type
     SILTypeCategoryField, // operand type category
     ValueIDField,         // operand id
-    SILValueResultField,  // operand result id
     TypeIDField,          // formal concrete type
     BCVBR<5>              // # of protocol conformances
     // Trailed by protocol conformance info (if any)
-  >;
-
-  // SIL Cast instructions with a cast kind, one type and one typed valueref.
-  using SILInstCastLayout = BCRecordLayout<
-    SIL_INST_CAST,
-    SILInstOpCodeField,
-    BCFixed<4>,          // Cast kind
-    TypeIDField,
-    SILTypeCategoryField,
-    TypeIDField,
-    SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
   >;
 
   // SIL instructions with one type and a list of values.
@@ -305,17 +366,18 @@ namespace sil_block {
     SIL_PARTIAL_APPLY,
     SIL_BUILTIN,
     SIL_TRY_APPLY,
-    SIL_NON_THROWING_APPLY
+    SIL_NON_THROWING_APPLY,
+    SIL_BEGIN_APPLY,
+    SIL_NON_THROWING_BEGIN_APPLY
   };
-  
+
   using SILInstApplyLayout = BCRecordLayout<
     SIL_INST_APPLY,
     BCFixed<3>,           // ApplyKind
-    BCFixed<32>,          // num substitutions
+    SubstitutionMapIDField,  // substitution map
     TypeIDField,          // callee unsubstituted type
     TypeIDField,          // callee substituted type
     ValueIDField,         // callee value
-    SILValueResultField,
     BCArray<ValueIDField> // a list of arguments
   >;
 
@@ -323,6 +385,7 @@ namespace sil_block {
   using SILOneTypeLayout = BCRecordLayout<
     SIL_ONE_TYPE,
     SILInstOpCodeField,
+    BCFixed<2>,          // Optional attributes
     TypeIDField,
     SILTypeCategoryField
   >;
@@ -331,11 +394,17 @@ namespace sil_block {
   using SILOneOperandLayout = BCRecordLayout<
     SIL_ONE_OPERAND,
     SILInstOpCodeField,
-    BCFixed<3>,          // Optional attributes
+    BCFixed<2>,          // Optional attributes
     TypeIDField,
     SILTypeCategoryField,
-    ValueIDField,
-    SILValueResultField
+    ValueIDField
+  >;
+
+  using SILOneOperandExtraAttributeLayout = BCRecordLayout<
+    SIL_ONE_OPERAND_EXTRA_ATTR,
+    SILInstOpCodeField,
+    BCFixed<6>, // Optional attributes
+    TypeIDField, SILTypeCategoryField, ValueIDField
   >;
 
   // SIL instructions with two typed values.
@@ -346,16 +415,32 @@ namespace sil_block {
     TypeIDField,
     SILTypeCategoryField,
     ValueIDField,
-    SILValueResultField,
+    TypeIDField,
+    SILTypeCategoryField,
+    ValueIDField
+  >;
+
+  using SILTwoOperandsExtraAttributeLayout = BCRecordLayout<
+    SIL_TWO_OPERANDS_EXTRA_ATTR,
+    SILInstOpCodeField,
+    BCFixed<6>,          // Optional attributes
     TypeIDField,
     SILTypeCategoryField,
     ValueIDField,
-    SILValueResultField
+    TypeIDField,
+    SILTypeCategoryField,
+    ValueIDField
   >;
 
-  using SILGenericOuterParamsLayout = BCRecordLayout<
-    SIL_GENERIC_OUTER_PARAMS,
-    DeclIDField // The decl id of the outer param if any.
+  // The tail_addr instruction.
+  using SILTailAddrLayout = BCRecordLayout<
+    SIL_TAIL_ADDR,
+    SILInstOpCodeField,
+    TypeIDField,          // Base operand
+    ValueIDField,
+    TypeIDField,          // Count operand
+    ValueIDField,
+    TypeIDField           // Result type
   >;
 
   using SILInstWitnessMethodLayout = BCRecordLayout<
@@ -370,6 +455,39 @@ namespace sil_block {
     ValueIDField,          // existential
     BCArray<ValueIDField>  // SILDeclRef
     // may be trailed by an inline protocol conformance
+  >;
+
+  using SILInstDifferentiableFunctionLayout = BCRecordLayout<
+    SIL_INST_DIFFERENTIABLE_FUNCTION,
+    BCVBR<8>,             // number of function parameters
+    BCVBR<8>,   // number of function results
+    BCVBR<8>,   // number of differentiability parameters
+    BCFixed<1>,           // has derivative functions?
+    BCArray<ValueIDField> // parameter indices and operands
+  >;
+
+  using SILInstLinearFunctionLayout = BCRecordLayout<
+    SIL_INST_LINEAR_FUNCTION,
+    BCVBR<8>,             // number of function parameters
+    BCFixed<1>,           // has transpose function?
+    BCArray<ValueIDField> // parameter indices and operands
+  >;
+
+  using SILInstDifferentiableFunctionExtractLayout = BCRecordLayout<
+    SIL_INST_DIFFERENTIABLE_FUNCTION_EXTRACT,
+    TypeIDField,
+    SILTypeCategoryField,
+    ValueIDField,
+    BCFixed<2>, // extractee
+    BCFixed<1>  // has explicit extractee type?
+  >;
+
+  using SILInstLinearFunctionExtractLayout = BCRecordLayout<
+    SIL_INST_LINEAR_FUNCTION_EXTRACT,
+    TypeIDField,
+    SILTypeCategoryField,
+    ValueIDField,
+    BCFixed<1> // extractee
   >;
 }
 

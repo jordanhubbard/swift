@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift | FileCheck %s
+// RUN: %target-run-simple-swift | %FileCheck %s
 // REQUIRES: executable_test
 
 // REQUIRES: objc_interop
@@ -7,11 +7,11 @@
 
 import Foundation
 
-func genericForcedCast<T, U>(a: T) -> U {
+func genericForcedCast<T, U>(_ a: T) -> U {
   return a as! U
 }
 
-func genericConditionalCast<T, U>(a: T) -> U? {
+func genericConditionalCast<T, U>(_ a: T) -> U? {
   return a as? U
 }
 
@@ -104,11 +104,11 @@ func testConditionalValueToObjectBridging() {
     print("Not an NSCoding")
   }
 
-  // CHECK-NEXT: NSXMLParserDelegate
-  if let delegate = (genericConditionalCast(array) as NSXMLParserDelegate?) {
+  // CHECK-NEXT: XMLParserDelegate
+  if let delegate = (genericConditionalCast(array) as XMLParserDelegate?) {
     print("\(delegate)")
   } else {
-    print("Not an NSXMLParserDelegate")
+    print("Not an XMLParserDelegate")
   }
 
   // Conditional bridging (unrelated class)
@@ -232,9 +232,16 @@ class Canary: NSObject {
 }
 var CanaryAssocObjectHandle = 0
 
+class ImmortalCanary: NSObject {
+  deinit {
+    print("oh noes")
+  }
+}
+var ImmortalCanaryAssocObjectHandle = 0
+
 func testValueToObjectBridgingInSwitch() {
   autoreleasepool {
-    let string = "hello"
+    let string = "hello, this is a string that won't be tagged"
     let nsString = string as NSString
     objc_setAssociatedObject(nsString, &CanaryAssocObjectHandle, Canary(),
       .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
@@ -246,8 +253,22 @@ func testValueToObjectBridgingInSwitch() {
       print("Not a string")
     }
   }
+
+#if !(arch(i386) || arch(arm))
+  // Small strings should be immortal on new enough 64-bit Apple platforms.
+  if #available(macOS 10.10, *) {
+    autoreleasepool {
+      let string = "hello"
+      let nsString = string as NSString
+      objc_setAssociatedObject(
+        nsString, &ImmortalCanaryAssocObjectHandle, ImmortalCanary(),
+        .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
+  }
+#endif // 64-bit
   print("Done")
 }
 // CHECK: died
+// CHECK-NOT: oh noes
 // CHECK: Done
 testValueToObjectBridgingInSwitch()

@@ -1,12 +1,12 @@
-//===- TreeScopedHashTable.h - A scoped hash table with multiple active scopes -===//
+//===--- TreeScopedHashTable.h - Hash table with multiple active scopes ---===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -18,6 +18,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Allocator.h"
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/Malloc.h"
 #include <utility>
 
@@ -37,6 +38,12 @@ template <typename K, typename V> class TreeScopedHashTableVal {
   TreeScopedHashTableVal(const K &Key, const V &Val) : Key(Key), Val(Val) {}
 
 public:
+  ~TreeScopedHashTableVal() = default;
+  TreeScopedHashTableVal(const TreeScopedHashTableVal &) = delete;
+  TreeScopedHashTableVal(TreeScopedHashTableVal &&) = delete;
+  TreeScopedHashTableVal &operator=(const TreeScopedHashTableVal &) = delete;
+  TreeScopedHashTableVal &operator=(TreeScopedHashTableVal &&) = delete;
+
   const K &getKey() const { return Key; }
   const V &getValue() const { return Val; }
   V &getValue() { return Val; }
@@ -66,7 +73,7 @@ public:
   }
 };
 
-/// \brief A reference-counted scope that actually owns the data in the
+/// A reference-counted scope that actually owns the data in the
 /// hashtable.
 template <typename K, typename V, typename AllocatorTy = llvm::MallocAllocator>
 class TreeScopedHashTableScopeImpl {
@@ -124,7 +131,7 @@ public:
   ~TreeScopedHashTableScopeImpl();
 };
 
-/// \brief A scope that was detached from the stack to heap.
+/// A scope that was detached from the stack to heap.
 template <typename K, typename V, typename AllocatorTy = llvm::MallocAllocator>
 class TreeScopedHashTableDetachedScope {
   friend class TreeScopedHashTableScope<K, V, AllocatorTy>;
@@ -144,6 +151,9 @@ class TreeScopedHashTableDetachedScope {
   const ImplTy *getImpl() { return DetachedImpl; }
 
 public:
+  TreeScopedHashTableDetachedScope &
+  operator=(TreeScopedHashTableDetachedScope &&) = default;
+
   TreeScopedHashTableDetachedScope() : DetachedImpl(0) {}
 
   TreeScopedHashTableDetachedScope(TreeScopedHashTableDetachedScope &&Other)
@@ -157,7 +167,7 @@ public:
   }
 };
 
-/// \brief A normal hashtable scope.  Objects of this class should be created only
+/// A normal hashtable scope.  Objects of this class should be created only
 /// on stack.  A normal scope is faster to create than a detached scope because
 /// it does not do heap allocation for the reference counted
 /// \c TreeScopedHashTableScopeImpl.
@@ -204,7 +214,7 @@ public:
       DetachedImpl->release();
   }
 
-  /// \brief Detach this scope to the heap.
+  /// Detach this scope to the heap.
   TreeScopedHashTableDetachedScope<K, V, AllocatorTy> detach() {
     if (DetachedImpl)
       return TreeScopedHashTableDetachedScope<K, V, AllocatorTy>(DetachedImpl);
@@ -257,7 +267,7 @@ public:
   }
 };
 
-/// \brief A scoped hashtable that can have multiple active scopes.
+/// A scoped hashtable that can have multiple active scopes.
 ///
 /// There are two kinds of scopes:
 ///
@@ -323,7 +333,6 @@ public:
     return false;
   }
 
-public:
   V lookup(const ScopeTy &S, const K &Key) {
     const typename ScopeTy::ImplTy *CurrScope = S.getImpl();
     while (CurrScope) {
@@ -347,6 +356,15 @@ public:
       return end();
     return iterator(I->second);
   }
+
+  using DebugVisitValueTy = TreeScopedHashTableVal<K, V> *;
+
+  /// Visit each entry in the map without regard to order. Meant to be used with
+  /// in the debugger in coordination with other dumpers that can dump whatever
+  /// is stored in the map. No-op when asserts are disabled.
+  SWIFT_DEBUG_HELPER(
+    void debugVisit(std::function<void(const DebugVisitValueTy &)> &&func) const
+  );
 
   /// This inserts the specified key/value at the specified
   /// (possibly not the current) scope.  While it is ok to insert into a scope
@@ -375,6 +393,16 @@ public:
 };
 
 template <typename K, typename V, typename Allocator>
+void TreeScopedHashTable<K, V, Allocator>::debugVisit(
+    std::function<void(const DebugVisitValueTy &)> &&func) const {
+#ifndef NDEBUG
+  for (auto entry : TopLevelMap) {
+    func(entry.second);
+  }
+#endif
+}
+
+template <typename K, typename V, typename Allocator>
 TreeScopedHashTableScopeImpl<K, V, Allocator>::~TreeScopedHashTableScopeImpl() {
   if (MovedFrom)
     return;
@@ -400,4 +428,4 @@ TreeScopedHashTableScopeImpl<K, V, Allocator>::~TreeScopedHashTableScopeImpl() {
 
 } // end namespace swift
 
-#endif
+#endif // SWIFT_BASIC_TREESCOPEDHASHTABLE_H

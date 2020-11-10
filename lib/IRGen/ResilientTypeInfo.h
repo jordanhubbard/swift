@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -42,107 +42,120 @@ namespace irgen {
 template <class Impl>
 class ResilientTypeInfo : public WitnessSizedTypeInfo<Impl> {
 protected:
-  ResilientTypeInfo(llvm::Type *type)
+  ResilientTypeInfo(llvm::Type *type, IsABIAccessible_t abiAccessible)
     : WitnessSizedTypeInfo<Impl>(type, Alignment(1),
-                                 IsNotPOD, IsNotBitwiseTakable) {}
+                                 IsNotPOD, IsNotBitwiseTakable,
+                                 abiAccessible) {}
 
 public:
-  void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
-                      SILType T) const override {
-    emitAssignWithCopyCall(IGF, T,
-                           dest.getAddress(), src.getAddress());
+  void assignWithCopy(IRGenFunction &IGF, Address dest, Address src, SILType T,
+                      bool isOutlined) const override {
+    emitAssignWithCopyCall(IGF, T, dest, src);
   }
 
-  void assignWithTake(IRGenFunction &IGF, Address dest, Address src,
-                      SILType T) const override {
-    emitAssignWithTakeCall(IGF, T,
-                           dest.getAddress(), src.getAddress());
+  void assignArrayWithCopyNoAlias(IRGenFunction &IGF, Address dest, Address src,
+                                  llvm::Value *count,
+                                  SILType T) const override {
+    emitAssignArrayWithCopyNoAliasCall(IGF, T, dest, src, count);
   }
 
-  Address initializeBufferWithCopy(IRGenFunction &IGF,
+  void assignArrayWithCopyFrontToBack(IRGenFunction &IGF, Address dest,
+                                      Address src, llvm::Value *count,
+                                      SILType T) const override {
+    emitAssignArrayWithCopyFrontToBackCall(IGF, T, dest, src, count);
+  }
+
+  void assignArrayWithCopyBackToFront(IRGenFunction &IGF, Address dest,
+                                      Address src, llvm::Value *count,
+                                      SILType T) const override {
+    emitAssignArrayWithCopyBackToFrontCall(IGF, T, dest, src, count);
+  }
+
+  void assignWithTake(IRGenFunction &IGF, Address dest, Address src, SILType T,
+                      bool isOutlined) const override {
+    emitAssignWithTakeCall(IGF, T, dest, src);
+  }
+
+  void assignArrayWithTake(IRGenFunction &IGF, Address dest, Address src,
+                           llvm::Value *count, SILType T) const override {
+    emitAssignArrayWithTakeCall(IGF, T, dest, src, count);
+  }
+
+  Address initializeBufferWithCopyOfBuffer(IRGenFunction &IGF,
                                    Address dest, Address src,
                                    SILType T) const override {
-    auto addr = emitInitializeBufferWithCopyCall(IGF, T,
-                                         dest.getAddress(), src.getAddress());
+    auto addr = emitInitializeBufferWithCopyOfBufferCall(IGF, T, dest, src);
     return this->getAddressForPointer(addr);
   }
 
-  Address initializeBufferWithTake(IRGenFunction &IGF,
-                                   Address dest, Address src,
-                                   SILType T) const override {
-    auto addr = emitInitializeBufferWithTakeCall(IGF, T,
-                                         dest.getAddress(), src.getAddress());
-    return this->getAddressForPointer(addr);
-  }
-
-  void initializeWithCopy(IRGenFunction &IGF,
-                        Address dest, Address src, SILType T) const override {
-    emitInitializeWithCopyCall(IGF, T,
-                               dest.getAddress(), src.getAddress());
+  void initializeWithCopy(IRGenFunction &IGF, Address dest, Address src,
+                          SILType T, bool isOutlined) const override {
+    emitInitializeWithCopyCall(IGF, T, dest, src);
   }
 
   void initializeArrayWithCopy(IRGenFunction &IGF,
                                Address dest, Address src, llvm::Value *count,
                                SILType T) const override {
-    emitInitializeArrayWithCopyCall(IGF, T,
-                               dest.getAddress(), src.getAddress(), count);
+    emitInitializeArrayWithCopyCall(IGF, T, dest, src, count);
   }
 
-  void initializeWithTake(IRGenFunction &IGF,
-                        Address dest, Address src, SILType T) const override {
-    emitInitializeWithTakeCall(IGF, T,
-                               dest.getAddress(), src.getAddress());
+  void initializeWithTake(IRGenFunction &IGF, Address dest, Address src,
+                          SILType T, bool isOutlined) const override {
+    emitInitializeWithTakeCall(IGF, T, dest, src);
+  }
+
+  void initializeArrayWithTakeNoAlias(IRGenFunction &IGF, Address dest,
+                                      Address src, llvm::Value *count,
+                                      SILType T) const override {
+    emitInitializeArrayWithTakeNoAliasCall(IGF, T, dest, src, count);
   }
 
   void initializeArrayWithTakeFrontToBack(IRGenFunction &IGF,
                                           Address dest, Address src,
                                           llvm::Value *count,
                                           SILType T) const override {
-    emitInitializeArrayWithTakeFrontToBackCall(IGF, T,
-                                  dest.getAddress(), src.getAddress(), count);
+    emitInitializeArrayWithTakeFrontToBackCall(IGF, T, dest, src, count);
   }
 
   void initializeArrayWithTakeBackToFront(IRGenFunction &IGF,
                                           Address dest, Address src,
                                           llvm::Value *count,
                                           SILType T) const override {
-    emitInitializeArrayWithTakeBackToFrontCall(IGF, T,
-                                  dest.getAddress(), src.getAddress(), count);
+    emitInitializeArrayWithTakeBackToFrontCall(IGF, T, dest, src, count);
   }
 
-  void destroy(IRGenFunction &IGF, Address addr, SILType T) const override {
-    emitDestroyCall(IGF, T, addr.getAddress());
+  void destroy(IRGenFunction &IGF, Address addr, SILType T,
+               bool isOutlined) const override {
+    emitDestroyCall(IGF, T, addr);
   }
 
   void destroyArray(IRGenFunction &IGF, Address addr, llvm::Value *count,
                     SILType T) const override {
-    emitDestroyArrayCall(IGF, T, addr.getAddress(), count);
+    emitDestroyArrayCall(IGF, T, addr, count);
   }
 
   bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
     return true;
   }
-  llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
-                                       Address src,
-                                       SILType T) const override {
-    return emitGetExtraInhabitantIndexCall(IGF, T, src.getAddress());
-  }
-  void storeExtraInhabitant(IRGenFunction &IGF,
-                            llvm::Value *index,
-                            Address dest,
-                            SILType T) const override {
-    emitStoreExtraInhabitantCall(IGF, T, index, dest.getAddress());
+
+  llvm::Value *getEnumTagSinglePayload(IRGenFunction &IGF,
+                                       llvm::Value *numEmptyCases,
+                                       Address enumAddr,
+                                       SILType T,
+                                       bool isOutlined) const override {
+    return emitGetEnumTagSinglePayloadCall(IGF, T, numEmptyCases, enumAddr);
   }
 
-  void initializeMetadata(IRGenFunction &IGF,
-                          llvm::Value *metadata,
-                          llvm::Value *vwtable,
-                          SILType T) const override {
-    // Resilient value types and archetypes always refer to an existing type.
-    // A witness table should never be independently initialized for one.
-    llvm_unreachable("initializing value witness table for opaque type?!");
+  void storeEnumTagSinglePayload(IRGenFunction &IGF, llvm::Value *whichCase,
+                                 llvm::Value *numEmptyCases, Address enumAddr,
+                                 SILType T, bool isOutlined) const override {
+    emitStoreEnumTagSinglePayloadCall(IGF, T, whichCase, numEmptyCases, enumAddr);
   }
 
+  void collectMetadataForOutlining(OutliningMetadataCollector &collector,
+                                   SILType T) const override {
+    collector.collectTypeMetadataForLayout(T);
+  }
 };
 
 }

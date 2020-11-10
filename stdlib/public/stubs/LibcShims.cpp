@@ -2,69 +2,76 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
-#include <type_traits>
-#include <unistd.h>
-#include <stdlib.h>
+#if defined(__APPLE__)
+#define _REENTRANT
+#include <math.h>
+#endif
+
+#if defined(_WIN32) && !defined(__CYGWIN__)
+#include <io.h>
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
+#endif
+
 #include <stdio.h>
-#include <string.h>
+#include <sys/types.h>
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__)) || defined(__wasi__)
+#include <unistd.h>
+#endif
+
+#include <type_traits>
+
 #include "../SwiftShims/LibcShims.h"
 
-#if defined(__linux__)
-#include <bsd/stdlib.h>
-#endif
-
-static_assert(std::is_same<ssize_t, swift::__swift_ssize_t>::value,
-              "__swift_ssize_t is wrong");
-
-namespace swift {
-
-void _swift_stdlib_free(void *ptr) { free(ptr); }
-
-int _swift_stdlib_putchar(int c) { return putchar(c); }
-
-__swift_size_t _swift_stdlib_strlen(const char *s) { return strlen(s); }
-
-int _swift_stdlib_memcmp(const void *s1, const void *s2, __swift_size_t n) {
-  return memcmp(s1, s2, n);
-}
-
-__swift_ssize_t _swift_stdlib_read(int fd, void *buf, __swift_size_t nbyte) {
-  return read(fd, buf, nbyte);
-}
-
-__swift_ssize_t _swift_stdlib_write(int fd, const void *buf,
-                                    __swift_size_t nbyte) {
-  return write(fd, buf, nbyte);
-}
-
-int _swift_stdlib_close(int fd) { return close(fd); }
-
-#if defined(__APPLE__)
-#include <malloc/malloc.h>
-size_t _swift_stdlib_malloc_size(const void *ptr) { return malloc_size(ptr); }
-#elif defined(__GNU_LIBRARY__)
-#include <malloc.h>
-size_t _swift_stdlib_malloc_size(const void *ptr) {
-  return malloc_usable_size(const_cast<void *>(ptr));
-}
+SWIFT_RUNTIME_STDLIB_INTERNAL
+int _swift_stdlib_putchar_unlocked(int c) {
+#if defined(_WIN32)
+  return _putc_nolock(c, stdout);
 #else
-#error No malloc_size analog known for this platform/libc.
+  return putchar_unlocked(c);
 #endif
-
-__swift_uint32_t _swift_stdlib_arc4random(void) { return arc4random(); }
-
-__swift_uint32_t
-_swift_stdlib_arc4random_uniform(__swift_uint32_t upper_bound) {
-  return arc4random_uniform(upper_bound);
 }
 
-} // namespace swift
+SWIFT_RUNTIME_STDLIB_INTERNAL
+__swift_size_t _swift_stdlib_fwrite_stdout(const void *ptr,
+                                                  __swift_size_t size,
+                                                  __swift_size_t nitems) {
+    return fwrite(ptr, size, nitems, stdout);
+}
 
+SWIFT_RUNTIME_STDLIB_SPI
+__swift_ssize_t
+_swift_stdlib_read(int fd, void *buf, __swift_size_t nbyte) {
+#if defined(_WIN32)
+  return _read(fd, buf, nbyte);
+#else
+  return read(fd, buf, nbyte);
+#endif
+}
+
+SWIFT_RUNTIME_STDLIB_SPI
+__swift_ssize_t
+_swift_stdlib_write(int fd, const void *buf, __swift_size_t nbyte) {
+#if defined(_WIN32)
+  return _write(fd, buf, nbyte);
+#else
+  return write(fd, buf, nbyte);
+#endif
+}
+
+SWIFT_RUNTIME_STDLIB_SPI
+int _swift_stdlib_close(int fd) {
+#if defined(_WIN32)
+  return _close(fd);
+#else
+  return close(fd);
+#endif
+}

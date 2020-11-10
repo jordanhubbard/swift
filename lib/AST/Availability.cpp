@@ -1,12 +1,12 @@
-//===--- Availability.cpp - Swift Availability Structures -------*- C++ -*-===//
+//===--- Availability.cpp - Swift Availability Structures -----------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -14,38 +14,46 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/AST/AST.h"
+#include "swift/AST/ASTContext.h"
 #include "swift/AST/Attr.h"
+#include "swift/AST/Decl.h"
+#include "swift/AST/Types.h"
 #include "swift/AST/Availability.h"
 #include "swift/AST/PlatformKind.h"
 #include "swift/AST/TypeWalker.h"
+#include <map>
 
 using namespace swift;
+
+AvailabilityContext AvailabilityContext::forDeploymentTarget(ASTContext &Ctx) {
+  return AvailabilityContext(
+      VersionRange::allGTE(Ctx.LangOpts.getMinPlatformVersion()));
+}
 
 namespace {
 
 /// The inferred availability required to access a group of declarations
 /// on a single platform.
 struct InferredAvailability {
-  UnconditionalAvailabilityKind Unconditional
-    = UnconditionalAvailabilityKind::None;
+  PlatformAgnosticAvailabilityKind PlatformAgnostic
+    = PlatformAgnosticAvailabilityKind::None;
   
-  Optional<clang::VersionTuple> Introduced;
-  Optional<clang::VersionTuple> Deprecated;
-  Optional<clang::VersionTuple> Obsoleted;
+  Optional<llvm::VersionTuple> Introduced;
+  Optional<llvm::VersionTuple> Deprecated;
+  Optional<llvm::VersionTuple> Obsoleted;
 };
 
 /// The type of a function that merges two version tuples.
-typedef const clang::VersionTuple &(*MergeFunction)(
-    const clang::VersionTuple &, const clang::VersionTuple &);
+typedef const llvm::VersionTuple &(*MergeFunction)(
+    const llvm::VersionTuple &, const llvm::VersionTuple &);
 
 } // end anonymous namespace
 
 /// Apply a merge function to two optional versions, returning the result
 /// in Inferred.
 static void
-mergeIntoInferredVersion(const Optional<clang::VersionTuple> &Version,
-                         Optional<clang::VersionTuple> &Inferred,
+mergeIntoInferredVersion(const Optional<llvm::VersionTuple> &Version,
+                         Optional<llvm::VersionTuple> &Inferred,
                          MergeFunction Merge) {
   if (Version.hasValue()) {
     if (Inferred.hasValue()) {
@@ -61,10 +69,10 @@ mergeIntoInferredVersion(const Optional<clang::VersionTuple> &Version,
 /// the attribute requires.
 static void mergeWithInferredAvailability(const AvailableAttr *Attr,
                                           InferredAvailability &Inferred) {
-  Inferred.Unconditional
-    = static_cast<UnconditionalAvailabilityKind>(
-      std::max(static_cast<unsigned>(Inferred.Unconditional),
-               static_cast<unsigned>(Attr->getUnconditionalAvailability())));
+  Inferred.PlatformAgnostic
+    = static_cast<PlatformAgnosticAvailabilityKind>(
+      std::max(static_cast<unsigned>(Inferred.PlatformAgnostic),
+               static_cast<unsigned>(Attr->getPlatformAgnosticAvailability())));
 
   // The merge of two introduction versions is the maximum of the two versions.
   mergeIntoInferredVersion(Attr->Introduced, Inferred.Introduced, std::max);
@@ -81,18 +89,21 @@ createAvailableAttr(PlatformKind Platform,
                        const InferredAvailability &Inferred,
                        ASTContext &Context) {
 
-  clang::VersionTuple Introduced =
-      Inferred.Introduced.getValueOr(clang::VersionTuple());
-  clang::VersionTuple Deprecated =
-      Inferred.Deprecated.getValueOr(clang::VersionTuple());
-  clang::VersionTuple Obsoleted =
-      Inferred.Obsoleted.getValueOr(clang::VersionTuple());
+  llvm::VersionTuple Introduced =
+      Inferred.Introduced.getValueOr(llvm::VersionTuple());
+  llvm::VersionTuple Deprecated =
+      Inferred.Deprecated.getValueOr(llvm::VersionTuple());
+  llvm::VersionTuple Obsoleted =
+      Inferred.Obsoleted.getValueOr(llvm::VersionTuple());
 
   return new (Context) AvailableAttr(
       SourceLoc(), SourceRange(), Platform,
       /*Message=*/StringRef(),
-      /*Rename=*/StringRef(), Introduced, Deprecated, Obsoleted,
-      Inferred.Unconditional, /*Implicit=*/true);
+      /*Rename=*/StringRef(),
+        Introduced, /*IntroducedRange=*/SourceRange(),
+        Deprecated, /*DeprecatedRange=*/SourceRange(),
+        Obsoleted, /*ObsoletedRange=*/SourceRange(),
+      Inferred.PlatformAgnostic, /*Implicit=*/true);
 }
 
 void AvailabilityInference::applyInferredAvailableAttrs(
@@ -121,37 +132,54 @@ void AvailabilityInference::applyInferredAvailableAttrs(
   }
 }
 
-Optional<VersionRange>
+/// Returns true if the introduced version in \p newAttr should be used instead
+/// of the introduced version in \p prevAttr when both are attached to the same
+/// declaration and refer to the active platform.
+static bool isBetterThan(const AvailableAttr *newAttr,
+                         const AvailableAttr *prevAttr) {
+  assert(newAttr);
+
+  // If there is no prevAttr, newAttr of course wins.
+  if (!prevAttr)
+    return true;
+
+  // If they belong to the same platform, the one that introduces later wins.
+  if (prevAttr->Platform == newAttr->Platform)
+    return prevAttr->Introduced.getValue() < newAttr->Introduced.getValue();
+
+  // If the new attribute's platform inherits from the old one, it wins.
+  return inheritsAvailabilityFromPlatform(newAttr->Platform,
+                                          prevAttr->Platform);
+}
+
+Optional<AvailabilityContext>
 AvailabilityInference::annotatedAvailableRange(const Decl *D, ASTContext &Ctx) {
-  Optional<VersionRange> AnnotatedRange;
+  const AvailableAttr *bestAvailAttr = nullptr;
 
   for (auto Attr : D->getAttrs()) {
     auto *AvailAttr = dyn_cast<AvailableAttr>(Attr);
-    if (AvailAttr == NULL || !AvailAttr->Introduced.hasValue() ||
-        !AvailAttr->isActivePlatform(Ctx)) {
+    if (AvailAttr == nullptr || !AvailAttr->Introduced.hasValue() ||
+        !AvailAttr->isActivePlatform(Ctx) ||
+        AvailAttr->isLanguageVersionSpecific() ||
+        AvailAttr->isPackageDescriptionVersionSpecific()) {
       continue;
     }
 
-    VersionRange AttrRange =
-        VersionRange::allGTE(AvailAttr->Introduced.getValue());
-
-    // If we have multiple introduction versions, we will conservatively
-    // assume the worst case scenario. We may want to be more precise here
-    // in the future or emit a diagnostic.
-
-    if (AnnotatedRange.hasValue()) {
-      AnnotatedRange.getValue().intersectWith(AttrRange);
-    } else {
-      AnnotatedRange = AttrRange;
-    }
+    if (isBetterThan(AvailAttr, bestAvailAttr))
+      bestAvailAttr = AvailAttr;
   }
 
-  return AnnotatedRange;
+  if (!bestAvailAttr)
+    return None;
+
+  return AvailabilityContext{
+    VersionRange::allGTE(bestAvailAttr->Introduced.getValue())};
 }
 
-VersionRange AvailabilityInference::availableRange(const Decl *D,
-                                                   ASTContext &Ctx) {
-  Optional<VersionRange> AnnotatedRange = annotatedAvailableRange(D, Ctx);
+AvailabilityContext AvailabilityInference::availableRange(const Decl *D,
+                                                          ASTContext &Ctx) {
+  Optional<AvailabilityContext> AnnotatedRange =
+      annotatedAvailableRange(D, Ctx);
   if (AnnotatedRange.hasValue()) {
     return AnnotatedRange.getValue();
   }
@@ -173,7 +201,7 @@ VersionRange AvailabilityInference::availableRange(const Decl *D,
   }
 
   // Treat unannotated declarations as always available.
-  return VersionRange::all();
+  return AvailabilityContext::alwaysAvailable();
 }
 
 namespace {
@@ -181,24 +209,202 @@ namespace {
 class AvailabilityInferenceTypeWalker : public TypeWalker {
 public:
   ASTContext &AC;
-  VersionRange AvailableRange = VersionRange::all();
+  AvailabilityContext AvailabilityInfo = AvailabilityContext::alwaysAvailable();
 
   AvailabilityInferenceTypeWalker(ASTContext &AC) : AC(AC) {}
 
-  virtual Action walkToTypePre(Type ty) {
-    if (auto *nominalDecl = ty.getCanonicalTypeOrNull().getAnyNominal()) {
-      AvailableRange.intersectWith(
+  Action walkToTypePre(Type ty) override {
+    if (auto *nominalDecl = ty->getAnyNominal()) {
+      AvailabilityInfo.intersectWith(
           AvailabilityInference::availableRange(nominalDecl, AC));
     }
 
     return Action::Continue;
   }
 };
-};
+} // end anonymous namespace
 
 
-VersionRange AvailabilityInference::inferForType(Type t) {
+AvailabilityContext AvailabilityInference::inferForType(Type t) {
   AvailabilityInferenceTypeWalker walker(t->getASTContext());
   t.walk(walker);
-  return walker.AvailableRange;
+  return walker.AvailabilityInfo;
+}
+
+AvailabilityContext ASTContext::getObjCMetadataUpdateCallbackAvailability() {
+  return getSwift50Availability();
+}
+
+AvailabilityContext ASTContext::getObjCGetClassHookAvailability() {
+  return getSwift50Availability();
+}
+
+AvailabilityContext ASTContext::getSwift50Availability() {
+  auto target = LangOpts.Target;
+
+  if (target.getArchName() == "arm64e")
+    return AvailabilityContext::alwaysAvailable();
+
+  if (target.isMacOSX()) {
+    if (target.isAArch64())
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+                            VersionRange::allGTE(llvm::VersionTuple(10,14,4)));
+  } else if (target.isiOS()) {
+    if (target.isAArch64() &&
+        (target.isSimulatorEnvironment() || target.isMacCatalystEnvironment()))
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+                            VersionRange::allGTE(llvm::VersionTuple(12,2)));
+  } else if (target.isWatchOS()) {
+    return AvailabilityContext(
+                            VersionRange::allGTE(llvm::VersionTuple(5,2)));
+  } else {
+    return AvailabilityContext::alwaysAvailable();
+  }
+}
+
+AvailabilityContext ASTContext::getOpaqueTypeAvailability() {
+  return getSwift51Availability();
+}
+
+AvailabilityContext ASTContext::getObjCClassStubsAvailability() {
+  return getSwift51Availability();
+}
+
+AvailabilityContext ASTContext::getSwift51Availability() {
+  auto target = LangOpts.Target;
+  
+  if (target.getArchName() == "arm64e")
+    return AvailabilityContext::alwaysAvailable();
+
+  if (target.isMacOSX()) {
+    if (target.isAArch64())
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+                            VersionRange::allGTE(llvm::VersionTuple(10,15,0)));
+  } else if (target.isiOS()) {
+    if (target.isAArch64() &&
+        (target.isSimulatorEnvironment() || target.isMacCatalystEnvironment()))
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+                            VersionRange::allGTE(llvm::VersionTuple(13,0,0)));
+  } else if (target.isWatchOS()) {
+    return AvailabilityContext(
+                            VersionRange::allGTE(llvm::VersionTuple(6,0,0)));
+  } else {
+    return AvailabilityContext::alwaysAvailable();
+  }
+}
+
+AvailabilityContext ASTContext::getTypesInAbstractMetadataStateAvailability() {
+  return getSwift52Availability();
+}
+
+AvailabilityContext ASTContext::getPrespecializedGenericMetadataAvailability() {
+  return getSwift54Availability();
+}
+
+AvailabilityContext ASTContext::getCompareTypeContextDescriptorsAvailability() {
+  return getSwift54Availability();
+}
+
+AvailabilityContext
+ASTContext::getCompareProtocolConformanceDescriptorsAvailability() {
+  return getSwift54Availability();
+}
+
+AvailabilityContext
+ASTContext::getIntermodulePrespecializedGenericMetadataAvailability() {
+  return getSwift54Availability();
+}
+
+AvailabilityContext ASTContext::getConcurrencyAvailability() {
+  return getSwiftFutureAvailability();
+}
+
+AvailabilityContext ASTContext::getSwift52Availability() {
+  auto target = LangOpts.Target;
+
+  if (target.getArchName() == "arm64e")
+    return AvailabilityContext::alwaysAvailable();
+
+  if (target.isMacOSX()) {
+    if (target.isAArch64())
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(10, 15, 4)));
+  } else if (target.isiOS()) {
+    if (target.isAArch64() &&
+        (target.isSimulatorEnvironment() || target.isMacCatalystEnvironment()))
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(13, 4, 0)));
+  } else if (target.isWatchOS()) {
+    if (target.isArch64Bit())
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(6, 2, 0)));
+  }
+  return AvailabilityContext::alwaysAvailable();
+}
+
+AvailabilityContext ASTContext::getSwift53Availability() {
+  auto target = LangOpts.Target;
+
+  if (target.getArchName() == "arm64e")
+    return AvailabilityContext::alwaysAvailable();
+
+  if (target.isMacOSX() ) {
+    if (target.isAArch64())
+      return AvailabilityContext::alwaysAvailable();
+
+    llvm::VersionTuple macOVersion53(10, 16, 0);
+    macOVersion53 = canonicalizePlatformVersion(PlatformKind::macOS, macOVersion53);
+    return AvailabilityContext(
+        VersionRange::allGTE(macOVersion53));
+  } else if (target.isiOS()) {
+    if (target.isAArch64() &&
+        (target.isSimulatorEnvironment() || target.isMacCatalystEnvironment()))
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(14, 0, 0)));
+  } else if (target.isWatchOS()) {
+    if (target.isArch64Bit())
+      return AvailabilityContext::alwaysAvailable();
+
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(7, 0, 0)));
+  } else {
+    return AvailabilityContext::alwaysAvailable();
+  }
+}
+
+AvailabilityContext ASTContext::getSwift54Availability() {
+  return getSwiftFutureAvailability();
+}
+
+AvailabilityContext ASTContext::getSwiftFutureAvailability() {
+  auto target = LangOpts.Target;
+
+  if (target.isMacOSX() ) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(99, 99, 0)));
+  } else if (target.isiOS()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(99, 0, 0)));
+  } else if (target.isWatchOS()) {
+    return AvailabilityContext(
+        VersionRange::allGTE(llvm::VersionTuple(9, 99, 0)));
+  } else {
+    return AvailabilityContext::alwaysAvailable();
+  }
 }

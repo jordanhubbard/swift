@@ -1,13 +1,14 @@
-add_swift_executable(sil-opt
+add_swift_host_tool(sil-opt
   SILOpt.cpp
-  LINK_LIBRARIES
-    swiftFrontend
-    swiftIRGen
-    swiftSILGen
-    swiftSILPasses
+  SWIFT_COMPONENT tools
 )
-
-swift_install_in_component(tools
-    TARGETS sil-opt
-    RUNTIME DESTINATION bin)
-
+target_link_libraries(sil-opt
+                      PRIVATE
+                        swiftFrontend
+                        swiftIRGen
+                        swiftSIL
+                        swiftSILGen
+                        swiftSILOptimizer
+                        # Clang libraries included to appease the linker on linux.
+                        clangBasic
+                        clangCodeGen)

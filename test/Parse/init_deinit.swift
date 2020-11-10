@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 struct FooStructConstructorA {
   init // expected-error {{expected '('}}
@@ -9,12 +9,16 @@ struct FooStructConstructorB {
 }
 
 struct FooStructConstructorC {
-  init {} // expected-error {{expected '('}}{{8-8=() }}
+  init {} // expected-error {{expected '('}}{{7-7=()}}
+  init<T> {} // expected-error {{expected '('}} {{10-10=()}}
+  init? { self.init() } // expected-error {{expected '('}} {{8-8=()}}
 }
 
 
 struct FooStructDeinitializerA {
   deinit // expected-error {{expected '{' for deinitializer}}
+  deinit x // expected-error {{deinitializers cannot have a name}} {{10-12=}}  expected-error {{expected '{' for deinitializer}}
+  deinit x() // expected-error {{deinitializers cannot have a name}} {{10-11=}} expected-error {{no parameter clause allowed on deinitializer}} {{11-13=}} expected-error {{expected '{' for deinitializer}}
 }
 
 struct FooStructDeinitializerB {
@@ -33,7 +37,11 @@ class FooClassDeinitializerB {
   deinit { }
 }
 
-init {} // expected-error {{initializers may only be declared within a type}} expected-error {{expected '('}} {{6-6=() }}
+class FooClassDeinitializerC {
+  deinit x (a : Int) {} // expected-error {{deinitializers cannot have a name}} {{10-12=}} expected-error{{no parameter clause allowed on deinitializer}}{{12-22=}}
+}
+
+init {} // expected-error {{initializers may only be declared within a type}} expected-error {{expected '('}} {{5-5=()}}
 init() // expected-error {{initializers may only be declared within a type}}
 init() {} // expected-error {{initializers may only be declared within a type}}
 
@@ -74,7 +82,7 @@ extension BarClass {
 }
 
 protocol BarProtocol {
-  init() {} // expected-error {{protocol initializers may not have bodies}}
+  init() {} // expected-error {{protocol initializers must not have bodies}}
   deinit {} // expected-error {{deinitializers may only be declared within a class}}
 }
 
@@ -90,13 +98,36 @@ func fooFunc() {
 
 func barFunc() {
   var x : () = { () -> () in
+    // expected-warning@-1 {{variable 'x' was never used; consider replacing with '_' or removing it}}
     init() {} // expected-error {{initializers may only be declared within a type}}
     return
   } ()
 
   var y : () = { () -> () in
+    // expected-warning@-1 {{variable 'y' was never used; consider replacing with '_' or removing it}}
     deinit {} // expected-error {{deinitializers may only be declared within a class}}
     return
   } ()
 }
 
+// SR-852
+class Aaron {
+  init(x: Int) {}
+  convenience init() { init(x: 1) } // expected-error {{missing 'self.' at initializer invocation}} {{24-24=self.}}
+}
+
+class Theodosia: Aaron {
+  init() {
+    init(x: 2) // expected-error {{missing 'super.' at initializer invocation}} {{5-5=super.}}
+  }
+}
+
+struct AaronStruct {
+  init(x: Int) {}
+  init() { init(x: 1) } // expected-error {{missing 'self.' at initializer invocation}} {{12-12=self.}}
+}
+
+enum AaronEnum: Int {
+  case A = 1
+  init(x: Int) { init(rawValue: x)! } // expected-error {{missing 'self.' at initializer invocation}} {{18-18=self.}}
+}

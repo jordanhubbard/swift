@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-objc-interop
 
 protocol P { }
 @objc protocol OP { }
@@ -8,18 +8,24 @@ protocol CP : class { }
   static func createNewOne() -> SP
 }
 
-func fP<T : P>(t: T) { }
-func fOP<T : OP>(t: T) { }
-func fOPE(t: OP) { }
-func fSP<T : SP>(t: T) { }
-func fAO<T : AnyObject>(t: T) { }
-func fAOE(t: AnyObject) { }
-func fT<T>(t: T) { }
+func fP<T : P>(_ t: T) { }
+// expected-note@-1 {{required by global function 'fP' where 'T' = 'P'}}
+// expected-note@-2 {{required by global function 'fP' where 'T' = 'OP & P'}}
+func fOP<T : OP>(_ t: T) { }
+// expected-note@-1 {{required by global function 'fOP' where 'T' = 'OP & P'}}
+func fOPE(_ t: OP) { }
+func fSP<T : SP>(_ t: T) { }
+func fAO<T : AnyObject>(_ t: T) { }
+// expected-note@-1 {{where 'T' = 'P'}}
+// expected-note@-2 {{where 'T' = 'CP'}}
+// expected-note@-3 {{where 'T' = 'OP & P'}}
+func fAOE(_ t: AnyObject) { }
+func fT<T>(_ t: T) { }
 
-func testPassExistential(p: P, op: OP, opp: protocol<OP, P>, cp: CP, sp: SP, any: Any, ao: AnyObject) {
-  fP(p) // expected-error{{cannot invoke 'fP' with an argument list of type '(P)'}} // expected-note{{expected an argument list of type '(T)'}}
-  fAO(p) // expected-error{{cannot invoke 'fAO' with an argument list of type '(P)'}} // expected-note{{expected an argument list of type '(T)'}}
-  fAOE(p) // expected-error{{argument type 'P' does not conform to expected type 'AnyObject'}}
+func testPassExistential(_ p: P, op: OP, opp: OP & P, cp: CP, sp: SP, any: Any, ao: AnyObject) {
+  fP(p) // expected-error{{protocol 'P' as a type cannot conform to the protocol itself}} expected-note {{only concrete types such as structs, enums and classes can conform to protocols}}
+  fAO(p) // expected-error{{global function 'fAO' requires that 'P' be a class type}}
+  fAOE(p) // expected-error{{argument type 'P' expected to be an instance of a class or class-constrained type}}
   fT(p)
 
   fOP(op)
@@ -27,18 +33,18 @@ func testPassExistential(p: P, op: OP, opp: protocol<OP, P>, cp: CP, sp: SP, any
   fAOE(op)
   fT(op)
 
-  fAO(cp) // expected-error{{cannot invoke 'fAO' with an argument list of type '(CP)'}} // expected-note{{expected an argument list of type '(T)'}}
+  fAO(cp) // expected-error{{global function 'fAO' requires that 'CP' be a class type}}
   fAOE(cp)
   fT(cp)
 
-  fP(opp) // expected-error{{cannot invoke 'fP' with an argument list of type '(protocol<OP, P>)'}} // expected-note{{expected an argument list of type '(T)'}}
-  fOP(opp) // expected-error{{cannot invoke 'fOP' with an argument list of type '(protocol<OP, P>)'}} // expected-note{{expected an argument list of type '(T)'}}
-  fAO(opp) // expected-error{{cannot invoke 'fAO' with an argument list of type '(protocol<OP, P>)'}} // expected-note{{expected an argument list of type '(T)'}}
+  fP(opp) // expected-error{{protocol 'OP & P' as a type cannot conform to 'P'}} expected-note {{only concrete types such as structs, enums and classes can conform to protocols}}
+  fOP(opp) // expected-error{{protocol 'OP & P' as a type cannot conform to 'OP'}} expected-note {{only concrete types such as structs, enums and classes can conform to protocols}}
+  fAO(opp) // expected-error{{global function 'fAO' requires that 'OP & P' be a class type}}
   fAOE(opp)
   fT(opp)
 
   fOP(sp)
-  fSP(sp) // expected-error{{cannot invoke 'fSP' with an argument list of type '(SP)'}} // expected-note{{expected an argument list of type '(T)'}}
+  fSP(sp) // expected-error{{'SP' cannot be used as a type conforming to protocol 'SP' because 'SP' has static requirements}}
   fAO(sp)
   fAOE(sp)
   fT(sp)
@@ -53,17 +59,17 @@ class GP<T : P> {}
 class GOP<T : OP> {}
 class GCP<T : CP> {}
 class GSP<T : SP> {}
-class GAO<T : AnyObject> {}
+class GAO<T : AnyObject> {} // expected-note 2{{requirement specified as 'T' : 'AnyObject'}}
 
-func blackHole(t: Any) {}
+func blackHole(_ t: Any) {}
 
 func testBindExistential() {
-  blackHole(GP<P>()) // expected-error{{using 'P' as a concrete type conforming to protocol 'P' is not supported}}
+  blackHole(GP<P>()) // expected-error{{protocol 'P' as a type cannot conform to the protocol itself}} expected-note {{only concrete types such as structs, enums and classes can conform to protocols}}
   blackHole(GOP<OP>())
-  blackHole(GCP<CP>()) // expected-error{{using 'CP' as a concrete type conforming to protocol 'CP' is not supported}}
-  blackHole(GAO<P>()) // expected-error{{type 'P' does not conform to protocol 'AnyObject'}}
+  blackHole(GCP<CP>()) // expected-error{{protocol 'CP' as a type cannot conform to the protocol itself}} expected-note {{only concrete types such as structs, enums and classes can conform to protocols}}
+  blackHole(GAO<P>()) // expected-error{{'GAO' requires that 'P' be a class type}}
   blackHole(GAO<OP>())
-  blackHole(GAO<CP>()) // expected-error{{using 'CP' as a concrete type conforming to protocol 'AnyObject' is not supported}}
+  blackHole(GAO<CP>()) // expected-error{{'GAO' requires that 'CP' be a class type}}
   blackHole(GSP<SP>()) // expected-error{{'SP' cannot be used as a type conforming to protocol 'SP' because 'SP' has static requirements}}
   blackHole(GAO<AnyObject>())
 }
@@ -72,8 +78,9 @@ func testBindExistential() {
 protocol Mine {}
 class M1: Mine {}
 class M2: Mine {}
-extension CollectionType where Generator.Element : Mine {
-    final func takeAll() {}
+extension Collection where Iterator.Element : Mine {
+// expected-note@-1 {{required by referencing instance method 'takeAll()' on 'Collection'}}
+    func takeAll() {}
 }
 
 func foo() {
@@ -85,5 +92,5 @@ func foo() {
   // generic no overloads error path. The error should actually talk
   // about the return type, and this can happen in other contexts as well;
   // <rdar://problem/21900971> tracks improving QoI here.
-  allMine.takeAll() // expected-error{{using 'Mine' as a concrete type conforming to protocol 'Mine' is not supported}}
+  allMine.takeAll() // expected-error{{protocol 'Mine' as a type cannot conform to the protocol itself}} expected-note {{only concrete types such as structs, enums and classes can conform to protocols}}
 }

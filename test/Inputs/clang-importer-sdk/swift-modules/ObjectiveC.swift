@@ -1,50 +1,47 @@
 @_exported import ObjectiveC // Clang module
 
-// The iOS/arm64 target uses _Bool for Objective C's BOOL.  We include
+// The iOS/arm64 target uses _Bool for Objective-C's BOOL.  We include
 // x86_64 here as well because the iOS simulator also uses _Bool.
-#if ((os(iOS) || os(tvOS)) && (arch(arm64) || arch(x86_64))) || os(watchOS)
-public struct ObjCBool : BooleanType {
-  private var value : Bool
+public struct ObjCBool {
+#if (os(macOS) && arch(x86_64)) || (os(iOS) && (arch(i386) || arch(arm) || targetEnvironment(macCatalyst)))
 
-  public init(_ value: Bool) {
-    self.value = value
-  }
-
-  /// \brief Allow use in a Boolean context.
-  public var boolValue: Bool {
-    return value
-  }
-}
-
-#else
-
-public struct ObjCBool : BooleanType {
-  private var value : UInt8
+  // On macOS and 32-bit iOS, Objective-C's BOOL type is a "signed char".
+  private var value: UInt8
 
   public init(_ value: Bool) {
     self.value = value ? 1 : 0
   }
 
-  public init(_ value: UInt8) {
+  /// Allow use in a Boolean context.
+  public var boolValue: Bool {
+    return value != 0
+  }
+#else
+  // Everywhere else it is C/C++'s "Bool"
+  private var value: Bool
+
+  public init(_ value: Bool) {
     self.value = value
   }
 
-  /// \brief Allow use in a Boolean context.
   public var boolValue: Bool {
-    if value == 0 { return false }
-    return true
+    return value
   }
-}
 #endif
+}
 
-extension ObjCBool : BooleanLiteralConvertible {
+extension ObjCBool : ExpressibleByBooleanLiteral {
   public init(booleanLiteral: Bool) {
     self.init(booleanLiteral)
   }
 }
 
-public struct Selector : StringLiteralConvertible {
-  private var ptr : COpaquePointer
+public struct Selector : ExpressibleByStringLiteral {
+  private var ptr : OpaquePointer
+
+  public init(_ value: String) {
+    self.init(stringLiteral: value)
+  }
 
   public init(unicodeScalarLiteral value: String) {
     self.init(stringLiteral: value)
@@ -57,23 +54,28 @@ public struct Selector : StringLiteralConvertible {
   public init (stringLiteral value: String) {
     self = sel_registerName(value)
   }
-}
 
-public struct NSZone: NilLiteralConvertible {
-  public var pointer : COpaquePointer
-
-  @_transparent public
-  init(nilLiteral: ()) {
-    pointer = COpaquePointer()
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(ptr)
   }
 }
 
-internal func _convertBoolToObjCBool(x: Bool) -> ObjCBool {
+extension Selector : Equatable, Hashable {}
+
+public func ==(lhs: Selector, rhs: Selector) -> Bool {
+  return sel_isEqual(lhs, rhs)
+}
+
+public struct NSZone {
+  public var pointer : OpaquePointer
+}
+
+public func _convertBoolToObjCBool(_ x: Bool) -> ObjCBool {
   return ObjCBool(x)
 }
 
-internal func _convertObjCBoolToBool(x: ObjCBool) -> Bool {
-  return Bool(x)
+public func _convertObjCBoolToBool(_ x: ObjCBool) -> Bool {
+  return x.boolValue
 }
 
 public func ~=(x: NSObject, y: NSObject) -> Bool {
@@ -81,11 +83,16 @@ public func ~=(x: NSObject, y: NSObject) -> Bool {
 }
 
 extension NSObject : Equatable, Hashable {
+  public static func == (lhs: NSObject, rhs: NSObject) -> Bool {
+    return lhs.isEqual(rhs)
+  }
+
   public var hashValue: Int {
     return hash
   }
+
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(hash)
+  }
 }
 
-public func == (lhs: NSObject, rhs: NSObject) -> Bool {
-  return lhs.isEqual(rhs)
-}

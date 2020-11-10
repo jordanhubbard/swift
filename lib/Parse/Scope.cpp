@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,7 +15,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Parse/Scope.h"
-#include "swift/AST/Attr.h"
 #include "swift/Parse/Parser.h"
 #include "llvm/ADT/Twine.h"
 
@@ -33,14 +32,11 @@ static bool isResolvableScope(ScopeKind SK) {
   case ScopeKind::ClassBody:
   case ScopeKind::ProtocolBody:
   case ScopeKind::TopLevel:
+  case ScopeKind::InheritanceClause:
     return false;
   case ScopeKind::FunctionBody:
   case ScopeKind::Generics:
-  case ScopeKind::ConstructorBody:
-  case ScopeKind::DestructorBody:
   case ScopeKind::Brace:
-  case ScopeKind::ActiveConfigBlock:
-  case ScopeKind::ForVars:
   case ScopeKind::ForeachVars:
   case ScopeKind::ClosureParams:
   case ScopeKind::CaseVars:
@@ -49,16 +45,19 @@ static bool isResolvableScope(ScopeKind SK) {
   case ScopeKind::WhileVars:
     return true;
   }
+
+  llvm_unreachable("Unhandled ScopeKind in switch.");
 }
 
-Scope::Scope(Parser *P, ScopeKind SC, bool InactiveConfigBlock)
-  : SI(P->getScopeInfo()),
-    HTScope(SI.HT, SI.CurScope ? &SI.CurScope->HTScope : 0),
-    PrevScope(SI.CurScope),
-    PrevResolvableDepth(SI.ResolvableDepth),
-    Kind(SC), IsInactiveConfigBlock(InactiveConfigBlock) {
+Scope::Scope(Parser *P, ScopeKind SC, bool isInactiveConfigBlock)
+    : Scope(P->getScopeInfo(), SC, isInactiveConfigBlock) {}
+
+Scope::Scope(ScopeInfo &SI, ScopeKind SC, bool isInactiveConfigBlock)
+    : SI(SI), HTScope(SI.HT, SI.CurScope ? &SI.CurScope->HTScope : nullptr),
+      PrevScope(SI.CurScope), PrevResolvableDepth(SI.ResolvableDepth), Kind(SC),
+      IsInactiveConfigBlock(isInactiveConfigBlock) {
   assert(PrevScope || Kind == ScopeKind::TopLevel);
-  
+
   if (SI.CurScope) {
     Depth = SI.CurScope->Depth + 1;
     IsInactiveConfigBlock |= SI.CurScope->IsInactiveConfigBlock;
@@ -76,8 +75,9 @@ Scope::Scope(Parser *P, SavedScope &&SS):
     PrevScope(SI.CurScope),
     PrevResolvableDepth(SI.ResolvableDepth),
     Depth(SS.Depth),
-    Kind(SS.Kind), IsInactiveConfigBlock(SS.IsInactiveConfigBlock) {
-    
+    Kind(SS.Kind),
+    IsInactiveConfigBlock(SS.IsInactiveConfigBlock) {
+
     SI.CurScope = this;
     if (!isResolvableScope(Kind))
       SI.ResolvableDepth = Depth + 1;
@@ -104,7 +104,8 @@ static bool checkValidOverload(const ValueDecl *D1, const ValueDecl *D2,
 
 /// addToScope - Register the specified decl as being in the current lexical
 /// scope.
-void ScopeInfo::addToScope(ValueDecl *D, Parser &TheParser) {
+void ScopeInfo::addToScope(ValueDecl *D, Parser &TheParser,
+                           bool diagnoseRedefinitions) {
   if (!CurScope->isResolvable())
     return;
 
@@ -121,9 +122,13 @@ void ScopeInfo::addToScope(ValueDecl *D, Parser &TheParser) {
     
     // If this is in a resolvable scope, diagnose redefinitions.  Later
     // phases will handle scopes like module-scope, etc.
-    if (CurScope->getDepth() >= ResolvableDepth)
-      return TheParser.diagnoseRedefinition(PrevDecl, D);
-    
+    if (CurScope->getDepth() >= ResolvableDepth) {
+      if (diagnoseRedefinitions) {
+        return TheParser.diagnoseRedefinition(PrevDecl, D);
+      }
+      return;
+    }
+
     // If this is at top-level scope, validate that the members of the overload
     // set all agree.
     
@@ -139,3 +144,37 @@ void ScopeInfo::addToScope(ValueDecl *D, Parser &TheParser) {
                      D->getName(),
                      std::make_pair(CurScope->getDepth(), D));
 }
+
+
+// Disable the "for use only in debugger" warning.
+#if SWIFT_COMPILER_IS_MSVC
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+
+void ScopeInfo::dump() const {
+#ifndef NDEBUG
+  // Dump out the current list of scopes.
+  if (!CurScope->isResolvable())
+    return;
+
+  assert(CurScope->getDepth() >= ResolvableDepth &&
+         "Attempting to dump a non-resolvable scope?!");
+
+  llvm::dbgs() << "--- Dumping ScopeInfo ---\n";
+  std::function<void(decltype(HT)::DebugVisitValueTy)> func =
+      [&](const decltype(HT)::DebugVisitValueTy &iter) -> void {
+    llvm::dbgs() << "DeclName: " << iter->getKey() << "\n"
+                 << "KeyScopeID: " << iter->getValue().first << "\n"
+                 << "Decl: ";
+    iter->getValue().second->dumpRef(llvm::dbgs());
+    llvm::dbgs() << "\n";
+  };
+  HT.debugVisit(std::move(func));
+  llvm::dbgs() << "\n";
+#endif
+}
+
+#if SWIFT_COMPILER_IS_MSVC
+#pragma warning(pop)
+#endif

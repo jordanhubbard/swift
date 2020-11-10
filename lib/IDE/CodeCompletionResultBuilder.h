@@ -1,12 +1,12 @@
-//===- CodeCompletionResultBuilder.h - Bulid completion results -----------===//
+//===--- CodeCompletionResultBuilder.h - Build completion results ---------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,12 +14,19 @@
 #define SWIFT_LIB_IDE_CODE_COMPLETION_RESULT_BUILDER_H
 
 #include "swift/IDE/CodeCompletion.h"
+#include "swift/AST/Types.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/Basic/StringExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
 
 namespace clang {
 class Module;
+}
+
+namespace {
+class AnnotatedTypePrinter;
 }
 
 namespace swift {
@@ -28,7 +35,44 @@ class ModuleDecl;
 
 namespace ide {
 
+/// The expected contextual type(s) for code-completion.
+struct ExpectedTypeContext {
+  /// Possible types of the code completion expression.
+  llvm::SmallVector<Type, 4> possibleTypes;
+
+  /// Pre typechecked type of the expression at the completion position.
+  Type idealType;
+
+  /// Whether the `ExpectedTypes` comes from a single-expression body, e.g.
+  /// `foo({ here })`.
+  ///
+  /// Since the input may be incomplete, we take into account that the types are
+  /// only a hint.
+  bool isSingleExpressionBody = false;
+  bool preferNonVoid = false;
+
+  bool empty() const { return possibleTypes.empty(); }
+  bool requiresNonVoid() const {
+    if (isSingleExpressionBody)
+      return false;
+    if (preferNonVoid)
+      return true;
+    if (possibleTypes.empty())
+      return false;
+    return std::all_of(possibleTypes.begin(), possibleTypes.end(), [](Type Ty) {
+      return !Ty->isVoid();
+    });
+  }
+
+  ExpectedTypeContext() = default;
+  ExpectedTypeContext(ArrayRef<Type> types, bool isSingleExpressionBody)
+      : possibleTypes(types.begin(), types.end()),
+        isSingleExpressionBody(isSingleExpressionBody) {}
+};
+
 class CodeCompletionResultBuilder {
+  friend AnnotatedTypePrinter;
+  
   CodeCompletionResultSink &Sink;
   CodeCompletionResult::ResultKind Kind;
   SemanticContextKind SemanticContext;
@@ -40,12 +84,15 @@ class CodeCompletionResultBuilder {
   SmallVector<CodeCompletionString::Chunk, 4> Chunks;
   llvm::PointerUnion<const ModuleDecl *, const clang::Module *>
       CurrentModule;
-  ArrayRef<Type> ExpectedDeclTypes;
+  ExpectedTypeContext declTypeContext;
   CodeCompletionResult::ExpectedTypeRelation ExpectedTypeRelation =
-      CodeCompletionResult::Unrelated;
+      CodeCompletionResult::Unknown;
   bool Cancelled = false;
   ArrayRef<std::pair<StringRef, StringRef>> CommentWords;
   bool IsNotRecommended = false;
+  CodeCompletionResult::NotRecommendedReason NotRecReason =
+    CodeCompletionResult::NotRecommendedReason::NoReason;
+  StringRef BriefDocComment = StringRef();
 
   void addChunkWithText(CodeCompletionString::Chunk::ChunkKind Kind,
                         StringRef Text);
@@ -73,9 +120,9 @@ public:
   CodeCompletionResultBuilder(CodeCompletionResultSink &Sink,
                               CodeCompletionResult::ResultKind Kind,
                               SemanticContextKind SemanticContext,
-                              ArrayRef<Type> ExpectedDeclTypes)
+                              const ExpectedTypeContext &declTypeContext)
       : Sink(Sink), Kind(Kind), SemanticContext(SemanticContext),
-        ExpectedDeclTypes(ExpectedDeclTypes) {}
+        declTypeContext(declTypeContext) {}
 
   ~CodeCompletionResultBuilder() {
     finishResult();
@@ -83,6 +130,13 @@ public:
 
   void cancel() {
     Cancelled = true;
+  }
+
+  /// Annotated results are requested by the client.
+  ///
+  /// This affects the structure of the CodeCompletionString.
+  bool shouldAnnotateResults() {
+    return Sink.annotateResult;
   }
 
   void setNumBytesToErase(unsigned N) {
@@ -93,8 +147,13 @@ public:
 
   void setLiteralKind(CodeCompletionLiteralKind kind) { LiteralKind = kind; }
   void setKeywordKind(CodeCompletionKeywordKind kind) { KeywordKind = kind; }
-  void setNotRecommended(bool NotRecommended = true) {
-    IsNotRecommended = NotRecommended;
+  void setNotRecommended(CodeCompletionResult::NotRecommendedReason Reason) {
+    IsNotRecommended = true;
+    NotRecReason = Reason;
+  }
+
+  void setSemanticContext(SemanticContextKind Kind) {
+    SemanticContext = Kind;
   }
 
   void
@@ -102,20 +161,33 @@ public:
     ExpectedTypeRelation = relation;
   }
 
-  void addAccessControlKeyword(Accessibility Access) {
+  void withNestedGroup(CodeCompletionString::Chunk::ChunkKind Kind,
+                  llvm::function_ref<void()> body);
+
+  void addAccessControlKeyword(AccessLevel Access) {
     switch (Access) {
-    case Accessibility::Private:
+    case AccessLevel::Private:
       addChunkWithTextNoCopy(
           CodeCompletionString::Chunk::ChunkKind::AccessControlKeyword,
           "private ");
       break;
-    case Accessibility::Internal:
+    case AccessLevel::FilePrivate:
+      addChunkWithTextNoCopy(
+          CodeCompletionString::Chunk::ChunkKind::AccessControlKeyword,
+          "fileprivate ");
+      break;
+    case AccessLevel::Internal:
       // 'internal' is the default, don't add it.
       break;
-    case Accessibility::Public:
+    case AccessLevel::Public:
       addChunkWithTextNoCopy(
           CodeCompletionString::Chunk::ChunkKind::AccessControlKeyword,
           "public ");
+      break;
+    case AccessLevel::Open:
+      addChunkWithTextNoCopy(
+          CodeCompletionString::Chunk::ChunkKind::AccessControlKeyword,
+          "open ");
       break;
     }
   }
@@ -130,8 +202,21 @@ public:
                      Text);
   }
 
+  void addBaseName(StringRef Text) {
+    addChunkWithText(CodeCompletionString::Chunk::ChunkKind::BaseName, Text);
+  }
+
+  void addKeyword(StringRef Text) {
+    addChunkWithText(CodeCompletionString::Chunk::ChunkKind::Keyword, Text);
+  }
+
   void addTextChunk(StringRef Text) {
     addChunkWithText(CodeCompletionString::Chunk::ChunkKind::Text, Text);
+  }
+
+  void addAnnotatedTextChunk(StringRef Text) {
+    addTextChunk(Text);
+    getLastChunk().setIsAnnotation();
   }
 
   void addAnnotatedThrows() {
@@ -157,8 +242,7 @@ public:
 
   void addRethrows() {
     addChunkWithTextNoCopy(
-        CodeCompletionString::Chunk::ChunkKind::RethrowsKeyword,
-        " rethrows");
+        CodeCompletionString::Chunk::ChunkKind::RethrowsKeyword, " rethrows");
   }
 
   void addAnnotatedLeftParen() {
@@ -181,9 +265,19 @@ public:
         CodeCompletionString::Chunk::ChunkKind::RightParen, ")");
   }
 
+  void addAnnotatedLeftBracket() {
+    addLeftBracket();
+    getLastChunk().setIsAnnotation();
+  }
+
   void addLeftBracket() {
     addChunkWithTextNoCopy(
         CodeCompletionString::Chunk::ChunkKind::LeftBracket, "[");
+  }
+
+  void addAnnotatedRightBracket() {
+    addRightBracket();
+    getLastChunk().setIsAnnotation();
   }
 
   void addRightBracket() {
@@ -229,34 +323,48 @@ public:
         CodeCompletionString::Chunk::ChunkKind::QuestionMark, "?");
   }
 
+  void addEqual() {
+    addChunkWithTextNoCopy(CodeCompletionString::Chunk::ChunkKind::Equal, "=");
+  }
+
   void addDeclAttrParamKeyword(StringRef Name, StringRef Annotation,
                                bool NeedSpecify) {
     addChunkWithText(CodeCompletionString::Chunk::ChunkKind::
                      DeclAttrParamKeyword, Name);
     if (NeedSpecify)
       addChunkWithText(CodeCompletionString::Chunk::ChunkKind::
-                       DeclAttrParamEqual, "=");
-    if(!Annotation.empty())
+                       DeclAttrParamColon, ": ");
+    if (!Annotation.empty())
       addTypeAnnotation(Annotation);
   }
 
   void addDeclAttrKeyword(StringRef Name, StringRef Annotation) {
     addChunkWithText(CodeCompletionString::Chunk::ChunkKind::
                      DeclAttrKeyword, Name);
-    if(!Annotation.empty())
+    if (!Annotation.empty())
       addTypeAnnotation(Annotation);
   }
 
-  bool escapeKeyword(StringRef Word, llvm::SmallString<16> &EscapedKeyword) {
-#define KEYWORD(kw)                                                           \
-    if (Word.equals(#kw)) {                                                   \
-      EscapedKeyword.append("`");                                             \
-      EscapedKeyword.append(Word);                                            \
-      EscapedKeyword.append("`");                                             \
-      return true;                                                            \
+  StringRef escapeKeyword(StringRef Word, bool escapeAllKeywords,
+                          llvm::SmallString<16> &EscapedKeyword) {
+    EscapedKeyword.clear();
+    bool shouldEscape = false;
+    if (escapeAllKeywords) {
+#define KEYWORD(kw) .Case(#kw, true)
+      shouldEscape = llvm::StringSwitch<bool>(Word)
+#include "swift/Syntax/TokenKinds.def"
+        .Default(false);
+    } else {
+      shouldEscape = !canBeArgumentLabel(Word);
     }
-#include "swift/Parse/Tokens.def"
-    return false;
+
+    if (!shouldEscape)
+      return Word;
+
+    EscapedKeyword.append("`");
+    EscapedKeyword.append(Word);
+    EscapedKeyword.append("`");
+    return EscapedKeyword;
   }
 
   void addCallParameterColon() {
@@ -265,116 +373,43 @@ public:
   }
 
   void addSimpleNamedParameter(StringRef name) {
-    CurrentNestingLevel++;
-    addSimpleChunk(CodeCompletionString::Chunk::ChunkKind::CallParameterBegin);
-    // Use internal, since we don't want the name to be outisde the placeholder.
-    addChunkWithText(
-        CodeCompletionString::Chunk::ChunkKind::CallParameterInternalName,
-        name);
-    CurrentNestingLevel--;
+    withNestedGroup(CodeCompletionString::Chunk::ChunkKind::CallParameterBegin, [&] {
+      // Use internal, since we don't want the name to be outside the
+      // placeholder.
+      addChunkWithText(
+          CodeCompletionString::Chunk::ChunkKind::CallParameterInternalName,
+          name);
+    });
   }
 
   void addSimpleTypedParameter(StringRef Annotation, bool IsVarArg = false) {
-    CurrentNestingLevel++;
-    addSimpleChunk(CodeCompletionString::Chunk::ChunkKind::CallParameterBegin);
-    addChunkWithText(CodeCompletionString::Chunk::ChunkKind::CallParameterType,
-                     Annotation);
-    if (IsVarArg)
-      addEllipsis();
-    CurrentNestingLevel--;
+    withNestedGroup(CodeCompletionString::Chunk::ChunkKind::CallParameterBegin, [&] {
+      addChunkWithText(
+          CodeCompletionString::Chunk::ChunkKind::CallParameterType,
+          Annotation);
+      if (IsVarArg)
+        addEllipsis();
+    });
   }
 
   void addCallParameter(Identifier Name, Identifier LocalName, Type Ty,
-                        bool IsVarArg) {
-    CurrentNestingLevel++;
+                        Type ContextTy, bool IsVarArg, bool IsInOut, bool IsIUO,
+                        bool isAutoClosure, bool useUnderscoreLabel,
+                        bool isLabeledTrailingClosure);
 
-    addSimpleChunk(CodeCompletionString::Chunk::ChunkKind::CallParameterBegin);
-
-    if (!Name.empty()) {
-      StringRef NameStr = Name.str();
-
-      // 'self' is a keyword, we can not allow to insert it into the source
-      // buffer.
-      bool IsAnnotation = (NameStr == "self");
-
-      llvm::SmallString<16> EscapedKeyword;
-      addChunkWithText(
-          CodeCompletionString::Chunk::ChunkKind::CallParameterName,
-          // if the name is not annotation, we need to escape keyword
-          !IsAnnotation && escapeKeyword(NameStr, EscapedKeyword) ?
-            EscapedKeyword.str() : NameStr);
-      if (IsAnnotation)
-        getLastChunk().setIsAnnotation();
-
-      addChunkWithTextNoCopy(
-          CodeCompletionString::Chunk::ChunkKind::CallParameterColon, ": ");
-      if (IsAnnotation)
-        getLastChunk().setIsAnnotation();
-    }
-
-    // 'inout' arguments are printed specially.
-    if (auto *IOT = Ty->getAs<InOutType>()) {
-      addChunkWithTextNoCopy(
-          CodeCompletionString::Chunk::ChunkKind::Ampersand, "&");
-      Ty = IOT->getObjectType();
-    }
-
-    if (Name.empty() && !LocalName.empty()) {
-      llvm::SmallString<16> EscapedKeyword;
-      // Use local (non-API) parameter name if we have nothing else.
-      addChunkWithText(
-          CodeCompletionString::Chunk::ChunkKind::CallParameterInternalName,
-          escapeKeyword(LocalName.str(), EscapedKeyword) ? EscapedKeyword.str()
-                                                         : LocalName.str());
-      addChunkWithTextNoCopy(
-          CodeCompletionString::Chunk::ChunkKind::CallParameterColon, ": ");
-    }
-
-    // If the parameter is of the type @autoclosure ()->output, then the
-    // code completion should show the parameter of the output type
-    // instead of the function type ()->output.
-    if (auto FuncType = Ty->getAs<AnyFunctionType>()) {
-      if (FuncType->isAutoClosure()) {
-        Ty = FuncType->getResult();
-      }
-    }
-
-    PrintOptions PO;
-    PO.SkipAttributes = true;
-    addChunkWithText(CodeCompletionString::Chunk::ChunkKind::CallParameterType,
-                     Ty->getString(PO));
-
-    // Look through optional types and type aliases to find out if we have
-    // function/closure parameter type that is not an autoclosure.
-    Ty = Ty->lookThroughAllAnyOptionalTypes();
-    if (auto AFT = Ty->getAs<AnyFunctionType>()) {
-      if (!AFT->isAutoClosure()) {
-        // If this is a closure type, add ChunkKind::CallParameterClosureType.
-        PrintOptions PO;
-        PO.PrintFunctionRepresentationAttrs = false;
-        PO.SkipAttributes = true;
-        addChunkWithText(
-            CodeCompletionString::Chunk::ChunkKind::CallParameterClosureType,
-            AFT->getString(PO));
-      }
-    }
-
-    if (IsVarArg)
-      addEllipsis();
-    CurrentNestingLevel--;
-  }
-
-  void addCallParameter(Identifier Name, Type Ty, bool IsVarArg) {
-    addCallParameter(Name, Identifier(), Ty, IsVarArg);
+  void addCallParameter(Identifier Name, Type Ty, Type ContextTy = Type()) {
+    addCallParameter(Name, Identifier(), Ty, ContextTy,
+                     /*IsVarArg=*/false, /*IsInOut=*/false, /*isIUO=*/false,
+                     /*isAutoClosure=*/false, /*useUnderscoreLabel=*/false,
+                     /*isLabeledTrailingClosure=*/false);
   }
 
   void addGenericParameter(StringRef Name) {
-    CurrentNestingLevel++;
-    addSimpleChunk(
-       CodeCompletionString::Chunk::ChunkKind::GenericParameterBegin);
-    addChunkWithText(
-      CodeCompletionString::Chunk::ChunkKind::GenericParameterName, Name);
-    CurrentNestingLevel--;
+    withNestedGroup(CodeCompletionString::Chunk::ChunkKind::GenericParameterBegin,
+               [&] {
+      addChunkWithText(
+        CodeCompletionString::Chunk::ChunkKind::GenericParameterName, Name);
+    });
   }
 
   void addDynamicLookupMethodCallTail() {
@@ -386,8 +421,7 @@ public:
 
   void addOptionalMethodCallTail() {
     addChunkWithTextNoCopy(
-        CodeCompletionString::Chunk::ChunkKind::OptionalMethodCallTail, "!");
-    getLastChunk().setIsAnnotation();
+        CodeCompletionString::Chunk::ChunkKind::OptionalMethodCallTail, "?");
   }
 
   void addTypeAnnotation(StringRef Type) {
@@ -396,9 +430,12 @@ public:
     getLastChunk().setIsAnnotation();
   }
 
-  void addBraceStmtWithCursor() {
-    addChunkWithTextNoCopy(
-        CodeCompletionString::Chunk::ChunkKind::BraceStmtWithCursor, " {}");
+  void addTypeAnnotation(Type T, PrintOptions PO, StringRef suffix = "");
+
+  void addBraceStmtWithCursor(StringRef Description = "") {
+    addChunkWithText(
+        CodeCompletionString::Chunk::ChunkKind::BraceStmtWithCursor,
+        Description);
   }
 
   void addWhitespace(StringRef space) {
@@ -410,10 +447,13 @@ public:
     addWhitespace(space);
     getLastChunk().setIsAnnotation();
   }
+
+  void setBriefDocComment(StringRef comment) {
+    BriefDocComment = comment;
+  }
 };
 
 } // namespace ide
 } // namespace swift
 
 #endif // SWIFT_LIB_IDE_CODE_COMPLETION_RESULT_BUILDER_H
-

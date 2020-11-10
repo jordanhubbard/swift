@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -73,11 +73,11 @@ public:
     return Values.size() - NextValue;
   }
 
-  typedef SmallVector<llvm::Value*, 8>::iterator iterator;
+  using iterator = SmallVector<llvm::Value *, 8>::iterator;
   iterator begin() { return Values.begin() + NextValue; }
   iterator end() { return Values.end(); }
 
-  typedef SmallVector<llvm::Value*, 8>::const_iterator const_iterator;
+  using const_iterator = SmallVector<llvm::Value *, 8>::const_iterator;
   const_iterator begin() const { return Values.begin() + NextValue; }
   const_iterator end() const { return Values.end(); }
 
@@ -233,12 +233,9 @@ public:
     return Elements[index];
   }
 
-  bool requiresIndirectParameter(IRGenModule &IGM) const;
-  bool requiresIndirectResult(IRGenModule &IGM) const;
+  using iterator = SmallVectorImpl<Element>::iterator;
+  using const_iterator = SmallVectorImpl<Element>::const_iterator;
 
-  typedef SmallVectorImpl<Element>::iterator iterator;
-  typedef SmallVectorImpl<Element>::const_iterator const_iterator;
-  
   iterator begin() { return Elements.begin(); }
   iterator end() { return Elements.end(); }
   const_iterator begin() const { return Elements.begin(); }
@@ -255,13 +252,6 @@ public:
   ///   - the element type, if the schema contains exactly one element;
   ///   - an anonymous struct type concatenating those types, otherwise.
   llvm::Type *getScalarResultType(IRGenModule &IGM) const;
-
-  /// Treating the types in this schema as potential arguments to a
-  /// function call, add them to the end of the given vector of types.
-  void addToArgTypes(IRGenModule &IGM,
-                     const TypeInfo &TI,
-                     llvm::AttributeSet &Attrs,
-                     SmallVectorImpl<llvm::Type*> &types) const;
 };
 
 } // end namespace irgen

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -26,6 +26,8 @@
 #define SWIFT_IRGEN_TYPEINFO_H
 
 #include "IRGen.h"
+#include "swift/AST/ReferenceCounting.h"
+#include "llvm/ADT/MapVector.h"
 
 namespace llvm {
   class Constant;
@@ -34,17 +36,25 @@ namespace llvm {
 }
 
 namespace swift {
+  enum IsInitialization_t : bool;
+  enum IsTake_t : bool;
+  class SILType;
+
 namespace irgen {
   class Address;
-  class ContainedAddress;
+  class StackAddress;
   class IRGenFunction;
+  class IRGenTypeVerifierFunction;
   class IRGenModule;
   class Explosion;
   class ExplosionSchema;
+  class NativeConventionSchema;
   enum OnHeap_t : unsigned char;
+  class OutliningMetadataCollector;
   class OwnedAddress;
   class RValue;
   class RValueSchema;
+  class TypeLayoutEntry;
 
 /// Ways in which an object can fit into a fixed-size buffer.
 enum class FixedPacking {
@@ -58,52 +68,24 @@ enum class FixedPacking {
   Dynamic
 };
 
-/// The kind of reference counting implementation a heap object uses.
-enum class ReferenceCounting : unsigned char {
-  /// The object uses native Swift reference counting.
-  Native,
-  
-  /// The object uses ObjC reference counting.
-  ///
-  /// When ObjC interop is enabled, native Swift class objects are also ObjC
-  /// reference counting compatible. Swift non-class heap objects are never
-  /// ObjC reference counting compatible.
-  ///
-  /// Blocks are always ObjC reference counting compatible.
-  ObjC,
-  
-  /// The object uses _Block_copy/_Block_release reference counting.
-  ///
-  /// This is a strict subset of ObjC; all blocks are also ObjC reference
-  /// counting compatible. The block is assumed to have already been moved to
-  /// the heap so that _Block_copy returns the same object back.
-  Block,
-  
-  /// The object has an unknown reference counting implementation.
-  ///
-  /// This uses maximally-compatible reference counting entry points in the
-  /// runtime.
-  ///
-  /// FIXME: Those entry points are currently objc_retain/objc_release, which
-  /// are not compatible with non-class heap objects.
-  Unknown,
-  
-  /// Cases prior to this one are binary-compatible with Unknown reference
-  /// counting.
-  LastUnknownCompatible = Unknown,
+enum class SpecialTypeInfoKind : uint8_t {
+  Unimplemented,
 
-  /// The object has an unknown reference counting implementation and
-  /// the reference value may contain extra bits that need to be masked.
-  ///
-  /// This uses maximally-compatible reference counting entry points in the
-  /// runtime, with a masking layer on top. A bit inside the pointer is used
-  /// to signal native Swift refcounting.
-  Bridge,
-  
-  /// The object uses ErrorType's reference counting entry points.
-  Error,
+  None,
+
+  /// Everything after this is statically fixed-size.
+  Fixed,
+  Weak,
+
+  /// Everything after this is loadable.
+  Loadable,
+  Reference,
+
+  Last_Kind = Reference
 };
-  
+enum : unsigned { NumSpecialTypeInfoKindBits =
+  countBitsUsed(static_cast<unsigned>(SpecialTypeInfoKind::Last_Kind)) };
+
 /// Information about the IR representation and generation of the
 /// given type.
 class TypeInfo {
@@ -111,42 +93,98 @@ class TypeInfo {
   TypeInfo &operator=(const TypeInfo &) = delete;
 
   friend class TypeConverter;
-  mutable const TypeInfo *NextConverted;
 
 protected:
-  enum SpecialTypeInfoKind {
-    STIK_Unimplemented,
-    
-    STIK_None,
+  union {
+    uint64_t OpaqueBits;
 
-    /// Everything after this is statically fixed-size.
-    STIK_Fixed,
-    STIK_Weak,
+    SWIFT_INLINE_BITFIELD_BASE(TypeInfo,
+                               bitmax(NumSpecialTypeInfoKindBits,8)+6+1+1+3+1+1,
+      /// The kind of supplemental API this type has, if any.
+      Kind : bitmax(NumSpecialTypeInfoKindBits,8),
 
-    /// Everything after this is loadable.
-    STIK_Loadable,
-    STIK_Reference,
-    STIK_Unowned,
-  };
+      /// The storage alignment of this type in log2 bytes.
+      AlignmentShift : 6,
+
+      /// Whether this type is known to be POD.
+      POD : 1,
+
+      /// Whether this type is known to be bitwise-takable.
+      BitwiseTakable : 1,
+
+      /// An arbitrary discriminator for the subclass.  This is useful for e.g.
+      /// distinguishing between different TypeInfos that all implement the same
+      /// kind of type.
+      /// FIXME -- Create TypeInfoNodes.def and get rid of this field.
+      SubclassKind : 3,
+
+      /// Whether this type can be assumed to have a fixed size from all
+      /// resilience domains.
+      AlwaysFixedSize : 1,
+
+      /// Whether this type is ABI-accessible from this SILModule.
+      ABIAccessible : 1
+    );
+
+    /// FixedTypeInfo will use the remaining bits for the size.
+    ///
+    /// NOTE: Until one can define statically sized inline arrays in the
+    /// language, defining an extremely large object is quite impractical.
+    /// For now: "4 GiB should be more than good enough."
+    SWIFT_INLINE_BITFIELD_FULL(FixedTypeInfo, TypeInfo, 32,
+      : NumPadBits,
+
+      /// The storage size of this type in bytes.  This may be zero even
+      /// for well-formed and complete types, such as a trivial enum or
+      /// tuple.
+      Size : 32
+    );
+  } Bits;
+  enum { InvalidSubclassKind = 0x7 };
 
   TypeInfo(llvm::Type *Type, Alignment A, IsPOD_t pod,
            IsBitwiseTakable_t bitwiseTakable,
            IsFixedSize_t alwaysFixedSize,
-           SpecialTypeInfoKind stik)
-    : NextConverted(0), StorageType(Type), StorageAlignment(A),
-      POD(pod), BitwiseTakable(bitwiseTakable),
-      AlwaysFixedSize(alwaysFixedSize), STIK(stik),
-      SubclassKind(InvalidSubclassKind) {
-    assert(STIK >= STIK_Fixed || !AlwaysFixedSize);
+           IsABIAccessible_t abiAccessible,
+           SpecialTypeInfoKind stik) : StorageType(Type) {
+    assert(stik >= SpecialTypeInfoKind::Fixed || !alwaysFixedSize);
+    Bits.OpaqueBits = 0;
+    Bits.TypeInfo.Kind = unsigned(stik);
+    Bits.TypeInfo.AlignmentShift = llvm::Log2_32(A.getValue());
+    Bits.TypeInfo.POD = pod;
+    Bits.TypeInfo.BitwiseTakable = bitwiseTakable;
+    Bits.TypeInfo.SubclassKind = InvalidSubclassKind;
+    Bits.TypeInfo.AlwaysFixedSize = alwaysFixedSize;
+    Bits.TypeInfo.ABIAccessible = abiAccessible;
   }
 
   /// Change the minimum alignment of a stored value of this type.
   void setStorageAlignment(Alignment alignment) {
-    StorageAlignment = alignment;
+    auto Prev = Bits.TypeInfo.AlignmentShift;
+    auto Next = llvm::Log2_32(alignment.getValue());
+    assert(Next >= Prev && "Alignment can only increase");
+    (void)Prev;
+    Bits.TypeInfo.AlignmentShift = Next;
   }
 
+  void setSubclassKind(unsigned kind) {
+    assert(kind != InvalidSubclassKind);
+    Bits.TypeInfo.SubclassKind = kind;
+    assert(Bits.TypeInfo.SubclassKind == kind && "kind was truncated?");
+  }
+
+private:
+  mutable const TypeInfo *NextConverted = nullptr;
+
+  /// The LLVM representation of a stored value of this type.  For
+  /// non-fixed types, this is really useful only for forming pointers to it.
+  llvm::Type *StorageType;
+
+  mutable NativeConventionSchema *nativeReturnSchema = nullptr;
+  mutable NativeConventionSchema *nativeParameterSchema = nullptr;
+
 public:
-  virtual ~TypeInfo() = default;
+  virtual ~TypeInfo();
 
   /// Unsafely cast this to the given subtype.
   template <class T> const T &as() const {
@@ -154,56 +192,30 @@ public:
     return static_cast<const T &>(*this);
   }
 
-  /// The LLVM representation of a stored value of this type.  For
-  /// non-fixed types, this is really useful only for forming pointers to it.
-  llvm::Type *StorageType;
-
-private:
-  /// The storage alignment of this type in bytes.  This is never zero
-  /// for a completely-converted type.
-  Alignment StorageAlignment;
-
-  /// Whether this type is known to be POD.
-  unsigned POD : 1;
-  
-  /// Whether this type is known to be bitwise-takable.
-  unsigned BitwiseTakable : 1;
-
-  /// Whether this type can be assumed to have a fixed size from all
-  /// resilience domains.
-  unsigned AlwaysFixedSize : 1;
-
-  /// The kind of supplemental API this type has, if any.
-  unsigned STIK : 3;
-
-  /// An arbitrary discriminator for the subclass.  This is useful for
-  /// e.g. distinguishing between different TypeInfos that all
-  /// implement the same kind of type.
-  unsigned SubclassKind : 3;
-  enum { InvalidSubclassKind = 0x7 };
-
-protected:
-  void setSubclassKind(unsigned kind) {
-    assert(kind != InvalidSubclassKind);
-    SubclassKind = kind;
-    assert(SubclassKind == kind && "kind was truncated?");
-  }
-
-public:
-  /// Whether this type info has been completely converted.
-  bool isComplete() const { return !StorageAlignment.isZero(); }
-
   /// Whether this type is known to be empty.
-  bool isKnownEmpty() const;
+  bool isKnownEmpty(ResilienceExpansion expansion) const;
+
+  /// Whether this type is known to be ABI-accessible, i.e. whether it's
+  /// actually possible to do ABI operations on it from this current SILModule.
+  /// See SILModule::isTypeABIAccessible.
+  ///
+  /// All fixed-size types are currently ABI-accessible, although this would
+  /// not be difficult to change (e.g. if we had an archetype size constraint
+  /// that didn't say anything about triviality).
+  IsABIAccessible_t isABIAccessible() const {
+    return IsABIAccessible_t(Bits.TypeInfo.ABIAccessible);
+  }
 
   /// Whether this type is known to be POD, i.e. to not require any
   /// particular action on copy or destroy.
-  IsPOD_t isPOD(ResilienceScope scope) const { return IsPOD_t(POD); }
+  IsPOD_t isPOD(ResilienceExpansion expansion) const {
+    return IsPOD_t(Bits.TypeInfo.POD);
+  }
   
   /// Whether this type is known to be bitwise-takable, i.e. "initializeWithTake"
   /// is equivalent to a memcpy.
-  IsBitwiseTakable_t isBitwiseTakable(ResilienceScope scope) const {
-    return IsBitwiseTakable_t(BitwiseTakable);
+  IsBitwiseTakable_t isBitwiseTakable(ResilienceExpansion expansion) const {
+    return IsBitwiseTakable_t(Bits.TypeInfo.BitwiseTakable);
   }
   
   /// Returns the type of special interface followed by this TypeInfo.
@@ -213,7 +225,7 @@ public:
   /// properties on their parameter types, but then the program
   /// can rely on them.
   SpecialTypeInfoKind getSpecialTypeInfoKind() const {
-    return SpecialTypeInfoKind(STIK);
+    return SpecialTypeInfoKind(Bits.TypeInfo.Kind);
   }
 
   /// Returns whatever arbitrary data has been stash in the subclass
@@ -221,44 +233,47 @@ public:
   /// distinguishing between TypeInfos, which is useful when multiple
   /// TypeInfo subclasses are used to implement the same kind of type.
   unsigned getSubclassKind() const {
-    assert(SubclassKind != InvalidSubclassKind &&
+    assert(Bits.TypeInfo.SubclassKind != InvalidSubclassKind &&
            "subclass kind has not been initialized!");
-    return SubclassKind;
+    return Bits.TypeInfo.SubclassKind;
   }
 
   /// Whether this type is known to be fixed-size in the local
   /// resilience domain.  If true, this TypeInfo can be cast to
   /// FixedTypeInfo.
   IsFixedSize_t isFixedSize() const {
-    return IsFixedSize_t(STIK >= STIK_Fixed);
+    return IsFixedSize_t(getSpecialTypeInfoKind() >= SpecialTypeInfoKind::Fixed);
   }
 
   /// Whether this type is known to be fixed-size in the given
   /// resilience domain.  If true, spare bits can be used.
-  IsFixedSize_t isFixedSize(ResilienceScope scope) const {
-    switch (scope) {
-    case ResilienceScope::Component:
+  IsFixedSize_t isFixedSize(ResilienceExpansion expansion) const {
+    switch (expansion) {
+    case ResilienceExpansion::Maximal:
       return isFixedSize();
-    case ResilienceScope::Universal:
+    case ResilienceExpansion::Minimal:
       // We can't be universally fixed size if we're not locally
       // fixed size.
-      assert((isFixedSize() || AlwaysFixedSize == IsNotFixedSize) &&
+      assert((isFixedSize() || Bits.TypeInfo.AlwaysFixedSize == IsNotFixedSize) &&
              "IsFixedSize vs IsAlwaysFixedSize mismatch");
-      return IsFixedSize_t(AlwaysFixedSize);
+      return IsFixedSize_t(Bits.TypeInfo.AlwaysFixedSize);
     }
+
+    llvm_unreachable("Not a valid ResilienceExpansion.");
   }
 
   /// Whether this type is known to be loadable in the local
   /// resilience domain.  If true, this TypeInfo can be cast to
   /// LoadableTypeInfo.
   IsLoadable_t isLoadable() const {
-    return IsLoadable_t(STIK >= STIK_Loadable);
+    return IsLoadable_t(getSpecialTypeInfoKind() >= SpecialTypeInfoKind::Loadable);
   }
 
   llvm::Type *getStorageType() const { return StorageType; }
 
   Alignment getBestKnownAlignment() const {
-    return StorageAlignment;
+    auto Shift = Bits.TypeInfo.AlignmentShift;
+    return Alignment(1ull << Shift);
   }
 
   /// Given a generic pointer to this type, produce an Address for it.
@@ -268,14 +283,11 @@ public:
   Address getUndefAddress() const;
     
   /// Return the size and alignment of this type.
-  virtual std::pair<llvm::Value*,llvm::Value*>
-    getSizeAndAlignmentMask(IRGenFunction &IGF, SILType T) const = 0;
-  virtual std::tuple<llvm::Value*,llvm::Value*,llvm::Value*>
-    getSizeAndAlignmentMaskAndStride(IRGenFunction &IGF, SILType T) const = 0;
   virtual llvm::Value *getSize(IRGenFunction &IGF, SILType T) const = 0;
   virtual llvm::Value *getAlignmentMask(IRGenFunction &IGF, SILType T) const = 0;
   virtual llvm::Value *getStride(IRGenFunction &IGF, SILType T) const = 0;
   virtual llvm::Value *getIsPOD(IRGenFunction &IGF, SILType T) const = 0;
+  virtual llvm::Value *getIsBitwiseTakable(IRGenFunction &IGF, SILType T) const = 0;
   virtual llvm::Value *isDynamicallyPackedInline(IRGenFunction &IGF,
                                                  SILType T) const = 0;
 
@@ -298,77 +310,86 @@ public:
   /// A convenience for getting the schema of a single type.
   ExplosionSchema getSchema() const;
 
+  /// Build the type layout for this type info.
+  virtual TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
+                                                SILType T) const = 0;
+
   /// Allocate a variable of this type on the stack.
-  virtual ContainedAddress allocateStack(IRGenFunction &IGF,
-                                         SILType T,
-                                         const llvm::Twine &name) const = 0;
+  virtual StackAddress allocateStack(IRGenFunction &IGF, SILType T,
+                                     const llvm::Twine &name) const = 0;
 
   /// Deallocate a variable of this type.
-  virtual void deallocateStack(IRGenFunction &IGF, Address addr,
+  virtual void deallocateStack(IRGenFunction &IGF, StackAddress addr,
                                SILType T) const = 0;
+
+  /// Destroy the value of a variable of this type, then deallocate its
+  /// memory.
+  virtual void destroyStack(IRGenFunction &IGF, StackAddress addr, SILType T,
+                            bool isOutlined) const = 0;
+
+  /// Copy or take a value out of one address and into another, destroying
+  /// old value in the destination.  Equivalent to either assignWithCopy
+  /// or assignWithTake depending on the value of isTake.
+  void assign(IRGenFunction &IGF, Address dest, Address src, IsTake_t isTake,
+              SILType T, bool isOutlined) const;
 
   /// Copy a value out of an object and into another, destroying the
   /// old value in the destination.
-  virtual void assignWithCopy(IRGenFunction &IGF, Address dest,
-                              Address src, SILType T) const = 0;
+  virtual void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
+                              SILType T, bool isOutlined) const = 0;
 
   /// Move a value out of an object and into another, destroying the
   /// old value there and leaving the source object in an invalid state.
-  virtual void assignWithTake(IRGenFunction &IGF, Address dest,
-                              Address src, SILType T) const = 0;
+  virtual void assignWithTake(IRGenFunction &IGF, Address dest, Address src,
+                              SILType T, bool isOutlined) const = 0;
+
+  /// Copy-initialize or take-initialize an uninitialized object
+  /// with the value from a different object.  Equivalent to either
+  /// initializeWithCopy or initializeWithTake depending on the value
+  /// of isTake.
+  void initialize(IRGenFunction &IGF, Address dest, Address src,
+                  IsTake_t isTake, SILType T, bool isOutlined) const;
 
   /// Perform a "take-initialization" from the given object.  A
   /// take-initialization is like a C++ move-initialization, except that
   /// the old object is actually no longer permitted to be destroyed.
   virtual void initializeWithTake(IRGenFunction &IGF, Address destAddr,
-                                  Address srcAddr, SILType T) const = 0;
+                                  Address srcAddr, SILType T,
+                                  bool isOutlined) const = 0;
 
   /// Perform a copy-initialization from the given object.
   virtual void initializeWithCopy(IRGenFunction &IGF, Address destAddr,
-                                  Address srcAddr, SILType T) const = 0;
+                                  Address srcAddr, SILType T,
+                                  bool isOutlined) const = 0;
 
-  /// Perform a "take-initialization" from the given object into an
-  /// uninitialized fixed-size buffer, allocating the buffer if necessary.
-  /// Returns the address of the value inside the buffer.
+  /// Perform a copy-initialization from the given fixed-size buffer
+  /// into an uninitialized fixed-size buffer, allocating the buffer if
+  /// necessary.  Returns the address of the value inside the buffer.
   ///
   /// This is equivalent to:
-  ///   auto destAddress = allocateBuffer(IGF, destBuffer, T);
-  ///   initializeWithTake(IGF, destAddr, srcAddr, T);
-  ///   return destAddress;
+  ///   auto srcAddress = projectBuffer(IGF, srcBuffer, T);
+  ///   initializeBufferWithCopy(IGF, destBuffer, srcAddress, T);
   /// but will be more efficient for dynamic types, since it uses a single
   /// value witness call.
-  virtual Address initializeBufferWithTake(IRGenFunction &IGF,
-                                           Address destBuffer,
-                                           Address srcAddr,
-                                           SILType T) const;
-
-  /// Perform a copy-initialization from the given object into an
-  /// uninitialized fixed-size buffer, allocating the buffer if necessary.
-  /// Returns the address of the value inside the buffer.
-  ///
-  /// This is equivalent to:
-  ///   auto destAddress = allocateBuffer(IGF, destBuffer, T);
-  ///   initializeWithCopy(IGF, destAddr, srcAddr, T);
-  ///   return destAddress;
-  /// but will be more efficient for dynamic types, since it uses a single
-  /// value witness call.
-  virtual Address initializeBufferWithCopy(IRGenFunction &IGF,
-                                           Address destBuffer,
-                                           Address srcAddr,
-                                           SILType T) const;
+  virtual Address initializeBufferWithCopyOfBuffer(IRGenFunction &IGF,
+                                                   Address destBuffer,
+                                                   Address srcBuffer,
+                                                   SILType T) const;
 
   /// Take-initialize an address from a parameter explosion.
   virtual void initializeFromParams(IRGenFunction &IGF, Explosion &params,
-                                    Address src, SILType T) const = 0;
+                                    Address src, SILType T,
+                                    bool isOutlined) const = 0;
 
   /// Destroy an object of this type in memory.
-  virtual void destroy(IRGenFunction &IGF, Address address, SILType T) const = 0;
-  
+  virtual void destroy(IRGenFunction &IGF, Address address, SILType T,
+                       bool isOutlined) const = 0;
+
   /// Should optimizations be enabled which rely on the representation
   /// for this type being a single object pointer?
   ///
   /// \return false by default
-  virtual bool isSingleRetainablePointer(ResilienceScope scope,
+  virtual bool isSingleRetainablePointer(ResilienceExpansion expansion,
                                          ReferenceCounting *refcounting
                                              = nullptr) const;
 
@@ -376,49 +397,82 @@ public:
   /// for this type being a single Swift-retainable object pointer?
   ///
   /// \return false by default
-  bool isSingleSwiftRetainablePointer(ResilienceScope scope) const {
+  bool isSingleSwiftRetainablePointer(ResilienceExpansion expansion) const {
     ReferenceCounting refcounting;
-    return (isSingleRetainablePointer(scope, &refcounting) &&
+    return (isSingleRetainablePointer(expansion, &refcounting) &&
             refcounting == ReferenceCounting::Native);
   }
 
   /// Does this type statically have extra inhabitants, or may it dynamically
   /// have extra inhabitants based on type arguments?
   virtual bool mayHaveExtraInhabitants(IRGenModule &IGM) const = 0;
-  
-  /// Map an extra inhabitant representation in memory to a unique 31-bit
-  /// identifier, and map a valid representation of the type to -1.
+
+  /// Returns true if the value witness operations on this type work correctly
+  /// with extra inhabitants up to the given index.
   ///
-  /// Calls to this witness must be dominated by a runtime check that the type
-  /// has extra inhabitants.
-  virtual llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
-                                               Address src,
-                                               SILType T) const = 0;
+  /// An example of this is retainable pointers. The first extra inhabitant for
+  /// these types is the null pointer, on which swift_retain is a harmless
+  /// no-op. If this predicate returns true, then a single-payload enum with
+  /// this type as its payload (like Optional<T>) can avoid additional branching
+  /// on the enum tag for value witness operations.
+  virtual bool canValueWitnessExtraInhabitantsUpTo(IRGenModule &IGM,
+                                                   unsigned index) const;
   
-  /// Store the extra inhabitant representation indexed by a 31-bit identifier
-  /// to memory.
+  /// Get the tag of a single payload enum with a payload of this type (\p T) e.g
+  /// Optional<T>.
+  virtual llvm::Value *getEnumTagSinglePayload(IRGenFunction &IGF,
+                                               llvm::Value *numEmptyCases,
+                                               Address enumAddr,
+                                               SILType T,
+                                               bool isOutlined) const = 0;
+
+  /// Store the tag of a single payload enum with a payload of this type.
+  virtual void storeEnumTagSinglePayload(IRGenFunction &IGF,
+                                         llvm::Value *whichCase,
+                                         llvm::Value *numEmptyCases,
+                                         Address enumAddr,
+                                         SILType T,
+                                         bool isOutlined) const = 0;
+
+  /// Return an extra-inhabitant tag for the given type, which will be
+  /// 0 for a value that's not an extra inhabitant or else a value in
+  /// 1...extraInhabitantCount.  Note that the range is off by one relative
+  /// to the expectations of FixedTypeInfo::getExtraInhabitantIndex!
   ///
-  /// Calls to this witness must be dominated by a runtime check that the type
-  /// has extra inhabitants.
-  virtual void storeExtraInhabitant(IRGenFunction &IGF,
-                                    llvm::Value *index,
-                                    Address dest,
-                                    SILType T) const = 0;
-  
-  /// Initialize a freshly instantiated value witness table. Should be a no-op
-  /// for fixed-size types.
-  virtual void initializeMetadata(IRGenFunction &IGF,
-                                  llvm::Value *metadata,
-                                  llvm::Value *vwtable,
-                                  SILType T) const = 0;
-  
+  /// Most places in IRGen shouldn't be using this.
+  ///
+  /// knownXICount can be null.
+  llvm::Value *getExtraInhabitantTagDynamic(IRGenFunction &IGF,
+                                            Address address,
+                                            SILType T,
+                                            llvm::Value *knownXICount,
+                                            bool isOutlined) const;
+
+  /// Store an extra-inhabitant tag for the given type, which is known to be
+  /// in 1...extraInhabitantCount.  Note that the range is off by one
+  /// relative to the expectations of FixedTypeInfo::storeExtraInhabitant!
+  ///
+  /// Most places in IRGen shouldn't be using this.
+  void storeExtraInhabitantTagDynamic(IRGenFunction &IGF,
+                                      llvm::Value *index,
+                                      Address address,
+                                      SILType T,
+                                      bool isOutlined) const;
+
   /// Compute the packing of values of this type into a fixed-size buffer.
+  /// A value might not be stored in the fixed-size buffer because it does not
+  /// fit or because it is not bit-wise takable. Non bit-wise takable values are
+  /// not stored inline by convention.
   FixedPacking getFixedPacking(IRGenModule &IGM) const;
   
   /// Index into an array of objects of this type.
   Address indexArray(IRGenFunction &IGF, Address base, llvm::Value *offset,
                      SILType T) const;
-  
+
+  /// Round up the address value \p base to the alignment of type \p T. 
+  Address roundUpToTypeAlignment(IRGenFunction &IGF, Address base,
+                                 SILType T) const;
+
   /// Destroy an array of objects of this type in memory.
   virtual void destroyArray(IRGenFunction &IGF, Address base,
                             llvm::Value *count, SILType T) const;
@@ -430,6 +484,12 @@ public:
                                        Address src,
                                        llvm::Value *count, SILType T) const;
   
+  /// Initialize an array of objects of this type in memory by taking the
+  /// values from another array. The array must not overlap.
+  virtual void initializeArrayWithTakeNoAlias(IRGenFunction &IGF,
+                                       Address dest, Address src,
+                                       llvm::Value *count, SILType T) const;
+
   /// Initialize an array of objects of this type in memory by taking the
   /// values from another array. The destination array may overlap the head of
   /// the source array because the elements are taken as if in front-to-back
@@ -445,6 +505,57 @@ public:
   virtual void initializeArrayWithTakeBackToFront(IRGenFunction &IGF,
                                        Address dest, Address src,
                                        llvm::Value *count, SILType T) const;
+
+  /// Assign to an array of objects of this type in memory by copying the
+  /// values from another array. The array must not overlap.
+  virtual void assignArrayWithCopyNoAlias(IRGenFunction &IGF, Address dest,
+                                          Address src, llvm::Value *count,
+                                          SILType T) const;
+
+  /// Assign to an array of objects of this type in memory by copying the
+  /// values from another array. The destination array may overlap the head of
+  /// the source array because the elements are taken as if in front-to-back
+  /// order.
+  virtual void assignArrayWithCopyFrontToBack(IRGenFunction &IGF, Address dest,
+                                              Address src, llvm::Value *count,
+                                              SILType T) const;
+
+  /// Assign to an array of objects of this type in memory by copying the
+  /// values from another array. The destination array may overlap the tail of
+  /// the source array because the elements are taken as if in back-to-front
+  /// order.
+  virtual void assignArrayWithCopyBackToFront(IRGenFunction &IGF, Address dest,
+                                              Address src, llvm::Value *count,
+                                              SILType T) const;
+
+  /// Assign to an array of objects of this type in memory by taking the
+  /// values from another array. The array must not overlap.
+  virtual void assignArrayWithTake(IRGenFunction &IGF, Address dest,
+                                   Address src, llvm::Value *count,
+                                   SILType T) const;
+
+  /// Collect all the metadata necessary in order to perform value
+  /// operations on this type.
+  virtual void collectMetadataForOutlining(OutliningMetadataCollector &collector,
+                                           SILType T) const;
+
+  /// Get the native (abi) convention for a return value of this type.
+  const NativeConventionSchema &nativeReturnValueSchema(IRGenModule &IGM) const;
+
+  /// Get the native (abi) convention for a parameter value of this type.
+  const NativeConventionSchema &nativeParameterValueSchema(IRGenModule &IGM) const;
+  
+  /// Emit verifier code that compares compile-time constant knowledge of
+  /// this kind of type's traits to its runtime manifestation.
+  virtual void verify(IRGenTypeVerifierFunction &IGF,
+                      llvm::Value *typeMetadata,
+                      SILType T) const;
+
+  void callOutlinedCopy(IRGenFunction &IGF, Address dest, Address src,
+                        SILType T, IsInitialization_t isInit,
+                        IsTake_t isTake) const;
+
+  void callOutlinedDestroy(IRGenFunction &IGF, Address addr, SILType T) const;
 };
 
 } // end namespace irgen

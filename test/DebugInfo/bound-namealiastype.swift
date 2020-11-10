@@ -1,13 +1,18 @@
-// RUN: %target-swift-frontend -emit-ir -g %s -o - | FileCheck %s
+// RUN: %target-swift-frontend -emit-ir -g %s -o - | %FileCheck %s
 
-// REQUIRES: objc_interop
+public protocol OS_dispatch_queue {
+}
+public typealias dispatch_queue_t = OS_dispatch_queue
 
-import Dispatch
+func dispatch_queue_create() -> dispatch_queue_t! {
+  return nil
+}
 
-func markUsed<T>(t: T) {}
-
-// CHECK-DAG: !DICompositeType(tag: DW_TAG_union_type, {{.*}}identifier: "_TtGSQaSC16dispatch_queue_t_"
-// CHECK-DAG: !DIGlobalVariable(name: "queue",{{.*}} line: [[@LINE+1]], type: !"_TtGSQaSC16dispatch_queue_t_"
-var queue = dispatch_queue_create("queue", nil)
-
-dispatch_sync(queue) { markUsed("Hello world"); }
+// CHECK: !DIGlobalVariable(name: "queue",
+// CHECK-SAME:              line: [[@LINE+6]], type: ![[TY_CONTAINER:[0-9]+]]
+// CHECK: ![[TY_CONTAINER]] = !DICompositeType({{.*}}elements: ![[TY_ELTS:[0-9]+]]
+// CHECK: ![[TY_ELTS]] = !{![[TY_MEMBER:[0-9]+]]}
+// CHECK: ![[TY_MEMBER]] = !DIDerivedType(tag: DW_TAG_member, {{.*}}baseType: ![[TY:[0-9]+]]
+// CHECK: ![[TY]] = !DICompositeType(
+// CHECK-SAME:             identifier: "$s4main16dispatch_queue_taSgD"
+public var queue = dispatch_queue_create()

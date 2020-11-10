@@ -2,66 +2,50 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
-extension LazySequenceType {
-  /// Returns the concatenated results of mapping `transform` over
-  /// `self`.  Equivalent to 
+extension LazySequenceProtocol {
+  /// Returns the concatenated results of mapping the given transformation over
+  /// this sequence.
   ///
-  ///     self.map(transform).flatten()
+  /// Use this method to receive a single-level sequence when your
+  /// transformation produces a sequence or collection for each element.
+  /// Calling `flatMap(_:)` on a sequence `s` is equivalent to calling
+  /// `s.map(transform).joined()`.
   ///
   /// - Complexity: O(1)
-  @warn_unused_result
-  public func flatMap<Intermediate: SequenceType>(
-    transform: (Elements.Generator.Element)->Intermediate
+  @inlinable // lazy-performance
+  public func flatMap<SegmentOfResult>(
+    _ transform: @escaping (Elements.Element) -> SegmentOfResult
   ) -> LazySequence<
-    FlattenSequence<LazyMapSequence<Elements, Intermediate>>> {
-    return self.map(transform).flatten()
+    FlattenSequence<LazyMapSequence<Elements, SegmentOfResult>>> {
+    return self.map(transform).joined()
   }
-}
 
-extension LazyCollectionType {
-  /// Returns the concatenated results of mapping `transform` over
-  /// `self`.  Equivalent to 
+  /// Returns the non-`nil` results of mapping the given transformation over
+  /// this sequence.
   ///
-  ///     self.map(transform).flatten()
+  /// Use this method to receive a sequence of non-optional values when your
+  /// transformation produces an optional value.
+  ///
+  /// - Parameter transform: A closure that accepts an element of this sequence
+  ///   as its argument and returns an optional value.
   ///
   /// - Complexity: O(1)
-  @warn_unused_result
-  public func flatMap<Intermediate: CollectionType>(
-    transform: (Elements.Generator.Element)->Intermediate
-  ) -> LazyCollection<
-    FlattenCollection<
-      LazyMapCollection<Elements, Intermediate>>
+  @inlinable // lazy-performance
+  public func compactMap<ElementOfResult>(
+    _ transform: @escaping (Elements.Element) -> ElementOfResult?
+  ) -> LazyMapSequence<
+    LazyFilterSequence<
+      LazyMapSequence<Elements, ElementOfResult?>>,
+    ElementOfResult
   > {
-    return self.map(transform).flatten()
-  }
-}
-
-extension LazyCollectionType where Elements.Index : BidirectionalIndexType
-{
-  /// Returns the concatenated results of mapping `transform` over
-  /// `self`.  Equivalent to 
-  ///
-  ///     self.map(transform).flatten()
-  ///
-  /// - Complexity: O(1)
-  @warn_unused_result
-  public func flatMap<
-    Intermediate: CollectionType
-    where Intermediate.Index : BidirectionalIndexType
-  >(
-    transform: (Elements.Generator.Element)->Intermediate
-  ) -> LazyCollection<
-    FlattenBidirectionalCollection<
-      LazyMapCollection<Elements, Intermediate>
-  >> {
-    return self.map(transform).flatten()
+    return self.map(transform).filter { $0 != nil }.map { $0! }
   }
 }

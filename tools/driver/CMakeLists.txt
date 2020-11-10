@@ -1,59 +1,70 @@
-add_swift_executable(swift
+add_swift_host_tool(swift-frontend
   driver.cpp
   autolink_extract_main.cpp
-  frontend_main.cpp
   modulewrap_main.cpp
-  LINK_LIBRARIES
-    swiftIDE
-    swiftDriver swiftIRGen swiftSIL swiftSILGen swiftSILPasses
-    swiftImmediate
-    swiftSerialization
-    swiftPrintAsObjC
-    swiftFrontend
-    swiftClangImporter
-    swiftOption
+  swift_indent_main.cpp
+  swift_symbolgraph_extract_main.cpp
+  SWIFT_COMPONENT compiler
 )
+target_link_libraries(swift-frontend
+                      PRIVATE
+                        swiftDriver
+                        swiftFrontendTool
+                        swiftSymbolGraphGen
+                        LLVMBitstreamReader)
 
-target_link_libraries(swift edit)
+swift_create_post_build_symlink(swift-frontend
+  SOURCE "swift-frontend${CMAKE_EXECUTABLE_SUFFIX}"
+  DESTINATION "swift${CMAKE_EXECUTABLE_SUFFIX}"
+  WORKING_DIRECTORY "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
 
-add_custom_command(TARGET swift POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" "-E" "create_symlink" "swift" "swiftc"
-    WORKING_DIRECTORY "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
+swift_create_post_build_symlink(swift-frontend
+  SOURCE "swift-frontend${CMAKE_EXECUTABLE_SUFFIX}"
+  DESTINATION "swiftc${CMAKE_EXECUTABLE_SUFFIX}"
+  WORKING_DIRECTORY "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
 
-add_custom_command(TARGET swift POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" "-E" "create_symlink" "swift" "swift-autolink-extract"
-    WORKING_DIRECTORY "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
+swift_create_post_build_symlink(swift-frontend
+  SOURCE "swift-frontend${CMAKE_EXECUTABLE_SUFFIX}"
+  DESTINATION "swift-indent${CMAKE_EXECUTABLE_SUFFIX}"
+  WORKING_DIRECTORY "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
+
+swift_create_post_build_symlink(swift-frontend
+  SOURCE "swift-frontend${CMAKE_EXECUTABLE_SUFFIX}"
+  DESTINATION "swift-symbolgraph-extract${CMAKE_EXECUTABLE_SUFFIX}"
+  WORKING_DIRECTORY "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
+
+swift_create_post_build_symlink(swift-frontend
+  SOURCE "swift-frontend${CMAKE_EXECUTABLE_SUFFIX}"
+  DESTINATION "swift-autolink-extract${CMAKE_EXECUTABLE_SUFFIX}"
+  WORKING_DIRECTORY "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
+
+add_swift_tool_symlink(swift swift-frontend compiler)
+add_swift_tool_symlink(swiftc swift-frontend compiler)
+add_swift_tool_symlink(swift-symbolgraph-extract swift-frontend compiler)
+add_swift_tool_symlink(swift-autolink-extract swift-frontend autolink-driver)
+add_swift_tool_symlink(swift-indent swift-frontend editor-integration)
 
 # If building as part of clang, make sure the headers are installed.
 if(NOT SWIFT_BUILT_STANDALONE)
-  add_dependencies(swift clang-headers)
+  add_dependencies(swift-frontend clang-resource-headers)
 endif()
 
-# Platforms that have a REPL need extra libraries to be linked into the 'swift'
-# binary.
-include(SwiftDarwin)
-if(SWIFT_HOST_VARIANT MATCHES "${SWIFT_DARWIN_VARIANTS}")
-  # Link in CoreFoundation on Darwin.
-  find_library(CORE_FOUNDATION NAMES CoreFoundation)
-  target_link_libraries(swift ${CORE_FOUNDATION})
+add_dependencies(compiler swift-frontend)
+swift_install_in_component(FILES "${SWIFT_RUNTIME_OUTPUT_INTDIR}/swift${CMAKE_EXECUTABLE_SUFFIX}"
+                           DESTINATION "bin"
+                           COMPONENT compiler)
+swift_install_in_component(FILES "${SWIFT_RUNTIME_OUTPUT_INTDIR}/swiftc${CMAKE_EXECUTABLE_SUFFIX}"
+                           DESTINATION "bin"
+                           COMPONENT compiler)
+swift_install_in_component(FILES "${SWIFT_RUNTIME_OUTPUT_INTDIR}/swift-symbolgraph-extract${CMAKE_EXECUTABLE_SUFFIX}"
+                           DESTINATION "bin"
+                           COMPONENT compiler)
+add_dependencies(autolink-driver swift-frontend)
+swift_install_in_component(FILES "${SWIFT_RUNTIME_OUTPUT_INTDIR}/swift-autolink-extract${CMAKE_EXECUTABLE_SUFFIX}"
+                           DESTINATION "bin"
+                           COMPONENT autolink-driver)
+add_dependencies(editor-integration swift-frontend)
+swift_install_in_component(FILES "${SWIFT_RUNTIME_OUTPUT_INTDIR}/swift-indent${CMAKE_EXECUTABLE_SUFFIX}"
+                           DESTINATION "bin"
+                           COMPONENT editor-integration)
 
-  # Link in arclite on Darwin.
-  get_default_toolchain_dir(toolchain_dir)
-  set(SWIFT_REPL_ARCLITE "${toolchain_dir}/usr/lib/arc/libarclite_${SWIFT_HOST_VARIANT}.a")
-  set_property(TARGET swift APPEND_STRING PROPERTY
-      LINK_FLAGS " -lobjc -Wl,-force_load,\"${SWIFT_REPL_ARCLITE}\"")
-endif()
-
-swift_install_in_component(compiler
-    TARGETS swift
-    RUNTIME DESTINATION "bin")
-swift_install_in_component(compiler
-    FILES "${SWIFT_RUNTIME_OUTPUT_INTDIR}/swiftc"
-    DESTINATION "bin")
-
-if(SWIFT_HOST_VARIANT STREQUAL "linux")
-# No need for this on other platforms.
-  swift_install_in_component(compiler
-      FILES "${SWIFT_RUNTIME_OUTPUT_INTDIR}/swift-autolink-extract"
-      DESTINATION "bin")
-endif()

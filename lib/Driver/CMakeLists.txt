@@ -1,25 +1,30 @@
+set_swift_llvm_is_available()
+
 set(swiftDriver_sources
   Action.cpp
   Compilation.cpp
-  DependencyGraph.cpp
+  DarwinToolChains.cpp
+  SourceComparator.cpp
   Driver.cpp
+  DriverIncrementalRanges.cpp
+  FineGrainedDependencyDriverGraph.cpp
   FrontendUtil.cpp
   Job.cpp
-  OutputFileMap.cpp
   ParseableOutput.cpp
+  PrettyStackTrace.cpp
   ToolChain.cpp
   ToolChains.cpp
-  Types.cpp
+  UnixToolChains.cpp
+  WindowsToolChains.cpp
   )
 
-add_swift_library(swiftDriver
-  ${swiftDriver_sources}
-  DEPENDS SwiftOptions
-  LINK_LIBRARIES swiftAST swiftBasic swiftFrontend swiftOption)
+set(swiftDriver_targetDefines)
 
-if(${SWIFT_ENABLE_TARGET_LINUX})
-  foreach(f ${swiftDriver_sources})
-    set_property(SOURCE ${f} APPEND_STRING PROPERTY COMPILE_FLAGS
-        " -DSWIFT_ENABLE_TARGET_LINUX=\"1\"")
-  endforeach()
-endif()
+add_swift_host_library(swiftDriver STATIC
+  ${swiftDriver_sources})
+add_dependencies(swiftDriver
+  SwiftOptions)
+target_link_libraries(swiftDriver PRIVATE
+  swiftAST
+  swiftBasic
+  swiftOption)

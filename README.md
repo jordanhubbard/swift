@@ -1,155 +1,164 @@
+<img src="https://swift.org/assets/images/swift.svg" alt="Swift logo" height="70" >
+
 # Swift Programming Language
 
-**Welcome to Swift!**
+
+| | **Architecture** | **main** | **Package** |
+|---|:---:|:---:|:---:|
+| **macOS**        | x86_64 |[![Build Status](https://ci.swift.org/job/oss-swift-incremental-RA-osx/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-incremental-RA-osx)|[![Build Status](https://ci.swift.org/job/oss-swift-package-osx/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-osx)|
+| **Ubuntu 16.04** | x86_64 | [![Build Status](https://ci.swift.org/job/oss-swift-incremental-RA-linux-ubuntu-16_04/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-incremental-RA-linux-ubuntu-16_04)|[![Build Status](https://ci.swift.org/job/oss-swift-package-linux-ubuntu-16_04/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-linux-ubuntu-16_04)|
+| **Ubuntu 18.04** | x86_64 | [![Build Status](https://ci.swift.org/job/oss-swift-incremental-RA-linux-ubuntu-18_04/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-incremental-RA-linux-ubuntu-18_04)|[![Build Status](https://ci.swift.org/job/oss-swift-package-linux-ubuntu-18_04/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-linux-ubuntu-18_04)|
+| **Ubuntu 20.04** | x86_64 | [![Build Status](https://ci.swift.org/job/oss-swift-package-ubuntu-20_04/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-ubuntu-20_04)|[![Build Status](https://ci.swift.org/job/oss-swift-package-ubuntu-20_04/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-ubuntu-20_04)|
+| **CentOS 8** | x86_64 | [![Build Status](https://ci.swift.org/job/oss-swift-package-centos-8/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-centos-8)|[![Build Status](https://ci.swift.org/job/oss-swift-package-centos-8/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-centos-8)|
+| **Amazon Linux 2** | x86_64 | [![Build Status](https://ci.swift.org/job/oss-swift-package-amazon-linux-2/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-amazon-linux-2)|[![Build Status](https://ci.swift.org/job/oss-swift-package-amazon-linux-2/lastCompletedBuild/badge/icon)](https://ci.swift.org/job/oss-swift-package-amazon-linux-2)|
+
+**Swift Community-Hosted CI Platforms**
+
+| **OS** | **Architecture** | **Build** |
+|---|:---:|:---:|
+|**[Ubuntu 16.04 ](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/ppc64le_ubuntu_16_04.json)** | PPC64LE |[![Build Status](https://ci-external.swift.org/job/oss-swift-5.1-RA-linux-ubuntu-16.04-ppc64le/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-5.1-RA-linux-ubuntu-16.04-ppc64le)|
+|**[Ubuntu 18.04](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/aarch64_ubuntu_18.04_docker.json)** | AArch64 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-ubuntu-18.04-aarch64/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-ubuntu-18.04-aarch64)|
+|**[Ubuntu 20.04](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/aarch64_ubuntu_20.04_docker.json)** | AArch64 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-ubuntu-20.04-aarch64/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-ubuntu-20.04-aarch64)|
+|**[CentOS 8 ](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/aarch64_centos_8_docker.json)** | AArch64 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-centos8-aarch64/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-centos8-aarch64)|
+|**[Amazon Linux 2](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/aarch64_amazon_linux_2_docker.json)** | AArch64 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-amazon-linux-2-aarch64/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-amazon-linux-2-aarch64)|
+|**[Android](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/x86_64_ubuntu_16_04_LTS_android.json)** | ARMv7 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-linux-ubuntu-16.04-android/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-linux-ubuntu-16.04-android)|
+|**[Android](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/x86_64_ubuntu_16_04_LTS_android.json)** | AArch64 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-linux-ubuntu-16.04-android-arm64/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-linux-ubuntu-16.04-android-arm64)|
+|**[Windows 2019 (VS 2017)](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/x86_64_windows_2019.json)** | x86_64 | [![Build Status](https://ci-external.swift.org/job/oss-swift-windows-x86_64/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-windows-x86_64)|
+|**[Windows 2019 (VS 2019)](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/x86_64_windows_2019_VS2019.json)** | x86_64 | [![Build Status](https://ci-external.swift.org/job/oss-swift-windows-x86_64-vs2019/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-windows-x86_64-vs2019)|
+
+**Swift TensorFlow Community-Hosted CI Platforms**
+
+| **OS** | **Architecture** | **Build** |
+|---|:---:|:---:|
+|**[Ubuntu 18.04](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/x86_64_ubuntu_18_04_tensorflow.json)** | x86_64 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-linux-ubuntu-18.04-tensorflow/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-linux-ubuntu-18.04-tensorflow)|
+|**[macOS 10.13](https://github.com/apple/swift-community-hosted-continuous-integration/blob/master/nodes/x86_64_macos_high_sierra_tensorflow.json)** | x86_64 |[![Build Status](https://ci-external.swift.org/job/oss-swift-RA-macOS-tensorflow/lastCompletedBuild/badge/icon)](https://ci-external.swift.org/job/oss-swift-RA-macOS-tensorflow)|
+
+## Welcome to Swift
 
 Swift is a high-performance system programming language.  It has a clean
-and modern syntax, and offers seamless access to existing C and Objective-C code
-and frameworks, and is memory safe (by default).
+and modern syntax, offers seamless access to existing C and Objective-C code
+and frameworks, and is memory safe by default.
 
 Although inspired by Objective-C and many other languages, Swift is not itself a
 C-derived language. As a complete and independent language, Swift packages core
 features like flow control, data structures, and functions, with high-level
-constructs like objects, protocols, closures, and generics.  Swift embraces
+constructs like objects, protocols, closures, and generics. Swift embraces
 modules, eliminating the need for headers and the code duplication they entail.
 
+To learn more about the programming language, visit [swift.org](https://swift.org/documentation/).
 
-## Documentation
-
-To read the documentation, start by installing the Sphinx documentation
-generator tool (http://sphinx-doc.org, just run `easy_install -U Sphinx` from
-the command line and you're good to go).  Once you have that, you can build the
-Swift documentation by going into `docs` and typing `make`.  This compiles
-the `.rst` files in the `docs` directory into HTML in the `docs/_build/html`
-directory.
-
-Once built, the best place to start is with the Swift white paper, which gives a
-tour of the language (in `docs/_build/html/whitepaper/index.html`).
-Another potentially useful document is `docs/LangRef`, which gives a low level
-tour of how the language works from the implementation perspective.
-
-Many of the docs are out of date, but you can see some historical design
-documents in the `docs` directory.
-
-Another source of documentation is the standard library itself, located in
-`stdlib`.  Much of the language is actually implemented in the library
-(including `Int`), and the standard library gives some examples of what can be
-expressed today.
-
-
-## Getting Started
-
-These instructions give the most direct path to a working Swift
-development environment.  Options for doing things differently are
-discussed below.
-
-
-### System Requirements
-
-OS X, Ubuntu Linux LTS, and the latest Ubuntu Linux release are the current
-supported host development operating systems.
-
-For OS X, you need [the latest Xcode](https://developer.apple.com/xcode/downloads/).
-
-For Ubuntu, you'll need the following development dependencies:
-
-    sudo apt-get install git cmake ninja-build clang uuid-dev libicu-dev icu-devtools libbsd-dev libedit-dev libxml2-dev libsqlite3-dev swig libpython-dev libncurses5-dev pkg-config
-
-Note: LLDB currently requires at least swig-1.3.40 but will successfully build
-with version 2 shipped with Ubuntu.
-
-If you are building on Ubuntu 14.04 LTS, you'll need to upgrade your clang
-compiler for C++14 support and create a symlink:
-
-     sudo apt-get install clang-3.6
-     sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-3.6 100
-     sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-3.6 100
-
-### Getting Sources for Swift and Related Projects
-
-     git clone git@github.com:apple/swift.git swift
-     git clone git@github.com:apple/swift-llvm.git llvm
-     git clone git@github.com:apple/swift-clang.git clang
-     git clone git@github.com:apple/swift-lldb.git lldb
-     git clone git@github.com:apple/swift-cmark.git cmark
-     git clone git@github.com:apple/swift-llbuild.git llbuild
-     git clone git@github.com:apple/swift-package-manager.git swiftpm
-     git clone git@github.com:apple/swift-corelibs-xctest.git
-     git clone git@github.com:apple/swift-corelibs-foundation.git
-
-
-[CMake](http://cmake.org) is the core infrastructure used to configure builds of
-Swift and its companion projects; at least version 2.8.12.2 is required. Your
-favorite Linux distribution likely already has a CMake package you can install.
-On OS X, you can download the [CMake Binary Distribution](https://cmake.org/install),
-bundled as an application, copy it to /Applications, and add the embedded
-command line tools to your `PATH`:
-
-    export PATH=/Applications/CMake.app/Contents/bin:$PATH
-
-[Ninja](https://ninja-build.org) is the current recommended build system
-for building Swift and is the default configuration generated by CMake. If
-you're on OS X or don't install it as part of your Linux distribution, clone
-it next to the other projects and it will be bootstrapped automatically:
-
-    git clone git@github.com:martine/ninja.git
-
-You can also use a third-party packaging tool like [Homebrew](http://brew.sh) to
-install CMake and Ninja on OS X:
-
-    brew install cmake ninja
-
-### Building Swift
-
-The `build-script` is a high-level build automation script that supports basic
-options such as building a Swift-compatible LLDB, building the Swift Package
-Manager, building for iOS, running tests after builds, and more. It also
-supports presets which you can define for common combinations of build options.
-
-To find out more:
-
-    utils/build-script -h
-
-Note: Arguments after "--" above are forwarded to `build-script-impl`, which is
-the ultimate shell script that invokes the actual build and test commands.
-
-A basic command to build Swift and run basic tests with Ninja:
-
-    utils/build-script -t
-
-## Develop Swift in Xcode
-
-The Xcode IDE can be used to edit the Swift source code, but it is not currently
-fully supported as a build environment for SDKs other than OS X. If you'd like
-to build for other SDKs but still use Xcode, once you've built Swift using Ninja
-or one of the other supported CMake generators, you can set up an IDE-only Xcode
-environment using the build-script's `-X` flag:
-
-    utils/build-script -X --skip-build -- --reconfigure
-
-The `--skip-build` flag tells `build-script` to only generate the project,
-not build it in its entirety. A bare minimum of LLVM tools will build in order
-to configure the Xcode projects.
-
-The `--reconfigure` flag tells `build-script-impl` to run the CMake configuration
-step even if there is a cached configuration. As you develop in Xcode, you may
-need to rerun this from time to time to refresh your generated Xcode project,
-picking up new targets, file removals, or file additions.
-
-## Testing Swift
-
-See [docs/Testing.rst](docs/Testing.rst).
+- [Contributing to Swift](#contributing-to-swift)
+- [Getting Started](#getting-started)
+  - [Swift Toolchains](#swift-toolchains)
+  - [Build Failures](#build-failures)
+- [Learning More](#learning-more)
 
 ## Contributing to Swift
 
-Contributions to Swift are welcomed and encouraged! Please see the [Contributing to Swift guide](https://swift.org/contributing/).
+Contributions to Swift are welcomed and encouraged! Please see the
+[Contributing to Swift guide](https://swift.org/contributing/).
 
-To be a truly great community, Swift.org needs to welcome developers from all
-walks of life, with different backgrounds, and with a wide range of experience.
-A diverse and friendly community will have more great ideas, more unique
-perspectives, and produce more great code. We will work diligently to make the
-Swift community welcoming to everyone.
+To be a truly great community, [Swift.org](https://swift.org/) needs to welcome
+developers from all walks of life, with different backgrounds, and with a wide
+range of experience. A diverse and friendly community will have more great
+ideas, more unique perspectives, and produce more great code. We will work
+diligently to make the Swift community welcoming to everyone.
 
 To give clarity of what is expected of our members, Swift has adopted the
 code of conduct defined by the Contributor Covenant. This document is used
 across many open source communities, and we think it articulates our values
-well. For more, see [the website](https://swift.org/community/#code-of-conduct).
+well. For more, see the [Code of Conduct](https://swift.org/community/#code-of-conduct).
+
+## Getting Started
+
+If you are interested in:
+- Contributing fixes and features to the compiler: See our
+  [How to Submit Your First Pull Request guide](/docs/HowToGuides/FirstPullRequest.md).
+- Building the compiler as a one-off: See our [Getting Started guide][].
+- Building a toolchain as a one-off: Follow the [Getting Started guide][]
+  up until the "Building the project" section. After that, follow the
+  instructions in the [Swift Toolchains](#swift-toolchains) section below.
+
+We also have an [FAQ](/docs/HowToGuides/FAQ.md) that answers common questions.
+
+[Getting Started guide]: /docs/HowToGuides/GettingStarted.md
+
+### Swift Toolchains
+
+#### Building
+
+Swift toolchains are created using the script
+[build-toolchain](https://github.com/apple/swift/blob/main/utils/build-toolchain). This
+script is used by swift.org's CI to produce snapshots and can allow for one to
+locally reproduce such builds for development or distribution purposes. A typical 
+invocation looks like the following:
+
+```
+  $ ./swift/utils/build-toolchain $BUNDLE_PREFIX
+```
+
+where ``$BUNDLE_PREFIX`` is a string that will be prepended to the build 
+date to give the bundle identifier of the toolchain's ``Info.plist``. For 
+instance, if ``$BUNDLE_PREFIX`` was ``com.example``, the toolchain 
+produced will have the bundle identifier ``com.example.YYYYMMDD``. It 
+will be created in the directory you run the script with a filename 
+of the form: ``swift-LOCAL-YYYY-MM-DD-a-osx.tar.gz``.
+
+Beyond building the toolchain, ``build-toolchain`` also supports the 
+following (non-exhaustive) set of useful options::
+
+- ``--dry-run``: Perform a dry run build. This is off by default.
+- ``--test``: Test the toolchain after it has been compiled. This is off by default.
+- ``--distcc``: Use distcc to speed up the build by distributing the c++ part of
+  the swift build. This is off by default.
+- ``--sccache``: Use sccache to speed up subsequent builds of the compiler by
+  caching more c++ build artifacts. This is off by default.
+
+More options may be added over time. Please pass ``--help`` to
+``build-toolchain`` to see the full set of options.
+
+#### Installing into Xcode
+
+On macOS if one wants to install such a toolchain into Xcode:
+
+1. Untar and copy the toolchain to one of `/Library/Developer/Toolchains/` or
+   `~/Library/Developer/Toolchains/`. E.x.:
+
+```
+  $ sudo tar -xzf swift-LOCAL-YYYY-MM-DD-a-osx.tar.gz -C /
+  $ tar -xzf swift-LOCAL-YYYY-MM-DD-a-osx.tar.gz -C ~/
+```
+
+The script also generates an archive containing debug symbols which
+can be installed over the main archive allowing symbolication of any
+compiler crashes.
+
+```
+  $ sudo tar -xzf swift-LOCAL-YYYY-MM-DD-a-osx-symbols.tar.gz -C /
+  $ tar -xzf swift-LOCAL-YYYY-MM-DD-a-osx-symbols.tar.gz -C ~/
+```
+
+2. Specify the local toolchain for Xcode's use via `Xcode->Toolchains`.
+
+### Build Failures
+
+Try the suggestions in
+[Troubleshooting build issues](/docs/HowToGuides/GettingStarted.md#troubleshooting-build-issues).
+
+Make sure you are using the
+[correct release](/docs/HowToGuides/GettingStarted.md#installing-dependencies)
+of Xcode.
+
+If you have changed Xcode versions but still encounter errors that appear to
+be related to the Xcode version, try passing `--clean` to `build-script`.
+
+When a new version of Xcode is released, you can update your build without
+recompiling the entire project by passing `--reconfigure` to `build-script`.
+
+## Learning More
+
+Be sure to look at the [documentation index](/docs/README.md) for a bird's eye
+view of the available documentation. In particular, the documents titled
+[Debugging the Swift Compiler](docs/DebuggingTheCompiler.md) and
+[Continuous Integration for Swift](docs/ContinuousIntegration.md) are very
+helpful to understand before submitting your first PR.

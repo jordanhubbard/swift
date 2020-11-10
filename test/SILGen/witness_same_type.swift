@@ -1,27 +1,29 @@
-// RUN: %target-swift-frontend -emit-silgen %s | FileCheck %s
+
+// RUN: %target-swift-emit-silgen -module-name witness_same_type %s | %FileCheck %s
+// RUN: %target-swift-emit-ir -module-name witness_same_type %s
 
 protocol Fooable {
-  typealias Bar
+  associatedtype Bar
 
-  func foo<T: Fooable where T.Bar == Self.Bar>(x x: T) -> Self.Bar
+  func foo<T: Fooable>(x x: T) -> Self.Bar where T.Bar == Self.Bar
 }
 
 struct X {}
 
 // Ensure that the protocol witness for requirements with same-type constraints
 // is set correctly. <rdar://problem/16369105>
-// CHECK-LABEL: sil hidden [transparent] [thunk] @_TTWV17witness_same_type3FooS_7FooableS_FS1_3foo{{.*}} : $@convention(witness_method) <T where T : Fooable, T.Bar == X> (@out X, @in T, @in_guaranteed Foo) -> ()
+// CHECK-LABEL: sil private [transparent] [thunk] [ossa] @$s17witness_same_type3FooVAA7FooableA2aDP3foo1x3BarQzqd___tAaDRd__AHQyd__AIRSlFTW : $@convention(witness_method: Fooable) <τ_0_0 where τ_0_0 : Fooable, τ_0_0.Bar == X> (@in_guaranteed τ_0_0, @in_guaranteed Foo) -> @out X
 struct Foo: Fooable {
   typealias Bar = X
 
-  func foo<T: Fooable where T.Bar == X>(x x: T) -> X { return X() }
+  func foo<T: Fooable>(x x: T) -> X where T.Bar == X { return X() }
 }
 
 // rdar://problem/19049566
-// CHECK-LABEL: sil [transparent] [thunk] @_TTWu0_Rxs12SequenceType_zWx9Generator7Element_rGV17witness_same_type14LazySequenceOfxq__S_S2_FS_8generate
-public struct LazySequenceOf<SS : SequenceType, A where SS.Generator.Element == A> : SequenceType {
-	public func generate() -> AnyGenerator<A> { 
-    var opt: AnyGenerator<A>?
+// CHECK-LABEL: sil shared [transparent] [serialized] [thunk] [ossa] @$s17witness_same_type14LazySequenceOfVyxq_GSTAAST12makeIterator0H0QzyFTW : $@convention(witness_method: Sequence) <τ_0_0, τ_0_1 where τ_0_0 : Sequence, τ_0_1 == τ_0_0.Element> (@in LazySequenceOf<τ_0_0, τ_0_1>) -> @out AnyIterator<τ_0_1>
+public struct LazySequenceOf<SS : Sequence, A> : Sequence where SS.Iterator.Element == A {
+  public func makeIterator() -> AnyIterator<A> { 
+    var opt: AnyIterator<A>?
     return opt!
   }
 	public subscript(i : Int) -> A { 

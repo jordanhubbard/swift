@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,8 +15,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef __SWIFT_IRGEN_TARGET_INFO_H__
-#define __SWIFT_IRGEN_TARGET_INFO_H__
+#ifndef SWIFT_IRGEN_SWIFTTARGETINFO_H
+#define SWIFT_IRGEN_SWIFTTARGETINFO_H
 
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/ClusteredBitVector.h"
@@ -44,6 +44,13 @@ public:
     return ObjCUseISAMask;
   }
 
+  /// True if the ObjC runtime for the chosen platform has opaque ISAs.  This
+  /// means that even masking the ISA may not return a pointer value.  The ObjC
+  /// runtime should be used for all accesses to get the ISA from a value.
+  bool hasOpaqueISAs() const {
+    return ObjCHasOpaqueISAs;
+  }
+
   /// The target's object format type.
   llvm::Triple::ObjectFormatType OutputObjectFormat;
   
@@ -59,7 +66,12 @@ public:
   /// used for Swift value layout when a reference type may reference ObjC
   /// objects.
   SpareBitVector ObjCPointerReservedBits;
-  
+
+  /// These bits, if set, indicate that a Builtin.BridgeObject value is holding
+  /// an Objective-C object.
+  SpareBitVector IsObjCPointerBit;
+
+
   /// The alignment of heap objects.  By default, assume pointer alignment.
   Alignment HeapObjectAlignment;
   
@@ -83,10 +95,15 @@ public:
   bool ObjCUseFPRet = false;
   bool ObjCUseFP2Ret = false;
   bool ObjCUseISAMask = false;
+  bool ObjCHasOpaqueISAs = false;
   
   /// The value stored in a Builtin.once predicate to indicate that an
   /// initialization has already happened, if known.
   Optional<int64_t> OnceDonePredicateValue = None;
+  
+  /// True if `swift_retain` and `swift_release` are no-ops when passed
+  /// "negative" pointer values.
+  bool SwiftRetainIgnoresNegativeValues = false;
 };
 
 }

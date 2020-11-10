@@ -1,89 +1,172 @@
-//===--- CollectionOfOne.swift - A CollectionType with one element --------===//
+//===--- CollectionOfOne.swift - A Collection with one element ------------===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
-/// A generator that produces one or fewer instances of `Element`.
-public struct GeneratorOfOne<Element> : GeneratorType, SequenceType {
-  @available(*, unavailable, renamed="Element")
-  public typealias T = Element
+/// A collection containing a single element.
+///
+/// You can use a `CollectionOfOne` instance when you need to efficiently
+/// represent a single value as a collection. For example, you can add a
+/// single element to an array by using a `CollectionOfOne` instance with the
+/// concatenation operator (`+`):
+///
+///     let a = [1, 2, 3, 4]
+///     let toAdd = 100
+///     let b = a + CollectionOfOne(toAdd)
+///     // b == [1, 2, 3, 4, 100]
+@frozen // trivial-implementation
+public struct CollectionOfOne<Element> {
+  @usableFromInline // trivial-implementation
+  internal var _element: Element
 
-  /// Construct an instance that generates `element!`, or an empty
-  /// sequence if `element == nil`.
-  public init(_ element: Element?) {
-    self.elements = element
-  }
-
-  /// Advance to the next element and return it, or `nil` if no next
-  /// element exists.
+  /// Creates an instance containing just the given element.
   ///
-  /// - Requires: `next()` has not been applied to a copy of `self`
-  ///   since the copy was made, and no preceding call to `self.next()`
-  ///   has returned `nil`.
-  public mutating func next() -> Element? {
-    let result = elements
-    elements = .None
-    return result
+  /// - Parameter element: The element to store in the collection.
+  @inlinable // trivial-implementation
+  public init(_ element: Element) {
+    self._element = element
   }
-  var elements: Element?
 }
 
-/// A collection containing a single element of type `Element`.
-public struct CollectionOfOne<Element> : CollectionType {
-  @available(*, unavailable, renamed="Element")
-  public typealias T = Element
-
-  /// A type that represents a valid position in the collection.
+extension CollectionOfOne {
+  /// An iterator that produces one or zero instances of an element.
   ///
-  /// Valid indices consist of the position of every element and a
-  /// "past the end" position that's not valid for use as a subscript.
-  public typealias Index = Bit
+  /// `IteratorOverOne` is the iterator for the `CollectionOfOne` type.
+  @frozen // trivial-implementation
+  public struct Iterator {
+    @usableFromInline // trivial-implementation
+    internal var _elements: Element?
 
-  /// Construct an instance containing just `element`.
-  public init(_ element: Element) {
-    self.element = element
+    /// Construct an instance that generates `_element!`, or an empty
+    /// sequence if `_element == nil`.
+    @inlinable // trivial-implementation
+    public // @testable
+    init(_elements: Element?) {
+      self._elements = _elements
+    }
   }
+}
+
+extension CollectionOfOne.Iterator: IteratorProtocol {
+  /// Advances to the next element and returns it, or `nil` if no next element
+  /// exists.
+  ///
+  /// Once `nil` has been returned, all subsequent calls return `nil`.
+  ///
+  /// - Returns: The next element in the underlying sequence, if a next element
+  ///   exists; otherwise, `nil`.
+  @inlinable // trivial-implementation
+  public mutating func next() -> Element? {
+    let result = _elements
+    _elements = nil
+    return result
+  }
+}
+
+extension CollectionOfOne: RandomAccessCollection, MutableCollection {
+
+  public typealias Index = Int
+  public typealias Indices = Range<Int>
+  public typealias SubSequence = Slice<CollectionOfOne<Element>>
 
   /// The position of the first element.
+  ///
+  /// In a `CollectionOfOne` instance, `startIndex` is always `0`.
+  @inlinable // trivial-implementation
   public var startIndex: Index {
-    return .Zero
+    return 0
   }
 
-  /// The "past the end" position; always identical to
-  /// `startIndex.successor()`.
+  /// The "past the end" position---that is, the position one greater than the
+  /// last valid subscript argument.
   ///
-  /// - Note: `endIndex` is not a valid argument to `subscript`.
+  /// In a `CollectionOfOne` instance, `endIndex` is always `1`.
+  @inlinable // trivial-implementation
   public var endIndex: Index {
-    return .One
+    return 1
   }
-
-  /// Return a *generator* over the elements of this *sequence*.
+  
+  /// Returns the position immediately after the given index.
   ///
-  /// - Complexity: O(1).
-  public func generate() -> GeneratorOfOne<Element> {
-    return GeneratorOfOne(element)
-  }
-
-  /// Access the element at `position`.
-  ///
-  /// - Requires: `position == .Zero`.
-  public subscript(position: Index) -> Element {
-    _precondition(position == .Zero, "Index out of range")
-    return element
-  }
-
-  /// Return the number of elements (always one).
-  public var count: Int {
+  /// - Parameter i: A valid index of the collection. `i` must be `0`.
+  /// - Returns: The index value immediately after `i`.
+  @inlinable // trivial-implementation
+  public func index(after i: Index) -> Index {
+    _precondition(i == startIndex)
     return 1
   }
 
-  let element: Element
+  /// Returns the position immediately before the given index.
+  ///
+  /// - Parameter i: A valid index of the collection. `i` must be `1`.
+  /// - Returns: The index value immediately before `i`.
+  @inlinable // trivial-implementation
+  public func index(before i: Index) -> Index {
+    _precondition(i == endIndex)
+    return 0
+  }
+
+  /// Returns an iterator over the elements of this collection.
+  ///
+  /// - Complexity: O(1)
+  @inlinable // trivial-implementation
+  public __consuming func makeIterator() -> Iterator {
+    return Iterator(_elements: _element)
+  }
+
+  /// Accesses the element at the specified position.
+  ///
+  /// - Parameter position: The position of the element to access. The only
+  ///   valid position in a `CollectionOfOne` instance is `0`.
+  @inlinable // trivial-implementation
+  public subscript(position: Int) -> Element {
+    _read {
+      _precondition(position == 0, "Index out of range")
+      yield _element
+    }
+    _modify {
+      _precondition(position == 0, "Index out of range")
+      yield &_element
+    }
+  }
+
+  @inlinable // trivial-implementation
+  public subscript(bounds: Range<Int>) -> SubSequence {
+    get {
+      _failEarlyRangeCheck(bounds, bounds: 0..<1)
+      return Slice(base: self, bounds: bounds)
+    }
+    set {
+      _failEarlyRangeCheck(bounds, bounds: 0..<1)
+      let n = newValue.count
+      _precondition(bounds.count == n, "CollectionOfOne can't be resized")
+      if n == 1 { self = newValue.base }
+    }
+  }
+
+  /// The number of elements in the collection, which is always one.
+  @inlinable // trivial-implementation
+  public var count: Int {
+    return 1
+  }
 }
 
+extension CollectionOfOne: CustomDebugStringConvertible {
+  /// A textual representation of the collection, suitable for debugging.
+  public var debugDescription: String {
+    return "CollectionOfOne(\(String(reflecting: _element)))"
+  }
+}
+
+extension CollectionOfOne: CustomReflectable {
+  public var customMirror: Mirror {
+    return Mirror(self, children: ["element": _element])
+  }
+}

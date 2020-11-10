@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -14,13 +14,13 @@
 // camelCase names.
 //
 //===----------------------------------------------------------------------===//
-#ifndef SWIFT_BASIC_STRINGEXTRAS_HPP
-#define SWIFT_BASIC_STRINGEXTRAS_HPP
+
+#ifndef SWIFT_BASIC_STRINGEXTRAS_H
+#define SWIFT_BASIC_STRINGEXTRAS_H
 
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/OptionSet.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Allocator.h"
@@ -28,23 +28,24 @@
 #include <string>
 
 namespace swift {
-  /// Describes the kind of preposition a word is.
-  enum PrepositionKind {
-    PK_None = 0,
-    PK_Directional,
-    PK_Nondirectional
-  };
+  /// Determine whether the given string can be an argument label.
+  ///
+  /// \seealso Token::canBeArgumentLabel()
+  bool canBeArgumentLabel(StringRef identifier);
 
-  /// Determine what kind of preposition the given word is, if any,
-  /// ignoring case.
-  PrepositionKind getPrepositionKind(StringRef word);
+  /// Determine whether the given string can be the name of a member.
+  bool canBeMemberName(StringRef identifier);
+
+  /// Returns true if the given word is one of Swift's known prepositions.
+  ///
+  /// This can be faster than getPartOfSpeech(StringRef).
+  bool isPreposition(StringRef word);
 
   /// Describes the part of speech of a particular word.
   enum class PartOfSpeech {
     Unknown,
     Preposition,
     Verb,
-    AuxiliaryVerb,
     Gerund,
   };
 
@@ -57,6 +58,8 @@ namespace swift {
 
   public:
     StringRef copyString(StringRef string);
+
+    llvm::BumpPtrAllocator &getAllocator() { return Allocator; }
   };
 
   namespace camel_case {
@@ -92,15 +95,16 @@ namespace swift {
       };
 
     public:
-      typedef StringRef value_type;
-      typedef StringRef reference;
-      typedef ArrowProxy pointer;
-      typedef int difference_type;
-      typedef std::bidirectional_iterator_tag iterator_category;
+      using value_type = StringRef;
+      using reference = StringRef;
+      using pointer = ArrowProxy;
+      using difference_type = int;
+      using iterator_category = std::bidirectional_iterator_tag;
 
       WordIterator(StringRef string, unsigned position)
         : String(string), Position(position) 
       {
+        assert(!string.empty());
         NextPositionValid = false;
         PrevPositionValid = false;
       }
@@ -177,6 +181,16 @@ namespace swift {
       unsigned getPosition() const {
         return Position;
       }
+
+      /// Retrieve the string up until this iterator
+      StringRef getPriorStr() const {
+        return String.slice(0, Position);
+      }
+
+      /// Retrieve the rest of the string (including this position)
+      StringRef getRestOfStr() const {
+        return String.slice(Position, String.size());
+      }
     };
 
     /// Find the first camelCase word in the given string.
@@ -190,11 +204,11 @@ namespace swift {
       StringRef String;
 
     public:
-      typedef WordIterator iterator;
-      typedef WordIterator const_iterator;
-      typedef std::reverse_iterator<WordIterator> reverse_iterator;
-      typedef std::reverse_iterator<WordIterator> const_reverse_iterator;
-      
+      using iterator = WordIterator;
+      using const_iterator = WordIterator;
+      using reverse_iterator = std::reverse_iterator<WordIterator>;
+      using const_reverse_iterator = std::reverse_iterator<WordIterator>;
+
       explicit Words(StringRef string) : String(string) { }
 
       bool empty() const { return String.empty(); }
@@ -237,6 +251,26 @@ namespace swift {
     /// unchanged.
     StringRef toLowercaseWord(StringRef string, StringScratchSpace &scratch);
 
+    /// Lowercase the first word within the given camelCase string.
+    ///
+    /// \param string The string to lowercase.
+    /// \param scratch Scratch buffer used to form the resulting string.
+    ///
+    /// \returns the string with the first word lowercased, including
+    /// initialisms.
+    StringRef toLowercaseInitialisms(StringRef string,
+                                     StringScratchSpace &scratch);
+
+    /// Lowercase the first word within the given camelCase string.
+    ///
+    /// \param string The string to lowercase.
+    /// \param scratch Scratch buffer used to form the resulting string.
+    ///
+    /// \returns the string with the first word lowercased, including
+    /// initialisms.
+    StringRef toLowercaseInitialisms(StringRef string,
+                                     SmallVectorImpl<char> &scratch);
+
     /// Sentence-case the given camelCase string by turning the first
     /// letter into an uppercase letter.
     ///
@@ -275,25 +309,6 @@ namespace swift {
     size_t findWord(StringRef string, StringRef word);
   } // end namespace camel_case
 
-/// Describes the role that a particular name has within a
-/// signature, which can affect how we omit needless words.
-enum class NameRole {
-  /// The base name of a function or method.
-  BaseName,
-
-  /// The first parameter of a function or method.
-  FirstParameter,
-
-  // Subsequent parameters in a function or method.
-  SubsequentParameter,
-
-  // The name of a property.
-  Property,
-
-  // A partial name; used internally.
-  Partial,
-};
-
 /// Flags used by \c OmissionTypeName to describe the input type.
 enum class OmissionTypeFlags {
   /// Whether the parameter with this type has a default argument.
@@ -301,10 +316,13 @@ enum class OmissionTypeFlags {
 
   /// Whether this parameter is of some Boolean type.
   Boolean = 0x02,
+
+  /// Whether this parameter is of some function/block type.
+  Function = 0x04,
 };
 
 /// Options that described omitted types.
-typedef OptionSet<OmissionTypeFlags> OmissionTypeOptions;
+using OmissionTypeOptions = OptionSet<OmissionTypeFlags>;
 
 /// Describes the name of a type as is used for omitting needless
 /// words.
@@ -352,6 +370,11 @@ struct OmissionTypeName {
     return Options.contains(OmissionTypeFlags::Boolean);
   }
 
+  /// Whether this type is a function/block type.
+  bool isFunction() const {
+    return Options.contains(OmissionTypeFlags::Function);
+  }
+
   /// Determine whether the type name is empty.
   bool empty() const { return Name.empty(); }
 
@@ -379,11 +402,13 @@ StringRef matchLeadingTypeName(StringRef name, OmissionTypeName typeName);
 /// Describes a set of names with an inheritance relationship.
 class InheritedNameSet {
   const InheritedNameSet *Parent;
-  llvm::StringSet<> Names;
+  llvm::StringSet<llvm::BumpPtrAllocator &> Names;
 
 public:
   /// Construct a new inherited name set with the given parent.
-  explicit InheritedNameSet(const InheritedNameSet *parent) : Parent(parent) { }
+  InheritedNameSet(const InheritedNameSet *parent,
+                   llvm::BumpPtrAllocator &allocator)
+      : Parent(parent), Names(allocator) { }
 
   // Add a new name to the set.
   void add(StringRef name);
@@ -417,6 +442,9 @@ public:
 ///
 /// \param allPropertyNames The set of property names in the enclosing context.
 ///
+/// \param completionHandlerIndex For an 'async' function, the index of the
+/// completion handler in argNames.
+///
 /// \param scratch Scratch space that will be used for modifications beyond
 /// just chopping names.
 ///
@@ -430,7 +458,13 @@ bool omitNeedlessWords(StringRef &baseName,
                        bool returnsSelf,
                        bool isProperty,
                        const InheritedNameSet *allPropertyNames,
+                       Optional<unsigned> completionHandlerIndex,
+                       Optional<StringRef> completionHandlerName,
                        StringScratchSpace &scratch);
-}
 
-#endif // LLVM_SWIFT_BASIC_STRINGEXTRAS_HPP
+/// If the name has a completion-handler suffix, strip off that suffix.
+Optional<StringRef> stripWithCompletionHandlerSuffix(StringRef name);
+
+} // end namespace swift
+
+#endif // SWIFT_BASIC_STRINGEXTRAS_H

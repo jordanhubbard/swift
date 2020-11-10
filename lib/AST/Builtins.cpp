@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -15,15 +15,21 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/Builtins.h"
-#include "swift/AST/AST.h"
+#include "swift/AST/ASTContext.h"
+#include "swift/AST/FileUnit.h"
+#include "swift/AST/Module.h"
+#include "swift/AST/ParameterList.h"
+#include "swift/AST/TypeCheckRequests.h"
+#include "swift/AST/Types.h"
+#include "swift/Strings.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/LLVMContext.h"
-#include <cstring>
+#include "llvm/Support/ManagedStatic.h"
 #include <tuple>
+
 using namespace swift;
 
 struct BuiltinExtraInfoTy {
@@ -31,20 +37,22 @@ struct BuiltinExtraInfoTy {
 };
 
 static const BuiltinExtraInfoTy BuiltinExtraInfo[] = {
-  {0},
+    {nullptr},
 #define BUILTIN(Id, Name, Attrs) {Attrs},
 #include "swift/AST/Builtins.def"
 };
 
 bool BuiltinInfo::isReadNone() const {
-  return strchr(BuiltinExtraInfo[(unsigned)ID].Attributes, 'n') != 0;
+  return strchr(BuiltinExtraInfo[(unsigned)ID].Attributes, 'n') != nullptr;
 }
 
-bool IntrinsicInfo::hasAttribute(llvm::Attribute::AttrKind Kind) const {
-  // FIXME: We should not be relying on the global LLVM context.
-  llvm::AttributeSet attrs
-    = llvm::Intrinsic::getAttributes(llvm::getGlobalContext(), ID);
-  return (attrs.hasAttribute(llvm::AttributeSet::FunctionIndex, Kind));
+const llvm::AttributeList &
+IntrinsicInfo::getOrCreateAttributes(ASTContext &Ctx) const {
+  using DenseMapInfo = llvm::DenseMapInfo<llvm::AttributeList>;
+  if (DenseMapInfo::isEqual(Attrs, DenseMapInfo::getEmptyKey())) {
+    Attrs = llvm::Intrinsic::getAttributes(Ctx.getIntrinsicScratchContext(), ID);
+  }
+  return Attrs;
 }
 
 Type swift::getBuiltinType(ASTContext &Context, StringRef Name) {
@@ -72,10 +80,10 @@ Type swift::getBuiltinType(ASTContext &Context, StringRef Name) {
     return Context.TheRawPointerType;
   if (Name == "NativeObject")
     return Context.TheNativeObjectType;
-  if (Name == "UnknownObject")
-    return Context.TheUnknownObjectType;
   if (Name == "BridgeObject")
     return Context.TheBridgeObjectType;
+  if (Name == "SILToken")
+    return Context.TheSILTokenType;
   if (Name == "UnsafeValueBuffer")
     return Context.TheUnsafeValueBufferType;
   
@@ -86,6 +94,9 @@ Type swift::getBuiltinType(ASTContext &Context, StringRef Name) {
 
   if (Name == "Word")
     return BuiltinIntegerType::getWordType(Context);
+
+  if (Name == "IntLiteral")
+    return Context.TheIntegerLiteralType;
 
   // Handle 'int8' and friends.
   if (Name.substr(0, 3) == "Int") {
@@ -104,6 +115,12 @@ Type swift::getBuiltinType(ASTContext &Context, StringRef Name) {
     return Context.TheIEEE128Type;
   if (Name == "FPPPC128")
     return Context.ThePPC128Type;
+
+  // AnyObject is the empty class-constrained existential.
+  if (Name == "AnyObject")
+    return CanType(
+      ProtocolCompositionType::get(Context, {},
+                                   /*HasExplicitAnyObject=*/true));
 
   return Type();
 }
@@ -132,138 +149,95 @@ StringRef swift::getBuiltinBaseName(ASTContext &C, StringRef Name,
 
 /// Build a builtin function declaration.
 static FuncDecl *
-getBuiltinFunction(Identifier Id,
-                   ArrayRef<TupleTypeElt> ArgTypes,
-                   Type ResType,
-                   FunctionType::ExtInfo Info = FunctionType::ExtInfo()) {
+getBuiltinFunction(Identifier Id, ArrayRef<Type> argTypes, Type ResType) {
   auto &Context = ResType->getASTContext();
-  Type ArgType = TupleType::get(ArgTypes, Context);
-  Type FnType;
-  FnType = FunctionType::get(ArgType, ResType, Info);
-
-  Module *M = Context.TheBuiltinModule;
+  
+  ModuleDecl *M = Context.TheBuiltinModule;
   DeclContext *DC = &M->getMainFile(FileUnitKind::Builtin);
 
-  SmallVector<TuplePatternElt, 4> ParamPatternElts;
-  for (auto &ArgTupleElt : ArgTypes) {
-    auto PD = new (Context) ParamDecl(/*IsLet*/true, SourceLoc(),
-                                      Identifier(), SourceLoc(),
-                                      Identifier(), ArgTupleElt.getType(),
-                                      DC);
+  SmallVector<ParamDecl*, 4> params;
+  for (Type argType : argTypes) {
+    auto PD = new (Context) ParamDecl(SourceLoc(), SourceLoc(),
+                                      Identifier(), SourceLoc(), Identifier(), DC);
+    PD->setSpecifier(ParamSpecifier::Default);
+    PD->setInterfaceType(argType);
     PD->setImplicit();
-    Pattern *Pat = new (Context) NamedPattern(PD, /*implicit=*/true);
-    Pat = new (Context) TypedPattern(Pat,
-            TypeLoc::withoutLoc(ArgTupleElt.getType()), /*implicit=*/true);
-    PD->setParamParentPattern(Pat);
-
-    ParamPatternElts.push_back(TuplePatternElt(Pat));
+    params.push_back(PD);
   }
 
-  Pattern *ParamPattern = TuplePattern::createSimple(
-      Context, SourceLoc(), ParamPatternElts, SourceLoc());
-
-  llvm::SmallVector<Identifier, 2> ArgNames(ParamPattern->numTopLevelVariables(),
-                                            Identifier());
-  DeclName Name(Context, Id, ArgNames);
-  auto FD = FuncDecl::create(Context, SourceLoc(), StaticSpellingKind::None,
-                          SourceLoc(), Name, SourceLoc(), SourceLoc(),
-                          SourceLoc(), /*GenericParams=*/nullptr, FnType,
-                          ParamPattern, TypeLoc::withoutLoc(ResType), DC);
-  FD->setImplicit();
-  FD->setAccessibility(Accessibility::Public);
+  auto *paramList = ParameterList::create(Context, params);
+  
+  DeclName Name(Context, Id, paramList);
+  auto *const FD = FuncDecl::createImplicit(
+      Context, StaticSpellingKind::None, Name, /*NameLoc=*/SourceLoc(),
+      /*Async=*/false, /*Throws=*/false,
+      /*GenericParams=*/nullptr, paramList, ResType, DC);
+  FD->setAccess(AccessLevel::Public);
   return FD;
 }
 
 /// Build a builtin function declaration.
 static FuncDecl *
 getBuiltinGenericFunction(Identifier Id,
-                          ArrayRef<TupleTypeElt> ArgParamTypes,
-                          ArrayRef<TupleTypeElt> ArgBodyTypes,
+                          ArrayRef<AnyFunctionType::Param> ArgParamTypes,
                           Type ResType,
-                          Type ResBodyType,
                           GenericParamList *GenericParams,
-                          FunctionType::ExtInfo Info = FunctionType::ExtInfo()) {
+                          GenericSignature Sig,
+                          bool Rethrows = false) {
   assert(GenericParams && "Missing generic parameters");
   auto &Context = ResType->getASTContext();
 
-  Type ArgParamType = TupleType::get(ArgParamTypes, Context);
-  Type ArgBodyType = TupleType::get(ArgBodyTypes, Context);
-
-  // Compute the function type.
-  Type FnType = PolymorphicFunctionType::get(ArgBodyType, ResBodyType,
-                                             GenericParams, Info);
-
-  // Compute the interface type.
-  SmallVector<GenericTypeParamType *, 1> GenericParamTypes;
-  for (auto gp : *GenericParams) {
-    GenericParamTypes.push_back(gp->getDeclaredType()
-                                  ->castTo<GenericTypeParamType>());
-  }
-  // Create witness markers for all of the generic param types.
-  SmallVector<Requirement, 2> requirements;
-  for (auto param : GenericParamTypes) {
-    requirements.push_back(Requirement(RequirementKind::WitnessMarker,
-                                       param, Type()));
-  }
-  
-  GenericSignature *Sig = GenericSignature::get(GenericParamTypes,requirements);
-  
-  Type InterfaceType = GenericFunctionType::get(Sig,
-                                                ArgParamType, ResType,
-                                                Info);
-
-  Module *M = Context.TheBuiltinModule;
+  ModuleDecl *M = Context.TheBuiltinModule;
   DeclContext *DC = &M->getMainFile(FileUnitKind::Builtin);
 
-  SmallVector<TuplePatternElt, 4> ParamPatternElts;
-  for (auto &ArgTupleElt : ArgBodyTypes) {
-    auto PD = new (Context) ParamDecl(/*IsLet*/true, SourceLoc(),
+  SmallVector<ParamDecl*, 4> params;
+  for (unsigned i = 0, e = ArgParamTypes.size(); i < e; ++i) {
+    auto paramIfaceType = ArgParamTypes[i].getPlainType();
+    auto specifier =
+      ParamDecl::getParameterSpecifierForValueOwnership(
+        ArgParamTypes[i].getParameterFlags().getValueOwnership());
+    auto PD = new (Context) ParamDecl(SourceLoc(), SourceLoc(),
                                       Identifier(), SourceLoc(),
-                                      Identifier(), ArgTupleElt.getType(),
-                                      DC);
+                                      Identifier(), DC);
+    PD->setSpecifier(specifier);
+    PD->setInterfaceType(paramIfaceType);
     PD->setImplicit();
-    Pattern *Pat = new (Context) NamedPattern(PD, /*implicit=*/true);
-    Pat = new (Context) TypedPattern(Pat,
-            TypeLoc::withoutLoc(ArgTupleElt.getType()), /*implicit=*/true);
-    PD->setParamParentPattern(Pat);
-
-    ParamPatternElts.push_back(TuplePatternElt(Pat));
+    params.push_back(PD);
   }
 
-  Pattern *ParamPattern = TuplePattern::createSimple(
-                          Context, SourceLoc(), ParamPatternElts, SourceLoc());
-  llvm::SmallVector<Identifier, 2> ArgNames(
-                                     ParamPattern->numTopLevelVariables(),
-                                     Identifier());
-  DeclName Name(Context, Id, ArgNames);
-  auto func = FuncDecl::create(Context, SourceLoc(), StaticSpellingKind::None,
-                               SourceLoc(), Name,
-                               SourceLoc(), SourceLoc(), SourceLoc(),
-                               GenericParams, FnType, ParamPattern,
-                               TypeLoc::withoutLoc(ResBodyType), DC);
-    
-  func->setInterfaceType(InterfaceType);
-  func->setImplicit();
-  func->setAccessibility(Accessibility::Public);
+  auto *paramList = ParameterList::create(Context, params);
+
+  DeclName Name(Context, Id, paramList);
+  auto *const func = FuncDecl::createImplicit(
+      Context, StaticSpellingKind::None, Name, /*NameLoc=*/SourceLoc(),
+      /*Async=*/false,
+      /*Throws=*/Rethrows, GenericParams, paramList, ResType, DC);
+
+  func->setAccess(AccessLevel::Public);
+  func->setGenericSignature(Sig);
+  if (Rethrows)
+    func->getAttrs().add(new (Context) RethrowsAttr(/*ThrowsLoc*/ SourceLoc()));
 
   return func;
 }
 
 /// Build a getelementptr operation declaration.
-static ValueDecl *getGepOperation(Identifier Id, Type ArgType) {
+static ValueDecl *getGepRawOperation(Identifier Id, Type ArgType) {
   auto &Context = ArgType->getASTContext();
   
   // This is always "(i8*, IntTy) -> i8*"
-  TupleTypeElt ArgElts[] = { Context.TheRawPointerType, ArgType };
+  Type ArgElts[] = { Context.TheRawPointerType, ArgType };
   Type ResultTy = Context.TheRawPointerType;
   return getBuiltinFunction(Id, ArgElts, ResultTy);
 }
 
+static ValueDecl *getStringObjectOrOperation(Identifier Id, Type ArgType) {
+  return getBuiltinFunction(Id, {ArgType, ArgType}, ArgType);
+}
+
 /// Build a binary operation declaration.
 static ValueDecl *getBinaryOperation(Identifier Id, Type ArgType) {
-  TupleTypeElt ArgElts[] = { ArgType, ArgType };
-  Type ResultTy = ArgType;
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { ArgType, ArgType }, ArgType);
 }
 
 /// Build a declaration for a binary operation with overflow.
@@ -271,7 +245,7 @@ static ValueDecl *getBinaryOperationWithOverflow(Identifier Id,
                                                  Type ArgType) {
   auto &Context = ArgType->getASTContext();
   Type ShouldCheckForOverflowTy = BuiltinIntegerType::get(1, Context);
-  TupleTypeElt ArgElts[] = { ArgType, ArgType, ShouldCheckForOverflowTy };
+  Type ArgElts[] = { ArgType, ArgType, ShouldCheckForOverflowTy };
   Type OverflowBitTy = BuiltinIntegerType::get(1, Context);
   TupleTypeElt ResultElts[] = { ArgType, OverflowBitTy };
   Type ResultTy = TupleType::get(ResultElts, Context);
@@ -279,16 +253,14 @@ static ValueDecl *getBinaryOperationWithOverflow(Identifier Id,
 }
 
 static ValueDecl *getUnaryOperation(Identifier Id, Type ArgType) {
-  TupleTypeElt ArgElts[] = { ArgType };
-  Type ResultTy = ArgType;
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { ArgType }, ArgType);
 }
 
 /// Build a binary predicate declaration.
 static ValueDecl *getBinaryPredicate(Identifier Id, Type ArgType) {
   auto &Context = ArgType->getASTContext();
 
-  TupleTypeElt ArgElts[] = { ArgType, ArgType };
+  Type ArgElts[] = { ArgType, ArgType };
   Type ResultTy = BuiltinIntegerType::get(1, Context);
   if (auto VecTy = ArgType->getAs<BuiltinVectorType>()) {
     ResultTy = BuiltinVectorType::get(Context, ResultTy,
@@ -301,7 +273,7 @@ static ValueDecl *getBinaryPredicate(Identifier Id, Type ArgType) {
 static ValueDecl *getCastOperation(ASTContext &Context, Identifier Id,
                                    BuiltinValueKind VK,
                                    ArrayRef<Type> Types) {
-  if (Types.size() == 0 || Types.size() > 2) return nullptr;
+  if (Types.empty() || Types.size() > 2) return nullptr;
   Type Input = Types[0];
   Type Output = Types.size() == 2 ? Types[1] : Type();
 
@@ -367,7 +339,7 @@ static ValueDecl *getCastOperation(ASTContext &Context, Identifier Id,
         !CheckOutput->is<BuiltinIntegerType>())
       return nullptr;
     break;
-      
+
   case BuiltinValueKind::UIToFP:
   case BuiltinValueKind::SIToFP:
     if (CheckOutput.isNull() || !CheckInput->is<BuiltinIntegerType>() ||
@@ -425,90 +397,110 @@ static ValueDecl *getCastOperation(ASTContext &Context, Identifier Id,
     return nullptr;
   }
 
-  TupleTypeElt ArgElts[] = { Input };
-  return getBuiltinFunction(Id, ArgElts, Output);
+  return getBuiltinFunction(Id, { Input }, Output);
 }
 
 static const char * const GenericParamNames[] = {
   "T",
   "U",
+  "V",
+  "W",
+  "X",
+  "Y",
+  "Z"
 };
 
-static std::pair<ArchetypeType*, GenericTypeParamDecl*>
+static GenericTypeParamDecl*
 createGenericParam(ASTContext &ctx, const char *name, unsigned index) {
-  Module *M = ctx.TheBuiltinModule;
+  ModuleDecl *M = ctx.TheBuiltinModule;
   Identifier ident = ctx.getIdentifier(name);
-  ArchetypeType *archetype
-    = ArchetypeType::getNew(ctx, nullptr,
-                            static_cast<AssociatedTypeDecl *>(nullptr),
-                            ident, ArrayRef<Type>(), Type(), false);
   auto genericParam =
     new (ctx) GenericTypeParamDecl(&M->getMainFile(FileUnitKind::Builtin),
                                    ident, SourceLoc(), 0, index);
-  genericParam->setArchetype(archetype);
-  return { archetype, genericParam };
+  return genericParam;
 }
 
 /// Create a generic parameter list with multiple generic parameters.
 static GenericParamList *getGenericParams(ASTContext &ctx,
-                                          unsigned numParameters,
-                       SmallVectorImpl<ArchetypeType*> &archetypes,
-                       SmallVectorImpl<GenericTypeParamDecl*> &genericParams) {
+                                          unsigned numParameters) {
   assert(numParameters <= llvm::array_lengthof(GenericParamNames));
-  assert(archetypes.empty() && genericParams.empty());
 
-  for (unsigned i = 0; i != numParameters; ++i) {
-    auto archetypeAndParam = createGenericParam(ctx, GenericParamNames[i], i);
-    archetypes.push_back(archetypeAndParam.first);
-    genericParams.push_back(archetypeAndParam.second);
-  }
+  SmallVector<GenericTypeParamDecl *, 2> genericParams;
+  for (unsigned i = 0; i != numParameters; ++i)
+    genericParams.push_back(createGenericParam(ctx, GenericParamNames[i], i));
 
   auto paramList = GenericParamList::create(ctx, SourceLoc(), genericParams,
                                             SourceLoc());
-  paramList->setAllArchetypes(ctx.AllocateCopy(archetypes));
   return paramList;
 }
 
 namespace {
-  class GenericSignatureBuilder {
+  class BuiltinFunctionBuilder {
   public:
     ASTContext &Context;
 
   private:
     GenericParamList *TheGenericParamList;
-
-    SmallVector<GenericTypeParamDecl*, 2> GenericTypeParams;
-    SmallVector<ArchetypeType*, 2> Archetypes;
-
-    SmallVector<TupleTypeElt, 4> InterfaceParams;
-    SmallVector<TupleTypeElt, 4> BodyParams;
-
+    SmallVector<AnyFunctionType::Param, 4> InterfaceParams;
     Type InterfaceResult;
-    Type BodyResult;
+    bool Rethrows = false;
+
+    // Accumulate params and requirements here, so that we can make the
+    // appropriate `AbstractGenericSignatureRequest` when `build()` is called.
+    SmallVector<GenericTypeParamType *, 2> genericParamTypes;
+    SmallVector<Requirement, 2> addedRequirements;
 
   public:
-    GenericSignatureBuilder(ASTContext &ctx, unsigned numGenericParams = 1)
+    BuiltinFunctionBuilder(ASTContext &ctx, unsigned numGenericParams = 1,
+                           bool wantsAdditionalAnyObjectRequirement = false)
         : Context(ctx) {
-      TheGenericParamList = getGenericParams(ctx, numGenericParams,
-                                             Archetypes, GenericTypeParams);
+      TheGenericParamList = getGenericParams(ctx, numGenericParams);
+      if (wantsAdditionalAnyObjectRequirement) {
+        Requirement req(RequirementKind::Conformance,
+                        TheGenericParamList->getParams()[0]->getInterfaceType(),
+                        ctx.getAnyObjectType());
+        addedRequirements.push_back(req);
+      }
+      for (auto gp : TheGenericParamList->getParams()) {
+        genericParamTypes.push_back(
+            gp->getDeclaredInterfaceType()->castTo<GenericTypeParamType>());
+      }
     }
 
     template <class G>
-    void addParameter(const G &generator) {
-      InterfaceParams.push_back(generator.build(*this, false));
-      BodyParams.push_back(generator.build(*this, true));
+    void addParameter(const G &generator,
+                      ValueOwnership ownership = ValueOwnership::Default) {
+      Type gTyIface = generator.build(*this);
+      auto flags = ParameterTypeFlags().withValueOwnership(ownership);
+      InterfaceParams.emplace_back(gTyIface, Identifier(), flags);
     }
 
     template <class G>
     void setResult(const G &generator) {
-      InterfaceResult = generator.build(*this, false);
-      BodyResult = generator.build(*this, true);
+      InterfaceResult = generator.build(*this);
     }
 
-    ValueDecl *build(Identifier name) {
-      return getBuiltinGenericFunction(name, InterfaceParams, BodyParams,
-                                       InterfaceResult, BodyResult,
-                                       TheGenericParamList);
+    template <class G>
+    void addConformanceRequirement(const G &generator, ProtocolDecl *proto) {
+      Requirement req(RequirementKind::Conformance,
+                      generator.build(*this),
+                      proto->getDeclaredInterfaceType());
+      addedRequirements.push_back(req);
+    }
+
+    void setRethrows(bool rethrows = true) {
+      Rethrows = rethrows;
+    }
+
+    FuncDecl *build(Identifier name) {
+      auto GenericSig = evaluateOrDefault(
+        Context.evaluator,
+        AbstractGenericSignatureRequest{
+          nullptr, std::move(genericParamTypes), std::move(addedRequirements)},
+        nullptr);
+      return getBuiltinGenericFunction(name, InterfaceParams,
+                                       InterfaceResult,
+                                       TheGenericParamList, GenericSig);
     }
 
     // Don't use these generator classes directly; call the make{...}
@@ -516,119 +508,102 @@ namespace {
 
     struct ConcreteGenerator {
       Type TheType;
-      Type build(GenericSignatureBuilder &builder, bool forBody) const {
+      Type build(BuiltinFunctionBuilder &builder) const {
         return TheType;
       }
     };
     struct ParameterGenerator {
       unsigned Index;
-      Type build(GenericSignatureBuilder &builder, bool forBody) const {
-        return (forBody ? builder.Archetypes[Index]
-                        : builder.GenericTypeParams[Index]->getDeclaredType());
+      Type build(BuiltinFunctionBuilder &builder) const {
+        return builder.TheGenericParamList->getParams()[Index]
+            ->getDeclaredInterfaceType();
       }
     };
     struct LambdaGenerator {
-      std::function<Type(GenericSignatureBuilder &,bool)> TheFunction;
-      Type build(GenericSignatureBuilder &builder, bool forBody) const {
-        return TheFunction(builder, forBody);
-      }
-    };
-    template <class T, class U>
-    struct FunctionGenerator {
-      T Arg;
-      U Result;
-      FunctionType::ExtInfo ExtInfo;
-      Type build(GenericSignatureBuilder &builder, bool forBody) const {
-        return FunctionType::get(Arg.build(builder, forBody),
-                                 Result.build(builder, forBody),
-                                 ExtInfo);
-      }
-    };
-    template <class T>
-    struct InOutGenerator {
-      T Object;
-      Type build(GenericSignatureBuilder &builder, bool forBody) const {
-        return InOutType::get(Object.build(builder, forBody));
+      std::function<Type(BuiltinFunctionBuilder &)> TheFunction;
+      Type build(BuiltinFunctionBuilder &builder) const {
+        return TheFunction(builder);
       }
     };
     template <class T>
     struct MetatypeGenerator {
       T Object;
       Optional<MetatypeRepresentation> Repr;
-      Type build(GenericSignatureBuilder &builder, bool forBody) const {
-        return MetatypeType::get(Object.build(builder, forBody), Repr);
+      Type build(BuiltinFunctionBuilder &builder) const {
+        return MetatypeType::get(Object.build(builder), Repr);
       }
     };
   };
-}
+} // end anonymous namespace
 
-static GenericSignatureBuilder::ConcreteGenerator
+static BuiltinFunctionBuilder::ConcreteGenerator
 makeConcrete(Type type) {
   return { type };
 }
 
-static GenericSignatureBuilder::ParameterGenerator
+static BuiltinFunctionBuilder::ParameterGenerator
 makeGenericParam(unsigned index = 0) {
   return { index };
 }
 
 template <class... Gs>
-static GenericSignatureBuilder::LambdaGenerator
+static BuiltinFunctionBuilder::LambdaGenerator
 makeTuple(const Gs & ...elementGenerators) {
   return {
-    [=](GenericSignatureBuilder &builder, bool forBody) -> Type {
+    [=](BuiltinFunctionBuilder &builder) -> Type {
       TupleTypeElt elts[] = {
-        elementGenerators.build(builder, forBody)...
+        elementGenerators.build(builder)...
       };
       return TupleType::get(elts, builder.Context);
     }
   };
 }
 
-template <class T, class U>
-static GenericSignatureBuilder::FunctionGenerator<T,U>
-makeFunction(const T &arg, const U &result,
-             FunctionType::ExtInfo extInfo = FunctionType::ExtInfo()) {
-  return { arg, result, extInfo };
+template <class... Gs>
+static BuiltinFunctionBuilder::LambdaGenerator
+makeBoundGenericType(NominalTypeDecl *decl,
+                     const Gs & ...argumentGenerators) {
+  return {
+    [=](BuiltinFunctionBuilder &builder) -> Type {
+      Type args[] = {
+        argumentGenerators.build(builder)...
+      };
+      return BoundGenericType::get(decl, Type(), args);
+    }
+  };
 }
 
 template <class T>
-static GenericSignatureBuilder::InOutGenerator<T>
-makeInOut(const T &object) {
-  return { object };
-}
-
-template <class T>
-static GenericSignatureBuilder::MetatypeGenerator<T>
+static BuiltinFunctionBuilder::MetatypeGenerator<T>
 makeMetatype(const T &object, Optional<MetatypeRepresentation> repr = None) {
   return { object, repr };
 }
 
 /// Create a function with type <T> T -> ().
 static ValueDecl *getRefCountingOperation(ASTContext &Context, Identifier Id) {
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeGenericParam());
   builder.setResult(makeConcrete(TupleType::getEmpty(Context)));
   return builder.build(Id);
 }
 
 static ValueDecl *getLoadOperation(ASTContext &Context, Identifier Id) {
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeConcrete(Context.TheRawPointerType));
   builder.setResult(makeGenericParam());
   return builder.build(Id);
 }
 
 static ValueDecl *getStoreOperation(ASTContext &Context, Identifier Id) {
-  GenericSignatureBuilder builder(Context);
-  builder.addParameter(makeGenericParam());
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeGenericParam(), ValueOwnership::Owned);
   builder.addParameter(makeConcrete(Context.TheRawPointerType));
   builder.setResult(makeConcrete(TupleType::getEmpty(Context)));
   return builder.build(Id);
 }
 
 static ValueDecl *getDestroyOperation(ASTContext &Context, Identifier Id) {
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeMetatype(makeGenericParam()));
   builder.addParameter(makeConcrete(Context.TheRawPointerType));
   builder.setResult(makeConcrete(TupleType::getEmpty(Context)));
@@ -638,7 +613,7 @@ static ValueDecl *getDestroyOperation(ASTContext &Context, Identifier Id) {
 static ValueDecl *getDestroyArrayOperation(ASTContext &Context, Identifier Id) {
   auto wordType = BuiltinIntegerType::get(BuiltinIntegerWidth::pointer(),
                                           Context);
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeMetatype(makeGenericParam()));
   builder.addParameter(makeConcrete(Context.TheRawPointerType));
   builder.addParameter(makeConcrete(wordType));
@@ -649,7 +624,7 @@ static ValueDecl *getDestroyArrayOperation(ASTContext &Context, Identifier Id) {
 static ValueDecl *getTransferArrayOperation(ASTContext &Context, Identifier Id){
   auto wordType = BuiltinIntegerType::get(BuiltinIntegerWidth::pointer(),
                                           Context);
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeMetatype(makeGenericParam()));
   builder.addParameter(makeConcrete(Context.TheRawPointerType));
   builder.addParameter(makeConcrete(Context.TheRawPointerType));
@@ -662,37 +637,152 @@ static ValueDecl *getIsUniqueOperation(ASTContext &Context, Identifier Id) {
   // <T> (@inout T) -> Int1
   Type Int1Ty = BuiltinIntegerType::get(1, Context);
 
-  GenericSignatureBuilder builder(Context);
-  builder.addParameter(makeInOut(makeGenericParam()));
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeGenericParam(), ValueOwnership::InOut);
   builder.setResult(makeConcrete(Int1Ty));
   return builder.build(Id);
 }
 
+static ValueDecl *getEndCOWMutation(ASTContext &Context, Identifier Id) {
+  // <T> (@inout T) -> ()
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeGenericParam(), ValueOwnership::InOut);
+  builder.setResult(makeConcrete(TupleType::getEmpty(Context)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getBindMemoryOperation(ASTContext &Context, Identifier Id) {
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeConcrete(Context.TheRawPointerType));
+  builder.addParameter(makeConcrete(BuiltinIntegerType::getWordType(Context)));
+  builder.addParameter(makeMetatype(makeGenericParam()));
+  builder.setResult(makeConcrete(TupleType::getEmpty(Context)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getAllocWithTailElemsOperation(ASTContext &Context,
+                                                 Identifier Id,
+                                                 int NumTailTypes) {
+  if (NumTailTypes < 1 ||
+      1 + NumTailTypes > (int)llvm::array_lengthof(GenericParamNames))
+    return nullptr;
+  BuiltinFunctionBuilder builder(Context, 1 + NumTailTypes);
+  builder.addParameter(makeMetatype(makeGenericParam(0)));
+  for (int Idx = 0; Idx < NumTailTypes; ++Idx) {
+    builder.addParameter(makeConcrete(BuiltinIntegerType::getWordType(Context)));
+    builder.addParameter(makeMetatype(makeGenericParam(Idx + 1)));
+  }
+  builder.setResult(makeGenericParam(0));
+  return builder.build(Id);
+}
+
+static ValueDecl *getProjectTailElemsOperation(ASTContext &Context,
+                                               Identifier Id) {
+  BuiltinFunctionBuilder builder(Context, 2);
+  builder.addParameter(makeGenericParam(0));
+  builder.addParameter(makeMetatype(makeGenericParam(1)));
+  builder.setResult(makeConcrete(Context.TheRawPointerType));
+  return builder.build(Id);
+}
+
+/// Build a getelementptr operation declaration.
+static ValueDecl *getGepOperation(ASTContext &Context, Identifier Id,
+                                  Type ArgType) {
+  BuiltinFunctionBuilder builder(Context, 1);
+  builder.addParameter(makeConcrete(Context.TheRawPointerType));
+  builder.addParameter(makeConcrete(ArgType));
+  builder.addParameter(makeMetatype(makeGenericParam(0)));
+  builder.setResult(makeConcrete(Context.TheRawPointerType));
+  return builder.build(Id);
+}
+
+static ValueDecl *getGetTailAddrOperation(ASTContext &Context, Identifier Id,
+                                          Type ArgType) {
+  BuiltinFunctionBuilder builder(Context, 2);
+  builder.addParameter(makeConcrete(Context.TheRawPointerType));
+  builder.addParameter(makeConcrete(ArgType));
+  builder.addParameter(makeMetatype(makeGenericParam(0)));
+  builder.addParameter(makeMetatype(makeGenericParam(1)));
+  builder.setResult(makeConcrete(Context.TheRawPointerType));
+  return builder.build(Id);
+}
+
+static ValueDecl *getBeginUnpairedAccessOperation(ASTContext &Context,
+                                                  Identifier Id) {
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeConcrete(Context.TheRawPointerType));
+  builder.addParameter(makeConcrete(Context.TheRawPointerType));
+  builder.addParameter(makeMetatype(makeGenericParam(0)));
+  builder.setResult(makeConcrete(Context.TheEmptyTupleType));
+  return builder.build(Id);
+}
+
+static ValueDecl *
+getPerformInstantaneousReadAccessOperation(ASTContext &Context,
+                                           Identifier Id) {
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeConcrete(Context.TheRawPointerType));
+  builder.addParameter(makeMetatype(makeGenericParam(0)));
+  builder.setResult(makeConcrete(Context.TheEmptyTupleType));
+  return builder.build(Id);
+}
+
+static ValueDecl *getEndUnpairedAccessOperation(ASTContext &Context,
+                                                Identifier Id) {
+  return getBuiltinFunction(Id, { Context.TheRawPointerType },
+                                Context.TheEmptyTupleType);
+}
 static ValueDecl *getSizeOrAlignOfOperation(ASTContext &Context,
                                             Identifier Id) {
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeMetatype(makeGenericParam()));
   builder.setResult(makeConcrete(BuiltinIntegerType::getWordType(Context)));
   return builder.build(Id);
 }
 
 static ValueDecl *getIsPODOperation(ASTContext &Context, Identifier Id) {
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeMetatype(makeGenericParam()));
   builder.setResult(makeConcrete(BuiltinIntegerType::get(1,Context)));
   return builder.build(Id);
 }
 
+static ValueDecl *getIsConcrete(ASTContext &Context, Identifier Id) {
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeMetatype(makeGenericParam()));
+  builder.setResult(makeConcrete(BuiltinIntegerType::get(1,Context)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getIsBitwiseTakable(ASTContext &Context, Identifier Id) {
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeMetatype(makeGenericParam()));
+  builder.setResult(makeConcrete(BuiltinIntegerType::get(1,Context)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getIsOptionalOperation(ASTContext &Context, Identifier Id) {
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeMetatype(makeGenericParam()));
+  builder.setResult(makeConcrete(BuiltinIntegerType::get(1,Context)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getIsSameMetatypeOperation(ASTContext &Context, Identifier Id) {
+  CanType anyMetatype = CanExistentialMetatypeType::get(Context.TheAnyType);
+  auto ResultTy = BuiltinIntegerType::get(1,Context);
+  return getBuiltinFunction(Id, {anyMetatype, anyMetatype}, ResultTy);
+}
+
 static ValueDecl *getAllocOperation(ASTContext &Context, Identifier Id) {
   Type PtrSizeTy = BuiltinIntegerType::getWordType(Context);
-  TupleTypeElt ArgElts[] = { PtrSizeTy, PtrSizeTy };
   Type ResultTy = Context.TheRawPointerType;
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { PtrSizeTy, PtrSizeTy }, ResultTy);
 }
 
 static ValueDecl *getDeallocOperation(ASTContext &Context, Identifier Id) {
   auto PtrSizeTy = BuiltinIntegerType::getWordType(Context);
-  TupleTypeElt ArgElts[] = { Context.TheRawPointerType, PtrSizeTy, PtrSizeTy };
+  Type ArgElts[] = { Context.TheRawPointerType, PtrSizeTy, PtrSizeTy };
   Type ResultTy = TupleType::getEmpty(Context);
   return getBuiltinFunction(Id, ArgElts, ResultTy);
 }
@@ -709,60 +799,64 @@ static ValueDecl *getVoidErrorOperation(ASTContext &Context, Identifier Id) {
 static ValueDecl *getUnexpectedErrorOperation(ASTContext &Context,
                                               Identifier Id) {
   return getBuiltinFunction(Id, {Context.getExceptionType()},
-                            TupleType::getEmpty(Context),
-                            AnyFunctionType::ExtInfo().withIsNoReturn());
+                            Context.getNeverType());
 }
 
 static ValueDecl *getCmpXChgOperation(ASTContext &Context, Identifier Id,
                                       Type T) {
-  TupleTypeElt ArgElts[] = { Context.TheRawPointerType, T, T };
+  Type ArgElts[] = { Context.TheRawPointerType, T, T };
   Type BoolTy = BuiltinIntegerType::get(1, Context);
-  TupleTypeElt ResultElts[] = { T, BoolTy };
-  Type ResultTy = TupleType::get(ResultElts, Context);
+  Type ResultTy = TupleType::get({ T, BoolTy }, Context);
   return getBuiltinFunction(Id, ArgElts, ResultTy);
 }
 
 static ValueDecl *getAtomicRMWOperation(ASTContext &Context, Identifier Id,
                                         Type T) {
-  TupleTypeElt ArgElts[] = { Context.TheRawPointerType, T };
-  Type ResultTy = T;
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { Context.TheRawPointerType, T }, T);
 }
 
 static ValueDecl *getAtomicLoadOperation(ASTContext &Context, Identifier Id,
                                          Type T) {
-  TupleTypeElt ArgElts[] = { Context.TheRawPointerType };
-  Type ResultTy = T;
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { Type(Context.TheRawPointerType) }, T);
 }
 
 static ValueDecl *getAtomicStoreOperation(ASTContext &Context, Identifier Id,
                                           Type T) {
-  TupleTypeElt ArgElts[] = { Context.TheRawPointerType, T };
-  Type ResultTy = Context.TheEmptyTupleType;
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { Context.TheRawPointerType, T },
+                            Context.TheEmptyTupleType);
 }
 
 static ValueDecl *getNativeObjectCast(ASTContext &Context, Identifier Id,
                                       BuiltinValueKind BV) {
-  Type BuiltinTy;
-  if (BV == BuiltinValueKind::BridgeToRawPointer ||
-      BV == BuiltinValueKind::BridgeFromRawPointer)
-    BuiltinTy = Context.TheRawPointerType;
-  else if (BV == BuiltinValueKind::CastToUnknownObject ||
-           BV == BuiltinValueKind::CastFromUnknownObject)
-    BuiltinTy = Context.TheUnknownObjectType;
-  else
-    BuiltinTy = Context.TheNativeObjectType;
 
-  GenericSignatureBuilder builder(Context);
+  ValueOwnership ownership;
+  Type builtinTy;
+  switch (BV) {
+  case BuiltinValueKind::CastToNativeObject:
+  case BuiltinValueKind::UnsafeCastToNativeObject:
+  case BuiltinValueKind::CastFromNativeObject:
+    builtinTy = Context.TheNativeObjectType;
+    ownership = ValueOwnership::Owned;
+    break;
+
+  case BuiltinValueKind::BridgeToRawPointer:
+  case BuiltinValueKind::BridgeFromRawPointer:
+    builtinTy = Context.TheRawPointerType;
+    ownership = ValueOwnership::Default;
+    break;
+
+  default:
+    llvm_unreachable("unexpected kind");
+  }
+
+  BuiltinFunctionBuilder builder(Context);
   if (BV == BuiltinValueKind::CastToNativeObject ||
-      BV == BuiltinValueKind::CastToUnknownObject ||
+      BV == BuiltinValueKind::UnsafeCastToNativeObject ||
       BV == BuiltinValueKind::BridgeToRawPointer) {
-    builder.addParameter(makeGenericParam());
-    builder.setResult(makeConcrete(BuiltinTy));
+    builder.addParameter(makeGenericParam(), ownership);
+    builder.setResult(makeConcrete(builtinTy));
   } else {
-    builder.addParameter(makeConcrete(BuiltinTy));
+    builder.addParameter(makeConcrete(builtinTy), ownership);
     builder.setResult(makeGenericParam());
   }
   return builder.build(Id);
@@ -772,8 +866,8 @@ static ValueDecl *getCastToBridgeObjectOperation(ASTContext &C,
                                                  Identifier Id) {
   auto wordType = BuiltinIntegerType::get(BuiltinIntegerWidth::pointer(),
                                           C);
-  GenericSignatureBuilder builder(C);
-  builder.addParameter(makeGenericParam());
+  BuiltinFunctionBuilder builder(C);
+  builder.addParameter(makeGenericParam(), ValueOwnership::Owned);
   builder.addParameter(makeConcrete(wordType));
   builder.setResult(makeConcrete(C.TheBridgeObjectType));
   return builder.build(Id);
@@ -783,32 +877,98 @@ static ValueDecl *getCastFromBridgeObjectOperation(ASTContext &C,
                                                    Identifier Id,
                                                    BuiltinValueKind BV) {
   Type BridgeTy = C.TheBridgeObjectType;
-  TupleTypeElt ArgElts[] = { BridgeTy };
-  
   switch (BV) {
   case BuiltinValueKind::CastReferenceFromBridgeObject: {
-    GenericSignatureBuilder builder(C);
-    builder.addParameter(makeConcrete(BridgeTy));
+    BuiltinFunctionBuilder builder(C);
+    builder.addParameter(makeConcrete(BridgeTy), ValueOwnership::Owned);
     builder.setResult(makeGenericParam());
     return builder.build(Id);
   }
 
   case BuiltinValueKind::CastBitPatternFromBridgeObject: {
     Type WordTy = BuiltinIntegerType::get(BuiltinIntegerWidth::pointer(), C);
-    return getBuiltinFunction(Id, ArgElts, WordTy);
+    return getBuiltinFunction(Id, { BridgeTy }, WordTy);
   }
-      
+
   default:
     llvm_unreachable("not a cast from bridge object op");
   }
+}
+
+/// ClassifyBridgeObject has type:
+///      (Builtin.BridgeObject) -> (Builtin.Int1, Builtin.Int1).
+static ValueDecl *getClassifyBridgeObject(ASTContext &C, Identifier Id) {
+  Type int1Ty = BuiltinIntegerType::get(1, C);
+  Type resultTy = TupleType::get({
+    TupleTypeElt(int1Ty, C.getIdentifier("isObjCObject")),
+    TupleTypeElt(int1Ty, C.getIdentifier("isObjCTaggedPointer"))
+  }, C);
+
+  return getBuiltinFunction(Id, { C.TheBridgeObjectType }, resultTy);
+}
+
+static ValueDecl *getValueToBridgeObject(ASTContext &C, Identifier Id) {
+  BuiltinFunctionBuilder builder(C);
+  builder.addParameter(makeGenericParam(0));
+  builder.setResult(makeConcrete(C.TheBridgeObjectType));
+  return builder.build(Id);
+}
+
+static ValueDecl *getCOWBufferForReading(ASTContext &C, Identifier Id) {
+  // <T : AnyObject> T -> T
+  //
+  BuiltinFunctionBuilder builder(C, 1, true);
+  auto T = makeGenericParam();
+  builder.addParameter(T);
+  builder.setResult(T);
+  return builder.build(Id);
+}
+
+static ValueDecl *getUnsafeGuaranteed(ASTContext &C, Identifier Id) {
+  // <T : AnyObject> T -> (T, Int8Ty)
+  //
+  BuiltinFunctionBuilder builder(C);
+  auto T = makeGenericParam();
+  builder.addParameter(T);
+  Type Int8Ty = BuiltinIntegerType::get(8, C);
+  builder.setResult(makeTuple(T, makeConcrete(Int8Ty)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getUnsafeGuaranteedEnd(ASTContext &C, Identifier Id) {
+  // Int8Ty -> ()
+  Type Int8Ty = BuiltinIntegerType::get(8, C);
+  return getBuiltinFunction(Id, { Int8Ty }, TupleType::getEmpty(C));
+}
+
+static ValueDecl *getIntInstrprofIncrement(ASTContext &C, Identifier Id) {
+  // (Builtin.RawPointer, Builtin.Int64, Builtin.Int32, Builtin.Int32) -> ()
+  Type Int64Ty = BuiltinIntegerType::get(64, C);
+  Type Int32Ty = BuiltinIntegerType::get(32, C);
+  return getBuiltinFunction(Id,
+                            {C.TheRawPointerType, Int64Ty, Int32Ty, Int32Ty},
+                            TupleType::getEmpty(C));
+}
+
+static ValueDecl *getTypePtrAuthDiscriminator(ASTContext &C, Identifier Id) {
+  // <T : AnyObject> (T.Type) -> Int64
+  BuiltinFunctionBuilder builder(C);
+  builder.addParameter(makeMetatype(makeGenericParam()));
+  Type Int64Ty = BuiltinIntegerType::get(64, C);
+  builder.setResult(makeConcrete(Int64Ty));
+  return builder.build(Id);
+}
+
+static ValueDecl *getOnFastPath(ASTContext &Context, Identifier Id) {
+  return getBuiltinFunction(Id, {}, TupleType::getEmpty(Context));
 }
 
 static ValueDecl *getCastReferenceOperation(ASTContext &ctx,
                                             Identifier name) {
   // <T, U> T -> U
   // SILGen and IRGen check additional constraints during lowering.
-  GenericSignatureBuilder builder(ctx, 2);
-  builder.addParameter(makeGenericParam(0));
+  BuiltinFunctionBuilder builder(ctx, 2);
+  builder.addParameter(makeGenericParam(0), ValueOwnership::Owned);
   builder.setResult(makeGenericParam(1));
   return builder.build(name);
 }
@@ -817,65 +977,498 @@ static ValueDecl *getReinterpretCastOperation(ASTContext &ctx,
                                               Identifier name) {
   // <T, U> T -> U
   // SILGen and IRGen check additional constraints during lowering.
-  GenericSignatureBuilder builder(ctx, 2);
-  builder.addParameter(makeGenericParam(0));
+  BuiltinFunctionBuilder builder(ctx, 2);
+  builder.addParameter(makeGenericParam(0), ValueOwnership::Owned);
   builder.setResult(makeGenericParam(1));
-  return builder.build(name);
-}
-
-static ValueDecl *getMarkDependenceOperation(ASTContext &ctx, Identifier name) {
-  // <T,U> (T,U) -> T
-  GenericSignatureBuilder builder(ctx, 2);
-  builder.addParameter(makeGenericParam(0));
-  builder.addParameter(makeGenericParam(1));
-  builder.setResult(makeGenericParam(0));
   return builder.build(name);
 }
 
 static ValueDecl *getZeroInitializerOperation(ASTContext &Context,
                                              Identifier Id) {
   // <T> () -> T
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.setResult(makeGenericParam());
+  return builder.build(Id);
+}
+
+static ValueDecl *getGetObjCTypeEncodingOperation(ASTContext &Context,
+                                                  Identifier Id) {
+  // <T> T.Type -> RawPointer
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeMetatype(makeGenericParam()));
+  builder.setResult(makeConcrete(Context.TheRawPointerType));
+  return builder.build(Id);
+}
+
+static ValueDecl *getAutoDiffApplyDerivativeFunction(
+    ASTContext &Context, Identifier Id, AutoDiffDerivativeFunctionKind kind,
+    unsigned arity, bool throws) {
+  assert(arity >= 1);
+  // JVP:
+  //   <...T...(arity), R> (@differentiable (...T) throws -> R, ...T)
+  //       rethrows -> (R, (...T.TangentVector) -> R.TangentVector)
+  // VJP:
+  //   <...T...(arity), R> (@differentiable (...T) throws -> R, ...T)
+  //       rethrows -> (R, (R.TangentVector) -> ...T.TangentVector)
+  unsigned numGenericParams = 1 + arity;
+  BuiltinFunctionBuilder builder(Context, numGenericParams);
+  // Get the `Differentiable` protocol.
+  auto *diffableProto = Context.getProtocol(KnownProtocolKind::Differentiable);
+  // Create type parameters and add conformance constraints.
+  auto fnResultGen = makeGenericParam(arity);
+  builder.addConformanceRequirement(fnResultGen, diffableProto);
+  SmallVector<decltype(fnResultGen), 2> fnParamGens;
+  for (auto i : range(arity)) {
+    auto T = makeGenericParam(i);
+    builder.addConformanceRequirement(T, diffableProto);
+    fnParamGens.push_back(T);
+  }
+  // Generator for the first argument, i.e. the `@differentiable` function.
+  BuiltinFunctionBuilder::LambdaGenerator firstArgGen{
+      // Generator for the function type at the argument position, i.e. the
+      // function being differentiated.
+      [=, &fnParamGens](BuiltinFunctionBuilder &builder) -> Type {
+        auto extInfo =
+            FunctionType::ExtInfoBuilder()
+                .withDifferentiabilityKind(DifferentiabilityKind::Normal)
+                .withNoEscape()
+                .withThrows(throws)
+                .build();
+        SmallVector<FunctionType::Param, 2> params;
+        for (auto &paramGen : fnParamGens)
+          params.push_back(FunctionType::Param(paramGen.build(builder)));
+        auto innerFunction =
+            FunctionType::get(params, fnResultGen.build(builder));
+        return innerFunction->withExtInfo(extInfo);
+      }};
+  // Eagerly build the type of the first arg, then use that to compute the type
+  // of the result.
+  auto *diffFnType =
+      firstArgGen.build(builder)->castTo<AnyFunctionType>();
+  diffFnType = diffFnType->getWithoutDifferentiability()->withExtInfo(
+      diffFnType->getExtInfo().withNoEscape(false));
+  auto *paramIndices = IndexSubset::get(
+      Context, SmallBitVector(diffFnType->getNumParams(), true));
+  // Generator for the resultant function type, i.e. the AD derivative function.
+  BuiltinFunctionBuilder::LambdaGenerator resultGen{
+      [=, &Context](BuiltinFunctionBuilder &builder) -> Type {
+        auto derivativeFnTy = diffFnType->getAutoDiffDerivativeFunctionType(
+            paramIndices, kind,
+            LookUpConformanceInModule(Context.TheBuiltinModule));
+        return derivativeFnTy->getResult();
+      }};
+  builder.addParameter(firstArgGen);
+  for (auto argGen : fnParamGens)
+    builder.addParameter(argGen);
+  if (throws)
+    builder.setRethrows();
+  builder.setResult(resultGen);
+  return builder.build(Id);
+}
+
+static ValueDecl *getAutoDiffApplyTransposeFunction(
+    ASTContext &Context, Identifier Id, unsigned arity, bool throws) {
+  assert(arity >= 1);
+  // <...T...(arity), R>
+  //     (@differentiable (...T) throws -> R, ...R.TangentVector)
+  //         rethrows -> (...T.TangentVector)
+  unsigned numGenericParams = 1 + arity;
+  BuiltinFunctionBuilder builder(Context, numGenericParams);
+  auto *diffableProto = Context.getProtocol(KnownProtocolKind::Differentiable);
+  auto *addArithProto =
+      Context.getProtocol(KnownProtocolKind::AdditiveArithmetic);
+  // Create type parameters and add conformance constraints.
+  auto linearFnResultGen = makeGenericParam(arity);
+  builder.addConformanceRequirement(linearFnResultGen, diffableProto);
+  builder.addConformanceRequirement(linearFnResultGen, addArithProto);
+  SmallVector<decltype(linearFnResultGen), 2> linearFnParamGens;
+  for (auto i : range(arity)) {
+    auto T = makeGenericParam(i);
+    builder.addConformanceRequirement(T, diffableProto);
+    builder.addConformanceRequirement(T, addArithProto);
+    linearFnParamGens.push_back(T);
+  }
+  // Generator for the first argument, i.e. the `@differentiable(linear)`
+  // function.
+  BuiltinFunctionBuilder::LambdaGenerator firstArgGen {
+    // Generator for the function type at the argument position, i.e. the
+    // function being differentiated.
+    [=, &linearFnParamGens](BuiltinFunctionBuilder &builder) -> Type {
+      FunctionType::ExtInfo ext;
+      auto extInfo =
+          FunctionType::ExtInfoBuilder()
+              .withDifferentiabilityKind(DifferentiabilityKind::Linear)
+              .withNoEscape()
+              .withThrows(throws)
+              .build();
+      SmallVector<FunctionType::Param, 2> params;
+      for (auto &paramGen : linearFnParamGens)
+        params.push_back(FunctionType::Param(paramGen.build(builder)));
+      auto innerFunction = FunctionType::get(params,
+                                             linearFnResultGen.build(builder));
+      return innerFunction->withExtInfo(extInfo);
+    }
+  };
+  builder.addParameter(firstArgGen);
+  builder.addParameter(linearFnResultGen);
+  if (throws)
+    builder.setRethrows();
+  if (arity == 1)
+    builder.setResult(linearFnParamGens.front());
+  else {
+    BuiltinFunctionBuilder::LambdaGenerator tupleResultGen {
+      [&](BuiltinFunctionBuilder &builder) -> Type {
+        SmallVector<TupleTypeElt, 2> tupleElts;
+        for (auto linearFnParamGen : linearFnParamGens)
+          tupleElts.push_back(linearFnParamGen.build(builder));
+        return TupleType::get(tupleElts, Context);
+      }
+    };
+    builder.setResult(tupleResultGen);
+  }
+  return builder.build(Id);
+}
+
+static ValueDecl *getDifferentiableFunctionConstructor(
+    ASTContext &Context, Identifier Id, unsigned arity, bool throws) {
+  assert(arity >= 1);
+  unsigned numGenericParams = 1 + arity;
+  BuiltinFunctionBuilder builder(Context, numGenericParams);
+  // Get the `Differentiable` and `AdditiveArithmetic` protocols.
+  auto *diffableProto =
+      Context.getProtocol(KnownProtocolKind::Differentiable);
+  auto *tangentVectorDecl =
+      diffableProto->getAssociatedType(Context.Id_TangentVector);
+  assert(tangentVectorDecl);
+  // Create type parameters and add conformance constraints.
+  auto origResultGen = makeGenericParam(arity);
+  builder.addConformanceRequirement(origResultGen, diffableProto);
+  SmallVector<decltype(origResultGen), 2> fnArgGens;
+  for (auto i : range(arity)) {
+    auto T = makeGenericParam(i);
+    builder.addConformanceRequirement(T, diffableProto);
+    fnArgGens.push_back(T);
+  }
+
+  BuiltinFunctionBuilder::LambdaGenerator origFnGen {
+    [=, &fnArgGens](BuiltinFunctionBuilder &builder) -> Type {
+      SmallVector<FunctionType::Param, 2> params;
+      for (auto &paramGen : fnArgGens)
+        params.push_back(FunctionType::Param(paramGen.build(builder)));
+      return FunctionType::get(params, origResultGen.build(builder))
+          ->withExtInfo(FunctionType::ExtInfoBuilder(
+                            FunctionTypeRepresentation::Swift, throws)
+                            .build());
+    }
+  };
+
+  BuiltinFunctionBuilder::LambdaGenerator jvpGen {
+    [=, &fnArgGens, &Context](BuiltinFunctionBuilder &builder) -> Type {
+      SmallVector<FunctionType::Param, 2> params;
+      for (auto &paramGen : fnArgGens)
+        params.push_back(FunctionType::Param(paramGen.build(builder)));
+      auto origResultType = origResultGen.build(builder);
+      SmallVector<FunctionType::Param, 2> differentialParams;
+      for (auto &param : params) {
+        auto tanType = DependentMemberType::get(
+            param.getPlainType(), tangentVectorDecl);
+        differentialParams.push_back(FunctionType::Param(tanType));
+      }
+      auto differentialResultType = DependentMemberType::get(
+          origResultType, tangentVectorDecl);
+      auto differentialType =
+          FunctionType::get({differentialParams}, differentialResultType);
+      auto jvpResultType = TupleType::get(
+          {TupleTypeElt(origResultType, Context.Id_value),
+           TupleTypeElt(differentialType, Context.Id_differential)}, Context);
+      return FunctionType::get(params, jvpResultType)
+          ->withExtInfo(FunctionType::ExtInfoBuilder(
+                            FunctionTypeRepresentation::Swift, throws)
+                            .build());
+    }
+  };
+
+  BuiltinFunctionBuilder::LambdaGenerator vjpGen {
+    [=, &fnArgGens, &Context](BuiltinFunctionBuilder &builder) -> Type {
+      SmallVector<FunctionType::Param, 2> params;
+      for (auto &paramGen : fnArgGens)
+        params.push_back(FunctionType::Param(paramGen.build(builder)));
+      auto origResultType = origResultGen.build(builder);
+      SmallVector<TupleTypeElt, 2> pullbackResultTupleElts;
+      for (auto &param : params) {
+        auto tanType = DependentMemberType::get(
+            param.getPlainType(), tangentVectorDecl);
+        pullbackResultTupleElts.push_back(TupleTypeElt(tanType));
+      }
+      auto pullbackParam = FunctionType::Param(
+            DependentMemberType::get(origResultType, tangentVectorDecl));
+      auto pullbackType = FunctionType::get(
+          {pullbackParam},
+          pullbackResultTupleElts.size() == 1
+              ? pullbackResultTupleElts.front().getType()
+              : TupleType::get(pullbackResultTupleElts, Context));
+      auto vjpResultType = TupleType::get(
+          {TupleTypeElt(origResultType, Context.Id_value),
+           TupleTypeElt(pullbackType, Context.Id_pullback)}, Context);
+      return FunctionType::get(params, vjpResultType)
+          ->withExtInfo(FunctionType::ExtInfoBuilder(
+                            FunctionTypeRepresentation::Swift, throws)
+                            .build());
+    }
+  };
+
+  BuiltinFunctionBuilder::LambdaGenerator resultGen {
+    [&](BuiltinFunctionBuilder &builder) -> Type {
+      auto origFnType = origFnGen.build(builder)->castTo<FunctionType>();
+      return origFnType->withExtInfo(
+          origFnType->getExtInfo()
+              .intoBuilder()
+              .withDifferentiabilityKind(DifferentiabilityKind::Normal)
+              .build());
+    }
+  };
+
+  builder.addParameter(origFnGen, ValueOwnership::Owned);
+  builder.addParameter(jvpGen, ValueOwnership::Owned);
+  builder.addParameter(vjpGen, ValueOwnership::Owned);
+  builder.setResult(resultGen);
+  return builder.build(Id);
+}
+
+static ValueDecl *getLinearFunctionConstructor(
+    ASTContext &Context, Identifier Id, unsigned arity, bool throws) {
+  assert(arity >= 1);
+  unsigned numGenericParams = 1 + arity;
+  BuiltinFunctionBuilder builder(Context, numGenericParams);
+  // Get the `Differentiable` and `AdditiveArithmetic` protocols.
+  auto *diffableProto =
+      Context.getProtocol(KnownProtocolKind::Differentiable);
+  auto *addArithProto =
+      Context.getProtocol(KnownProtocolKind::AdditiveArithmetic);
+  // Create type parameters and add conformance constraints.
+  auto origResultGen = makeGenericParam(arity);
+  builder.addConformanceRequirement(origResultGen, diffableProto);
+  builder.addConformanceRequirement(origResultGen, addArithProto);
+  SmallVector<decltype(origResultGen), 2> fnArgGens;
+  for (auto i : range(arity)) {
+    auto T = makeGenericParam(i);
+    builder.addConformanceRequirement(T, diffableProto);
+    builder.addConformanceRequirement(T, addArithProto);
+    fnArgGens.push_back(T);
+  }
+
+  BuiltinFunctionBuilder::LambdaGenerator origFnGen {
+    [=, &fnArgGens](BuiltinFunctionBuilder &builder) -> Type {
+      SmallVector<FunctionType::Param, 2> params;
+      for (auto &paramGen : fnArgGens)
+        params.push_back(FunctionType::Param(paramGen.build(builder)));
+      return FunctionType::get(params, origResultGen.build(builder))
+          ->withExtInfo(FunctionType::ExtInfoBuilder(
+                            FunctionTypeRepresentation::Swift, throws)
+                            .build());
+    }
+  };
+
+  BuiltinFunctionBuilder::LambdaGenerator transposeFnGen {
+    [=, &fnArgGens, &Context](BuiltinFunctionBuilder &builder) -> Type {
+      auto origResultType = origResultGen.build(builder);
+      SmallVector<TupleTypeElt, 2> resultTupleElts;
+      for (auto &paramGen : fnArgGens)
+        resultTupleElts.push_back(paramGen.build(builder));
+      return FunctionType::get(
+          {FunctionType::Param(origResultType)},
+          resultTupleElts.size() == 1
+              ? resultTupleElts.front().getType()
+              : TupleType::get(resultTupleElts, Context));
+    }
+  };
+
+  BuiltinFunctionBuilder::LambdaGenerator resultGen {
+    [&](BuiltinFunctionBuilder &builder) -> Type {
+      auto origFnType = origFnGen.build(builder)->castTo<FunctionType>();
+      return origFnType->withExtInfo(
+          origFnType->getExtInfo()
+              .intoBuilder()
+              .withDifferentiabilityKind(DifferentiabilityKind::Linear)
+              .build());
+    }
+  };
+
+  builder.addParameter(origFnGen, ValueOwnership::Owned);
+  builder.addParameter(transposeFnGen, ValueOwnership::Owned);
+  builder.setResult(resultGen);
+  return builder.build(Id);
+}
+
+
+
+static ValueDecl *getGlobalStringTablePointer(ASTContext &Context,
+                                              Identifier Id) {
+  // String -> Builtin.RawPointer
+  auto stringType = NominalType::get(Context.getStringDecl(), Type(), Context);
+  return getBuiltinFunction(Id, {stringType}, Context.TheRawPointerType);
+}
+
+static ValueDecl *getConvertStrongToUnownedUnsafe(ASTContext &ctx,
+                                                  Identifier id) {
+  // We actually want this:
+  //
+  // (T, inout unowned (unsafe) T) -> ()
+  //
+  // But for simplicity, we actually accept T, U and do the checking
+  // in the emission method that everything works up. This is a
+  // builtin, so we can crash.
+  BuiltinFunctionBuilder builder(ctx, 2);
+  builder.addParameter(makeGenericParam(0));
+  builder.addParameter(makeGenericParam(1), ValueOwnership::InOut);
+  builder.setResult(makeConcrete(TupleType::getEmpty(ctx)));
+  return builder.build(id);
+}
+
+static ValueDecl *getConvertUnownedUnsafeToGuaranteed(ASTContext &ctx,
+                                                      Identifier id) {
+  // We actually want this:
+  //
+  ///   <BaseT, T> (BaseT, @inout unowned(unsafe) T) -> T
+  //
+  // But for simplicity, we actually accept three generic params T, U and do the
+  // checking in the emission method that everything works up. This is a
+  // builtin, so we can crash.
+  BuiltinFunctionBuilder builder(ctx, 3);
+  builder.addParameter(makeGenericParam(0));                        // Base
+  builder.addParameter(makeGenericParam(1), ValueOwnership::InOut); // Unmanaged
+  builder.setResult(makeGenericParam(2)); // Guaranteed Result
+  return builder.build(id);
+}
+
+static ValueDecl *getGetCurrentAsyncTask(ASTContext &ctx, Identifier id) {
+  return getBuiltinFunction(id, { }, ctx.TheNativeObjectType);
+}
+
+static ValueDecl *getCancelAsyncTask(ASTContext &ctx, Identifier id) {
+  return getBuiltinFunction(
+      id, { ctx.TheNativeObjectType }, ctx.TheEmptyTupleType);
+}
+
+Type swift::getAsyncTaskAndContextType(ASTContext &ctx) {
+  TupleTypeElt resultTupleElements[2] = {
+    ctx.TheNativeObjectType, // task,
+    ctx.TheRawPointerType    // initial context
+  };
+
+  return TupleType::get(resultTupleElements, ctx);
+}
+
+static ValueDecl *getCreateAsyncTask(ASTContext &ctx, Identifier id) {
+  auto extInfo = ASTExtInfoBuilder().withAsync().withThrows().build();
+  return getBuiltinFunction(
+      id,
+      { ctx.getIntDecl()->getDeclaredInterfaceType(),
+        OptionalType::get(ctx.TheNativeObjectType),
+        FunctionType::get({ }, ctx.TheEmptyTupleType, extInfo) },
+      getAsyncTaskAndContextType(ctx));
+}
+
+static ValueDecl *getPoundAssert(ASTContext &Context, Identifier Id) {
+  auto int1Type = BuiltinIntegerType::get(1, Context);
+  auto optionalRawPointerType = BoundGenericEnumType::get(
+      Context.getOptionalDecl(), Type(), {Context.TheRawPointerType});
+  return getBuiltinFunction(Id, {int1Type, optionalRawPointerType},
+                            Context.TheEmptyTupleType);
+}
+
+static ValueDecl *getTSanInoutAccess(ASTContext &Context, Identifier Id) {
+  // <T> T -> ()
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeGenericParam());
+  builder.setResult(makeConcrete(Context.TheEmptyTupleType));
   return builder.build(Id);
 }
 
 static ValueDecl *getAddressOfOperation(ASTContext &Context, Identifier Id) {
   // <T> (@inout T) -> RawPointer
-  GenericSignatureBuilder builder(Context);
-  builder.addParameter(makeInOut(makeGenericParam()));
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeGenericParam(), ValueOwnership::InOut);
   builder.setResult(makeConcrete(Context.TheRawPointerType));
   return builder.build(Id);
+}
+
+static ValueDecl *getAddressOfBorrowOperation(ASTContext &Context,
+                                              Identifier Id) {
+  // <T> (T) -> RawPointer
+  BuiltinFunctionBuilder builder(Context);
+  builder.addParameter(makeGenericParam());
+  builder.setResult(makeConcrete(Context.TheRawPointerType));
+  return builder.build(Id);
+}
+
+static ValueDecl *getTypeJoinOperation(ASTContext &Context, Identifier Id) {
+  // <T,U,V> (T.Type, U.Type) -> V.Type
+  BuiltinFunctionBuilder builder(Context, 3);
+  builder.addParameter(makeMetatype(makeGenericParam(0)));
+  builder.addParameter(makeMetatype(makeGenericParam(1)));
+  builder.setResult(makeMetatype(makeGenericParam(2)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getTypeJoinInoutOperation(ASTContext &Context,
+                                            Identifier Id) {
+  // <T,U,V> (inout T, U.Type) -> V.Type
+  BuiltinFunctionBuilder builder(Context, 3);
+  builder.addParameter(makeGenericParam(0), ValueOwnership::InOut);
+  builder.addParameter(makeMetatype(makeGenericParam(1)));
+  builder.setResult(makeMetatype(makeGenericParam(2)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getTypeJoinMetaOperation(ASTContext &Context, Identifier Id) {
+  // <T,U,V> (T.Type, U.Type) -> V.Type
+  BuiltinFunctionBuilder builder(Context, 3);
+  builder.addParameter(makeMetatype(makeGenericParam(0)));
+  builder.addParameter(makeMetatype(makeGenericParam(1)));
+  builder.setResult(makeMetatype(makeGenericParam(2)));
+  return builder.build(Id);
+}
+
+static ValueDecl *getTriggerFallbackDiagnosticOperation(ASTContext &Context,
+                                                        Identifier Id) {
+  // () -> Void
+  return getBuiltinFunction(Id, {}, Context.TheEmptyTupleType);
 }
 
 static ValueDecl *getCanBeObjCClassOperation(ASTContext &Context,
                                              Identifier Id) {
   // <T> T.Type -> Builtin.Int8
-  GenericSignatureBuilder builder(Context);
+  BuiltinFunctionBuilder builder(Context);
   builder.addParameter(makeMetatype(makeGenericParam()));
   builder.setResult(makeConcrete(BuiltinIntegerType::get(8, Context)));
   return builder.build(Id);
 }
 
-static ValueDecl *getCondFailOperation(ASTContext &C, Identifier Id) {
+static ValueDecl *getLegacyCondFailOperation(ASTContext &C, Identifier Id) {
   // Int1 -> ()
   auto CondTy = BuiltinIntegerType::get(1, C);
   auto VoidTy = TupleType::getEmpty(C);
-  TupleTypeElt CondElt(CondTy);
-  return getBuiltinFunction(Id, CondElt, VoidTy);
+  return getBuiltinFunction(Id, {CondTy}, VoidTy);
+}
+
+static ValueDecl *getCondFailOperation(ASTContext &C, Identifier Id) {
+  // Int1 -> ()
+  auto CondTy = BuiltinIntegerType::get(1, C);
+  auto MsgTy = C.TheRawPointerType;
+  auto VoidTy = TupleType::getEmpty(C);
+  return getBuiltinFunction(Id, {CondTy, MsgTy}, VoidTy);
 }
 
 static ValueDecl *getAssertConfOperation(ASTContext &C, Identifier Id) {
   // () -> Int32
   auto Int32Ty = BuiltinIntegerType::get(32, C);
-  auto VoidTy = TupleType::getEmpty(C);
-  TupleTypeElt EmptyElt(VoidTy);
-  return getBuiltinFunction(Id, EmptyElt, Int32Ty);
+  return getBuiltinFunction(Id, {}, Int32Ty);
 }
 
 static ValueDecl *getFixLifetimeOperation(ASTContext &C, Identifier Id) {
   // <T> T -> ()
-  GenericSignatureBuilder builder(C);
+  BuiltinFunctionBuilder builder(C);
   builder.addParameter(makeGenericParam());
   builder.setResult(makeConcrete(TupleType::getEmpty(C)));
   return builder.build(Id);
@@ -892,9 +1485,8 @@ static ValueDecl *getExtractElementOperation(ASTContext &Context, Identifier Id,
   if (!IndexTy || !IndexTy->isFixedWidth() || IndexTy->getFixedWidth() != 32)
     return nullptr;
 
-  TupleTypeElt ArgElts[] = { VecTy, IndexTy };
   Type ResultTy = VecTy->getElementType();
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { VecTy, IndexTy }, ResultTy);
 }
 
 static ValueDecl *getInsertElementOperation(ASTContext &Context, Identifier Id,
@@ -913,154 +1505,97 @@ static ValueDecl *getInsertElementOperation(ASTContext &Context, Identifier Id,
   if (!IndexTy || !IndexTy->isFixedWidth() || IndexTy->getFixedWidth() != 32)
     return nullptr;
 
-  TupleTypeElt ArgElts[] = { VecTy, ElementTy, IndexTy };
-  Type ResultTy = VecTy;
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  Type ArgElts[] = { VecTy, ElementTy, IndexTy };
+  return getBuiltinFunction(Id, ArgElts, VecTy);
 }
 
 static ValueDecl *getStaticReportOperation(ASTContext &Context, Identifier Id) {
   auto BoolTy = BuiltinIntegerType::get(1, Context);
   auto MessageTy = Context.TheRawPointerType;
 
-  TupleTypeElt ArgElts[] = { BoolTy, BoolTy, MessageTy };
+  Type ArgElts[] = { BoolTy, BoolTy, MessageTy };
   Type ResultTy = TupleType::getEmpty(Context);
   
   return getBuiltinFunction(Id, ArgElts, ResultTy);
 }
 
-static ValueDecl *getCheckedTruncOperation(ASTContext &Context,
-                                                Identifier Id,
-                                                Type InputTy,
-                                                Type OutputTy) {
-  auto InTy = InputTy->getAs<BuiltinIntegerType>();
+static ValueDecl *getCheckedTruncOperation(ASTContext &Context, Identifier Id,
+                                           Type InputTy, Type OutputTy,
+                                           bool AllowLiteral) {
+  auto InTy = InputTy->getAs<AnyBuiltinIntegerType>();
   auto OutTy = OutputTy->getAs<BuiltinIntegerType>();
   if (!InTy || !OutTy)
     return nullptr;
-  if (InTy->getLeastWidth() < OutTy->getGreatestWidth())
+  if (isa<BuiltinIntegerLiteralType>(InTy)) {
+    if (!AllowLiteral)
+      return nullptr;
+  } else if (cast<BuiltinIntegerType>(InTy)->getLeastWidth()
+               < OutTy->getGreatestWidth()) {
     return nullptr;
+  }
 
-  TupleTypeElt ArgElts[] = { InTy };
   Type OverflowBitTy = BuiltinIntegerType::get(1, Context);
-  TupleTypeElt ResultElts[] = { OutTy, OverflowBitTy };
+  TupleTypeElt ResultElts[] = { Type(OutTy), OverflowBitTy };
   Type ResultTy = TupleType::get(ResultElts, Context);
-
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
-}
-
-static ValueDecl *getCheckedConversionOperation(ASTContext &Context,
-                                                Identifier Id,
-                                                Type Ty) {
-  auto BuiltinTy = Ty->getAs<BuiltinIntegerType>();
-  if (!BuiltinTy)
-    return nullptr;
-
-  TupleTypeElt ArgElts[] = { BuiltinTy };
-  Type SignErrorBitTy = BuiltinIntegerType::get(1, Context);
-  TupleTypeElt ResultElts[] = { BuiltinTy, SignErrorBitTy };
-  Type ResultTy = TupleType::get(ResultElts, Context);
-
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { InTy }, ResultTy);
 }
 
 static ValueDecl *getIntToFPWithOverflowOperation(ASTContext &Context,
                                                   Identifier Id, Type InputTy,
                                                   Type OutputTy) {
-  auto InTy = InputTy->getAs<BuiltinIntegerType>();
+  auto InTy = InputTy->getAs<BuiltinIntegerLiteralType>();
   auto OutTy = OutputTy->getAs<BuiltinFloatType>();
   if (!InTy || !OutTy)
     return nullptr;
 
-  TupleTypeElt ArgElts[] = { InTy };
-  Type ResultTy = OutTy;
-
-  return getBuiltinFunction(Id, ArgElts, ResultTy);
+  return getBuiltinFunction(Id, { InTy }, OutTy);
 }
 
 static ValueDecl *getUnreachableOperation(ASTContext &Context,
                                           Identifier Id) {
-  // @noreturn () -> ()
-  auto VoidTy = Context.TheEmptyTupleType;
-  return getBuiltinFunction(Id, {}, VoidTy,
-                            AnyFunctionType::ExtInfo().withIsNoReturn(true));
+  auto NeverTy = Context.getNeverType();
+  if (!NeverTy)
+    return nullptr;
+
+  // () -> Never
+  return getBuiltinFunction(Id, {}, NeverTy);
 }
 
 static ValueDecl *getOnceOperation(ASTContext &Context,
-                                   Identifier Id) {
-  // (RawPointer, @convention(thin) () -> ()) -> ()
+                                   Identifier Id,
+                                   bool withContext) {
+  // (RawPointer, @convention(c) ([Context]) -> ()[, Context]) -> ()
   
   auto HandleTy = Context.TheRawPointerType;
   auto VoidTy = Context.TheEmptyTupleType;
-  auto Thin = FunctionType::ExtInfo(FunctionTypeRepresentation::Thin,
-                                    /*noreturn*/ false, /*throws*/ false);
-  
-  auto BlockTy = FunctionType::get(VoidTy, VoidTy, Thin);
-  
-  TupleTypeElt InFields[] = {HandleTy, BlockTy};
-  auto OutTy = VoidTy;
-  
-  return getBuiltinFunction(Id, InFields, OutTy);
+  SmallVector<AnyFunctionType::Param, 1> CFuncParams;
+  swift::CanType ContextTy;
+  if (withContext) {
+    ContextTy = Context.TheRawPointerType;
+    auto ContextArg = FunctionType::Param(ContextTy);
+    CFuncParams.push_back(ContextArg);
+  }
+  auto Rep = FunctionTypeRepresentation::CFunctionPointer;
+  auto ClangType = Context.getClangFunctionType(CFuncParams, VoidTy, Rep);
+  auto Thin =
+      FunctionType::ExtInfoBuilder(FunctionTypeRepresentation::CFunctionPointer,
+                                   /*throws*/ false)
+          .withClangFunctionType(ClangType)
+          .build();
+  auto BlockTy = FunctionType::get(CFuncParams, VoidTy, Thin);
+  SmallVector<swift::Type, 3> ArgTypes = {HandleTy, BlockTy};
+  if (withContext)
+    ArgTypes.push_back(ContextTy);
+  return getBuiltinFunction(Id, ArgTypes, VoidTy);
 }
 
-static ValueDecl *getTryPinOperation(ASTContext &ctx, Identifier name) {
-  // <T> NativeObject -> T
-  // (T must actually be NativeObject?)
-  GenericSignatureBuilder builder(ctx);
-  builder.addParameter(makeConcrete(ctx.TheNativeObjectType));
+static ValueDecl *getPolymorphicBinaryOperation(ASTContext &ctx,
+                                                Identifier id) {
+  BuiltinFunctionBuilder builder(ctx);
+  builder.addParameter(makeGenericParam());
+  builder.addParameter(makeGenericParam());
   builder.setResult(makeGenericParam());
-  return builder.build(name);
-}
-
-static ValueDecl *getProjectValueBufferOperation(ASTContext &ctx,
-                                                 Identifier name) {
-  // <T> (inout Builtin.UnsafeValueBuffer, T.Type) -> Builtin.RawPointer
-  GenericSignatureBuilder builder(ctx);
-  builder.addParameter(makeConcrete(
-                              InOutType::get(ctx.TheUnsafeValueBufferType)));
-  builder.addParameter(makeMetatype(makeGenericParam()));
-  builder.setResult(makeConcrete(ctx.TheRawPointerType));
-  return builder.build(name);
-}
-
-static ValueDecl *getDeallocValueBufferOperation(ASTContext &ctx,
-                                                 Identifier name) {
-  // <T> (inout Builtin.UnsafeValueBuffer, T.Type) -> ()
-  GenericSignatureBuilder builder(ctx);
-  builder.addParameter(makeConcrete(
-                              InOutType::get(ctx.TheUnsafeValueBufferType)));
-  builder.addParameter(makeMetatype(makeGenericParam()));
-  builder.setResult(makeConcrete(ctx.TheRawPointerType));
-  return builder.build(name);
-}
-
-static ValueDecl *
-getMakeMaterializeForSetCallbackOperation(ASTContext &ctx, Identifier name) {
-  // <T>    ((Builtin.RawPointer,
-  //          inout Builtin.UnsafeValueBuffer,
-  //          inout T,
-  //          T.Type) -> ())
-  //      ->
-  //  @convention(thin) ((Builtin.RawPointer,
-  //          inout Builtin.UnsafeValueBuffer,
-  //          inout T,
-  //          @thick T.Type) -> ())
-  GenericSignatureBuilder builder(ctx);
-  builder.addParameter(
-    makeFunction(
-      makeTuple(makeConcrete(ctx.TheRawPointerType),
-                makeConcrete(InOutType::get(ctx.TheUnsafeValueBufferType)),
-                makeInOut(makeGenericParam()),
-                makeMetatype(makeGenericParam())),
-      makeConcrete(TupleType::getEmpty(ctx))));
-  builder.setResult(
-    makeFunction(
-      makeTuple(makeConcrete(ctx.TheRawPointerType),
-                makeConcrete(InOutType::get(ctx.TheUnsafeValueBufferType)),
-                makeInOut(makeGenericParam()),
-                makeMetatype(makeGenericParam(), MetatypeRepresentation::Thick)),
-      makeConcrete(TupleType::getEmpty(ctx)),
-      FunctionType::ExtInfo()
-        .withRepresentation(FunctionType::Representation::Thin)));
-  return builder.build(name);
+  return builder.build(id);
 }
 
 /// An array of the overloaded builtin kinds.
@@ -1073,8 +1608,10 @@ static const OverloadedBuiltinKind OverloadedBuiltinKinds[] = {
    OverloadedBuiltinKind::Special,
 #define BUILTIN_CAST_OR_BITCAST_OPERATION(id, attrs, name) \
    OverloadedBuiltinKind::Special,
-#define BUILTIN_BINARY_OPERATION(id, name, attrs, overload) \
-   OverloadedBuiltinKind::overload,
+#define BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC(id, name, attrs, overload)  \
+  OverloadedBuiltinKind::overload,
+#define BUILTIN_BINARY_OPERATION_POLYMORPHIC(id, name)                         \
+  OverloadedBuiltinKind::Special,
 #define BUILTIN_BINARY_OPERATION_WITH_OVERFLOW(id, name, _, attrs, overload) \
    OverloadedBuiltinKind::overload,
 #define BUILTIN_BINARY_PREDICATE(id, name, attrs, overload) \
@@ -1085,6 +1622,9 @@ static const OverloadedBuiltinKind OverloadedBuiltinKinds[] = {
    OverloadedBuiltinKind::overload,
 #define BUILTIN_MISC_OPERATION(id, name, attrs, overload) \
    OverloadedBuiltinKind::overload,
+#define BUILTIN_SANITIZER_OPERATION(id, name, attrs) \
+  OverloadedBuiltinKind::None,
+#define BUILTIN_TYPE_CHECKER_OPERATION(id, name) OverloadedBuiltinKind::Special,
 #define BUILTIN_TYPE_TRAIT_OPERATION(id, name) \
    OverloadedBuiltinKind::Special,
 #define BUILTIN_RUNTIME_CALL(id, attrs, name) \
@@ -1124,10 +1664,26 @@ inline bool isBuiltinTypeOverloaded(Type T, OverloadedBuiltinKind OK) {
   llvm_unreachable("bad overloaded builtin kind");
 }
 
-/// getLLVMIntrinsicID - Given an LLVM IR intrinsic name with argument types
-/// removed (e.g. like "bswap") return the LLVM IR IntrinsicID for the intrinsic
-/// or 0 if the intrinsic name doesn't match anything.
-unsigned swift::getLLVMIntrinsicID(StringRef InName, bool hasArgTypes) {
+bool swift::canBuiltinBeOverloadedForType(BuiltinValueKind ID, Type Ty) {
+  if (ID == BuiltinValueKind::None)
+    return false;
+
+  return isBuiltinTypeOverloaded(Ty, OverloadedBuiltinKinds[unsigned(ID)]);
+}
+
+/// Table of string intrinsic names indexed by enum value.
+static const char *const IntrinsicNameTable[] = {
+    "not_intrinsic",
+#define GET_INTRINSIC_NAME_TABLE
+#include "llvm/IR/IntrinsicImpl.inc"
+#undef GET_INTRINSIC_NAME_TABLE
+};
+
+#define GET_INTRINSIC_TARGET_DATA
+#include "llvm/IR/IntrinsicImpl.inc"
+#undef GET_INTRINSIC_TARGET_DATA
+
+llvm::Intrinsic::ID swift::getLLVMIntrinsicID(StringRef InName) {
   using namespace llvm;
 
   // Swift intrinsic names start with int_.
@@ -1140,15 +1696,12 @@ unsigned swift::getLLVMIntrinsicID(StringRef InName, bool hasArgTypes) {
   NameS.append("llvm.");
   for (char C : InName)
     NameS.push_back(C == '_' ? '.' : C);
-  if (hasArgTypes)
-    NameS.push_back('.');
-  
+
   const char *Name = NameS.c_str();
-  unsigned Len = NameS.size();
-#define GET_FUNCTION_RECOGNIZER
-#include "llvm/IR/Intrinsics.gen"
-#undef GET_FUNCTION_RECOGNIZER
-  return llvm::Intrinsic::not_intrinsic;
+  ArrayRef<const char *> NameTable(&IntrinsicNameTable[1],
+                                   TargetInfos[1].Offset);
+  int Idx = Intrinsic::lookupLLVMIntrinsicByName(NameTable, Name);
+  return static_cast<Intrinsic::ID>(Idx + 1);
 }
 
 llvm::Intrinsic::ID
@@ -1171,46 +1724,143 @@ swift::getLLVMIntrinsicIDForBuiltinWithOverflow(BuiltinValueKind ID) {
   llvm_unreachable("Cannot convert the overflow builtin to llvm intrinsic.");
 }
 
-static Type DecodeIntrinsicType(ArrayRef<llvm::Intrinsic::IITDescriptor> &Table,
-                                ArrayRef<Type> Tys, ASTContext &Context) {
+namespace {
+
+class IntrinsicTypeDecoder {
+  ArrayRef<llvm::Intrinsic::IITDescriptor> &Table;
+  ArrayRef<Type> TypeArguments;
+  ASTContext &Context;
+public:
+  IntrinsicTypeDecoder(ArrayRef<llvm::Intrinsic::IITDescriptor> &table,
+                       ArrayRef<Type> typeArguments, ASTContext &ctx)
+    : Table(table), TypeArguments(typeArguments), Context(ctx) {}
+
+  Type decodeImmediate();
+
+  /// Return the type argument at the given index.
+  Type getTypeArgument(unsigned index) {
+    if (index >= TypeArguments.size())
+      return Type();
+    return TypeArguments[index];
+  }
+
+  /// Create a pointer type.
+  Type makePointer(Type eltType, unsigned addrspace) {
+    // Reject non-default address space pointers.
+    if (addrspace)
+      return Type();
+
+    // For now, always ignore the element type and use RawPointer.
+    return Context.TheRawPointerType;
+  }
+
+  /// Create a vector type.
+  Type makeVector(Type eltType, unsigned width) {
+    return BuiltinVectorType::get(Context, eltType, width);
+  }
+
+  /// Return the first type or, if the second type is a vector type, a vector
+  /// of the first type of the same length as the second type.
+  Type maybeMakeVectorized(Type eltType, Type maybeVectorType) {
+    if (auto vectorType = maybeVectorType->getAs<BuiltinVectorType>()) {
+      return makeVector(eltType, vectorType->getNumElements());
+    }
+    return eltType;
+  }
+};
+
+} // end anonymous namespace
+
+static Type DecodeIntrinsicType(ArrayRef<llvm::Intrinsic::IITDescriptor> &table,
+                                ArrayRef<Type> typeArguments, ASTContext &ctx) {
+  return IntrinsicTypeDecoder(table, typeArguments, ctx).decodeImmediate();
+}
+
+Type IntrinsicTypeDecoder::decodeImmediate() {
   typedef llvm::Intrinsic::IITDescriptor IITDescriptor;
   IITDescriptor D = Table.front();
   Table = Table.slice(1);
   switch (D.Kind) {
-  default:
-    llvm_unreachable("Unhandled case");
-  case IITDescriptor::Half:
+  case IITDescriptor::BFloat:
   case IITDescriptor::MMX:
   case IITDescriptor::Metadata:
-  case IITDescriptor::Vector:
   case IITDescriptor::ExtendArgument:
   case IITDescriptor::TruncArgument:
+  case IITDescriptor::HalfVecArgument:
   case IITDescriptor::VarArg:
+  case IITDescriptor::Token:
+  case IITDescriptor::VecElementArgument:
+  case IITDescriptor::VecOfAnyPtrsToElt:
+  case IITDescriptor::VecOfBitcastsToInt:
+  case IITDescriptor::Subdivide2Argument:
+  case IITDescriptor::Subdivide4Argument:
     // These types cannot be expressed in swift yet.
     return Type();
 
-  case IITDescriptor::Void: return TupleType::getEmpty(Context);
-  case IITDescriptor::Float: return Context.TheIEEE32Type;
-  case IITDescriptor::Double: return Context.TheIEEE64Type;
-
+  // Fundamental types.
+  case IITDescriptor::Void:
+    return TupleType::getEmpty(Context);
+  case IITDescriptor::Half:
+    return Context.TheIEEE16Type;
+  case IITDescriptor::Float:
+    return Context.TheIEEE32Type;
+  case IITDescriptor::Double:
+    return Context.TheIEEE64Type;
+  case IITDescriptor::Quad:
+    return Context.TheIEEE128Type;
   case IITDescriptor::Integer:
     return BuiltinIntegerType::get(D.Integer_Width, Context);
-  case IITDescriptor::Pointer:
-    if (D.Pointer_AddressSpace)
-      return Type();  // Reject non-default address space pointers.
-      
-    // Decode but ignore the pointee.  Just decode all IR pointers to unsafe
-    // pointer type.
-    (void)DecodeIntrinsicType(Table, Tys, Context);
-    return Context.TheRawPointerType;
+
+  // A vector of an immediate type.
+  case IITDescriptor::Vector: {
+    Type eltType = decodeImmediate();
+    if (!eltType) return Type();
+    return makeVector(eltType, D.Vector_Width.Min);
+  }
+
+  // A pointer to an immediate type.
+  case IITDescriptor::Pointer: {
+    Type pointeeType = decodeImmediate();
+    if (!pointeeType) return Type();
+    return makePointer(pointeeType, D.Pointer_AddressSpace);
+  }
+
+  // A type argument.
   case IITDescriptor::Argument:
-    if (D.getArgumentNumber() >= Tys.size())
-      return Type();
-    return Tys[D.getArgumentNumber()];
+    return getTypeArgument(D.getArgumentNumber());
+
+  // A pointer to a type argument.
+  case IITDescriptor::PtrToArgument: {
+    Type argType = getTypeArgument(D.getArgumentNumber());
+    if (!argType) return Type();
+    unsigned addrspace = 0; // An apparent limitation of LLVM.
+    return makePointer(argType, addrspace);
+  }
+
+  // A vector of the same width as a type argument.
+  case IITDescriptor::SameVecWidthArgument: {
+    Type maybeVectorType = getTypeArgument(D.getArgumentNumber());
+    if (!maybeVectorType) return Type();
+    Type eltType = decodeImmediate();
+    if (!eltType) return Type();
+    return maybeMakeVectorized(eltType, maybeVectorType);
+  }
+
+  // A pointer to the element type of a type argument, which must be a vector.
+  case IITDescriptor::PtrToElt: {
+    Type argType = getTypeArgument(D.getArgumentNumber());
+    if (!argType) return Type();
+    auto vecType = argType->getAs<BuiltinVectorType>();
+    if (!vecType) return Type();
+    unsigned addrspace = 0; // An apparent limitation of LLVM.
+    return makePointer(vecType->getElementType(), addrspace);
+  }
+
+  // A struct, which we translate as a tuple.
   case IITDescriptor::Struct: {
     SmallVector<TupleTypeElt, 5> Elts;
     for (unsigned i = 0; i != D.Struct_NumElements; ++i) {
-      Type T = DecodeIntrinsicType(Table, Tys, Context);
+      Type T = decodeImmediate();
       if (!T) return Type();
       
       Elts.push_back(T);
@@ -1223,12 +1873,11 @@ static Type DecodeIntrinsicType(ArrayRef<llvm::Intrinsic::IITDescriptor> &Table,
 
 /// \returns true on success, false on failure.
 static bool
-getSwiftFunctionTypeForIntrinsic(unsigned iid, ArrayRef<Type> TypeArgs,
+getSwiftFunctionTypeForIntrinsic(llvm::Intrinsic::ID ID,
+                                 ArrayRef<Type> TypeArgs,
                                  ASTContext &Context,
-                                 SmallVectorImpl<TupleTypeElt> &ArgElts,
-                                 Type &ResultTy, FunctionType::ExtInfo &Info) {
-  llvm::Intrinsic::ID ID = (llvm::Intrinsic::ID)iid;
-  
+                                 SmallVectorImpl<Type> &ArgElts,
+                                 Type &ResultTy) {
   typedef llvm::Intrinsic::IITDescriptor IITDescriptor;
   SmallVector<IITDescriptor, 8> Table;
   getIntrinsicInfoTableEntries(ID, Table);
@@ -1248,12 +1897,15 @@ getSwiftFunctionTypeForIntrinsic(unsigned iid, ArrayRef<Type> TypeArgs,
   }
   
   // Translate LLVM function attributes to Swift function attributes.
-  llvm::AttributeSet attrs
-    = llvm::Intrinsic::getAttributes(llvm::getGlobalContext(), ID);
-  Info = FunctionType::ExtInfo();
-  if (attrs.hasAttribute(llvm::AttributeSet::FunctionIndex,
-                         llvm::Attribute::NoReturn))
-    Info = Info.withIsNoReturn(true);
+  IntrinsicInfo II;
+  II.ID = ID;
+  auto attrs = II.getOrCreateAttributes(Context);
+  if (attrs.hasAttribute(llvm::AttributeList::FunctionIndex,
+                         llvm::Attribute::NoReturn)) {
+    ResultTy = Context.getNeverType();
+    if (!ResultTy)
+      return false;
+  }
   
   return true;
 }
@@ -1281,17 +1933,34 @@ static bool isValidStoreOrdering(StringRef Ordering) {
          Ordering == "seqcst";
 }
 
-/// decodeLLVMAtomicOrdering - turn a string like "release" into the LLVM enum.
-static llvm::AtomicOrdering decodeLLVMAtomicOrdering(StringRef O) {
+llvm::AtomicOrdering swift::decodeLLVMAtomicOrdering(StringRef O) {
   using namespace llvm;
   return StringSwitch<AtomicOrdering>(O)
-    .Case("unordered", Unordered)
-    .Case("monotonic", Monotonic)
-    .Case("acquire", Acquire)
-    .Case("release", Release)
-    .Case("acqrel", AcquireRelease)
-    .Case("seqcst", SequentiallyConsistent)
-    .Default(NotAtomic);
+    .Case("unordered", AtomicOrdering::Unordered)
+    .Case("monotonic", AtomicOrdering::Monotonic)
+    .Case("acquire", AtomicOrdering::Acquire)
+    .Case("release", AtomicOrdering::Release)
+    .Case("acqrel", AtomicOrdering::AcquireRelease)
+    .Case("seqcst", AtomicOrdering::SequentiallyConsistent)
+    .Default(AtomicOrdering::NotAtomic);
+}
+
+static bool isUnknownOrUnordered(llvm::AtomicOrdering ordering) {
+  using namespace llvm;
+  switch (ordering) {
+  case AtomicOrdering::NotAtomic:
+  case AtomicOrdering::Unordered:
+    return true;
+
+  case AtomicOrdering::Monotonic:
+  case AtomicOrdering::Acquire:
+  case AtomicOrdering::Release:
+  case AtomicOrdering::AcquireRelease:
+  case AtomicOrdering::SequentiallyConsistent:
+    return false;
+  }
+
+  llvm_unreachable("Unhandled AtomicOrdering in switch.");
 }
 
 static bool isValidCmpXChgOrdering(StringRef SuccessString, 
@@ -1301,31 +1970,35 @@ static bool isValidCmpXChgOrdering(StringRef SuccessString,
   AtomicOrdering FailureOrdering = decodeLLVMAtomicOrdering(FailureString);
 
   // Unordered and unknown values are not allowed.
-  if (SuccessOrdering <= Unordered  ||  FailureOrdering <= Unordered)
+  if (isUnknownOrUnordered(SuccessOrdering) ||
+      isUnknownOrUnordered(FailureOrdering))
     return false;
   // Success must be at least as strong as failure.
-  if (SuccessOrdering < FailureOrdering)
+  if (!isAtLeastOrStrongerThan(SuccessOrdering, FailureOrdering))
     return false;
   // Failure may not release because no store occurred.
-  if (FailureOrdering == Release  ||  FailureOrdering == AcquireRelease)
+  if (FailureOrdering == AtomicOrdering::Release ||
+      FailureOrdering == AtomicOrdering::AcquireRelease)
     return false;
 
   return true;
 }
 
 ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
+  #if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
+    return nullptr; // not needed for the parser library.
+  #endif
+
   SmallVector<Type, 4> Types;
   StringRef OperationName = getBuiltinBaseName(Context, Id.str(), Types);
 
   // If this is the name of an LLVM intrinsic, cons up a swift function with a
   // type that matches the IR types.
-  if (unsigned ID = getLLVMIntrinsicID(OperationName, !Types.empty())) {
-    SmallVector<TupleTypeElt, 8> ArgElts;
+  if (llvm::Intrinsic::ID ID = getLLVMIntrinsicID(OperationName)) {
+    SmallVector<Type, 8> ArgElts;
     Type ResultTy;
-    FunctionType::ExtInfo Info;
-    if (getSwiftFunctionTypeForIntrinsic(ID, Types, Context, ArgElts, ResultTy,
-                                         Info))
-      return getBuiltinFunction(Id, ArgElts, ResultTy, Info);
+    if (getSwiftFunctionTypeForIntrinsic(ID, Types, Context, ArgElts, ResultTy))
+      return getBuiltinFunction(Id, ArgElts, ResultTy);
   }
   
   // If this starts with fence, we have special suffixes to handle.
@@ -1372,11 +2045,11 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
 
     // Accept weak, volatile, and singlethread if present.
     if (NextPart != Parts.end() && *NextPart == "weak")
-      NextPart++;
+      ++NextPart;
     if (NextPart != Parts.end() && *NextPart == "volatile")
-      NextPart++;
+      ++NextPart;
     if (NextPart != Parts.end() && *NextPart == "singlethread")
-      NextPart++;
+      ++NextPart;
     // Nothing else is allowed in the name.
     if (NextPart != Parts.end())
       return nullptr;
@@ -1474,12 +2147,53 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
       return nullptr;
     return getAtomicStoreOperation(Context, Id, T);
   }
+  if (OperationName.startswith("allocWithTailElems_")) {
+    OperationName = OperationName.drop_front(strlen("allocWithTailElems_"));
+    int NumTailTypes = 0;
+    if (OperationName.getAsInteger(10, NumTailTypes))
+      return nullptr;
 
-  BuiltinValueKind BV = llvm::StringSwitch<BuiltinValueKind>(OperationName)
-#define BUILTIN(id, name, Attrs) \
-       .Case(name, BuiltinValueKind::id)
+    return getAllocWithTailElemsOperation(Context, Id, NumTailTypes);
+  }
+  if (OperationName.startswith("applyDerivative_")) {
+    AutoDiffDerivativeFunctionKind kind;
+    unsigned arity;
+    bool throws;
+    if (!autodiff::getBuiltinApplyDerivativeConfig(
+            OperationName, kind, arity, throws))
+      return nullptr;
+    return getAutoDiffApplyDerivativeFunction(Context, Id, kind, arity,
+                                              throws);
+  }
+  if (OperationName.startswith("applyTranspose_")) {
+    unsigned arity;
+    bool throws;
+    if (!autodiff::getBuiltinApplyTransposeConfig(
+            OperationName, arity, throws))
+      return nullptr;
+    return getAutoDiffApplyTransposeFunction(Context, Id, arity, throws);
+  }
+  if (OperationName.startswith("differentiableFunction_")) {
+    unsigned arity;
+    bool throws;
+    if (!autodiff::getBuiltinDifferentiableOrLinearFunctionConfig(
+            OperationName, arity, throws))
+      return nullptr;
+    return getDifferentiableFunctionConstructor(Context, Id, arity, throws);
+  }
+  if (OperationName.startswith("linearFunction_")) {
+    unsigned arity;
+    bool throws;
+    if (!autodiff::getBuiltinDifferentiableOrLinearFunctionConfig(
+          OperationName, arity, throws))
+      return nullptr;
+    return getLinearFunctionConstructor(Context, Id, arity, throws);
+  }
+
+  auto BV = llvm::StringSwitch<BuiltinValueKind>(OperationName)
+#define BUILTIN(id, name, Attrs) .Case(name, BuiltinValueKind::id)
 #include "swift/AST/Builtins.def"
-       .Default(BuiltinValueKind::None);
+    .Default(BuiltinValueKind::None);
 
   // Filter out inappropriate overloads.
   OverloadedBuiltinKind OBK = OverloadedBuiltinKinds[unsigned(BV)];
@@ -1495,18 +2209,55 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::AtomicRMW:
   case BuiltinValueKind::AtomicLoad:
   case BuiltinValueKind::AtomicStore:
+  case BuiltinValueKind::AllocWithTailElems:
     llvm_unreachable("Handled above");
   case BuiltinValueKind::None: return nullptr;
 
+  case BuiltinValueKind::GepRaw:
+    if (Types.size() != 1) return nullptr;
+    return getGepRawOperation(Id, Types[0]);
+
+  case BuiltinValueKind::StringObjectOr:
+    if (Types.size() != 1)
+      return nullptr;
+    return getStringObjectOrOperation(Id, Types[0]);
+
   case BuiltinValueKind::Gep:
     if (Types.size() != 1) return nullptr;
-    return getGepOperation(Id, Types[0]);
+    return getGepOperation(Context, Id, Types[0]);
+
+  case BuiltinValueKind::GetTailAddr:
+    if (Types.size() != 1) return nullptr;
+    return getGetTailAddrOperation(Context, Id, Types[0]);
+
+  case BuiltinValueKind::PerformInstantaneousReadAccess:
+    if (!Types.empty()) return nullptr;
+      return getPerformInstantaneousReadAccessOperation(Context, Id);
+
+  case BuiltinValueKind::BeginUnpairedModifyAccess:
+    if (!Types.empty()) return nullptr;
+    return getBeginUnpairedAccessOperation(Context, Id);
+
+  case BuiltinValueKind::EndUnpairedAccess:
+    if (!Types.empty()) return nullptr;
+    return getEndUnpairedAccessOperation(Context, Id);
 
 #define BUILTIN(id, name, Attrs)
-#define BUILTIN_BINARY_OPERATION(id, name, attrs, overload)  case BuiltinValueKind::id:
+#define BUILTIN_BINARY_OPERATION(id, name, attrs)
+#define BUILTIN_BINARY_OPERATION_OVERLOADED_STATIC(id, name, attrs, overload)  \
+  case BuiltinValueKind::id:
 #include "swift/AST/Builtins.def"
     if (Types.size() != 1) return nullptr;
-    return getBinaryOperation(Id, Types[0]);
+      return getBinaryOperation(Id, Types[0]);
+
+#define BUILTIN(id, name, attrs)
+#define BUILTIN_BINARY_OPERATION(id, name, attrs)
+#define BUILTIN_BINARY_OPERATION_POLYMORPHIC(id, name)                         \
+  case BuiltinValueKind::id:
+#include "swift/AST/Builtins.def"
+      if (!Types.empty())
+        return nullptr;
+      return getPolymorphicBinaryOperation(Context, Id);
 
 #define BUILTIN(id, name, Attrs)
 #define BUILTIN_BINARY_OPERATION_WITH_OVERFLOW(id, name, _, attrs, overload)  case BuiltinValueKind::id:
@@ -1532,17 +2283,15 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
 #include "swift/AST/Builtins.def"
     return getCastOperation(Context, Id, BV, Types);
 
-  case BuiltinValueKind::TryPin:
-    return getTryPinOperation(Context, Id);
-
   case BuiltinValueKind::Retain:
   case BuiltinValueKind::Release:
   case BuiltinValueKind::Autorelease:
-  case BuiltinValueKind::Unpin:
     if (!Types.empty()) return nullptr;
     return getRefCountingOperation(Context, Id);
       
   case BuiltinValueKind::Load:
+  case BuiltinValueKind::LoadRaw:
+  case BuiltinValueKind::LoadInvariant:
   case BuiltinValueKind::Take:
     if (!Types.empty()) return nullptr;
     return getLoadOperation(Context, Id);
@@ -1561,26 +2310,55 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     return getDestroyArrayOperation(Context, Id);
       
   case BuiltinValueKind::CopyArray:
+  case BuiltinValueKind::TakeArrayNoAlias:
   case BuiltinValueKind::TakeArrayFrontToBack:
   case BuiltinValueKind::TakeArrayBackToFront:
+  case BuiltinValueKind::AssignCopyArrayNoAlias:
+  case BuiltinValueKind::AssignCopyArrayFrontToBack:
+  case BuiltinValueKind::AssignCopyArrayBackToFront:
+  case BuiltinValueKind::AssignTakeArray:
     if (!Types.empty()) return nullptr;
     return getTransferArrayOperation(Context, Id);
 
   case BuiltinValueKind::IsUnique:
-  case BuiltinValueKind::IsUniqueOrPinned:
   case BuiltinValueKind::IsUnique_native:
-  case BuiltinValueKind::IsUniqueOrPinned_native:
+  case BuiltinValueKind::BeginCOWMutation:
+  case BuiltinValueKind::BeginCOWMutation_native:
     if (!Types.empty()) return nullptr;
+    // BeginCOWMutation has the same signature as IsUnique.
     return getIsUniqueOperation(Context, Id);
+
+  case BuiltinValueKind::EndCOWMutation:
+    if (!Types.empty()) return nullptr;
+    return getEndCOWMutation(Context, Id);
+
+  case BuiltinValueKind::BindMemory:
+    if (!Types.empty()) return nullptr;
+    return getBindMemoryOperation(Context, Id);
+
+  case BuiltinValueKind::ProjectTailElems:
+    if (!Types.empty()) return nullptr;
+    return getProjectTailElemsOperation(Context, Id);
 
   case BuiltinValueKind::Sizeof:
   case BuiltinValueKind::Strideof:
   case BuiltinValueKind::Alignof:
-  case BuiltinValueKind::StrideofNonZero:
     return getSizeOrAlignOfOperation(Context, Id);
 
   case BuiltinValueKind::IsPOD:
     return getIsPODOperation(Context, Id);
+
+  case BuiltinValueKind::IsConcrete:
+    return getIsConcrete(Context, Id);
+
+  case BuiltinValueKind::IsBitwiseTakable:
+    return getIsBitwiseTakable(Context, Id);
+
+  case BuiltinValueKind::IsOptionalType:
+    return getIsOptionalOperation(Context, Id);
+
+  case BuiltinValueKind::IsSameMetatype:
+    return getIsSameMetatypeOperation(Context, Id);
 
   case BuiltinValueKind::AllocRaw:
     return getAllocOperation(Context, Id);
@@ -1588,18 +2366,14 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::DeallocRaw:
     return getDeallocOperation(Context, Id);
 
-  case BuiltinValueKind::MarkDependence:
-    return getMarkDependenceOperation(Context, Id);
-
   case BuiltinValueKind::CastToNativeObject:
+  case BuiltinValueKind::UnsafeCastToNativeObject:
   case BuiltinValueKind::CastFromNativeObject:
-  case BuiltinValueKind::CastToUnknownObject:
-  case BuiltinValueKind::CastFromUnknownObject:
   case BuiltinValueKind::BridgeToRawPointer:
   case BuiltinValueKind::BridgeFromRawPointer:
     if (!Types.empty()) return nullptr;
     return getNativeObjectCast(Context, Id, BV);
-      
+
   case BuiltinValueKind::CastToBridgeObject:
     if (!Types.empty()) return nullptr;
     return getCastToBridgeObjectOperation(Context, Id);
@@ -1615,25 +2389,19 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
   case BuiltinValueKind::ReinterpretCast:
     if (!Types.empty()) return nullptr;
     return getReinterpretCastOperation(Context, Id);
-
-  case BuiltinValueKind::AllocValueBuffer:
-  case BuiltinValueKind::ProjectValueBuffer:
-    if (!Types.empty()) return nullptr;
-    return getProjectValueBufferOperation(Context, Id);
-
-  case BuiltinValueKind::DeallocValueBuffer:
-    if (!Types.empty()) return nullptr;
-    return getDeallocValueBufferOperation(Context, Id);
-
-  case BuiltinValueKind::MakeMaterializeForSetCallback:
-    if (!Types.empty()) return nullptr;
-    return getMakeMaterializeForSetCallbackOperation(Context, Id);
       
   case BuiltinValueKind::AddressOf:
     if (!Types.empty()) return nullptr;
     return getAddressOfOperation(Context, Id);
-      
-  case BuiltinValueKind::CondFail:
+
+  case BuiltinValueKind::LegacyCondFail:
+    return getLegacyCondFailOperation(Context, Id);
+
+  case BuiltinValueKind::AddressOfBorrow:
+    if (!Types.empty()) return nullptr;
+    return getAddressOfBorrowOperation(Context, Id);
+
+  case BuiltinValueKind::CondFailMessage:
     return getCondFailOperation(Context, Id);
 
   case BuiltinValueKind::AssertConf:
@@ -1653,7 +2421,8 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     return getZeroInitializerOperation(Context, Id);
       
   case BuiltinValueKind::Once:
-    return getOnceOperation(Context, Id);
+  case BuiltinValueKind::OnceWithContext:
+    return getOnceOperation(Context, Id, BV == BuiltinValueKind::OnceWithContext);
 
   case BuiltinValueKind::WillThrow:
   case BuiltinValueKind::ErrorInMain:
@@ -1674,22 +2443,97 @@ ValueDecl *swift::getBuiltinValueDecl(ASTContext &Context, Identifier Id) {
     if (!Types.empty()) return nullptr;
     return getStaticReportOperation(Context, Id);
 
-  case BuiltinValueKind::UToSCheckedTrunc:
   case BuiltinValueKind::SToSCheckedTrunc:
   case BuiltinValueKind::SToUCheckedTrunc:
+    if (Types.size() != 2) return nullptr;
+    return getCheckedTruncOperation(Context, Id, Types[0], Types[1], true);
+
+  case BuiltinValueKind::UToSCheckedTrunc:
   case BuiltinValueKind::UToUCheckedTrunc:
     if (Types.size() != 2) return nullptr;
-    return getCheckedTruncOperation(Context, Id, Types[0], Types[1]);
+    return getCheckedTruncOperation(Context, Id, Types[0], Types[1], false);
 
-  case BuiltinValueKind::SUCheckedConversion:
-  case BuiltinValueKind::USCheckedConversion:
-    if (Types.size() != 1) return nullptr;
-    return getCheckedConversionOperation(Context, Id, Types[0]);
+  case BuiltinValueKind::ClassifyBridgeObject:
+    if (!Types.empty()) return nullptr;
+    return getClassifyBridgeObject(Context, Id);
+  case BuiltinValueKind::ValueToBridgeObject:
+    if (!Types.empty())
+      return nullptr;
+    return getValueToBridgeObject(Context, Id);
+
+  case BuiltinValueKind::COWBufferForReading:
+    return getCOWBufferForReading(Context, Id);
+
+  case BuiltinValueKind::UnsafeGuaranteed:
+    return getUnsafeGuaranteed(Context, Id);
+
+  case BuiltinValueKind::UnsafeGuaranteedEnd:
+    return getUnsafeGuaranteedEnd(Context, Id);
+
+  case BuiltinValueKind::ApplyDerivative:
+  case BuiltinValueKind::ApplyTranspose:
+  case BuiltinValueKind::DifferentiableFunction:
+  case BuiltinValueKind::LinearFunction:
+    llvm_unreachable("Handled above");
+
+  case BuiltinValueKind::OnFastPath:
+    return getOnFastPath(Context, Id);
 
   case BuiltinValueKind::IntToFPWithOverflow:
     if (Types.size() != 2) return nullptr;
     return getIntToFPWithOverflowOperation(Context, Id, Types[0], Types[1]);
+
+  case BuiltinValueKind::GetObjCTypeEncoding:
+    return getGetObjCTypeEncodingOperation(Context, Id);
+
+  case BuiltinValueKind::GlobalStringTablePointer:
+    return getGlobalStringTablePointer(Context, Id);
+
+  case BuiltinValueKind::ConvertStrongToUnownedUnsafe:
+    return getConvertStrongToUnownedUnsafe(Context, Id);
+
+  case BuiltinValueKind::ConvertUnownedUnsafeToGuaranteed:
+    return getConvertUnownedUnsafeToGuaranteed(Context, Id);
+
+  case BuiltinValueKind::GetCurrentAsyncTask:
+    return getGetCurrentAsyncTask(Context, Id);
+
+  case BuiltinValueKind::CancelAsyncTask:
+    return getCancelAsyncTask(Context, Id);
+
+  case BuiltinValueKind::CreateAsyncTask:
+    return getCreateAsyncTask(Context, Id);
+
+  case BuiltinValueKind::PoundAssert:
+    return getPoundAssert(Context, Id);
+
+  case BuiltinValueKind::TSanInoutAccess:
+    return getTSanInoutAccess(Context, Id);
+
+  case BuiltinValueKind::Swift3ImplicitObjCEntrypoint:
+    return getBuiltinFunction(Id,
+                              {},
+                              TupleType::getEmpty(Context));
+
+  case BuiltinValueKind::IntInstrprofIncrement:
+    return getIntInstrprofIncrement(Context, Id);
+
+  case BuiltinValueKind::TypePtrAuthDiscriminator:
+    return getTypePtrAuthDiscriminator(Context, Id);
+    
+  case BuiltinValueKind::TypeJoin:
+    return getTypeJoinOperation(Context, Id);
+
+  case BuiltinValueKind::TypeJoinInout:
+    return getTypeJoinInoutOperation(Context, Id);
+
+  case BuiltinValueKind::TypeJoinMeta:
+    return getTypeJoinMetaOperation(Context, Id);
+
+  case BuiltinValueKind::TriggerFallbackDiagnostic:
+    return getTriggerFallbackDiagnosticOperation(Context, Id);
   }
+
   llvm_unreachable("bad builtin value!");
 }
 
@@ -1705,3 +2549,114 @@ StringRef swift::getBuiltinName(BuiltinValueKind ID) {
   llvm_unreachable("bad BuiltinValueKind");
 }
 
+bool swift::isPolymorphicBuiltin(BuiltinValueKind id) {
+  switch (id) {
+  case BuiltinValueKind::None:
+    llvm_unreachable("no builtin kind");
+#define BUILTIN(Id, Name, Attrs)                                               \
+  case BuiltinValueKind::Id:                                                   \
+    return false;
+#define BUILTIN_BINARY_OPERATION_POLYMORPHIC(Id, Name)                         \
+  case BuiltinValueKind::Id:                                                   \
+    return true;
+#include "swift/AST/Builtins.def"
+  }
+  llvm_unreachable("bad BuiltinValueKind");
+}
+
+BuiltinTypeKind BuiltinType::getBuiltinTypeKind() const {
+  // If we do not have a vector or an integer our job is easy.
+  return BuiltinTypeKind(std::underlying_type<TypeKind>::type(getKind()));
+}
+
+StringRef BuiltinType::getTypeName(SmallVectorImpl<char> &result,
+                                   bool prependBuiltinNamespace) const {
+#ifdef MAYBE_GET_NAMESPACED_BUILTIN
+#error                                                                         \
+    "We define MAYBE_GET_NAMESPACED_BUILTIN here. Do not define before this?!"
+#endif
+#define MAYBE_GET_NAMESPACED_BUILTIN(NAME)                                     \
+  ((prependBuiltinNamespace) ? NAME : NAME.getWithoutPrefix())
+
+  llvm::raw_svector_ostream printer(result);
+  switch (getBuiltinTypeKind()) {
+  case BuiltinTypeKind::BuiltinRawPointer:
+    printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_RAWPOINTER);
+    break;
+  case BuiltinTypeKind::BuiltinNativeObject:
+    printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_NATIVEOBJECT);
+    break;
+  case BuiltinTypeKind::BuiltinBridgeObject:
+    printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_BRIDGEOBJECT);
+    break;
+  case BuiltinTypeKind::BuiltinUnsafeValueBuffer:
+    printer << MAYBE_GET_NAMESPACED_BUILTIN(
+        BUILTIN_TYPE_NAME_UNSAFEVALUEBUFFER);
+    break;
+  case BuiltinTypeKind::BuiltinIntegerLiteral:
+    printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_INTLITERAL);
+    break;
+  case BuiltinTypeKind::BuiltinVector: {
+    const auto *t = cast<const BuiltinVectorType>(this);
+    llvm::SmallString<32> UnderlyingStrVec;
+    StringRef UnderlyingStr;
+    {
+      // FIXME: Ugly hack: remove the .Builtin from the element type.
+      {
+        llvm::raw_svector_ostream UnderlyingOS(UnderlyingStrVec);
+        t->getElementType().print(UnderlyingOS);
+      }
+      if (UnderlyingStrVec.startswith(BUILTIN_TYPE_NAME_PREFIX))
+        UnderlyingStr = UnderlyingStrVec.substr(8);
+      else
+        UnderlyingStr = UnderlyingStrVec;
+    }
+
+    printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_VEC)
+            << t->getNumElements() << "x" << UnderlyingStr;
+    break;
+  }
+  case BuiltinTypeKind::BuiltinInteger: {
+    auto width = cast<const BuiltinIntegerType>(this)->getWidth();
+    if (width.isFixedWidth()) {
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_INT)
+              << width.getFixedWidth();
+      break;
+    }
+
+    if (width.isPointerWidth()) {
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_WORD);
+      break;
+    }
+
+    llvm_unreachable("impossible bit width");
+  }
+  case BuiltinTypeKind::BuiltinFloat: {
+    switch (cast<const BuiltinFloatType>(this)->getFPKind()) {
+    case BuiltinFloatType::IEEE16:
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_FLOAT) << "16";
+      break;
+    case BuiltinFloatType::IEEE32:
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_FLOAT) << "32";
+      break;
+    case BuiltinFloatType::IEEE64:
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_FLOAT) << "64";
+      break;
+    case BuiltinFloatType::IEEE80:
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_FLOAT) << "80";
+      break;
+    case BuiltinFloatType::IEEE128:
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_FLOAT) << "128";
+      break;
+    case BuiltinFloatType::PPC128:
+      printer << MAYBE_GET_NAMESPACED_BUILTIN(BUILTIN_TYPE_NAME_FLOAT_PPC)
+              << "128";
+      break;
+    }
+    break;
+  }
+  }
+#undef MAYBE_GET_NAMESPACED_BUILTIN
+
+  return printer.str();
+}

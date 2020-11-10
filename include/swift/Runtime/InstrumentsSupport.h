@@ -1,12 +1,12 @@
-//===--- InstrumentsSupport.h - Support for Instruments.app ------ C++ -*--===//
+//===--- InstrumentsSupport.h - Support for Instruments.app -----*- C++ -*-===//
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -18,33 +18,47 @@
 #ifndef SWIFT_RUNTIME_INSTRUMENTS_SUPPORT_H
 #define SWIFT_RUNTIME_INSTRUMENTS_SUPPORT_H
 
+#define SWIFT_RT_DECLARE_ENTRY \
+  __ptrauth_swift_runtime_function_entry
+
 namespace swift {
 
-extern "C" HeapObject *(*_swift_allocObject)(HeapMetadata const *metadata,
-                                             size_t requiredSize,
-                                             size_t requiredAlignmentMask);
+// liboainject patches the function pointers and calls the functions below.
+SWIFT_RUNTIME_EXPORT
+HeapObject *(*SWIFT_RT_DECLARE_ENTRY _swift_allocObject)(
+                                  HeapMetadata const *metadata,
+                                  size_t requiredSize,
+                                  size_t requiredAlignmentMask);
+SWIFT_RUNTIME_EXPORT
+HeapObject *(*SWIFT_RT_DECLARE_ENTRY _swift_retain)(HeapObject *object);
+SWIFT_RUNTIME_EXPORT
+HeapObject *(*SWIFT_RT_DECLARE_ENTRY _swift_retain_n)(HeapObject *object, uint32_t n);
+SWIFT_RUNTIME_EXPORT
+HeapObject *(*SWIFT_RT_DECLARE_ENTRY _swift_tryRetain)(HeapObject *object);
+SWIFT_RUNTIME_EXPORT
+void (*SWIFT_RT_DECLARE_ENTRY _swift_release)(HeapObject *object);
+SWIFT_RUNTIME_EXPORT
+void (*SWIFT_RT_DECLARE_ENTRY _swift_release_n)(HeapObject *object, uint32_t n);
+SWIFT_RUNTIME_EXPORT
+size_t swift_retainCount(HeapObject *object);
 
-extern "C" BoxPair::Return (*_swift_allocBox)(Metadata const *type);
-
-extern "C" void (*_swift_retain)(HeapObject *object);
-extern "C" void (*_swift_retain_n)(HeapObject *object, uint32_t n);
-extern "C" HeapObject *(*_swift_tryRetain)(HeapObject *object);
-extern "C" bool (*_swift_isDeallocating)(HeapObject *object);
-extern "C" void (*_swift_release)(HeapObject *object);
-extern "C" void (*_swift_release_n)(HeapObject *object, uint32_t n);
-
-// liboainject on iOS 8 patches the function pointers below if present. 
+// liboainject tries to patch the function pointers and call the functions below
+// Swift used to implement these but no longer does.
 // Do not reuse these names unless you do what oainject expects you to do.
-typedef size_t AllocIndex;
-extern "C" void *(*_swift_alloc)(AllocIndex idx);
-extern "C" void *(*_swift_tryAlloc)(AllocIndex idx);
-extern "C" void *(*_swift_slowAlloc)(size_t bytes, size_t alignMask,
-                                     uintptr_t flags);
-extern "C" void (*_swift_dealloc)(void *ptr, AllocIndex idx);
-extern "C" void (*_swift_slowDealloc)(void *ptr, size_t bytes, size_t alignMask);
-extern "C" size_t _swift_indexToSize(AllocIndex idx);
-extern "C" int _swift_sizeToIndex(size_t size);
-extern "C" void _swift_zone_init(void);
+SWIFT_RUNTIME_EXPORT
+void *(*_swift_alloc)(size_t idx);
+SWIFT_RUNTIME_EXPORT
+void *(*_swift_tryAlloc)(size_t idx);
+SWIFT_RUNTIME_EXPORT
+void *(*_swift_slowAlloc)(size_t bytes, size_t alignMask, uintptr_t flags);
+SWIFT_RUNTIME_EXPORT
+void (*_swift_dealloc)(void *ptr, size_t idx);
+SWIFT_RUNTIME_EXPORT
+void (*_swift_slowDealloc)(void *ptr, size_t bytes, size_t alignMask);
+SWIFT_RUNTIME_EXPORT
+size_t _swift_indexToSize(size_t idx);
+SWIFT_RUNTIME_EXPORT
+void _swift_zone_init(void);
 
 };
 

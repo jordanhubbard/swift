@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 
@@ -14,13 +14,14 @@
 #define SWIFT_PARSER_PARSER_RESULT_H
 
 #include "llvm/ADT/PointerIntPair.h"
+#include "swift/AST/ParameterList.h"
 #include <type_traits>
 
 namespace swift {
 
 class ParserStatus;
 
-/// \brief A wrapper for a parser AST node result (Decl, Stmt, Expr, Pattern,
+/// A wrapper for a parser AST node result (Decl, Stmt, Expr, Pattern,
 /// etc.)
 ///
 /// Contains the pointer to the AST node itself (or null) and additional bits
@@ -38,7 +39,12 @@ template <typename T> class ParserResult {
     IsCodeCompletion = 0x2,
   };
 
-  template <typename U> friend class ParserResult;
+  template <typename U>
+  friend class ParserResult;
+
+  template <typename U>
+  friend inline ParserResult<U> makeParserResult(ParserStatus Status,
+                                                 U *Result);
 
 public:
   /// Construct a null result with error bit set.
@@ -49,7 +55,7 @@ public:
 
   /// Construct a successful parser result.
   explicit ParserResult(T *Result) : PtrAndBits(Result) {
-    assert(Result && "a successful parser result can not be null");
+    assert(Result && "a successful parser result cannot be null");
   }
 
   /// Convert from a different but compatible parser result.
@@ -77,11 +83,21 @@ public:
   /// Return the AST node or a null pointer.
   T *getPtrOrNull() const { return PtrAndBits.getPointer(); }
 
-  /// Return true if there was a parse error.
+  /// Return true if there was a parse error that the parser has not yet
+  /// recovered from.
   ///
   /// Note that we can still have an AST node which was constructed during
   /// recovery.
   bool isParseError() const { return PtrAndBits.getInt() & IsError; }
+
+  /// Return true if there was a parse error that the parser has not yet
+  /// recovered from, or if we found a code completion token while parsing.
+  ///
+  /// Note that we can still have an AST node which was constructed during
+  /// recovery.
+  bool isParseErrorOrHasCompletion() const {
+    return PtrAndBits.getInt() & (IsError | IsCodeCompletion);
+  }
 
   /// Return true if we found a code completion token while parsing this.
   bool hasCodeCompletion() const {
@@ -89,9 +105,13 @@ public:
   }
 
   void setIsParseError() { PtrAndBits.setInt(PtrAndBits.getInt() | IsError); }
-
-  void setHasCodeCompletion() {
+  void setHasCodeCompletionAndIsError() {
     PtrAndBits.setInt(PtrAndBits.getInt() | IsError | IsCodeCompletion);
+  }
+
+private:
+  void setHasCodeCompletion() {
+    PtrAndBits.setInt(PtrAndBits.getInt() | IsCodeCompletion);
   }
 };
 
@@ -118,15 +138,15 @@ static inline ParserResult<T> makeParserCodeCompletionResult(T *Result =
   ParserResult<T> PR;
   if (Result)
     PR = ParserResult<T>(Result);
-  PR.setHasCodeCompletion();
+  PR.setHasCodeCompletionAndIsError();
   return PR;
 }
 
-/// \brief Same as \c ParserResult, but just the status bits without the AST
+/// Same as \c ParserResult, but just the status bits without the AST
 /// node.
 ///
-/// Useful when the AST node is returned by some other means (for example, a in
-/// vector out parameter).
+/// Useful when the AST node is returned by some other means (for example, in
+/// a vector out parameter).
 ///
 /// If you want to use 'bool' as a result type in the Parser, consider using
 /// ParserStatus instead.
@@ -144,27 +164,32 @@ public:
     if (Result.isParseError())
       setIsParseError();
     if (Result.hasCodeCompletion())
-      setHasCodeCompletion();
+      IsCodeCompletion = true;
   }
 
+  /// Return true if either 1) no errors were encountered while parsing this,
+  /// or 2) there were errors but the the parser already recovered from them.
   bool isSuccess() const { return !isError(); }
-  bool isError() const { return IsError; }
+  bool isErrorOrHasCompletion() const { return IsError || IsCodeCompletion; }
 
   /// Return true if we found a code completion token while parsing this.
   bool hasCodeCompletion() const { return IsCodeCompletion; }
+
+  /// Return true if we encountered any errors while parsing this that the
+  /// parser hasn't yet recovered from.
+  bool isError() const { return IsError; }
 
   void setIsParseError() {
     IsError = true;
   }
 
-  void setHasCodeCompletion() {
-    IsError = true;
-    IsCodeCompletion = true;
+  void clearIsError() {
+    IsError = false;
   }
 
-  /// True if we should stop parsing for any reason.
-  bool shouldStopParsing() const {
-    return IsError || IsCodeCompletion;
+  void setHasCodeCompletionAndIsError() {
+    IsError = true;
+    IsCodeCompletion = true;
   }
 
   ParserStatus &operator|=(ParserStatus RHS) {
@@ -195,7 +220,7 @@ static inline ParserStatus makeParserError() {
 /// Create a status with error and code completion bits set.
 static inline ParserStatus makeParserCodeCompletionStatus() {
   ParserStatus Status;
-  Status.setHasCodeCompletion();
+  Status.setHasCodeCompletionAndIsError();
   return Status;
 }
 
@@ -203,11 +228,13 @@ static inline ParserStatus makeParserCodeCompletionStatus() {
 template <typename T>
 static inline ParserResult<T> makeParserResult(ParserStatus Status,
                                                T *Result) {
-  if (Status.isSuccess())
-    return makeParserResult(Result);
+  ParserResult<T> PR = Status.isError()
+    ? makeParserErrorResult(Result)
+    : makeParserResult(Result);
+
   if (Status.hasCodeCompletion())
-    return makeParserCodeCompletionResult(Result);
-  return makeParserErrorResult(Result);
+    PR.setHasCodeCompletion();
+  return PR;
 }
 
 template <typename T> ParserResult<T>::ParserResult(ParserStatus Status) {
@@ -216,64 +243,6 @@ template <typename T> ParserResult<T>::ParserResult(ParserStatus Status) {
   if (Status.hasCodeCompletion())
     setHasCodeCompletion();
 }
-
-enum class ConfigExprKind {
-  Unknown,
-  Error,
-  OS,
-  Arch,
-  CompilerVersion,
-  Binary,
-  Paren,
-  DeclRef,
-  Boolean,
-  Integer
-};
-
-class ConfigParserState {
-
-  unsigned ConditionActive : 1;
-  ConfigExprKind Kind;
-public:
-  friend class ConfigParserState;
-
-  ConfigParserState() : ConditionActive(false), Kind(ConfigExprKind::Unknown) {}
-
-  ConfigParserState(bool ConditionActive, ConfigExprKind Kind)
-    : ConditionActive(ConditionActive), Kind(Kind) {}
-
-  bool isConditionActive() const {
-    return ConditionActive;
-  }
-
-  void setConditionActive(bool A) {
-    ConditionActive = A;
-  }
-
-  ConfigExprKind getKind() const {
-    return Kind;
-  }
-
-  void setKind(ConfigExprKind K) {
-    Kind = K;
-  }
-
-  bool shouldParse() const {
-    if (Kind == ConfigExprKind::Error)
-      return true;
-    return ConditionActive || (Kind != ConfigExprKind::CompilerVersion);
-  }
-
-  static ConfigParserState error() {
-    return ConfigParserState(false, ConfigExprKind::Error);
-  }
-};
-
-ConfigParserState operator&&(const ConfigParserState lhs,
-                              const ConfigParserState rhs);
-ConfigParserState operator||(const ConfigParserState lhs,
-                              const ConfigParserState rhs);
-ConfigParserState operator!(const ConfigParserState Result);
 
 } // namespace swift
 

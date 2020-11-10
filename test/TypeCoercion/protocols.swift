@@ -1,4 +1,4 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 protocol MyPrintable {
   func print()
@@ -37,21 +37,25 @@ struct Number {
   var title : Int
 }
 
-func testPrintableCoercion(ip1: IsPrintable1,
+func testPrintableCoercion(_ ip1: IsPrintable1,
                            ip2: IsPrintable2,
                            inp1: IsNotPrintable1,
                            inp2: IsNotPrintable2,
                            op: OtherPrintable) {
   var p : MyPrintable = ip1 // okay
+  let _: MyPrintable & Titled = Book(title: "")
+  // expected-error@-1 {{value of type 'Book' does not conform to specified type 'MyPrintable'}}
   p = ip1 // okay
   p = ip2 // okay
   p = inp1 // expected-error{{value of type 'IsNotPrintable1' does not conform to 'MyPrintable' in assignment}}
+  let _: MyPrintable = inp1
+  // expected-error@-1 {{value of type 'IsNotPrintable1' does not conform to specified type 'MyPrintable'}}
   p = inp2 // expected-error{{value of type 'IsNotPrintable2' does not conform to 'MyPrintable' in assignment}}
   p = op // expected-error{{value of type 'OtherPrintable' does not conform to 'MyPrintable' in assignment}}
   _ = p
 }
 
-func testTitledCoercion(ip1: IsPrintable1, book: Book, lackey: Lackey,
+func testTitledCoercion(_ ip1: IsPrintable1, book: Book, lackey: Lackey,
                         number: Number, ip2: IsPrintable2) {
   var t : Titled = ip1 // okay
   t = ip1
@@ -83,11 +87,11 @@ struct NotFormattedPrintable1 {
   func print(_: TestFormat) { }
 }
 
-func testFormattedPrintableCoercion(ip1: IsPrintable1,
+func testFormattedPrintableCoercion(_ ip1: IsPrintable1,
                                     ip2: IsPrintable2,
-                                    inout fp: FormattedPrintable,
-                                    inout p: MyPrintable,
-                                    inout op: OtherPrintable,
+                                    fp: inout FormattedPrintable,
+                                    p: inout MyPrintable,
+                                    op: inout OtherPrintable,
                                     nfp1: NotFormattedPrintable1) {
   fp = ip1
   fp = ip2 // expected-error{{value of type 'IsPrintable2' does not conform to 'FormattedPrintable' in assignment}}
@@ -100,27 +104,92 @@ func testFormattedPrintableCoercion(ip1: IsPrintable1,
 protocol Document : Titled, MyPrintable {
 }
 
-func testMethodsAndVars(fp: FormattedPrintable, f: TestFormat, inout doc: Document) {
+func testMethodsAndVars(_ fp: FormattedPrintable, f: TestFormat, doc: inout Document) {
   fp.print(f)
   fp.print()
   doc.title = "Gone with the Wind"
   doc.print()
 }
 
-func testDocumentCoercion(inout doc: Document, ip1: IsPrintable1, l: Lackey) {
+func testDocumentCoercion(_ doc: inout Document, ip1: IsPrintable1, l: Lackey) {
   doc = ip1
   doc = l // expected-error{{value of type 'Lackey' does not conform to 'Document' in assignment}}
 }
 
 // Check coercion of references.
-func refCoercion(inout p: MyPrintable) { }
+func refCoercion(_ p: inout MyPrintable) { }
 var p : MyPrintable = IsPrintable1()
 var fp : FormattedPrintable = IsPrintable1()
+// expected-note@-1{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'FormattedPrintable'}} {{10-28=MyPrintable}}
 var ip1 : IsPrintable1
+// expected-note@-1{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'IsPrintable1'}} {{11-23=MyPrintable}}
 
 refCoercion(&p)
-refCoercion(&fp) // expected-error{{cannot pass immutable value as inout argument: implicit conversion from 'FormattedPrintable' to 'MyPrintable' requires a temporary}}
-refCoercion(&ip1) // expected-error{{cannot pass immutable value as inout argument: implicit conversion from 'IsPrintable1' to 'MyPrintable' requires a temporary}}
+refCoercion(&fp)
+// expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+refCoercion(&ip1)
+// expected-error@-1{{inout argument could be set to a value with a type other than 'IsPrintable1'; use a value declared as type 'MyPrintable' instead}}
+
+do {
+  var fp_2 = fp
+  // expected-note@-1{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'FormattedPrintable'}} {{11-11=: MyPrintable}}
+  var ip1_2 = ip1
+  // expected-note@-1{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'IsPrintable1'}} {{12-12=: MyPrintable}}
+  refCoercion(&fp_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+  refCoercion(&ip1_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'IsPrintable1'; use a value declared as type 'MyPrintable' instead}}
+}
+
+do {
+  var fp_2 : FormattedPrintable = fp, ip1_2 = ip1
+  // expected-note@-1{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'FormattedPrintable'}} {{14-32=MyPrintable}}
+  // expected-note@-2{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'IsPrintable1'}} {{44-44=: MyPrintable}}
+  refCoercion(&fp_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+  refCoercion(&ip1_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'IsPrintable1'; use a value declared as type 'MyPrintable' instead}}
+}
+
+do {
+  var fp_2, fp_3 : FormattedPrintable
+  // expected-note@-1{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'FormattedPrintable'}} {{20-38=MyPrintable}}
+  // expected-note@-2{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'FormattedPrintable'}} {{20-38=MyPrintable}}
+  fp_2 = fp
+  fp_3 = fp
+  refCoercion(&fp_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+  refCoercion(&fp_3)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+}
+
+do {
+  func wrapRefCoercion1(fp_2: inout FormattedPrintable,
+                        ip1_2: inout IsPrintable1) {
+    // expected-note@-2{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'FormattedPrintable'}} {{31-55=MyPrintable}}
+    // expected-note@-2{{change variable type to 'MyPrintable' if it doesn't need to be declared as 'IsPrintable1'}} {{32-50=MyPrintable}}
+    refCoercion(&fp_2)
+    // expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+    refCoercion(&ip1_2)
+    // expected-error@-1{{inout argument could be set to a value with a type other than 'IsPrintable1'; use a value declared as type 'MyPrintable' instead}}
+  }
+}
+
+do {
+  // Make sure we don't add the fix-it for tuples:
+  var (fp_2, ip1_2) = (fp, ip1)
+  refCoercion(&fp_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+  refCoercion(&ip1_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'IsPrintable1'; use a value declared as type 'MyPrintable' instead}}
+}
+
+do {
+  // Make sure we don't add the fix-it for vars in different scopes:
+  enum ParentScope { static var fp_2 = fp }
+  refCoercion(&ParentScope.fp_2)
+  // expected-error@-1{{inout argument could be set to a value with a type other than 'FormattedPrintable'; use a value declared as type 'MyPrintable' instead}}
+}
 
 protocol IntSubscriptable {
   subscript(i: Int) -> Int { get }
@@ -138,7 +207,7 @@ struct IsIntToStringSubscriptable {
   subscript(i: Int) -> String { get {} set {} }
 }
 
-func testIntSubscripting(inout i_s: IntSubscriptable,
+func testIntSubscripting(i_s: inout IntSubscriptable,
                          iis: IsIntSubscriptable,
                          ids: IsDoubleSubscriptable,
                          iiss: IsIntToStringSubscriptable) {
@@ -161,7 +230,7 @@ extension String : MyREPLPrintable {
   func myReplPrint() {}
 }
 
-func doREPLPrint(p: MyREPLPrintable) {
+func doREPLPrint(_ p: MyREPLPrintable) {
   p.myReplPrint()
 }
 
@@ -173,5 +242,5 @@ func testREPLPrintable() {
   doREPLPrint("foo")
 }
 
-// Boolean coercion
-if true as BooleanType {}
+// Bool coercion
+if true as Bool {}

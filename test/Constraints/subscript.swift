@@ -1,7 +1,7 @@
-// RUN: %target-parse-verify-swift
+// RUN: %target-typecheck-verify-swift
 
 // Simple subscript of arrays:
-func simpleSubscript(array: [Float], x: Int) -> Float {
+func simpleSubscript(_ array: [Float], x: Int) -> Float {
   _ = array[x]
   return array[x]
 }
@@ -11,7 +11,7 @@ protocol IntToStringSubscript {
   subscript (i : Int) -> String { get }
 }
 
-class LameDictionary {
+class FauxDictionary {
   subscript (i : Int) -> String {
     get {
       return String(i)
@@ -19,7 +19,7 @@ class LameDictionary {
   }
 }
 
-func archetypeSubscript<T : IntToStringSubscript, U : LameDictionary>(t: T, u: U)
+func archetypeSubscript<T : IntToStringSubscript, U : FauxDictionary>(_ t: T, u: U)
        -> String {
   // Subscript an archetype.
   if false { return t[17] }
@@ -29,9 +29,42 @@ func archetypeSubscript<T : IntToStringSubscript, U : LameDictionary>(t: T, u: U
 }
 
 // Subscript of existential type.
-func existentialSubscript(a: IntToStringSubscript) -> String {
+func existentialSubscript(_ a: IntToStringSubscript) -> String {
   return a[17]
 }
+
+// Static of above:
+
+// Subscript of archetype.
+protocol IntToStringStaticSubscript {
+  static subscript (i : Int) -> String { get }
+}
+
+class FauxStaticDictionary {
+  static subscript (i : Int) -> String {
+    get {
+      return String(i)
+    }
+  }
+}
+
+func archetypeStaticSubscript<
+  T : IntToStringStaticSubscript, U : FauxStaticDictionary
+>(_ t: T.Type, u: U.Type) -> String {
+  // Subscript an archetype.
+  if false { return t[17] }
+  
+  // Subscript an archetype for which the subscript operator is in a base class.
+  return u[17]
+}
+
+// Subscript of existential type.
+func existentialStaticSubscript(
+  _ a: IntToStringStaticSubscript.Type
+) -> String {
+  return a[17]
+}
+
 
 class MyDictionary<Key, Value> {
   subscript (key : Key) -> Value {
@@ -42,7 +75,7 @@ class MyDictionary<Key, Value> {
 class MyStringToInt<T> : MyDictionary<String, Int> { }
 
 // Subscript of generic type.
-func genericSubscript<T>(t: T,
+func genericSubscript<T>(_ t: T,
                          array: Array<Int>,
                          i2i: MyDictionary<Int, Int>,
                          t2i: MyDictionary<T, Int>,
@@ -68,16 +101,118 @@ extension Int {
   subscript(key: String) -> Double {  get {} }   // expected-note {{found this candidate}}
 }
 
-let _ = 1["1"]  // expected-error {{ambiguous use of 'subscript'}}
+let _ = 1["1"]  // expected-error {{ambiguous use of 'subscript(_:)'}}
 
-
-// rdar://17687826 - QoI: error message when reducing to an untyped dictionary isn't helpful
-let squares = [ 1, 2, 3 ].reduce([:]) { (dict, n) in // expected-error {{cannot invoke 'reduce' with an argument list of type '([_ : _], @noescape (_, Int) throws -> _)'}}
-  // expected-note @-1 {{expected an argument list of type '(T, combine: @noescape (T, Int) throws -> T)'}}
-  var dict = dict // expected-error {{type of expression is ambiguous without more context}}
-
+let squares = [ 1, 2, 3 ].reduce([:]) { (dict, n) in
+  var dict = dict
   dict[n] = n * n
   return dict
 }
 
+// <rdar://problem/23670252> QoI: Misleading error message when assigning a value from [String : AnyObject]
+func r23670252(_ dictionary: [String : AnyObject], someObject: AnyObject) {
+  let color : String?
+  color = dictionary["color"]  // expected-error {{cannot assign value of type 'AnyObject?' to type 'String?'}}
+  _ = color
+}
 
+
+// SR-718 - Type mismatch reported as extraneous parameter
+struct SR718 {
+  subscript(b : Int) -> Int
+    { return 0 }
+  subscript(a a : UInt) -> Int { return 0 }
+}
+
+SR718()[a: Int()] // expected-error {{cannot convert value of type 'Int' to expected argument type 'UInt'}}
+
+// rdar://problem/25601561 - Qol: Bad diagnostic for failed assignment from Any to more specific type
+
+struct S_r25601561 {
+  func value() -> Any? { return "hi" }
+}
+
+class C_r25601561 {
+  var a: [S_r25601561?] = []
+  func test(i: Int) -> String {
+    let s: String = a[i]!.value()! // expected-error {{cannot convert value of type 'Any' to specified type 'String'}}
+    return s
+  }
+}
+
+// rdar://problem/31977679 - Misleading diagnostics when using subscript with incorrect argument
+
+func r31977679_1(_ properties: [String: String]) -> Any? {
+  return properties[0] // expected-error {{cannot convert value of type 'Int' to expected argument type 'String'}}
+}
+
+func r31977679_2(_ properties: [String: String]) -> Any? {
+  return properties["foo"] // Ok
+}
+
+// rdar://problem/45819956 - inout-to-pointer in a subscript arg could use a better diagnostic
+func rdar_45819956() {
+  struct S {
+    subscript(takesPtr ptr: UnsafeMutablePointer<Int>) -> Int {
+      get { return 0 }
+    }
+  }
+
+  let s = S()
+  var i = 0
+
+  // TODO: It should be possible to suggest `withUnsafe[Mutable]Pointer` as a fix-it
+  _ = s[takesPtr: &i]
+  // expected-error@-1 {{cannot pass an inout argument to a subscript; use 'withUnsafeMutablePointer' to explicitly convert argument to a pointer}}
+}
+
+// rdar://problem/45825806 - [SR-7190] Array-to-pointer in subscript arg crashes compiler
+func rdar_45825806() {
+  struct S {
+    subscript(takesPtr ptr: UnsafePointer<Int>) -> Int {
+      get { return 0 }
+    }
+  }
+
+  let s = S()
+  _ = s[takesPtr: [1, 2, 3]] // Ok
+}
+
+func test_generic_subscript_requirements_mismatch_diagnostics() {
+  struct S {
+    subscript<T: StringProtocol>(_: T) -> T { // expected-note {{where 'T' = 'Int'}}
+      fatalError()
+    }
+
+    subscript<T, U: Collection>(v v: [T]) -> U where U.Element == T {
+      fatalError()
+    }
+
+    subscript<T: Collection>(number num: T) -> Int where T.Element: BinaryInteger {
+      // expected-note@-1 {{'T.Element' = 'String'}}
+      return 42
+    }
+  }
+
+  var s = S()
+  _ = s[42] // expected-error {{subscript 'subscript(_:)' requires that 'Int' conform to 'StringProtocol'}}
+
+  var arr: [Int] = []
+  let _: [String] = s[v: arr] // expected-error {{cannot convert value of type '[Int]' to expected argument type '[String]'}}
+  // expected-note@-1 {{arguments to generic parameter 'Element' ('Int' and 'String') are expected to be equal}}
+
+  s[number: ["hello"]] // expected-error {{subscript 'subscript(number:)' requires that 'String' conform to 'BinaryInteger'}}
+}
+
+// rdar://61084565 - infinite recursion in dynamic member lookup
+func rdar61084565() {
+  @dynamicMemberLookup
+  struct Foo {
+    subscript(dynamicMember _: KeyPath<Foo, Int>) -> Int {
+      return 42
+    }
+  }
+
+  let a = Foo()
+  a[] // expected-error {{value of type 'Foo' has no subscripts}}
+}

@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 ///
@@ -19,8 +19,10 @@
 #include "swift/AST/Comment.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/FileUnit.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/Types.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Markup/Markup.h"
@@ -56,23 +58,17 @@ static SingleRawComment::CommentKind getCommentKind(StringRef Comment) {
 SingleRawComment::SingleRawComment(CharSourceRange Range,
                                    const SourceManager &SourceMgr)
     : Range(Range), RawText(SourceMgr.extractText(Range)),
-      Kind(static_cast<unsigned>(getCommentKind(RawText))),
-      EndLine(SourceMgr.getLineNumber(Range.getEnd())) {
-  auto StartLineAndColumn = SourceMgr.getLineAndColumn(Range.getStart());
+      Kind(static_cast<unsigned>(getCommentKind(RawText))) {
+  auto StartLineAndColumn =
+      SourceMgr.getPresumedLineAndColumnForLoc(Range.getStart());
   StartLine = StartLineAndColumn.first;
   StartColumn = StartLineAndColumn.second;
+  EndLine = SourceMgr.getLineAndColumnInBuffer(Range.getEnd()).first;
 }
 
 SingleRawComment::SingleRawComment(StringRef RawText, unsigned StartColumn)
     : RawText(RawText), Kind(static_cast<unsigned>(getCommentKind(RawText))),
       StartColumn(StartColumn), StartLine(0), EndLine(0) {}
-
-static bool canHaveComment(const Decl *D) {
-  return !D->hasClangNode() &&
-         (isa<ValueDecl>(D) || isa<ExtensionDecl>(D)) &&
-         !isa<ParamDecl>(D) &&
-         (!isa<AbstractTypeParamDecl>(D) || isa<AssociatedTypeDecl>(D));
-}
 
 static void addCommentToList(SmallVectorImpl<SingleRawComment> &Comments,
                              const SingleRawComment &SRC) {
@@ -114,8 +110,11 @@ static RawComment toRawComment(ASTContext &Context, CharSourceRange Range) {
   unsigned Offset = SourceMgr.getLocOffsetInBuffer(Range.getStart(), BufferID);
   unsigned EndOffset = SourceMgr.getLocOffsetInBuffer(Range.getEnd(), BufferID);
   LangOptions FakeLangOpts;
-  Lexer L(FakeLangOpts, SourceMgr, BufferID, nullptr, /*InSILMode=*/false,
-          CommentRetentionMode::ReturnAsTokens, Offset, EndOffset);
+  Lexer L(FakeLangOpts, SourceMgr, BufferID, nullptr, LexerMode::Swift,
+          HashbangMode::Disallowed,
+          CommentRetentionMode::ReturnAsTokens,
+          TriviaRetentionMode::WithoutTrivia,
+          Offset, EndOffset);
   SmallVector<SingleRawComment, 16> Comments;
   Token Tok;
   while (true) {
@@ -130,8 +129,8 @@ static RawComment toRawComment(ASTContext &Context, CharSourceRange Range) {
   return Result;
 }
 
-RawComment Decl::getRawComment() const {
-  if (!canHaveComment(this))
+RawComment Decl::getRawComment(bool SerializedOK) const {
+  if (!this->canHaveComment())
     return RawComment();
 
   // Check the cache in ASTContext.
@@ -149,9 +148,24 @@ RawComment Decl::getRawComment() const {
   // Ask the parent module.
   if (auto *Unit =
           dyn_cast<FileUnit>(this->getDeclContext()->getModuleScopeContext())) {
-    if (Optional<BriefAndRawComment> C = Unit->getCommentForDecl(this)) {
-      llvm::markup::MarkupContext MC;
-      Context.setBriefComment(this, C->Brief);
+    if (SerializedOK) {
+      if (const auto *CachedLocs = getSerializedLocs()) {
+        if (!CachedLocs->DocRanges.empty()) {
+          SmallVector<SingleRawComment, 4> SRCs;
+          for (const auto &Range : CachedLocs->DocRanges) {
+            SRCs.push_back({ Range, Context.SourceMgr });
+          }
+          auto RC = RawComment(Context.AllocateCopy(llvm::makeArrayRef(SRCs)));
+
+          if (!RC.isEmpty()) {
+            Context.setRawComment(this, RC);
+            return RC;
+          }
+        }
+      }
+    }
+
+    if (Optional<CommentInfo> C = Unit->getCommentForDecl(this)) {
       Context.setRawComment(this, C->Raw);
       return C->Raw;
     }
@@ -161,44 +175,66 @@ RawComment Decl::getRawComment() const {
   return RawComment();
 }
 
-static StringRef extractBriefComment(ASTContext &Context, RawComment RC,
-                                     const Decl *D) {
-  PrettyStackTraceDecl StackTrace("extracting brief comment for", D);
+static const Decl* getGroupDecl(const Decl *D) {
+  auto GroupD = D;
 
-  if (!canHaveComment(D))
-    return StringRef();
-
-  llvm::markup::MarkupContext MC;
-  auto DC = getDocComment(MC, D);
-  if (!DC.hasValue())
-    return StringRef();
-
-  auto Brief = DC.getValue()->getBrief();
-  if (!Brief.hasValue())
-    return StringRef();
-
-  SmallString<256> BriefStr("");
-  llvm::raw_svector_ostream OS(BriefStr);
-  llvm::markup::printInlinesUnder(Brief.getValue(), OS);
-  if (OS.str().empty())
-    return StringRef();
-
-  return Context.AllocateCopy(OS.str());
+  // Extensions always exist in the same group with the nominal.
+  if (auto ED = dyn_cast_or_null<ExtensionDecl>(D->getDeclContext()->
+                                                getInnermostTypeContext())) {
+    if (auto ExtNominal = ED->getExtendedNominal())
+      GroupD = ExtNominal;
+  }
+  return GroupD;
 }
 
-StringRef Decl::getBriefComment() const {
-  if (!canHaveComment(this))
-    return StringRef();
+Optional<StringRef> Decl::getGroupName() const {
+  if (hasClangNode())
+    return None;
+  if (auto GroupD = getGroupDecl(this)) {
+    // We can only get group information from deserialized module files.
+    if (auto *Unit =
+        dyn_cast<FileUnit>(GroupD->getDeclContext()->getModuleScopeContext())) {
+      return Unit->getGroupNameForDecl(GroupD);
+    }
+  }
+  return None;
+}
 
-  auto &Context = getASTContext();
-  if (Optional<StringRef> Comment = Context.getBriefComment(this))
-    return Comment.getValue();
+Optional<StringRef> Decl::getSourceFileName() const {
+  if (hasClangNode())
+    return None;
+  if (auto GroupD = getGroupDecl(this)) {
+    // We can only get group information from deserialized module files.
+    if (auto *Unit =
+        dyn_cast<FileUnit>(GroupD->getDeclContext()->getModuleScopeContext())) {
+      return Unit->getSourceFileNameForDecl(GroupD);
+    }
+  }
+  return None;
+}
 
-  StringRef Result;
-  auto RC = getRawComment();
-  if (!RC.isEmpty())
-    Result = extractBriefComment(Context, RC, this);
+Optional<unsigned> Decl::getSourceOrder() const {
+  if (hasClangNode())
+    return None;
+  // We can only get source orders from deserialized module files.
+  if (auto *Unit =
+      dyn_cast<FileUnit>(this->getDeclContext()->getModuleScopeContext())) {
+    return Unit->getSourceOrderForDecl(this);
+  }
+  return None;
+}
 
-  Context.setBriefComment(this, Result);
-  return Result;
+CharSourceRange RawComment::getCharSourceRange() {
+  if (this->isEmpty()) {
+    return CharSourceRange();
+  }
+
+  auto Start = this->Comments.front().Range.getStart();
+  if (Start.isInvalid()) {
+    return CharSourceRange();
+  }
+  auto End = this->Comments.back().Range.getEnd();
+  auto Length = static_cast<const char *>(End.getOpaquePointerValue()) -
+                static_cast<const char *>(Start.getOpaquePointerValue());
+  return CharSourceRange(Start, Length);
 }

@@ -13,7 +13,7 @@ Abstract
 This document describes the high-level abstraction of built-in Swift
 data structures in SIL that is used by the optimizer. You need to read
 this document if you wish to understand the early stages of the Swift
-optimizer or if you are working on one of the containers in the 
+optimizer or if you are working on one of the containers in the
 standard library.
 
 
@@ -33,29 +33,30 @@ Any Swift developer could identify the redundancy in the code sample above.
 Storing two values into the same key in the dictionary is inefficient.
 However, optimizing compilers are unaware of the special semantics that the
 Swift dictionary has and can't perform this optimization. Traditional
-compilers would start optimizing this code by inlining the subscript 
+compilers would start optimizing this code by inlining the subscript
 function call and try to analyze the sequence of load/store instructions.
 This approach is not very effective because the compiler has to be very
-conservative when optimizing general code with pointers. 
+conservative when optimizing general code with pointers.
 
 On the other hand, compilers for high-level languages usually have special
 bytecode instructions that allow them to perform high-level optimizations.
 However, unlike high-level languages such as JavaScript or Python, Swift
 containers are implemented in Swift itself. Moreover, it is beneficial to
 be able to inline code from the container into the user program and optimize
-them together, especially for code that uses Generics. 
+them together, especially for code that uses Generics.
 
 In order to perform both high-level optimizations, that are common in
 high-level languages, and low-level optimizations we annotate parts of the
 standard library and describe the semantics of a domain-specific high-level
-operations on data types in the Swift standard library. 
+operations on data types in the Swift standard library.
 
 Annotation of code in the standard library
 ------------------------------------------
 
 We use the ``@_semantics`` attribute to annotate code in the standard library.
 These annotations can be used by the high-level SIL optimizer to perform
-domain-specific optimizations.
+domain-specific optimizations. The same function may have multiple ``@_semantics``
+attributes.
 
 This is an example of the ``@_semantics`` attribute::
 
@@ -78,25 +79,25 @@ operations in the semantic model. One for checking the bounds and
 another one for accessing the elements. With this abstraction the
 optimizer can remove the ``checkSubscript`` instruction and keep the
 getElement instruction::
- 
+
   @public subscript(index: Int) -> Element {
      get {
       checkSubscript(index)
       return getElement(index)
      }
 
-  @_semantics("array.check_subscript") func checkSubscript(index: Int) {
+  @_semantics("array.check_subscript") func checkSubscript(_ index: Int) {
     ...
   }
-	
-  @_semantics("array.get_element") func getElement(index: Int) -> Element {
+
+  @_semantics("array.get_element") func getElement(_ index: Int) -> Element {
     return _buffer[index]
   }
 
 
 Swift optimizations
 -------------------
-The swift optimizer can access the information that is provided by the
+The Swift optimizer can access the information that is provided by the
 ``@_semantics`` attribute to perform high-level optimizations. In the early
 stages of the optimization pipeline the optimizer does not inline functions
 with special semantics in order to allow the early high-level optimization
@@ -116,26 +117,25 @@ Cloning code from the standard library
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The Swift compiler can copy code from the standard library into the
-application. This allows the optimizer to inline calls from stdlib and improve
-the performance of code that uses common operators such as '++' or basic
-containers such as Array. However, importing code from the standard library can
-increase the binary size. Marking functions with @_semantics("stdlib_binary_only")
-will prevent the copying of the marked function from the standard library into the
-user program.
+application for functions marked @inlinable. This allows the optimizer to
+inline calls from the stdlib and improve the performance of code that uses
+common operators such as '+=' or basic containers such as Array. However,
+importing code from the standard library can increase the binary size.
 
-Notice that this annotation is similar to the resilient annotation that will
-disallow the cloning of code into the user application.
+To prevent copying of functions from the standard library into the user
+program, make sure the function in question is not marked @inlinable.
 
 Array
 ~~~~~
 
 The following semantic tags describe Array operations. The operations
 are first described in terms of the Array "state". Relations between the
-operations are formally defined below. 'Array' referes to the standard library
-Array<T>, ContigousArray<T>, and ArraySlice<T> data-structures.
+operations are formally defined below. 'Array' refers to the standard library
+Array<Element>, ContiguousArray<Element>, and ArraySlice<Element>
+data-structures.
 
 We consider the array state to consist of a set of disjoint elements
-and a storage descriptor that encapsulates nonelement data such as the
+and a storage descriptor that encapsulates non-element data such as the
 element count and capacity. Operations that semantically write state
 are always *control dependent*. A control dependent operation is one
 that may only be executed on the control flow paths in which the
@@ -156,7 +156,7 @@ array.init
   may act as a guard to other potentially mutating operations, such as
   ``get_element_address``.
 
-array.uninitialized(count: Builtin.Word) -> (Array<T>, Builtin.RawPointer)
+array.uninitialized(count: Builtin.Word) -> (Array<Element>, Builtin.RawPointer)
 
   Creates an array with the specified number of elements. It initializes
   the storage descriptor but not the array elements. The returned tuple
@@ -164,11 +164,12 @@ array.uninitialized(count: Builtin.Word) -> (Array<T>, Builtin.RawPointer)
   The caller is responsible for writing the elements to the element storage.
 
 array.props.isCocoa/needsElementTypeCheck -> Bool
+
   Reads storage descriptors properties (isCocoa, needsElementTypeCheck).
   This is not control dependent or guarded. The optimizer has
-  semantic knowledge of the state transfer those properties can not make:
-  An array that is not ``isCocoa`` can not transfer to ``isCocoa``.
-  An array that is not ``needsElementTypeCheck`` can not transfer to
+  semantic knowledge of the state transfer those properties cannot make:
+  An array that is not ``isCocoa`` cannot transfer to ``isCocoa``.
+  An array that is not ``needsElementTypeCheck`` cannot transfer to
   ``needsElementTypeCheck``.
 
 array.get_element(index: Int) -> Element
@@ -205,6 +206,18 @@ array.get_capacity() -> Int
   Read the array capacity from the storage descriptor. The semantics
   are identical to ``get_count`` except for the meaning of the return value.
 
+array.append_element(newElement: Element)
+
+  Appends a single element to the array. No elements are read.
+  The operation is itself guarded by ``make_mutable``.
+  In contrast to other semantics operations, this operation is allowed to be
+  inlined in the early stages of the compiler.
+
+array.append_contentsOf(contentsOf newElements: S)
+
+  Appends all elements from S, which is a Sequence. No elements are read.
+  The operation is itself guarded by ``make_mutable``.
+
 array.make_mutable()
 
   This operation guards mutating operations that don't already imply
@@ -236,7 +249,7 @@ array.mutate_unknown
 To complete the semantics understood by the optimizer, we define these relations:
 
 interferes-with
-  
+
   Given idempotent ``OpA``, the sequence "``OpA, OpB, OpA``" is
   semantically equivalent to the sequence "``OpA, OpB``" *iff* ``OpB``
   does not interfere with ``OpA``.
@@ -248,7 +261,7 @@ interferes-with
 guards
 
   If ``OpA`` guards ``OpB``, then the sequence of operations
-  ``OpA,OpB`` must be preserved on any control flow path on which the
+  ``OpA, OpB`` must be preserved on any control flow path on which the
   sequence originally appears.
 
 An operation can only interfere-with or guard another if they may operate on the same Array.
@@ -262,7 +275,7 @@ check_subscript  guards          get_element, get_element_address
 make_mutable     interferes-with props.isCocoa/needsElementTypeCheck
 get_elt_addr     interferes-with get_element, get_element_address,
                                  props.isCocoa/needsElementTypeCheck
-mutate_unknown   itereferes-with get_element, check_subscript, get_count,
+mutate_unknown   interferes-with get_element, check_subscript, get_count,
                                  get_capacity, get_element_address,
                                  props.isCocoa/needsElementTypeCheck
 ================ =============== ==========================================
@@ -282,37 +295,37 @@ String
 ~~~~~~
 
 string.concat(lhs: String, rhs: String) -> String
-  
+
   Performs concatenation of two strings. Operands are not mutated.
   This operation can be optimized away in case of both operands
   being string literals. In this case, it can be replaced by
   a string literal representing a concatenation of both operands.
-  
-string.makeUTF8(start: RawPointer, byteSize: Word, isASCII: Int1) -> String
-  
+
+string.makeUTF8(start: RawPointer, utf8CodeUnitCount: Word, isASCII: Int1) -> String
+
   Converts a built-in UTF8-encoded string literal into a string.
-  
-string.makeUTF16(start: RawPointer, numberOfCodeUnits: Word) -> String
-  
+
+string.makeUTF16(start: RawPointer, utf16CodeUnitCount: Word) -> String
+
   Converts a built-in UTF16-encoded string literal into a string.
 
 Dictionary
 ~~~~~~~~~~
 TBD.
 
-@effects attribute
+@_effects attribute
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The @effects attribute describes how a function affects "the state of the world".
+The @_effects attribute describes how a function affects "the state of the world".
 More practically how the optimizer can modify the program based on information
 that is provided by the attribute.
 
 Usage:
 
-  @effects(readonly) func foo() { .. }
+  @_effects(readonly) func foo() { .. }
 
 
-The @effects attribute supports the following tags:
+The @_effects attribute supports the following tags:
 
 readnone
 
@@ -323,10 +336,53 @@ readnone
 
 readonly
 
-  function has no side effects, but is dependent on the global 
+  function has no side effects, but is dependent on the global
   state of the program. Calls to readonly functions can be
   eliminated, but cannot be reordered or folded in a way that would
   move calls to the readnone function across side effects.
+
+releasenone
+
+  function has side effects, it can read or write global state, or state
+  reachable from its arguments. It can however be assumed that no externally
+  visible release has happened (i.e it is allowed for a ``releasenone``
+  function to allocate and destruct an object in its implementation as long as
+  this is does not cause an release of an object visible outside of the
+  implementation). Here are some examples::
+
+    class SomeObject {
+      final var x: Int = 3
+    }
+
+    var global = SomeObject()
+
+    class SomeOtherObject {
+      var x: Int = 2
+      deinit {
+        global = SomeObject()
+      }
+    }
+
+    @_effects(releasenone)
+    func validReleaseNoneFunction(x: Int) -> Int {
+      global.x = 5
+      return x + 2
+    }
+
+    @_effects(releasenone)
+    func validReleaseNoneFunction(x: Int) -> Int {
+      var notExternallyVisibleObject = SomeObject()
+      return x +  notExternallyVisibleObject.x
+    }
+
+    func notAReleaseNoneFunction(x: Int, y: SomeObject) -> Int {
+      return x + y.x
+    }
+
+    func notAReleaseNoneFunction(x: Int) -> Int {
+      var releaseExternallyVisible = SomeOtherObject()
+      return x + releaseExternallyVisible.x
+    }
 
 readwrite
 
@@ -335,17 +391,17 @@ readwrite
 Optimize semantics attribute
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The optimize attribute adds function-sepcific directives to the optimizer.
+The optimize attribute adds function-specific directives to the optimizer.
 
 The optimize attribute supports the following tags:
 
-sil.never
+sil.specialize.generic.never
 
-   The sil optimizer should not optimize this funciton.
+   The sil optimizer should never create generic specializations of this function. 
 
-  Example:
-  @_semantics("optimize.sil.never")
-  func miscompile() { ... }
+optimize.sil.specialize.generic.partial.never
+
+   The sil optimizer should never create generic partial specializations of this function. 
 
 Availability checks
 ~~~~~~~~~~~~~~~~~~~
@@ -358,4 +414,3 @@ The availability attribute supports the following tags:
 availability.osversion(major: Builtin.Word, minor: Builtin.Word, patch: Builtin.Word) -> Builtin.Int1
 
   Returns true if the OS version matches the parameters.
-

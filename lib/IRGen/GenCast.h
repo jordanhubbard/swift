@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -34,7 +34,7 @@ namespace irgen {
   class Explosion;
 
   /// Discriminator for checked cast modes.
-  enum class CheckedCastMode : unsigned char {
+  enum class CheckedCastMode : uint8_t {
     Unconditional,
     Conditional,
   };
@@ -47,13 +47,18 @@ namespace irgen {
                                CastConsumptionKind consumptionKind,
                                CheckedCastMode mode);
 
-  /// \brief Convert a class object to the given destination type,
+  void emitScalarCheckedCast(IRGenFunction &IGF, Explosion &value,
+                             SILType sourceLoweredType,
+                             CanType sourceFormalType,
+                             SILType targetLoweredType,
+                             CanType targetFormalType,
+                             CheckedCastMode mode, Explosion &out);
+
+  /// Convert a class object to the given destination type,
   /// using a runtime-checked cast.
-  ///
-  /// FIXME: toType should be an AST CanType.
   llvm::Value *emitClassDowncast(IRGenFunction &IGF,
                                  llvm::Value *from,
-                                 SILType toType,
+                                 CanType toType,
                                  CheckedCastMode mode);
 
   /// A result of a cast generation function.
@@ -64,7 +69,7 @@ namespace irgen {
     llvm::Value *casted;
   };
 
-  /// \brief Convert the given value to the exact destination type.
+  /// Convert the given value to the exact destination type.
   FailableCastResult emitClassIdenticalCast(IRGenFunction &IGF,
                                                   llvm::Value *from,
                                                   SILType fromType,
@@ -91,16 +96,14 @@ namespace irgen {
                                   Explosion &ex);
 
   /// Emit a checked cast from a metatype to AnyObject.
-  void emitMetatypeToObjectDowncast(IRGenFunction &IGF,
-                                    llvm::Value *metatypeValue,
-                                    CanAnyMetatypeType type,
-                                    CheckedCastMode mode,
-                                    Explosion &ex);
+  llvm::Value *emitMetatypeToAnyObjectDowncast(IRGenFunction &IGF,
+                                            llvm::Value *metatypeValue,
+                                            CanAnyMetatypeType type,
+                                            CheckedCastMode mode);
 
   /// Emit a Protocol* value referencing an ObjC protocol.
   llvm::Value *emitReferenceToObjCProtocol(IRGenFunction &IGF,
                                            ProtocolDecl *proto);
-
 } // end namespace irgen
 } // end namespace swift
 

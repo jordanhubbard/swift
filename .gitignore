@@ -13,32 +13,54 @@
 *~
 # Merge files created by git.
 *.orig
-# Byte compiled python modules.
+# Byte compiled Python modules.
 *.pyc
 # vim swap files
-.*.swp
+.*.sw[a-z]
 .sw?
 
 #==============================================================================#
 # Explicit files to ignore (only matches one).
 #==============================================================================#
+Brewfile.lock.json
 cscope.files
 cscope.out
+.vimrc
+tags
 
 #==============================================================================#
 # Directories to ignore (do not add trailing '/'s, they skip symlinks).
 #==============================================================================#
-# Swift performance test suite.
-benchmark/PerfTestSuite
-
 # Generated docs
 docs/_build
 
 # Finder metadata
 .DS_Store
 
+# Visual Studio metadata
+.vs
+
+# clangd
+.cache
+.clangd
+
 #==============================================================================#
 # Ignore CMake temporary files
 #==============================================================================#
 CMakeCache.txt
 CMakeFiles
+.atom-build.json
+
+#==============================================================================#
+# Ignore compile database
+#==============================================================================#
+compile_commands.json
+
+# Ignore generated GYB files until we fix the workaround on Windows
+#==============================================================================#
+8
+4
+SortedCFDatabase.def
+htmlcov
+.coverage
+/benchmark/scripts/Benchmark_Driverc

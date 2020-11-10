@@ -2,11 +2,11 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2015 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
-// See http://swift.org/LICENSE.txt for license information
-// See http://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
+// See https://swift.org/LICENSE.txt for license information
+// See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 //
 //===----------------------------------------------------------------------===//
 //
@@ -19,55 +19,82 @@
 #include "swift/AST/Pattern.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILGlobalVariable.h"
+#include "swift/IRGen/Linking.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Module.h"
 
-#include "Explosion.h"
-#include "GenHeap.h"
+#include "DebugTypeInfo.h"
 #include "GenTuple.h"
+#include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 #include "FixedTypeInfo.h"
+#include "Temporary.h"
 
 using namespace swift;
 using namespace irgen;
 
 /// Emit a global variable.
-Address IRGenModule::emitSILGlobalVariable(SILGlobalVariable *var) {
-  auto &type = getTypeInfo(var->getLoweredType());
-  
-  // If the variable is empty, don't actually emit it; just return undef.
-  if (type.isKnownEmpty()) {
-    return type.getUndefAddress();
+void IRGenModule::emitSILGlobalVariable(SILGlobalVariable *var) {
+  auto &ti = getTypeInfo(var->getLoweredType());
+  auto expansion = getResilienceExpansionForLayout(var);
+
+  // If the variable is empty in all resilience domains that can access this
+  // variable directly, don't actually emit it; just return undef.
+  if (ti.isKnownEmpty(expansion)) {
+    if (DebugInfo && var->getDecl()) {
+      auto DbgTy = DebugTypeInfo::getGlobal(var, Int8Ty, Size(0), Alignment(1));
+      DebugInfo->emitGlobalVariableDeclaration(
+          nullptr, var->getDecl()->getName().str(), "", DbgTy,
+          var->getLinkage() != SILLinkage::Public,
+          IRGenDebugInfo::NotHeapAllocated, SILLocation(var->getDecl()));
+    }
+    return;
   }
-  
-  /// Get the global variable.
-  Address addr = getAddrOfSILGlobalVariable(var,
+
+  /// Create the global variable.
+  getAddrOfSILGlobalVariable(var, ti,
                      var->isDefinition() ? ForDefinition : NotForDefinition);
-  
-  /// Add a zero initializer.
-  if (var->isDefinition()) {
-    auto gvar = cast<llvm::GlobalVariable>(addr.getAddress());
-    gvar->setInitializer(llvm::Constant::getNullValue(type.getStorageType()));
-  }
-  return addr;
 }
 
-ContainedAddress FixedTypeInfo::allocateStack(IRGenFunction &IGF, SILType T,
-                                              const Twine &name) const {
+StackAddress FixedTypeInfo::allocateStack(IRGenFunction &IGF, SILType T,
+                                          const Twine &name) const {
   // If the type is known to be empty, don't actually allocate anything.
-  if (isKnownEmpty()) {
+  if (isKnownEmpty(ResilienceExpansion::Maximal)) {
     auto addr = getUndefAddress();
-    return { addr, addr };
+    return { addr };
   }
 
   Address alloca =
     IGF.createAlloca(getStorageType(), getFixedAlignment(), name);
-  // TODO: lifetime intrinsics?
-
-  return { alloca, alloca };
+  IGF.Builder.CreateLifetimeStart(alloca, getFixedSize());
+  
+  return { alloca };
 }
 
-void FixedTypeInfo::deallocateStack(IRGenFunction &IGF, Address addr,
+void FixedTypeInfo::destroyStack(IRGenFunction &IGF, StackAddress addr,
+                                 SILType T, bool isOutlined) const {
+  destroy(IGF, addr.getAddress(), T, isOutlined);
+  FixedTypeInfo::deallocateStack(IGF, addr, T);
+}
+
+void FixedTypeInfo::deallocateStack(IRGenFunction &IGF, StackAddress addr,
                                     SILType T) const {
-  // TODO: lifetime intrinsics?
+  if (isKnownEmpty(ResilienceExpansion::Maximal))
+    return;
+  IGF.Builder.CreateLifetimeEnd(addr.getAddress(), getFixedSize());
+}
+
+void TemporarySet::destroyAll(IRGenFunction &IGF) const {
+  assert(!hasBeenCleared() && "destroying a set that's been cleared?");
+
+  // Deallocate all the temporaries.
+  for (auto &temporary : llvm::reverse(Stack)) {
+    temporary.destroy(IGF);
+  }
+}
+
+void Temporary::destroy(IRGenFunction &IGF) const {
+  auto &ti = IGF.getTypeInfo(Type);
+  ti.deallocateStack(IGF, Addr, Type);
 }

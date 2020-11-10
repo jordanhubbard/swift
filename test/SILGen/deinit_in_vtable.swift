@@ -1,7 +1,7 @@
-// RUN: %target-swift-frontend -O -emit-sil %s | FileCheck %s
+// RUN: %target-swift-emit-sil -Xllvm -sil-full-demangle -O %s | %FileCheck %s
 
 // The second run tests is it can be compiled without crashes.
-// RUN: %target-swift-frontend -O -S %s
+// RUN: %target-swift-frontend -Xllvm -sil-full-demangle -O -S %s
 
 private class A {
 	func foo() -> Int { return 0 }
@@ -18,7 +18,7 @@ private class B : A {
 // CHECK: sil private @[[B:.*]] :
 
 @inline(never)
-private func testfunc(a: A) -> Int {
+private func testfunc(_ a: A) -> Int {
   return a.foo()
 }
 
@@ -31,9 +31,9 @@ public func testmain() {
 // function elimination
 
 // CHECK-LABEL: sil_vtable A
-// CHECK: A.deinit!deallocator: [[A]]
+// CHECK: A.deinit!deallocator: @[[A]]
 
 // CHECK-LABEL: sil_vtable B
 // CHECK-NOT: A.deinit
-// CHECK: B.deinit!deallocator: [[B]]
+// CHECK: B.deinit!deallocator: @[[B]]
 
