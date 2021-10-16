@@ -15,7 +15,7 @@
 
 #include "swift/Basic/LLVM.h"
 #include "swift/Driver/ToolChain.h"
-#include "clang/Driver/DarwinSDKInfo.h"
+#include "clang/Basic/DarwinSDKInfo.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/Compiler.h"
 
@@ -81,7 +81,7 @@ protected:
   /// Information about the SDK that the application is being built against.
   /// This information is only used by the linker, so it is only populated
   /// when there will be a linker job.
-  mutable Optional<clang::driver::DarwinSDKInfo> SDKInfo;
+  mutable Optional<clang::DarwinSDKInfo> SDKInfo;
 
   const Optional<llvm::Triple> TargetVariant;
 
@@ -130,11 +130,6 @@ protected:
   /// and to not provide a specific linker otherwise.
   virtual std::string getDefaultLinker() const;
 
-  /// The target to be passed to the compiler invocation. By default, this
-  /// is the target triple, but this may be overridden to accommodate some
-  /// platforms.
-  virtual std::string getTargetForLinker() const;
-
   bool addRuntimeRPath(const llvm::Triple &T,
                        const llvm::opt::ArgList &Args) const;
 
@@ -152,9 +147,6 @@ public:
 };
 
 class LLVM_LIBRARY_VISIBILITY Android : public GenericUnix {
-protected:
-  std::string getTargetForLinker() const override;
-
 public:
   Android(const Driver &D, const llvm::Triple &Triple)
       : GenericUnix(D, Triple) {}
@@ -164,8 +156,6 @@ public:
 class LLVM_LIBRARY_VISIBILITY Cygwin : public GenericUnix {
 protected:
   std::string getDefaultLinker() const override;
-
-  std::string getTargetForLinker() const override;
 
 public:
   Cygwin(const Driver &D, const llvm::Triple &Triple)

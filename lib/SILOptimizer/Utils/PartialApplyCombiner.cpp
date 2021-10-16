@@ -98,16 +98,13 @@ bool PartialApplyCombiner::copyArgsToTemporaries(
 
   for (Operand *argOp : argsToHandle) {
     SILValue arg = argOp->get();
-    int argIdx = ApplySite(pai).getAppliedArgIndex(*argOp);
-    SILDebugVariable dbgVar(/*Constant*/ true, argIdx);
-
     SILValue tmp = arg;
     SILBuilderWithScope builder(pai, builderCtxt);
     if (arg->getType().isObject()) {
       tmp = builder.emitCopyValueOperation(pai->getLoc(), arg);
     } else {
       // Copy address-arguments into a stack-allocated temporary.
-      tmp = builder.createAllocStack(pai->getLoc(), arg->getType(), dbgVar);
+      tmp = builder.createAllocStack(pai->getLoc(), arg->getType());
       builder.createCopyAddr(pai->getLoc(), arg, tmp, IsTake_t::IsNotTake,
                              IsInitialization_t::IsInitialization);
     }
@@ -168,16 +165,14 @@ void PartialApplyCombiner::processSingleApply(FullApplySite paiAI) {
   SILValue callee = pai->getCallee();
   SubstitutionMap subs = pai->getSubstitutionMap();
 
-  // The partial_apply might be substituting in an open existential type.
-  builder.addOpenedArchetypeOperands(pai);
-
   if (auto *tai = dyn_cast<TryApplyInst>(paiAI)) {
     builder.createTryApply(paiAI.getLoc(), callee, subs, argList,
-                           tai->getNormalBB(), tai->getErrorBB());
+                           tai->getNormalBB(), tai->getErrorBB(),
+                           tai->getApplyOptions());
   } else {
     auto *apply = cast<ApplyInst>(paiAI);
     auto *newAI = builder.createApply(paiAI.getLoc(), callee, subs, argList,
-                                      apply->isNonThrowing());
+                                      apply->getApplyOptions());
     callbacks.replaceValueUsesWith(apply, newAI);
   }
   // We also need to destroy the partial_apply instruction itself because it is
@@ -214,6 +209,13 @@ bool PartialApplyCombiner::combine() {
   while (!worklist.empty()) {
     auto *use = worklist.pop_back_val();
     auto *user = use->getUser();
+
+    // Recurse through copy_value
+    if (auto *cvi = dyn_cast<CopyValueInst>(user)) {
+      for (auto *copyUse : cvi->getUses())
+        worklist.push_back(copyUse);
+      continue;
+    }
 
     // Recurse through conversions.
     if (auto *cfi = dyn_cast<ConvertEscapeToNoEscapeInst>(user)) {

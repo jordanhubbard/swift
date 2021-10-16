@@ -19,6 +19,7 @@
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Subsystems.h"
 
 using namespace swift;
@@ -175,7 +176,8 @@ void ExtendedNominalRequest::cacheResult(NominalTypeDecl *value) const {
 }
 
 void ExtendedNominalRequest::writeDependencySink(
-    evaluator::DependencyCollector &tracker, NominalTypeDecl *value) const {
+    evaluator::DependencyCollector &tracker,
+    NominalTypeDecl *value) const {
   if (!value)
     return;
 
@@ -183,8 +185,7 @@ void ExtendedNominalRequest::writeDependencySink(
   auto *SF = std::get<0>(getStorage())->getParentSourceFile();
   if (!SF)
     return;
-  if (SF != tracker.getRecorder().getActiveDependencySourceOrNull().getPtrOrNull())
-    return;
+
   tracker.addPotentialMember(value);
 }
 
@@ -303,8 +304,15 @@ SourceLoc swift::extractNearestSourceLoc(const OperatorLookupDescriptor &desc) {
 
 void DirectLookupRequest::writeDependencySink(
     evaluator::DependencyCollector &tracker,
-    TinyPtrVector<ValueDecl *> result) const {
+    const TinyPtrVector<ValueDecl *> &result) const {
   auto &desc = std::get<0>(getStorage());
+  // Add used members from the perspective of
+  // 1) The decl context they are found in
+  // 2) The decl context of the request
+  // This gets us a dependency not just on `Foo.bar` but on `extension Foo.bar`.
+  for (const auto *member : result) {
+    tracker.addUsedMember(member->getDeclContext(), desc.Name.getBaseName());
+  }
   tracker.addUsedMember(desc.DC, desc.Name.getBaseName());
 }
 
@@ -313,7 +321,8 @@ void DirectLookupRequest::writeDependencySink(
 //----------------------------------------------------------------------------//
 
 void LookupInModuleRequest::writeDependencySink(
-    evaluator::DependencyCollector &reqTracker, QualifiedLookupResult l) const {
+    evaluator::DependencyCollector &reqTracker,
+    const QualifiedLookupResult &l) const {
   auto *DC = std::get<0>(getStorage());
   auto member = std::get<1>(getStorage());
 
@@ -340,7 +349,8 @@ void swift::simple_display(llvm::raw_ostream &out,
 }
 
 void AnyObjectLookupRequest::writeDependencySink(
-    evaluator::DependencyCollector &reqTracker, QualifiedLookupResult l) const {
+    evaluator::DependencyCollector &reqTracker,
+    const QualifiedLookupResult &l) const {
   auto member = std::get<1>(getStorage());
   reqTracker.addDynamicLookupName(member.getBaseName());
 }
@@ -355,7 +365,8 @@ swift::extractNearestSourceLoc(const LookupConformanceDescriptor &desc) {
 //----------------------------------------------------------------------------//
 
 void ModuleQualifiedLookupRequest::writeDependencySink(
-    evaluator::DependencyCollector &reqTracker, QualifiedLookupResult l) const {
+    evaluator::DependencyCollector &reqTracker,
+    const QualifiedLookupResult &l) const {
   auto *module = std::get<1>(getStorage());
   auto member = std::get<2>(getStorage());
 
@@ -395,7 +406,8 @@ void LookupConformanceInModuleRequest::writeDependencySink(
 //----------------------------------------------------------------------------//
 
 void UnqualifiedLookupRequest::writeDependencySink(
-    evaluator::DependencyCollector &track, LookupResult res) const {
+    evaluator::DependencyCollector &track,
+    const LookupResult &res) const {
   auto &desc = std::get<0>(getStorage());
   track.addTopLevelName(desc.Name.getBaseName());
 }

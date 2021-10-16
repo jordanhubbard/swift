@@ -17,6 +17,28 @@ import SwiftShims
 internal let _cocoaASCIIEncoding:UInt = 1 /* NSASCIIStringEncoding */
 internal let _cocoaUTF8Encoding:UInt = 4 /* NSUTF8StringEncoding */
 
+extension String {
+  @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+  @_spi(Foundation)
+  public init?(_nativeStorage: AnyObject) {
+    let knownOther = _KnownCocoaString(_nativeStorage)
+    switch knownOther {
+    case .storage:
+      self = _unsafeUncheckedDowncast(
+        _nativeStorage,
+        to: __StringStorage.self
+      ).asString
+    case .shared:
+      self = _unsafeUncheckedDowncast(
+        _nativeStorage,
+        to: __SharedStringStorage.self
+      ).asString
+    default:
+      return nil
+    }
+  }
+}
+
 // ObjC interfaces.
 extension _AbstractStringStorage {
   @inline(__always)
@@ -30,7 +52,7 @@ extension _AbstractStringStorage {
                   "Range out of bounds")
 
     let range = Range(
-      uncheckedBounds: (aRange.location, aRange.location+aRange.length))
+      _uncheckedBounds: (aRange.location, aRange.location+aRange.length))
     let str = asString
     str._copyUTF16CodeUnits(
       into: UnsafeMutableBufferPointer(start: buffer, count: range.count),

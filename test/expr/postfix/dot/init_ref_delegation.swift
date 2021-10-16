@@ -125,7 +125,7 @@ class Z5 : Z4 {
 // Ill-formed initialization: failure to call initializer.
 class Z6 {
   convenience init() {
-    var _ : () -> Z6 = self.init // expected-error{{partial application of 'self.init' initializer delegation is not allowed}}
+    var _ : () -> Z6 = self.init // expected-error{{cannot reference 'self.init' initializer delegation as function value}}
   }
 
   init(other: Z6) { }
@@ -171,7 +171,7 @@ struct S {
   init() {
     let _ = S.init()
     self.init()
-    let _ = self.init // expected-error{{partial application of 'self.init' initializer delegation is not allowed}}
+    let _ = self.init // expected-error{{cannot reference 'self.init' initializer delegation as function value}}
   }
 }
 
@@ -179,7 +179,7 @@ class C {
   convenience init() { // expected-note 11 {{selected non-required initializer 'init()'}}
     self.init()
     let _: C = self.init() // expected-error{{cannot convert value of type '()' to specified type 'C'}}
-    let _: () -> C = self.init // expected-error{{partial application of 'self.init' initializer delegation is not allowed}}
+    let _: () -> C = self.init // expected-error{{cannot reference 'self.init' initializer delegation as function value}}
   }
 
   init(x: Int) {} // expected-note 11 {{selected non-required initializer 'init(x:)'}}
@@ -191,7 +191,7 @@ class D: C {
   override init(x: Int) {
     super.init(x: x)
     let _: C = super.init() // expected-error{{cannot convert value of type '()' to specified type 'C'}}
-    let _: () -> C = super.init // expected-error{{partial application of 'super.init' initializer chain is not allowed}}
+    let _: () -> C = super.init // expected-error{{cannot reference 'super.init' initializer chain as function value}}
   }
 
   func foo() {
@@ -272,10 +272,10 @@ func foo<T: C>(_ x: T, y: T.Type) where T: P {
   var ci4 = x.init(proto: "") // expected-error{{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{13-13=type(of: }} {{14-14=)}}
   
   var z = x
-  z.init(required: 0) // expected-error {{'init' is a member of the type; use assignment to initalize the value instead}} {{4-4= = }}
-  z.init(x: 0) // expected-error {{'init' is a member of the type; use assignment to initalize the value instead}} {{4-4= = }}
-  z.init() // expected-error {{'init' is a member of the type; use assignment to initalize the value instead}} {{4-4= = }}
-  z.init(proto: "") // expected-error {{'init' is a member of the type; use assignment to initalize the value instead}} {{4-4= = }}
+  z.init(required: 0) // expected-error {{'init' is a member of the type; use assignment to initialize the value instead}} {{4-4= = }}
+  z.init(x: 0) // expected-error {{'init' is a member of the type; use assignment to initialize the value instead}} {{4-4= = }}
+  z.init() // expected-error {{'init' is a member of the type; use assignment to initialize the value instead}} {{4-4= = }}
+  z.init(proto: "") // expected-error {{'init' is a member of the type; use assignment to initialize the value instead}} {{4-4= = }}
   
   var ci1a = z.init(required: 0) // expected-error {{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{14-14=type(of: }} {{15-15=)}}
   var ci2a = z.init(x: 0) // expected-error {{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{14-14=type(of: }} {{15-15=)}}
@@ -520,7 +520,7 @@ struct Y {
   let x2: X
   
   init() {
-    x.init() // expected-error {{'init' is a member of the type; use assignment to initalize the value instead}} {{6-6= = }}
+    x.init() // expected-error {{'init' is a member of the type; use assignment to initialize the value instead}} {{6-6= = }}
     foo(x.init()) // expected-error {{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{9-9=type(of: }} {{10-10=)}}
   }
   
@@ -537,7 +537,7 @@ struct MultipleMemberAccesses {
   init() {
     y = Y()
     y2 = Y()
-    y.x.init() // expected-error {{'init' is a member of the type; use assignment to initalize the value instead}} {{8-8= = }}
+    y.x.init() // expected-error {{'init' is a member of the type; use assignment to initialize the value instead}} {{8-8= = }}
     y2.x2.init() // expected-error {{'init' is a member of the type; use 'type(of: ...)' to initialize a new object of the same dynamic type}} {{5-5=type(of: }} {{10-10=)}}
   }
 }

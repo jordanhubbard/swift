@@ -9,11 +9,11 @@ else()
   )
 endif()
 
-set_swift_llvm_is_available()
-
 add_swift_host_library(swiftAST STATIC
   AbstractSourceFileDepGraphFactory.cpp
+  AccessNotes.cpp
   AccessRequests.cpp
+  ArgumentList.cpp
   ASTContext.cpp
   ASTDemangler.cpp
   ASTDumper.cpp
@@ -44,6 +44,7 @@ add_swift_host_library(swiftAST STATIC
   DiagnosticEngine.cpp
   DiagnosticList.cpp
   DocComment.cpp
+  Effects.cpp
   Evaluator.cpp
   Expr.cpp
   ExtInfo.cpp
@@ -56,7 +57,6 @@ add_swift_host_library(swiftAST STATIC
   GenericSignatureBuilder.cpp
   Identifier.cpp
   ImportCache.cpp
-  IncrementalRanges.cpp
   IndexSubset.cpp
   InlinableText.cpp
   LayoutConstraint.cpp
@@ -74,7 +74,18 @@ add_swift_host_library(swiftAST STATIC
   ProtocolConformance.cpp
   RawComment.cpp
   RequirementEnvironment.cpp
-  SyntaxASTMap.cpp
+  RequirementMachine/HomotopyReduction.cpp
+  RequirementMachine/GeneratingConformances.cpp
+  RequirementMachine/GenericSignatureQueries.cpp
+  RequirementMachine/PropertyMap.cpp
+  RequirementMachine/ProtocolGraph.cpp
+  RequirementMachine/RequirementMachine.cpp
+  RequirementMachine/RequirementMachineRequests.cpp
+  RequirementMachine/RewriteContext.cpp
+  RequirementMachine/RewriteSystem.cpp
+  RequirementMachine/RewriteSystemCompletion.cpp
+  RequirementMachine/Symbol.cpp
+  RequirementMachine/Term.cpp
   SILLayout.cpp
   Stmt.cpp
   SubstitutionMap.cpp
@@ -147,13 +158,4 @@ endif()
 # For more information see the comment at the top of lib/CMakeLists.txt.
 add_dependencies(swiftAST intrinsics_gen clang-tablegen-targets)
 
-set(swift_ast_verifier_flag)
-if(SWIFT_AST_VERIFIER)
-  set(swift_ast_verifier_flag " -USWIFT_DISABLE_AST_VERIFIER")
-else()
-  set(swift_ast_verifier_flag " -DSWIFT_DISABLE_AST_VERIFIER=1")
-endif()
-
-set_property(SOURCE ASTVerifier.cpp APPEND_STRING PROPERTY COMPILE_FLAGS
-  "${swift_ast_verifier_flag}")
-
+set_swift_llvm_is_available(swiftAST)

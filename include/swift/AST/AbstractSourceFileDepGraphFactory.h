@@ -32,7 +32,7 @@ protected:
   const std::string swiftDeps;
 
   /// The fingerprint of the whole file
-  const std::string fileFingerprint;
+  Fingerprint fileFingerprint;
 
   /// For debugging
   const bool emitDotFileAfterConstruction;
@@ -47,7 +47,7 @@ public:
   /// See the instance variable comments for explanation.
   AbstractSourceFileDepGraphFactory(bool hadCompilationError,
                                     StringRef swiftDeps,
-                                    StringRef fileFingerprint,
+                                    Fingerprint fileFingerprint,
                                     bool emitDotFileAfterConstruction,
                                     DiagnosticEngine &diags);
 
@@ -71,11 +71,13 @@ protected:
   template <NodeKind kind, typename ContentsT>
   void addAllDefinedDeclsOfAGivenType(std::vector<ContentsT> &contentsVec) {
     for (const auto &declOrPair : contentsVec) {
-      Optional<std::string> fp =
+      auto fp =
           AbstractSourceFileDepGraphFactory::getFingerprintIfAny(declOrPair);
-      addADefinedDecl(
-          DependencyKey::createForProvidedEntityInterface<kind>(declOrPair),
-          fp ? StringRef(fp.getValue()) : Optional<StringRef>());
+      auto key = DependencyKey::Builder{kind, DeclAspect::interface}
+                    .withContext(declOrPair)
+                    .withName(declOrPair)
+                    .build();
+      addADefinedDecl(key, fp);
     }
   }
 
@@ -83,21 +85,24 @@ protected:
   /// represent some \c Decl defined in this source file. \param key the
   /// interface key of the pair
   void addADefinedDecl(const DependencyKey &key,
-                       Optional<StringRef> fingerprint);
+                       Optional<Fingerprint> fingerprint);
 
   void addAUsedDecl(const DependencyKey &def, const DependencyKey &use);
 
-  static Optional<std::string> getFingerprintIfAny(
-      std::pair<const NominalTypeDecl *, const ValueDecl *>) {
+  /// Add an external dependency node to the graph. If the provided fingerprint
+  /// is not \c None, it is added to the def key.
+  void addAnExternalDependency(const DependencyKey &def,
+                               const DependencyKey &use,
+                               Optional<Fingerprint> dependencyFingerprint);
+
+  static Optional<Fingerprint>
+  getFingerprintIfAny(std::pair<const NominalTypeDecl *, const ValueDecl *>) {
     return None;
   }
 
-  static Optional<std::string> getFingerprintIfAny(const Decl *d) {
+  static Optional<Fingerprint> getFingerprintIfAny(const Decl *d) {
     if (const auto *idc = dyn_cast<IterableDeclContext>(d)) {
-      auto result = idc->getBodyFingerprint();
-      assert((!result || !result->empty()) &&
-             "Fingerprint should never be empty");
-      return result;
+      return idc->getBodyFingerprint();
     }
     return None;
   }

@@ -16,9 +16,9 @@ enum Z {
 
   init() { self = .none }
   init(_ c: UnicodeScalar) { self = .char(c) }
-  // expected-note@-1 2 {{candidate expects value of type 'UnicodeScalar' (aka 'Unicode.Scalar') for parameter #1}}
+  // expected-note@-1 2 {{candidate expects value of type 'UnicodeScalar' (aka 'Unicode.Scalar') for parameter #1 (got 'Z')}}
   init(_ s: String) { self = .string(s) }
-  // expected-note@-1 2 {{candidate expects value of type 'String' for parameter #1}}
+  // expected-note@-1 2 {{candidate expects value of type 'String' for parameter #1 (got 'Z')}}
   init(_ x: Int, _ y: Int) { self = .point(x, y) }
 }
 
@@ -241,7 +241,7 @@ func sr_10837() {
     convenience init(foo: Int = 42) {
       self.init(value:)(foo) // Ok
       self.init(value:)
-      // expected-error@-1 {{partial application of 'self.init' initializer delegation is not allowed}}
+      // expected-error@-1 {{cannot reference 'self.init' initializer delegation as function value}}
     }
   }
 
@@ -249,7 +249,7 @@ func sr_10837() {
     override init(bar: Int) {
       super.init(bar:)(bar) // Ok
       super.init(bar:)
-      // expected-error@-1 {{partial application of 'super.init' initializer chain is not allowed}}
+      // expected-error@-1 {{cannot reference 'super.init' initializer chain as function value}}
     }
   }
 }

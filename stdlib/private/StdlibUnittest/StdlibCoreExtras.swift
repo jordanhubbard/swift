@@ -128,14 +128,14 @@ public struct TypeIdentifier : Hashable, Comparable {
   internal var objectID : ObjectIdentifier {
     return ObjectIdentifier(value)
   }
-}
 
-public func < (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
-  return lhs.objectID < rhs.objectID
-}
+  public static func < (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
+    return lhs.objectID < rhs.objectID
+  }
 
-public func == (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
-  return lhs.objectID == rhs.objectID
+  public static func == (lhs: TypeIdentifier, rhs: TypeIdentifier) -> Bool {
+    return lhs.objectID == rhs.objectID
+  }
 }
 
 extension TypeIdentifier
@@ -294,3 +294,11 @@ public struct LinearCongruentialGenerator: RandomNumberGenerator {
     return _state
   }
 }
+
+#if !SWIFT_ENABLE_REFLECTION
+
+public func dump<T, TargetStream: TextOutputStream>(_ value: T, to target: inout TargetStream) {
+  target.write("(reflection not available)")
+}
+
+#endif

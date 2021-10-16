@@ -34,6 +34,9 @@
 #define __has_cpp_attribute(attribute) 0
 #endif
 
+// TODO: These macro definitions are duplicated in BridgedSwiftObject.h. Move
+// them to a single file if we find a location that both Visibility.h and
+// BridgedSwiftObject.h can import.
 #if __has_feature(nullability)
 // Provide macros to temporarily suppress warning about the use of
 // _Nullable and _Nonnull.
@@ -178,6 +181,16 @@
 #else
 #define SWIFT_IMAGE_EXPORTS_swift_Concurrency 0
 #endif
+#if defined(swift_Distributed_EXPORTS)
+#define SWIFT_IMAGE_EXPORTS_swift_Distributed 1
+#else
+#define SWIFT_IMAGE_EXPORTS_swift_Distributed 0
+#endif
+#if defined(swift_Differentiation_EXPORTS)
+#define SWIFT_IMAGE_EXPORTS_swift_Differentiation 1
+#else
+#define SWIFT_IMAGE_EXPORTS_swift_Differentiation 0
+#endif
 
 #define SWIFT_EXPORT_FROM_ATTRIBUTE(LIBRARY)                          \
   SWIFT_MACRO_IF(SWIFT_IMAGE_EXPORTS_##LIBRARY,                       \
@@ -209,7 +222,7 @@
 #define SWIFT_FALLTHROUGH
 #endif
 
-#if __cplusplus >= 201402l && __has_cpp_attribute(nodiscard)
+#if __cplusplus > 201402l && __has_cpp_attribute(nodiscard)
 #define SWIFT_NODISCARD [[nodiscard]]
 #elif __has_cpp_attribute(clang::warn_unused_result)
 #define SWIFT_NODISCARD [[clang::warn_unused_result]]

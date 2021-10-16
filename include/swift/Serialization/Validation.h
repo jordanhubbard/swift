@@ -39,6 +39,12 @@ enum class Status {
   /// compiler.
   FormatTooNew,
 
+  /// The precise revision version doesn't match.
+  RevisionIncompatible,
+
+  /// The module is required to be in OSSA, but is not.
+  NotInOSSA,
+
   /// The module file depends on another module that can't be loaded.
   MissingDependency,
 
@@ -66,7 +72,11 @@ enum class Status {
   TargetIncompatible,
 
   /// The module file was built for a target newer than the current target.
-  TargetTooNew
+  TargetTooNew,
+
+  /// The module file was built with a different SDK than the one in use
+  /// to build the client.
+  SDKMismatch
 };
 
 /// Returns true if the data looks like it contains a serialized AST.
@@ -79,6 +89,8 @@ struct ValidationInfo {
   StringRef shortVersion = {};
   StringRef miscVersion = {};
   version::Version compatibilityVersion = {};
+  llvm::VersionTuple userModuleVersion;
+  StringRef sdkName = {};
   size_t bytes = 0;
   Status status = Status::Malformed;
 };
@@ -93,12 +105,16 @@ struct ValidationInfo {
 class ExtendedValidationInfo {
   SmallVector<StringRef, 4> ExtraClangImporterOpts;
   StringRef SDKPath;
+  StringRef ModuleABIName;
   struct {
     unsigned ArePrivateImportsEnabled : 1;
     unsigned IsSIB : 1;
+    unsigned IsStaticLibrary: 1;
     unsigned IsTestable : 1;
     unsigned ResilienceStrategy : 2;
-    unsigned IsImplicitDynamicEnabled: 1;
+    unsigned IsImplicitDynamicEnabled : 1;
+    unsigned IsAllowModuleWithCompilerErrorsEnabled : 1;
+    unsigned IsConcurrencyChecked : 1;
   } Bits;
 public:
   ExtendedValidationInfo() : Bits() {}
@@ -128,6 +144,10 @@ public:
   void setImplicitDynamicEnabled(bool val) {
     Bits.IsImplicitDynamicEnabled = val;
   }
+  bool isStaticLibrary() const { return Bits.IsStaticLibrary; }
+  void setIsStaticLibrary(bool val) {
+    Bits.IsStaticLibrary = val;
+  }
   bool isTestable() const { return Bits.IsTestable; }
   void setIsTestable(bool val) {
     Bits.IsTestable = val;
@@ -137,6 +157,22 @@ public:
   }
   void setResilienceStrategy(ResilienceStrategy resilience) {
     Bits.ResilienceStrategy = unsigned(resilience);
+  }
+  bool isAllowModuleWithCompilerErrorsEnabled() {
+    return Bits.IsAllowModuleWithCompilerErrorsEnabled;
+  }
+  void setAllowModuleWithCompilerErrorsEnabled(bool val) {
+    Bits.IsAllowModuleWithCompilerErrorsEnabled = val;
+  }
+
+  StringRef getModuleABIName() const { return ModuleABIName; }
+  void setModuleABIName(StringRef name) { ModuleABIName = name; }
+
+  bool isConcurrencyChecked() const {
+    return Bits.IsConcurrencyChecked;
+  }
+  void setIsConcurrencyChecked(bool val = true) {
+    Bits.IsConcurrencyChecked = val;
   }
 };
 
@@ -153,13 +189,16 @@ public:
 ///
 /// \param data A buffer containing the serialized AST. Result information
 /// refers directly into this buffer.
+/// \param requiresOSSAModules If true, necessitates the module to be
+/// compiled with -enable-ossa-modules.
 /// \param[out] extendedInfo If present, will be populated with additional
 /// compilation options serialized into the AST at build time that may be
 /// necessary to load it properly.
 /// \param[out] dependencies If present, will be populated with list of
 /// input files the module depends on, if present in INPUT_BLOCK.
 ValidationInfo validateSerializedAST(
-    StringRef data, ExtendedValidationInfo *extendedInfo = nullptr,
+    StringRef data, bool requiresOSSAModules,
+    ExtendedValidationInfo *extendedInfo = nullptr,
     SmallVectorImpl<SerializationOptions::FileDependency> *dependencies =
         nullptr);
 

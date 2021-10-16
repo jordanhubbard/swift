@@ -58,10 +58,9 @@
 
    ;; SIL Instructions - Allocation/Deallocation.
    `(,(regexp-opt '("alloc_stack" "alloc_ref" "alloc_ref_dynamic" "alloc_box"
-                    "alloc_value_buffer" "alloc_global"
+                    "alloc_global"
                     "dealloc_stack" "dealloc_box" "project_box" "dealloc_ref"
-                    "dealloc_partial_ref" "dealloc_value_buffer"
-                    "project_value_buffer")
+                    "dealloc_partial_ref")
                   'words) . font-lock-keyword-face)
 
    ;; SIL Instructions - Debug Information.
@@ -124,7 +123,7 @@
                     "unmanaged_retain_value" "unmanaged_release_value"
                     "unmanaged_autorelease_value"
                     "strong_copy_unowned_value" "strong_copy_unmanaged_value"
-                    "destructure_struct" "destructure_tuple")
+                    "destructure_struct" "destructure_tuple" "move_value")
                   'words) . font-lock-keyword-face)
    ;; Enums. *NOTE* We do not include enum itself here since enum is a
    ;; swift declaration as well handled at the top.
@@ -275,16 +274,20 @@
 
 (defun sil-mode-display-function-cfg()
   (interactive)
-  ;; First we need to find the previous '{' and then the next '}'
+  ;; First we need to find the previous '{' and then the next '}'.
   (save-mark-and-excursion
-   (let ((brace-start (search-backward "{"))
-         (brace-end (search-forward "}"))
-         (process-connection-type nil))
-     (let ((p (start-process sil-mode-viewcfg-program-name
-                             sil-mode-viewcfg-buffer-name
-                             sil-mode-viewcfg-command
-                             (concat "--renderer=" sil-mode-viewcfg-renderer))))
-       (process-send-region p brace-start brace-end)
+    (let ((brace-start (re-search-backward "{\s*$"))
+          (brace-end (re-search-forward "^} // end sil function '" nil t))
+          (process-connection-type nil))
+      ;; See if we failed to find } // end sil function. If we did, search again
+      ;; for ^} itself and see if we find anything.
+      (if (null brace-end)
+          (setq brace-end (re-search-forward "^}")))
+      (let ((p (start-process sil-mode-viewcfg-program-name
+                              sil-mode-viewcfg-buffer-name
+                              sil-mode-viewcfg-command
+                              (concat "--renderer=" sil-mode-viewcfg-renderer))))
+        (process-send-region p brace-start brace-end)
        (process-send-eof p)))))
 
 ;;; Top Level Entry point

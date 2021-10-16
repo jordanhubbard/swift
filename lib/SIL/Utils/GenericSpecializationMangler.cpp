@@ -65,7 +65,9 @@ std::string SpecializationMangler::finalize() {
   for (NodePointer FuncChild : *FuncTopLevel) {
     TopLevel->addChild(FuncChild, D);
   }
-  std::string mangledName = Demangle::mangleNode(TopLevel);
+  auto mangling = Demangle::mangleNode(TopLevel);
+  assert(mangling.isSuccess());
+  std::string mangledName = mangling.result();
   verify(mangledName);
   return mangledName;
 }
@@ -74,39 +76,60 @@ std::string SpecializationMangler::finalize() {
 //                           Generic Specialization
 //===----------------------------------------------------------------------===//
 
-std::string GenericSpecializationMangler::mangle(GenericSignature Sig) {
-  beginMangling();
-
-  if (!Sig) {
-    assert(Function &&
-           "Need a SIL function if no generic signature is provided");
-    SILFunctionType *FTy = Function->getLoweredFunctionType();
-    Sig = FTy->getInvocationGenericSignature();
-  }
-
+void GenericSpecializationMangler::
+appendSubstitutions(GenericSignature sig, SubstitutionMap subs) {
   bool First = true;
-  Sig->forEachParam([&](GenericTypeParamType *ParamType, bool Canonical) {
+  sig->forEachParam([&](GenericTypeParamType *ParamType, bool Canonical) {
     if (Canonical) {
-      appendType(Type(ParamType).subst(SubMap)->getCanonicalType());
+      appendType(Type(ParamType).subst(subs)->getCanonicalType(), nullptr);
       appendListSeparator(First);
     }
   });
   assert(!First && "no generic substitutions");
+}
 
-  if (isInlined)
-    appendSpecializationOperator("Ti");
-  else
-    appendSpecializationOperator(
-        isPrespecializaton ? "Ts" : (isReAbstracted ? "Tg" : "TG"));
+std::string GenericSpecializationMangler::
+manglePrespecialized(GenericSignature sig, SubstitutionMap subs) {
+  beginMangling();
+  appendSubstitutions(sig, subs);
+  appendSpecializationOperator("Ts");
   return finalize();
 }
+                                  
+std::string GenericSpecializationMangler::
+mangleNotReabstracted(SubstitutionMap subs) {
+  beginMangling();
+  appendSubstitutions(getGenericSignature(), subs);
+  appendSpecializationOperator("TG");
+  return finalize();
+}
+                                  
+std::string GenericSpecializationMangler::
+mangleReabstracted(SubstitutionMap subs, bool alternativeMangling) {
+  beginMangling();
+  appendSubstitutions(getGenericSignature(), subs);
+  
+  // See ReabstractionInfo::hasConvertedResilientParams for why and when to use
+  // the alternative mangling.
+  appendSpecializationOperator(alternativeMangling ? "TB" : "Tg");
+  return finalize();
+}
+
+std::string GenericSpecializationMangler::
+mangleForDebugInfo(GenericSignature sig, SubstitutionMap subs, bool forInlining) {
+  beginMangling();
+  appendSubstitutions(sig, subs);
+  appendSpecializationOperator(forInlining ? "Ti" : "TG");
+  return finalize();
+}
+
 
 static SubstitutionMap
 getSubstitutionMapForPrespecialization(GenericSignature genericSig,
                                        GenericSignature specSig) {
   auto CalleeGenericSig = genericSig;
   auto SpecializedGenericSig = specSig;
-  auto SpecializedGenericEnv = specSig->getGenericEnvironment();
+  auto SpecializedGenericEnv = specSig.getGenericEnvironment();
 
   auto CalleeInterfaceToSpecializedInterfaceMap = SubstitutionMap::get(
       CalleeGenericSig,
@@ -132,6 +155,6 @@ std::string GenericSpecializationMangler::manglePrespecialization(
     GenericSignature specializedSig) {
   auto subs =
       getSubstitutionMapForPrespecialization(genericSig, specializedSig);
-  GenericSpecializationMangler mangler(unspecializedName, subs);
-  return mangler.mangle(genericSig);
+  GenericSpecializationMangler mangler(unspecializedName);
+  return mangler.manglePrespecialized(genericSig, subs);
 }

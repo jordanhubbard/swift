@@ -172,7 +172,9 @@ printTypeInterface(ModuleDecl *M, Type Ty, ASTPrinter &Printer,
   }
   Ty = Ty->getRValueType();
   if (auto ND = Ty->getNominalOrBoundGenericNominal()) {
-    PrintOptions Options = PrintOptions::printTypeInterface(Ty.getPointer());
+    PrintOptions Options = PrintOptions::printTypeInterface(
+        Ty.getPointer(),
+        Ty->getASTContext().TypeCheckerOpts.PrintFullConvention);
     ND->print(Printer, Options);
     printTypeNameToString(Ty, TypeName);
     return false;
@@ -200,15 +202,14 @@ static void adjustPrintOptions(PrintOptions &AdjustedOptions) {
   AdjustedOptions.VarInitializers = false;
 }
 
-ArrayRef<StringRef>
-swift::ide::collectModuleGroups(ModuleDecl *M, std::vector<StringRef> &Scratch) {
+void swift::ide::collectModuleGroups(ModuleDecl *M,
+                                     SmallVectorImpl<StringRef> &Into) {
   for (auto File : M->getFiles()) {
-    File->collectAllGroups(Scratch);
+    File->collectAllGroups(Into);
   }
-  std::sort(Scratch.begin(), Scratch.end(), [](StringRef L, StringRef R) {
-    return L.compare_lower(R) < 0;
+  std::sort(Into.begin(), Into.end(), [](StringRef L, StringRef R) {
+    return L.compare_insensitive(R) < 0;
   });
-  return llvm::makeArrayRef(Scratch);
 }
 
 /// Determine whether the given extension has a Clang node that
@@ -247,7 +248,8 @@ static bool printModuleInterfaceDecl(Decl *D,
     // a cross-module extension.
     if (!extensionHasClangNode(Ext)) {
       auto ExtendedNominal = Ext->getExtendedNominal();
-      if (Ext->getModuleContext() == ExtendedNominal->getModuleContext())
+      if (!ExtendedNominal ||
+          Ext->getModuleContext() == ExtendedNominal->getModuleContext())
         return false;
     }
   }
@@ -360,8 +362,9 @@ static bool printModuleInterfaceDecl(Decl *D,
               Opened |= ET.Ext->print(Printer, Options);
               if (ET.IsSynthesized)
                 Options.clearSynthesizedExtension();
-              if (Options.BracketOptions.shouldCloseExtension(ET.Ext))
+              if (Options.BracketOptions.shouldCloseExtension(ET.Ext)) {
                 Printer << "\n";
+              }
             }
           });
         Options.BracketOptions = BracketOptions();
@@ -421,7 +424,7 @@ getDeclsFromCrossImportOverlay(ModuleDecl *Overlay, ModuleDecl *Declaring,
         return false;
 
       // Ignore an imports of modules also imported by the underlying module.
-      if (PrevImported.find(Imported) != PrevImported.end())
+      if (PrevImported.contains(Imported))
         return false;
     }
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
@@ -606,8 +609,14 @@ void swift::ide::printModuleInterface(
     }
 
     auto ShouldPrintImport = [&](ImportDecl *ImportD) -> bool {
+      if (ImportD->getAttrs().hasAttribute<ImplementationOnlyAttr>())
+        return false;
+
       if (!TargetClangMod)
         return true;
+      if (ImportD->getModule() == TargetMod)
+        return false;
+
       auto ImportedMod = ImportD->getClangModule();
       if (!ImportedMod)
         return true;
@@ -652,7 +661,28 @@ void swift::ide::printModuleInterface(
     };
 
     if (auto clangNode = getEffectiveClangNode(D)) {
-      addToClangDecls(D, clangNode);
+      if (auto namespaceDecl =
+              dyn_cast_or_null<clang::NamespaceDecl>(clangNode.getAsDecl())) {
+        // An imported namespace decl will contain members from all redecls, so
+        // make sure we add all the redecls.
+        for (auto redecl : namespaceDecl->redecls()) {
+          // Namespace redecls may exist across mutliple modules. We want to
+          // add the decl "D" to every module that has a redecl. But we only
+          // want to add "D" once to prevent duplicate printing.
+          clang::SourceLocation loc = redecl->getLocation();
+          auto *owningModule = Importer.getClangOwningModule(redecl);
+          auto found = ClangDecls.find(owningModule);
+          if (found != ClangDecls.end() &&
+              // Don't re-add this decl if it already exists for "OwningModule".
+              llvm::find_if(found->second, [D](auto p) {
+                return p.first == D;
+              }) == found->second.end()) {
+            found->second.push_back({D, loc});
+          }
+        }
+      } else {
+        addToClangDecls(D, clangNode);
+      }
       continue;
     }
 
@@ -800,7 +830,7 @@ static SourceLoc getDeclStartPosition(SourceFile &File) {
   for (auto D : File.getTopLevelDecls()) {
     if (tryUpdateStart(D->getStartLoc())) {
       tryUpdateStart(D->getAttrs().getStartLoc());
-      auto RawComment = D->getRawComment();
+      auto RawComment = D->getRawComment(/*SerializedOK=*/false);
       if (!RawComment.isEmpty())
         tryUpdateStart(RawComment.Comments.front().Range.getStart());
     }

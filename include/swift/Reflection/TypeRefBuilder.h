@@ -24,7 +24,6 @@
 #include "swift/Reflection/TypeLowering.h"
 #include "swift/Reflection/TypeRef.h"
 #include "llvm/ADT/Optional.h"
-
 #include <vector>
 #include <unordered_map>
 
@@ -287,6 +286,10 @@ public:
 
   Demangle::NodeFactory &getNodeFactory() { return Dem; }
 
+  void clearNodeFactory() { Dem.clear(); }
+
+  BuiltType decodeMangledType(Node *node);
+
   ///
   /// Factory methods for all TypeRef kinds
   ///
@@ -297,12 +300,20 @@ public:
   }
 
   llvm::Optional<std::string> createTypeDecl(Node *node, bool &typeAlias) {
-    return Demangle::mangleNode(node);
+    auto mangling = Demangle::mangleNode(node);
+    if (!mangling.isSuccess()) {
+      return llvm::None;
+    }
+    return mangling.result();
   }
 
   BuiltProtocolDecl
   createProtocolDecl(Node *node) {
-    return std::make_pair(Demangle::mangleNode(node), false);
+    auto mangling = Demangle::mangleNode(node);
+    if (!mangling.isSuccess()) {
+      return llvm::None;
+    }
+    return std::make_pair(mangling.result(), false);
   }
 
   BuiltProtocolDecl
@@ -392,12 +403,16 @@ public:
       
       return underlyingTy->subst(*this, subs);
     }
-    
+
+    auto mangling = mangleNode(opaqueDescriptor,
+                               SymbolicResolver(),
+                               Dem);
+    if (!mangling.isSuccess())
+      return nullptr;
+
     // Otherwise, build a type ref that represents the opaque type.
     return OpaqueArchetypeTypeRef::create(*this,
-                                          mangleNode(opaqueDescriptor,
-                                                     SymbolicResolver(),
-                                                     Dem),
+                                          mangling.result(),
                                           nodeToString(opaqueDescriptor),
                                           ordinal,
                                           genericArgs);
@@ -410,8 +425,11 @@ public:
 
   const FunctionTypeRef *createFunctionType(
       llvm::ArrayRef<remote::FunctionParam<const TypeRef *>> params,
-      const TypeRef *result, FunctionTypeFlags flags) {
-    return FunctionTypeRef::create(*this, params, result, flags);
+      const TypeRef *result, FunctionTypeFlags flags,
+      FunctionMetadataDifferentiabilityKind diffKind,
+      const TypeRef *globalActor) {
+    return FunctionTypeRef::create(
+        *this, params, result, flags, diffKind, globalActor);
   }
 
   const FunctionTypeRef *createImplFunctionType(
@@ -443,10 +461,32 @@ public:
       break;
     }
 
+    funcFlags = funcFlags.withConcurrent(flags.isSendable());
     funcFlags = funcFlags.withAsync(flags.isAsync());
+    funcFlags = funcFlags.withDifferentiable(flags.isDifferentiable());
+
+    FunctionMetadataDifferentiabilityKind diffKind;
+    switch (flags.getDifferentiabilityKind()) {
+    case ImplFunctionDifferentiabilityKind::NonDifferentiable:
+      diffKind = FunctionMetadataDifferentiabilityKind::NonDifferentiable;
+      break;
+    case ImplFunctionDifferentiabilityKind::Forward:
+      diffKind = FunctionMetadataDifferentiabilityKind::Forward;
+      break;
+    case ImplFunctionDifferentiabilityKind::Reverse:
+      diffKind = FunctionMetadataDifferentiabilityKind::Reverse;
+      break;
+    case ImplFunctionDifferentiabilityKind::Normal:
+      diffKind = FunctionMetadataDifferentiabilityKind::Normal;
+      break;
+    case ImplFunctionDifferentiabilityKind::Linear:
+      diffKind = FunctionMetadataDifferentiabilityKind::Linear;
+      break;
+    }
 
     auto result = createTupleType({}, "");
-    return FunctionTypeRef::create(*this, {}, result, funcFlags);
+    return FunctionTypeRef::create(
+        *this, {}, result, funcFlags, diffKind, nullptr);
   }
 
   const ProtocolCompositionTypeRef *
@@ -513,6 +553,34 @@ public:
     return SILBoxTypeRef::create(*this, base);
   }
 
+  using BuiltSILBoxField = typename SILBoxTypeWithLayoutTypeRef::Field;
+  using BuiltSubstitution = std::pair<const TypeRef *, const TypeRef *>;
+  using BuiltRequirement = TypeRefRequirement;
+  using BuiltLayoutConstraint = TypeRefLayoutConstraint;
+  BuiltLayoutConstraint getLayoutConstraint(LayoutConstraintKind kind) {
+    // FIXME: Implement this.
+    return {};
+  }
+  BuiltLayoutConstraint
+  getLayoutConstraintWithSizeAlign(LayoutConstraintKind kind, unsigned size,
+                                   unsigned alignment) {
+    // FIXME: Implement this.
+    return {};
+  }
+
+  const SILBoxTypeWithLayoutTypeRef *createSILBoxTypeWithLayout(
+      const llvm::SmallVectorImpl<BuiltSILBoxField> &Fields,
+      const llvm::SmallVectorImpl<BuiltSubstitution> &Substitutions,
+      const llvm::SmallVectorImpl<BuiltRequirement> &Requirements) {
+    return SILBoxTypeWithLayoutTypeRef::create(*this, Fields, Substitutions,
+                                               Requirements);
+  }
+
+  bool isExistential(const TypeRef *) {
+    // FIXME: Implement this.
+    return true;
+  }
+
   const TypeRef *createDynamicSelfType(const TypeRef *selfType) {
     // TypeRefs should not contain DynamicSelfType.
     return nullptr;
@@ -576,7 +644,7 @@ public:
 private:
   std::vector<ReflectionInfo> ReflectionInfos;
     
-  std::string normalizeReflectionName(RemoteRef<char> name);
+  llvm::Optional<std::string> normalizeReflectionName(RemoteRef<char> name);
   bool reflectionNameMatches(RemoteRef<char> reflectionName,
                              StringRef searchName);
 
@@ -600,7 +668,7 @@ private:
   // TypeRefBuilder struct, to isolate its template-ness from the rest of
   // TypeRefBuilder.
   unsigned PointerSize;
-  std::function<Demangle::Node * (RemoteRef<char>)>
+  std::function<Demangle::Node * (RemoteRef<char>, bool)>
     TypeRefDemangler;
   std::function<const TypeRef* (uint64_t, unsigned)>
     OpaqueUnderlyingTypeReader;
@@ -611,10 +679,10 @@ public:
     : TC(*this),
       PointerSize(sizeof(typename Runtime::StoredPointer)),
       TypeRefDemangler(
-      [this, &reader](RemoteRef<char> string) -> Demangle::Node * {
+      [this, &reader](RemoteRef<char> string, bool useOpaqueTypeSymbolicReferences) -> Demangle::Node * {
         return reader.demangle(string,
                                remote::MangledNameKind::Type,
-                               Dem, /*useOpaqueTypeSymbolicReferences*/ true);
+                               Dem, useOpaqueTypeSymbolicReferences);
       }),
       OpaqueUnderlyingTypeReader(
       [&reader](uint64_t descriptorAddr, unsigned ordinal) -> const TypeRef* {
@@ -623,8 +691,9 @@ public:
       })
   {}
 
-  Demangle::Node *demangleTypeRef(RemoteRef<char> string) {
-    return TypeRefDemangler(string);
+  Demangle::Node *demangleTypeRef(RemoteRef<char> string,
+                                  bool useOpaqueTypeSymbolicReferences = true) {
+    return TypeRefDemangler(string, useOpaqueTypeSymbolicReferences);
   }
 
   TypeConverter &getTypeConverter() { return TC; }

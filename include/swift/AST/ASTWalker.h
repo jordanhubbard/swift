@@ -13,11 +13,13 @@
 #ifndef SWIFT_AST_ASTWALKER_H
 #define SWIFT_AST_ASTWALKER_H
 
+#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/PointerUnion.h"
 #include <utility>
 
 namespace swift {
 
+class ArgumentList;
 class Decl;
 class Expr;
 class ClosureExpr;
@@ -215,6 +217,10 @@ public:
   /// TapExpr.
   virtual bool shouldWalkIntoTapExpression() { return true; }
 
+  /// This method configures whether the the walker should visit the underlying
+  /// value of a property wrapper placeholder.
+  virtual bool shouldWalkIntoPropertyWrapperPlaceholderValue() { return true; }
+
   /// This method configures whether the walker should visit the capture
   /// initializer expressions within a capture list directly, rather than
   /// walking the declarations.
@@ -240,6 +246,30 @@ public:
   /// traversal is terminated and returns failure.
   virtual bool walkToParameterListPost(ParameterList *PL) { return true; }
 
+  /// This method is called when first visiting an argument list before walking
+  /// into its arguments.
+  ///
+  /// \param ArgList The argument list to walk.
+  ///
+  /// \returns a pair indicating whether to visit the arguments, along with
+  /// the argument list that should replace this argument list in the tree. If
+  /// the latter is null, the traversal will be terminated.
+  ///
+  /// The default implementation returns \c {true, ArgList}.
+  virtual std::pair<bool, ArgumentList *>
+  walkToArgumentListPre(ArgumentList *ArgList) {
+    return {true, ArgList};
+  }
+
+  /// This method is called after visiting the arguments in an argument list.
+  /// If it returns null, the walk is terminated; otherwise, the
+  /// returned argument list is spliced in where the old argument list
+  /// previously appeared.
+  ///
+  /// The default implementation always returns the argument list.
+  virtual ArgumentList *walkToArgumentListPost(ArgumentList *ArgList) {
+    return ArgList;
+  }
 
 protected:
   ASTWalker() = default;

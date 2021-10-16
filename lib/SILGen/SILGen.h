@@ -27,6 +27,7 @@
 
 namespace swift {
   class SILBasicBlock;
+  class ForeignAsyncConvention;
 
 namespace Lowering {
   class TypeConverter;
@@ -85,8 +86,6 @@ public:
   /// Set of delayed conformances that have already been forced.
   llvm::DenseSet<NormalProtocolConformance *> forcedConformances;
 
-  SILFunction *emitTopLevelFunction(SILLocation Loc);
-
   size_t anonymousSymbolCounter = 0;
 
   Optional<SILDeclRef> StringToNSStringFn;
@@ -117,6 +116,25 @@ public:
   Optional<VarDecl*> NSErrorRequirement;
 
   Optional<ProtocolConformance *> NSErrorConformanceToError;
+
+  Optional<FuncDecl*> AsyncLetStart;
+  Optional<FuncDecl*> AsyncLetGet;
+  Optional<FuncDecl*> AsyncLetGetThrowing;
+  Optional<FuncDecl*> EndAsyncLet;
+
+  Optional<FuncDecl*> TaskFutureGet;
+  Optional<FuncDecl*> TaskFutureGetThrowing;
+
+  Optional<FuncDecl*> RunTaskForBridgedAsyncMethod;
+  Optional<FuncDecl*> ResumeUnsafeContinuation;
+  Optional<FuncDecl*> ResumeUnsafeThrowingContinuation;
+  Optional<FuncDecl*> ResumeUnsafeThrowingContinuationWithError;
+  Optional<FuncDecl*> CheckExpectedExecutor;
+
+  Optional<FuncDecl *> AsyncMainDrainQueue;
+  Optional<FuncDecl *> GetMainExecutor;
+  Optional<FuncDecl *> SwiftJobRun;
+  Optional<FuncDecl *> ExitFunc;
 
 public:
   SILGenModule(SILModule &M, ModuleDecl *SM);
@@ -162,7 +180,17 @@ public:
                                            CanSILFunctionType thunkType,
                                            CanSILFunctionType fromType,
                                            CanSILFunctionType toType,
-                                           CanType dynamicSelfType);
+                                           CanType dynamicSelfType,
+                                           CanType fromGlobalActor);
+  
+  /// Get or create the declaration of a completion handler block
+  /// implementation function for an ObjC API that was imported
+  /// as `async` in Swift.
+  SILFunction *getOrCreateForeignAsyncCompletionHandlerImplFunction(
+      CanSILFunctionType blockType, CanType continuationTy,
+      AbstractionPattern origFormalType, CanGenericSignature sig,
+      ForeignAsyncConvention convention,
+      Optional<ForeignErrorConvention> foreignError);
 
   /// Determine whether the given class has any instance variables that
   /// need to be destroyed.
@@ -217,14 +245,14 @@ public:
   /// - The last parameter in the returned differential.
   /// - The last result in the returned pullback.
   SILFunction *getOrCreateCustomDerivativeThunk(
-      SILFunction *customDerivativeFn, SILFunction *originalFn,
-      const AutoDiffConfig &config, AutoDiffDerivativeFunctionKind kind);
+      AbstractFunctionDecl *originalAFD, SILFunction *originalFn,
+      SILFunction *customDerivativeFn, const AutoDiffConfig &config,
+      AutoDiffDerivativeFunctionKind kind);
 
   /// Get or create a derivative function vtable entry thunk for the given
   /// SILDeclRef and derivative function type.
-  SILFunction *
-  getOrCreateAutoDiffClassMethodThunk(SILDeclRef derivativeFnRef,
-                                      CanSILFunctionType derivativeFnTy);
+  SILFunction *getOrCreateDerivativeVTableThunk(
+      SILDeclRef derivativeFnRef, CanSILFunctionType derivativeFnTy);
 
   /// Determine whether we need to emit an ivar destroyer for the given class.
   /// An ivar destroyer is needed if a superclass of this class may define a
@@ -237,7 +265,7 @@ public:
 
   // These are either not allowed at global scope or don't require
   // code emission.
-  void visitImportDecl(ImportDecl *d);
+  void visitImportDecl(ImportDecl *d) {}
   void visitEnumCaseDecl(EnumCaseDecl *d) {}
   void visitEnumElementDecl(EnumElementDecl *d) {}
   void visitOperatorDecl(OperatorDecl *d) {}
@@ -295,9 +323,9 @@ public:
   /// Emits the backing initializer for a property with an attached wrapper.
   void emitPropertyWrapperBackingInitializer(VarDecl *var);
 
-  /// Emits default argument generators for the given parameter list.
-  void emitDefaultArgGenerators(SILDeclRef::Loc decl,
-                                ParameterList *paramList);
+  /// Emits argument generators, including default argument generators and
+  /// property wrapper argument generators, for the given parameter list.
+  void emitArgumentGenerators(SILDeclRef::Loc decl, ParameterList *paramList);
   
   /// Emits a thunk from a foreign function to the native Swift convention.
   void emitForeignToNativeThunk(SILDeclRef thunk);
@@ -305,6 +333,9 @@ public:
   /// Emits a thunk from a Swift function to the native Swift convention.
   void emitNativeToForeignThunk(SILDeclRef thunk);
 
+  /// Emits a thunk from an actor function to a potentially distributed call.
+  void emitDistributedThunk(SILDeclRef thunk);
+  
   void preEmitFunction(SILDeclRef constant, SILFunction *F, SILLocation L);
   void postEmitFunction(SILDeclRef constant, SILFunction *F);
   
@@ -401,6 +432,7 @@ public:
   /// functions (null if undefined).
   void emitDifferentiabilityWitness(AbstractFunctionDecl *originalAFD,
                                     SILFunction *originalFunction,
+                                    DifferentiabilityKind diffKind,
                                     const AutoDiffConfig &config,
                                     SILFunction *jvp, SILFunction *vjp,
                                     const DeclAttribute *diffAttr);
@@ -426,6 +458,10 @@ public:
 #define FUNC_DECL(NAME, ID) \
   FuncDecl *get##NAME(SILLocation loc);
 #include "swift/AST/KnownDecls.def"
+
+#define KNOWN_SDK_FUNC_DECL(MODULE, NAME, ID) \
+  FuncDecl *get##NAME(SILLocation loc);
+#include "swift/AST/KnownSDKDecls.def"
   
   /// Retrieve the _ObjectiveCBridgeable protocol definition.
   ProtocolDecl *getObjectiveCBridgeable(SILLocation loc);
@@ -459,6 +495,41 @@ public:
 
   /// Retrieve the conformance of NSError to the Error protocol.
   ProtocolConformance *getNSErrorConformanceToError();
+
+  /// Retrieve the _Concurrency._asyncLetStart intrinsic.
+  FuncDecl *getAsyncLetStart();
+  /// Retrieve the _Concurrency._asyncLetGet intrinsic.
+  FuncDecl *getAsyncLetGet();
+  /// Retrieve the _Concurrency._asyncLetGetThrowing intrinsic.
+  FuncDecl *getAsyncLetGetThrowing();
+  /// Retrieve the _Concurrency._asyncLetFinish intrinsic.
+  FuncDecl *getFinishAsyncLet();
+
+  /// Retrieve the _Concurrency._taskFutureGet intrinsic.
+  FuncDecl *getTaskFutureGet();
+
+  /// Retrieve the _Concurrency._taskFutureGetThrowing intrinsic.
+  FuncDecl *getTaskFutureGetThrowing();
+
+  /// Retrieve the _Concurrency._resumeUnsafeContinuation intrinsic.
+  FuncDecl *getResumeUnsafeContinuation();
+  /// Retrieve the _Concurrency._resumeUnsafeThrowingContinuation intrinsic.
+  FuncDecl *getResumeUnsafeThrowingContinuation();
+  /// Retrieve the _Concurrency._resumeUnsafeThrowingContinuationWithError intrinsic.
+  FuncDecl *getResumeUnsafeThrowingContinuationWithError();
+  /// Retrieve the _Concurrency._runTaskForBridgedAsyncMethod intrinsic.
+  FuncDecl *getRunTaskForBridgedAsyncMethod();
+  /// Retrieve the _Concurrency._checkExpectedExecutor intrinsic.
+  FuncDecl *getCheckExpectedExecutor();
+
+  /// Retrieve the _Concurrency._asyncMainDrainQueue intrinsic.
+  FuncDecl *getAsyncMainDrainQueue();
+  /// Retrieve the _Concurrency._getMainExecutor intrinsic.
+  FuncDecl *getGetMainExecutor();
+  /// Retrieve the _Concurrency._swiftJobRun intrinsic.
+  FuncDecl *getSwiftJobRun();
+  // Retrieve the _SwiftConcurrencyShims.exit intrinsic.
+  FuncDecl *getExit();
 
   SILFunction *getKeyPathProjectionCoroutine(bool isReadAccess,
                                              KeyPathTypeKind typeKind);

@@ -121,7 +121,9 @@ where SubSequence: MutableCollection
   /// After partitioning a collection, there is a pivot index `p` where
   /// no element before `p` satisfies the `belongsInSecondPartition`
   /// predicate and every element at or after `p` satisfies
-  /// `belongsInSecondPartition`.
+  /// `belongsInSecondPartition`. This operation isn't guaranteed to be
+  /// stable, so the relative ordering of elements within the partitions might
+  /// change.
   ///
   /// In the following example, an array of numbers is partitioned by a
   /// predicate that matches elements greater than 30.
@@ -140,6 +142,10 @@ where SubSequence: MutableCollection
   ///     // first == [30, 10, 20, 30, 30]
   ///     let second = numbers[p...]
   ///     // second == [60, 40]
+  ///
+  /// Note that the order of elements in both partitions changed.
+  /// That is, `40` appears before `60` in the original collection,
+  /// but, after calling `partition(by:)`, `60` appears before `40`.
   ///
   /// - Parameter belongsInSecondPartition: A predicate used to partition
   ///   the collection. All elements satisfying this predicate are ordered
@@ -177,6 +183,7 @@ where SubSequence: MutableCollection
   /// within an algorithm, but when that fails, invoking the
   /// same algorithm on `body`\ 's argument lets you trade safety for
   /// speed.
+  @available(*, deprecated, renamed: "withContiguousMutableStorageIfAvailable")
   mutating func _withUnsafeMutableBufferPointerIfSupported<R>(
     _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
   ) rethrows -> R?
@@ -199,6 +206,7 @@ where SubSequence: MutableCollection
 // TODO: swift-3-indexing-model - review the following
 extension MutableCollection {
   @inlinable
+  @available(*, deprecated, renamed: "withContiguousMutableStorageIfAvailable")
   public mutating func _withUnsafeMutableBufferPointerIfSupported<R>(
     _ body: (inout UnsafeMutableBufferPointer<Element>) throws -> R
   ) rethrows -> R? {
@@ -236,6 +244,7 @@ extension MutableCollection {
   ///   the range must be valid indices of the collection.
   ///
   /// - Complexity: O(1)
+  @available(*, unavailable)
   @inlinable
   public subscript(bounds: Range<Index>) -> Slice<Self> {
     get {
@@ -245,6 +254,19 @@ extension MutableCollection {
     set {
       _writeBackMutableSlice(&self, bounds: bounds, slice: newValue)
     }
+  }
+
+  // This unavailable default implementation of `subscript(bounds: Range<_>)`
+  // prevents incomplete MutableCollection implementations from satisfying the
+  // protocol through the use of the generic convenience implementation
+  // `subscript<R: RangeExpression>(r: R)`. If that were the case, at
+  // runtime the generic implementation would call itself
+  // in an infinite recursion due to the absence of a better option.
+  @available(*, unavailable)
+  @_alwaysEmitIntoClient
+  public subscript(bounds: Range<Index>) -> SubSequence {
+    get { fatalError() }
+    set { fatalError() }
   }
 
   /// Exchanges the values at the specified indices of the collection.
@@ -267,45 +289,42 @@ extension MutableCollection {
   }
 }
 
-//===----------------------------------------------------------------------===//
-// moveSubranges(_:to:)
-//===----------------------------------------------------------------------===//
+extension MutableCollection where SubSequence == Slice<Self> {
 
-extension MutableCollection {
-  /// Moves the elements in the given subranges to just before the element at
-  /// the specified index.
+  /// Accesses a contiguous subrange of the collection's elements.
   ///
-  /// This example finds all the uppercase letters in the array and then
-  /// moves them to between `"i"` and `"j"`.
+  /// The accessed slice uses the same indices for the same elements as the
+  /// original collection. Always use the slice's `startIndex` property
+  /// instead of assuming that its indices start at a particular value.
   ///
-  ///     var letters = Array("ABCdeFGhijkLMNOp")
-  ///     let uppercaseRanges = letters.subranges(where: { $0.isUppercase })
-  ///     let rangeOfUppercase = letters.moveSubranges(uppercaseRanges, to: 10)
-  ///     // String(letters) == "dehiABCFGLMNOjkp"
-  ///     // rangeOfUppercase == 4..<13
+  /// This example demonstrates getting a slice of an array of strings, finding
+  /// the index of one of the strings in the slice, and then using that index
+  /// in the original array.
   ///
-  /// - Parameters:
-  ///   - subranges: The subranges of the elements to move.
-  ///   - insertionPoint: The index to use as the destination of the elements.
-  /// - Returns: The new bounds of the moved elements.
+  ///     var streets = ["Adams", "Bryant", "Channing", "Douglas", "Evarts"]
+  ///     let streetsSlice = streets[2 ..< streets.endIndex]
+  ///     print(streetsSlice)
+  ///     // Prints "["Channing", "Douglas", "Evarts"]"
   ///
-  /// - Complexity: O(*n* log *n*) where *n* is the length of the collection.
-  @available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
-  @discardableResult
-  public mutating func moveSubranges(
-    _ subranges: RangeSet<Index>, to insertionPoint: Index
-  ) -> Range<Index> {
-    let lowerCount = distance(from: startIndex, to: insertionPoint)
-    let upperCount = distance(from: insertionPoint, to: endIndex)
-    let start = _indexedStablePartition(
-      count: lowerCount,
-      range: startIndex..<insertionPoint,
-      by: { subranges.contains($0) })
-    let end = _indexedStablePartition(
-      count: upperCount,
-      range: insertionPoint..<endIndex,
-      by: { !subranges.contains($0) })
-    return start..<end
+  ///     let index = streetsSlice.firstIndex(of: "Evarts")    // 4
+  ///     streets[index!] = "Eustace"
+  ///     print(streets[index!])
+  ///     // Prints "Eustace"
+  ///
+  /// - Parameter bounds: A range of the collection's indices. The bounds of
+  ///   the range must be valid indices of the collection.
+  ///
+  /// - Complexity: O(1)
+  @inlinable
+  @_alwaysEmitIntoClient
+  public subscript(bounds: Range<Index>) -> Slice<Self> {
+    get {
+      _failEarlyRangeCheck(bounds, bounds: startIndex..<endIndex)
+      return Slice(base: self, bounds: bounds)
+    }
+    set {
+      _writeBackMutableSlice(&self, bounds: bounds, slice: newValue)
+    }
   }
 }
 

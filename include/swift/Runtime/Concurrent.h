@@ -63,7 +63,7 @@ template <class ElemTy> struct ConcurrentList {
 
   /// Remove all of the links in the chain. This method leaves
   /// the list at a usable state and new links can be added.
-  /// Notice that this operation is non-concurrent because
+  /// Notice that this operation is non-sendable because
   /// we have no way of ensuring that no one is currently
   /// traversing the list.
   void clear() {
@@ -416,6 +416,35 @@ public:
   }
 };
 
+/// A simple linked list representing pointers that need to be freed. This is
+/// not a concurrent data structure, just a bit of support used in the types
+/// below.
+struct ConcurrentFreeListNode {
+  ConcurrentFreeListNode *Next;
+  void *Ptr;
+
+  static void add(ConcurrentFreeListNode **head, void *ptr) {
+    auto *newNode = reinterpret_cast<ConcurrentFreeListNode *>(
+        malloc(sizeof(ConcurrentFreeListNode)));
+    newNode->Next = *head;
+    newNode->Ptr = ptr;
+    *head = newNode;
+  }
+
+  /// Free all nodes in the free list, resetting `head` to `NULL`. Calls
+  /// `FreeFn` on the Ptr field of every node.
+  template <typename FreeFn>
+  static void freeAll(ConcurrentFreeListNode **head, const FreeFn &freeFn) {
+    auto *node = *head;
+    while (node) {
+      auto *next = node->Next;
+      freeFn(node->Ptr);
+      free(node);
+      node = next;
+    }
+    *head = nullptr;
+  }
+};
 
 /// An append-only array that can be read without taking locks. Writes
 /// are still locked and serialized, but only with respect to other
@@ -454,8 +483,8 @@ private:
   std::atomic<size_t> ReaderCount;
   std::atomic<Storage *> Elements;
   Mutex WriterLock;
-  std::vector<Storage *> FreeList;
-  
+  ConcurrentFreeListNode *FreeList{nullptr};
+
   void incrementReaders() {
     ReaderCount.fetch_add(1, std::memory_order_acquire);
   }
@@ -465,10 +494,9 @@ private:
   }
   
   void deallocateFreeList() {
-    for (Storage *storage : FreeList)
-      storage->deallocate();
-    FreeList.clear();
-    FreeList.shrink_to_fit();
+    ConcurrentFreeListNode::freeAll(&FreeList, [](void *ptr) {
+      reinterpret_cast<Storage *>(ptr)->deallocate();
+    });
   }
   
 public:
@@ -488,9 +516,13 @@ public:
     ~Snapshot() {
       Array->decrementReaders();
     }
-    
-    const ElemTy *begin() { return Start; }
-    const ElemTy *end() { return Start + Count; }
+
+    // These are marked as ref-qualified (the &) to make sure they can't be
+    // called on temporaries, since the temporary would be destroyed before the
+    // return value can be used, making it invalid.
+    const ElemTy *begin() & { return Start; }
+    const ElemTy *end() & { return Start + Count; }
+
     size_t count() { return Count; }
   };
 
@@ -508,8 +540,8 @@ public:
   }
   
   void push_back(const ElemTy &elem) {
-    ScopedLock guard(WriterLock);
-    
+    Mutex::ScopedLock guard(WriterLock);
+
     auto *storage = Elements.load(std::memory_order_relaxed);
     auto count = storage ? storage->Count.load(std::memory_order_relaxed) : 0;
     if (count >= Capacity) {
@@ -518,18 +550,22 @@ public:
       if (storage) {
         std::copy(storage->data(), storage->data() + count, newStorage->data());
         newStorage->Count.store(count, std::memory_order_release);
-        FreeList.push_back(storage);
+        ConcurrentFreeListNode::add(&FreeList, storage);
       }
       
       storage = newStorage;
       Capacity = newCapacity;
+
       Elements.store(storage, std::memory_order_release);
     }
     
     new(&storage->data()[count]) ElemTy(elem);
     storage->Count.store(count + 1, std::memory_order_release);
     
-    if (ReaderCount.load(std::memory_order_acquire) == 0)
+    // The standard says that std::memory_order_seq_cst only applies to
+    // read-modify-write operations, so we need an explicit fence:
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (ReaderCount.load(std::memory_order_relaxed) == 0)
       deallocateFreeList();
   }
 
@@ -594,9 +630,6 @@ struct ConcurrentReadableHashMap {
                 "Elements must not have destructors (they won't be called).");
 
 private:
-  // A scoped lock type to use on MutexTy.
-  using ScopedLockTy = ScopedLockT<MutexTy, false>;
-
   /// The reciprocal of the load factor at which we expand the table. A value of
   /// 4 means that we resize at 1/4 = 75% load factor.
   static const size_t ResizeProportion = 4;
@@ -606,7 +639,7 @@ private:
   /// Otherwise, just return the passed-in size, which is always valid even if
   /// not necessarily optimal.
   static size_t goodSize(size_t size) {
-#if defined(__APPLE__) && defined(__MACH__)
+#if defined(__APPLE__) && defined(__MACH__) && SWIFT_STDLIB_HAS_DARWIN_LIBMALLOC
     return malloc_good_size(size);
 #else
     return size;
@@ -624,6 +657,76 @@ private:
   /// is stored inline. We work around this contradiction by considering the
   /// first index to always be occupied with a value that never matches any key.
   struct IndexStorage {
+    using RawType = uintptr_t;
+
+    RawType Value;
+
+    static constexpr uintptr_t log2(uintptr_t x) {
+      return x <= 1 ? 0 : log2(x >> 1) + 1;
+    }
+
+    // A crude way to detect trivial use-after-free bugs given that a lot of
+    // data structure have a strong bias toward bits that are zero.
+#ifndef NDEBUG
+    static constexpr uint8_t InlineCapacityDebugBits = 0xC0;
+#else
+    static constexpr uint8_t InlineCapacityDebugBits = 0;
+#endif
+    static constexpr uintptr_t InlineIndexBits = 4;
+    static constexpr uintptr_t InlineIndexMask = 0xF;
+    static constexpr uintptr_t InlineCapacity =
+        sizeof(RawType) * CHAR_BIT / InlineIndexBits;
+    static constexpr uintptr_t InlineCapacityLog2 = log2(InlineCapacity);
+
+    // Indices can be stored in different ways, depending on how big they need
+    // to be. The index mode is stored in the bottom two bits of Value. The
+    // meaning of the rest of Value depends on the mode.
+    enum class IndexMode {
+      // Value is treated as an array of four-bit integers, storing the indices.
+      // The first element overlaps with the mode, and is never used.
+      Inline,
+
+      // The rest of Value holds a pointer to storage. The first byte of this
+      // storage holds the log2 of the storage capacity. The storage is treated
+      // as an array of 8, 16, or 32-bit integers. The first element overlaps
+      // with the capacity, and is never used.
+      Array8,
+      Array16,
+      Array32,
+    };
+
+    IndexStorage() : Value(0) {}
+    IndexStorage(RawType value) : Value(value) {}
+    IndexStorage(void *ptr, unsigned indexSize, uint8_t capacityLog2) {
+      assert(capacityLog2 > InlineCapacityLog2);
+      IndexMode mode;
+      switch (indexSize) {
+      case sizeof(uint8_t):
+        mode = IndexMode::Array8;
+        break;
+      case sizeof(uint16_t):
+        mode = IndexMode::Array16;
+        break;
+      case sizeof(uint32_t):
+        mode = IndexMode::Array32;
+        break;
+      default:
+        swift_unreachable("unknown index size");
+      }
+      Value = reinterpret_cast<uintptr_t>(ptr) | static_cast<uintptr_t>(mode);
+      *reinterpret_cast<uint8_t *>(ptr) = capacityLog2 | InlineCapacityDebugBits;
+    }
+
+    bool valueIsPointer() { return Value & 3; }
+
+    void *pointer() {
+      if (valueIsPointer())
+        return (void *)(Value & (RawType)~3);
+      return nullptr;
+    }
+
+    IndexMode indexMode() { return IndexMode(Value & 3); }
+
     // Index size is variable based on capacity, either 8, 16, or 32 bits.
     //
     // This is somewhat conservative. We could have, for example, a capacity of
@@ -631,18 +734,6 @@ private:
     // indices. However, taking advantage of this would require reallocating
     // the index storage when the element count crossed a threshold, which is
     // more complex, and the advantages are minimal. This keeps it simple.
-    //
-    // The first byte of the storage is the log 2 of the capacity. The remaining
-    // storage is then an array of 8, 16, or 32 bit integers, depending on the
-    // capacity number. This union allows us to access the capacity, and then
-    // access the rest of the storage by taking the address of one of the
-    // IndexZero members and indexing into it (always avoiding index 0).
-    union {
-      uint8_t CapacityLog2;
-      std::atomic<uint8_t> IndexZero8;
-      std::atomic<uint16_t> IndexZero16;
-      std::atomic<uint32_t> IndexZero32;
-    };
 
     // Get the size, in bytes, of the index needed for the given capacity.
     static unsigned indexSize(uint8_t capacityLog2) {
@@ -653,46 +744,69 @@ private:
       return sizeof(uint32_t);
     }
 
-    unsigned indexSize() { return indexSize(CapacityLog2); }
+    uint8_t getCapacityLog2() {
+      if (auto *ptr = pointer()) {
+        auto result = *reinterpret_cast<uint8_t *>(ptr);
+        assert((result & InlineCapacityDebugBits) == InlineCapacityDebugBits);
+        return result & ~InlineCapacityDebugBits;
+      }
+      return InlineCapacityLog2;
+    }
 
-    static IndexStorage *allocate(size_t capacityLog2) {
+    static IndexStorage allocate(size_t capacityLog2) {
       assert(capacityLog2 > 0);
       size_t capacity = 1UL << capacityLog2;
-      auto *ptr = reinterpret_cast<IndexStorage *>(
-          calloc(capacity, indexSize(capacityLog2)));
+      unsigned size = indexSize(capacityLog2);
+      auto *ptr = calloc(capacity, size);
       if (!ptr)
         swift::crash("Could not allocate memory.");
-      ptr->CapacityLog2 = capacityLog2;
-      return ptr;
+      return IndexStorage(ptr, size, capacityLog2);
     }
 
     unsigned loadIndexAt(size_t i, std::memory_order order) {
       assert(i > 0 && "index zero is off-limits, used to store capacity");
+      assert(i < (1 << getCapacityLog2()) &&
+             "index is off the end of the indices");
 
-      switch (indexSize()) {
-      case sizeof(uint8_t):
-        return (&IndexZero8)[i].load(order);
-      case sizeof(uint16_t):
-        return (&IndexZero16)[i].load(order);
-      case sizeof(uint32_t):
-        return (&IndexZero32)[i].load(order);
-      default:
-        swift_unreachable("unknown index size");
+      switch (indexMode()) {
+      case IndexMode::Inline:
+        return (Value >> (i * InlineIndexBits)) & InlineIndexMask;
+      case IndexMode::Array8:
+        return ((std::atomic<uint8_t> *)pointer())[i].load(order);
+      case IndexMode::Array16:
+        return ((std::atomic<uint16_t> *)pointer())[i].load(order);
+      case IndexMode::Array32:
+        return ((std::atomic<uint32_t> *)pointer())[i].load(order);
       }
     }
 
-    void storeIndexAt(unsigned value, size_t i, std::memory_order order) {
+    void storeIndexAt(std::atomic<RawType> *inlineStorage, unsigned value,
+                      size_t i, std::memory_order order) {
       assert(i > 0 && "index zero is off-limits, used to store capacity");
+      assert(i < (1 << getCapacityLog2()) &&
+             "index is off the end of the indices");
 
-      switch (indexSize()) {
-      case sizeof(uint8_t):
-        return (&IndexZero8)[i].store(value, order);
-      case sizeof(uint16_t):
-        return (&IndexZero16)[i].store(value, order);
-      case sizeof(uint32_t):
-        return (&IndexZero32)[i].store(value, order);
-      default:
-        swift_unreachable("unknown index size");
+      switch (indexMode()) {
+      case IndexMode::Inline: {
+        assert(value == (value & InlineIndexMask) && "value is too big to fit");
+        auto shift = i * InlineIndexBits;
+        assert((Value & (InlineIndexMask << shift)) == 0 &&
+               "can't overwrite an existing index");
+        assert(Value == inlineStorage->load(std::memory_order_relaxed) &&
+               "writing with a stale IndexStorage");
+        auto newStorage = Value | ((RawType)value << shift);
+        inlineStorage->store(newStorage, order);
+        break;
+      }
+      case IndexMode::Array8:
+        ((std::atomic<uint8_t> *)pointer())[i].store(value, order);
+        break;
+      case IndexMode::Array16:
+        ((std::atomic<uint16_t> *)pointer())[i].store(value, order);
+        break;
+      case IndexMode::Array32:
+        ((std::atomic<uint32_t> *)pointer())[i].store(value, order);
+        break;
       }
     }
   };
@@ -720,28 +834,6 @@ private:
     ElemTy *data() { return &Elem; }
   };
 
-  /// A simple linked list representing pointers that need to be freed.
-  struct FreeListNode {
-    FreeListNode *Next;
-    void *Ptr;
-
-    static void add(FreeListNode **head, void *ptr) {
-      auto *newNode = new FreeListNode{*head, ptr};
-      *head = newNode;
-    }
-
-    static void freeAll(FreeListNode **head) {
-      auto *node = *head;
-      while (node) {
-        auto *next = node->Next;
-        free(node->Ptr);
-        delete node;
-        node = next;
-      }
-      *head = nullptr;
-    }
-  };
-
   /// The number of readers currently active, equal to the number of snapshot
   /// objects currently alive.
   std::atomic<uint32_t> ReaderCount{0};
@@ -753,13 +845,17 @@ private:
   std::atomic<ElementStorage *> Elements{nullptr};
 
   /// The array of indices.
-  std::atomic<IndexStorage *> Indices{nullptr};
+  ///
+  /// This has to be stored as a IndexStorage::RawType instead of a IndexStorage
+  /// because some of our targets don't support interesting structs as atomic
+  /// types. See also MetadataCache::TrackingInfo which uses the same technique.
+  std::atomic<typename IndexStorage::RawType> Indices{0};
 
   /// The writer lock, which must be taken before any mutation of the table.
   MutexTy WriterLock;
 
   /// The list of pointers to be freed once no readers are active.
-  FreeListNode *FreeList{nullptr};
+  ConcurrentFreeListNode *FreeList{nullptr};
 
   void incrementReaders() {
     ReaderCount.fetch_add(1, std::memory_order_acquire);
@@ -772,8 +868,11 @@ private:
   /// Free all the arrays in the free lists if there are no active readers. If
   /// there are active readers, do nothing.
   void deallocateFreeListIfSafe() {
-    if (ReaderCount.load(std::memory_order_acquire) == 0)
-      FreeListNode::freeAll(&FreeList);
+    // The standard says that std::memory_order_seq_cst only applies to
+    // read-modify-write operations, so we need an explicit fence:
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (ReaderCount.load(std::memory_order_relaxed) == 0)
+      ConcurrentFreeListNode::freeAll(&FreeList, free);
   }
 
   /// Grow the elements array, adding the old array to the free list and
@@ -787,10 +886,14 @@ private:
     if (elements) {
       memcpy(newElements->data(), elements->data(),
              elementCount * sizeof(ElemTy));
-      FreeListNode::add(&FreeList, elements);
+      ConcurrentFreeListNode::add(&FreeList, elements);
     }
 
-    Elements.store(newElements, std::memory_order_release);
+    // Use seq_cst here to ensure that the subsequent load of ReaderCount is
+    // ordered after this store. If ReaderCount is loaded first, then a new
+    // reader could come in between that load and this store, and then we
+    // could end up freeing the old elements pointer while it's still in use.
+    Elements.store(newElements, std::memory_order_seq_cst);
     return newElements;
   }
 
@@ -798,18 +901,17 @@ private:
   /// returning the new array with all existing indices copied into it. This
   /// operation performs a rehash, so that the indices are in the correct
   /// location in the new array.
-  IndexStorage *resize(IndexStorage *indices, uint8_t indicesCapacityLog2,
-                       ElemTy *elements) {
-    // Double the size. Start with 16 (fits into 16-byte malloc
-    // bucket), which is 2^4.
-    size_t newCapacityLog2 = indices ? indicesCapacityLog2 + 1 : 4;
+  IndexStorage resize(IndexStorage indices, uint8_t indicesCapacityLog2,
+                      ElemTy *elements) {
+    // Double the size.
+    size_t newCapacityLog2 = indicesCapacityLog2 + 1;
     size_t newMask = (1UL << newCapacityLog2) - 1;
 
-    IndexStorage *newIndices = IndexStorage::allocate(newCapacityLog2);
+    IndexStorage newIndices = IndexStorage::allocate(newCapacityLog2);
 
     size_t indicesCount = 1UL << indicesCapacityLog2;
     for (size_t i = 1; i < indicesCount; i++) {
-      unsigned index = indices->loadIndexAt(i, std::memory_order_relaxed);
+      unsigned index = indices.loadIndexAt(i, std::memory_order_relaxed);
       if (index == 0)
         continue;
 
@@ -819,15 +921,20 @@ private:
       size_t newI = hash & newMask;
       // Index 0 is unusable (occupied by the capacity), so always skip it.
       while (newI == 0 ||
-             newIndices->loadIndexAt(newI, std::memory_order_relaxed) != 0) {
+             newIndices.loadIndexAt(newI, std::memory_order_relaxed) != 0) {
         newI = (newI + 1) & newMask;
       }
-      newIndices->storeIndexAt(index, newI, std::memory_order_relaxed);
+      newIndices.storeIndexAt(nullptr, index, newI, std::memory_order_relaxed);
     }
 
-    Indices.store(newIndices, std::memory_order_release);
+    // Use seq_cst here to ensure that the subsequent load of ReaderCount is
+    // ordered after this store. If ReaderCount is loaded first, then a new
+    // reader could come in between that load and this store, and then we
+    // could end up freeing the old indices pointer while it's still in use.
+    Indices.store(newIndices.Value, std::memory_order_seq_cst);
 
-    FreeListNode::add(&FreeList, indices);
+    if (auto *ptr = indices.pointer())
+      ConcurrentFreeListNode::add(&FreeList, ptr);
 
     return newIndices;
   }
@@ -838,12 +945,10 @@ private:
   /// of the new element would be stored.
   template <class KeyTy>
   static std::pair<ElemTy *, unsigned>
-  find(const KeyTy &key, IndexStorage *indices, size_t elementCount,
+  find(const KeyTy &key, IndexStorage indices, size_t elementCount,
        ElemTy *elements) {
-    if (!indices)
-      return {nullptr, 0};
     auto hash = hash_value(key);
-    auto indicesMask = (1UL << indices->CapacityLog2) - 1;
+    auto indicesMask = (1UL << indices.getCapacityLog2()) - 1;
 
     auto i = hash & indicesMask;
     while (true) {
@@ -851,7 +956,7 @@ private:
       if (i == 0)
         i++;
 
-      auto index = indices->loadIndexAt(i, std::memory_order_acquire);
+      auto index = indices.loadIndexAt(i, std::memory_order_acquire);
       // Element indices are 1-based, 0 means no entry.
       if (index == 0)
         return {nullptr, i};
@@ -884,12 +989,12 @@ public:
   /// Readers take a snapshot of the hash map, then work with the snapshot.
   class Snapshot {
     ConcurrentReadableHashMap *Map;
-    IndexStorage *Indices;
+    IndexStorage Indices;
     ElemTy *Elements;
     size_t ElementCount;
 
   public:
-    Snapshot(ConcurrentReadableHashMap *map, IndexStorage *indices,
+    Snapshot(ConcurrentReadableHashMap *map, IndexStorage indices,
              ElemTy *elements, size_t elementCount)
         : Map(map), Indices(indices), Elements(elements),
           ElementCount(elementCount) {}
@@ -904,8 +1009,12 @@ public:
 
     /// Search for an element matching the given key. Returns a pointer to the
     /// found element, or nullptr if no matching element exists.
-    template <class KeyTy> const ElemTy *find(const KeyTy &key) {
-      if (!Indices || !ElementCount || !Elements)
+    //
+    // This is marked as ref-qualified (the &) to make sure it can't be called
+    // on temporaries, since the temporary would be destroyed before the return
+    // value can be used, making it invalid.
+    template <class KeyTy> const ElemTy *find(const KeyTy &key) & {
+      if (!Indices.Value || !ElementCount || !Elements)
         return nullptr;
       return ConcurrentReadableHashMap::find(key, Indices, ElementCount,
                                              Elements)
@@ -937,7 +1046,7 @@ public:
     // pointer can just mean a concurrent insert that triggered a resize of the
     // elements array. This is harmless aside from a small performance hit, and
     // should not happen often.
-    IndexStorage *indices;
+    IndexStorage indices;
     size_t elementCount;
     ElementStorage *elements;
     ElementStorage *elements2;
@@ -970,13 +1079,10 @@ public:
   /// The return value is ignored when `created` is `false`.
   template <class KeyTy, typename Call>
   void getOrInsert(KeyTy key, const Call &call) {
-    ScopedLockTy guard(WriterLock);
+    typename MutexTy::ScopedLock guard(WriterLock);
 
-    auto *indices = Indices.load(std::memory_order_relaxed);
-    if (!indices)
-      indices = resize(indices, 0, nullptr);
-
-    auto indicesCapacityLog2 = indices->CapacityLog2;
+    auto indices = IndexStorage{Indices.load(std::memory_order_relaxed)};
+    auto indicesCapacityLog2 = indices.getCapacityLog2();
     auto elementCount = ElementCount.load(std::memory_order_relaxed);
     auto *elements = Elements.load(std::memory_order_relaxed);
     auto *elementsPtr = elements ? elements->data() : nullptr;
@@ -1012,8 +1118,8 @@ public:
       assert(hash_value(key) == hash_value(*element) &&
              "Element must have the same hash code as its key.");
       ElementCount.store(elementCount + 1, std::memory_order_release);
-      indices->storeIndexAt(elementCount + 1, found.second,
-                            std::memory_order_release);
+      indices.storeIndexAt(&Indices, elementCount + 1, found.second,
+                           std::memory_order_release);
     }
 
     deallocateFreeListIfSafe();
@@ -1022,19 +1128,20 @@ public:
   /// Clear the hash table, freeing (when safe) all memory currently used for
   /// indices and elements.
   void clear() {
-    ScopedLockTy guard(WriterLock);
+    typename MutexTy::ScopedLock guard(WriterLock);
 
-    auto *indices = Indices.load(std::memory_order_relaxed);
+    IndexStorage indices = Indices.load(std::memory_order_relaxed);
     auto *elements = Elements.load(std::memory_order_relaxed);
 
     // Order doesn't matter here, snapshots will gracefully handle any field
     // being NULL/0 while the others are not.
-    Indices.store(nullptr, std::memory_order_relaxed);
+    Indices.store(0, std::memory_order_relaxed);
     ElementCount.store(0, std::memory_order_relaxed);
     Elements.store(nullptr, std::memory_order_relaxed);
 
-    FreeListNode::add(&FreeList, indices);
-    FreeListNode::add(&FreeList, elements);
+    if (auto *ptr = indices.pointer())
+      ConcurrentFreeListNode::add(&FreeList, ptr);
+    ConcurrentFreeListNode::add(&FreeList, elements);
 
     deallocateFreeListIfSafe();
   }
@@ -1078,9 +1185,15 @@ struct StableAddressConcurrentReadableHashMap
         return {lastFound, false};
 
     // Optimize for the case where the value already exists.
-    if (auto wrapper = this->snapshot().find(key)) {
-      LastFound.store(wrapper->Ptr, std::memory_order_relaxed);
-      return {wrapper->Ptr, false};
+    {
+      // Tightly scope the snapshot so it's gone before we call getOrInsert
+      // below, otherwise that call will always see an outstanding snapshot and
+      // never be able to collect garbage.
+      auto snapshot = this->snapshot();
+      if (auto wrapper = snapshot.find(key)) {
+        LastFound.store(wrapper->Ptr, std::memory_order_relaxed);
+        return {wrapper->Ptr, false};
+      }
     }
 
     // No such element. Insert if needed. Note: another thread may have inserted
@@ -1107,7 +1220,8 @@ struct StableAddressConcurrentReadableHashMap
   }
 
   template <class KeyTy> ElemTy *find(const KeyTy &key) {
-    auto result = this->snapshot().find(key);
+    auto snapshot = this->snapshot();
+    auto result = snapshot.find(key);
     if (!result)
       return nullptr;
     return result->Ptr;

@@ -85,9 +85,13 @@ ToolChain::InvocationInfo toolchains::GenericUnix::constructInvocation(
 }
 
 std::string toolchains::GenericUnix::getDefaultLinker() const {
+  if (getTriple().isAndroid())
+    return "lld";
+
   switch (getTriple().getArch()) {
   case llvm::Triple::arm:
   case llvm::Triple::aarch64:
+  case llvm::Triple::aarch64_32:
   case llvm::Triple::armeb:
   case llvm::Triple::thumb:
   case llvm::Triple::thumbeb:
@@ -107,10 +111,6 @@ std::string toolchains::GenericUnix::getDefaultLinker() const {
     // Otherwise, use the default BFD linker.
     return "";
   }
-}
-
-std::string toolchains::GenericUnix::getTargetForLinker() const {
-  return getTriple().str();
 }
 
 bool toolchains::GenericUnix::addRuntimeRPath(const llvm::Triple &T,
@@ -146,12 +146,6 @@ toolchains::GenericUnix::constructInvocation(const DynamicLinkJobAction &job,
          "Invalid linker output type.");
 
   ArgStringList Arguments;
-
-  std::string Target = getTargetForLinker();
-  if (!Target.empty()) {
-    Arguments.push_back("-target");
-    Arguments.push_back(context.Args.MakeArgString(Target));
-  }
 
   switch (job.getKind()) {
   case LinkKind::None:
@@ -273,12 +267,25 @@ toolchains::GenericUnix::constructInvocation(const DynamicLinkJobAction &job,
     Arguments.push_back(context.Args.MakeArgString(context.OI.SDKPath));
   }
 
+  // If we are linking statically, we need to add all
+  // dependencies to a library search group to resolve
+  // potential circular dependencies
+  if (staticExecutable || staticStdlib) {
+    Arguments.push_back("-Xlinker");
+    Arguments.push_back("--start-group");
+  }
+
   // Add any autolinking scripts to the arguments
   for (const Job *Cmd : context.Inputs) {
     auto &OutputInfo = Cmd->getOutput();
     if (OutputInfo.getPrimaryOutputType() == file_types::TY_AutolinkFile)
       Arguments.push_back(context.Args.MakeArgString(
           Twine("@") + OutputInfo.getPrimaryOutputFilename()));
+  }
+
+  if (staticExecutable || staticStdlib) {
+    Arguments.push_back("-Xlinker");
+    Arguments.push_back("--end-group");
   }
 
   // Add the runtime library link paths.
@@ -354,7 +361,9 @@ toolchains::GenericUnix::constructInvocation(const DynamicLinkJobAction &job,
   }
 
   // These custom arguments should be right before the object file at the end.
-  context.Args.AddAllArgs(Arguments, options::OPT_linker_option_Group);
+  context.Args.AddAllArgsExcept(Arguments, {options::OPT_linker_option_Group},
+                                {options::OPT_l});
+  ToolChain::addLinkedLibArgs(context.Args, Arguments);
   context.Args.AddAllArgs(Arguments, options::OPT_Xlinker);
   context.Args.AddAllArgValues(Arguments, options::OPT_Xclang_linker);
 
@@ -398,32 +407,10 @@ toolchains::GenericUnix::constructInvocation(const StaticLinkJobAction &job,
   return II;
 }
 
-std::string toolchains::Android::getTargetForLinker() const {
-  const llvm::Triple &T = getTriple();
-  switch (T.getArch()) {
-  default:
-    // FIXME: we should just abort on an unsupported target
-    return T.str();
-  case llvm::Triple::arm:
-  case llvm::Triple::thumb:
-    // Current Android NDK versions only support ARMv7+.  Always assume ARMv7+
-    // for the arm/thumb target.
-    return "armv7-unknown-linux-androideabi";
-  case llvm::Triple::aarch64:
-    return "aarch64-unknown-linux-android";
-  case llvm::Triple::x86:
-    return "i686-unknown-linux-android";
-  case llvm::Triple::x86_64:
-    return "x86_64-unknown-linux-android";
-  }
-}
-
 std::string toolchains::Cygwin::getDefaultLinker() const {
   // Cygwin uses the default BFD linker, even on ARM.
   return "";
 }
-
-std::string toolchains::Cygwin::getTargetForLinker() const { return ""; }
 
 std::string toolchains::OpenBSD::getDefaultLinker() const {
   return "lld";

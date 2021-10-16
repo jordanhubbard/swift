@@ -19,9 +19,10 @@ using namespace swift;
 using namespace swift::semanticarc;
 
 OwnershipLiveRange::OwnershipLiveRange(SILValue value)
-    : introducer(*OwnedValueIntroducer::get(value)), destroyingUses(),
+    : introducer(OwnedValueIntroducer::get(value)), destroyingUses(),
       ownershipForwardingUses(), unknownConsumingUses() {
-  assert(introducer.value.getOwnershipKind() == ValueOwnershipKind::Owned);
+  assert(introducer);
+  assert(introducer.value.getOwnershipKind() == OwnershipKind::Owned);
 
   SmallVector<Operand *, 32> tmpDestroyingUses;
   SmallVector<Operand *, 32> tmpForwardingConsumingUses;
@@ -39,7 +40,7 @@ OwnershipLiveRange::OwnershipLiveRange(SILValue value)
 
     // Do a quick check that we did not add ValueOwnershipKind that are not
     // owned to the worklist.
-    assert(op->get().getOwnershipKind() == ValueOwnershipKind::Owned &&
+    assert(op->get().getOwnershipKind() == OwnershipKind::Owned &&
            "Added non-owned value to worklist?!");
 
     auto *user = op->getUser();
@@ -72,12 +73,11 @@ OwnershipLiveRange::OwnershipLiveRange(SILValue value)
     // support it though if we need to.
     auto *ti = dyn_cast<TermInst>(user);
     if ((ti && !ti->isTransformationTerminator()) ||
-        !isGuaranteedForwardingInst(user) ||
+        !canOpcodeForwardGuaranteedValues(op) ||
         1 != count_if(user->getOperandValues(
                           true /*ignore type dependent operands*/),
                       [&](SILValue v) {
-                        return v.getOwnershipKind() ==
-                               ValueOwnershipKind::Owned;
+                        return v.getOwnershipKind() == OwnershipKind::Owned;
                       })) {
       tmpUnknownConsumingUses.push_back(op);
       continue;
@@ -91,7 +91,7 @@ OwnershipLiveRange::OwnershipLiveRange(SILValue value)
     // the the users force the live range to be alive.
     if (!ti) {
       for (SILValue v : user->getResults()) {
-        if (v.getOwnershipKind() != ValueOwnershipKind::Owned)
+        if (v.getOwnershipKind() != OwnershipKind::Owned)
           continue;
         llvm::copy(v->getUses(), std::back_inserter(worklist));
       }
@@ -110,7 +110,7 @@ OwnershipLiveRange::OwnershipLiveRange(SILValue value)
 
       for (auto *succArg : succBlock->getSILPhiArguments()) {
         // If we have an any value, just continue.
-        if (succArg->getOwnershipKind() == ValueOwnershipKind::None)
+        if (succArg->getOwnershipKind() == OwnershipKind::None)
           continue;
 
         // Otherwise add all users of this BBArg to the worklist to visit
@@ -228,9 +228,9 @@ void OwnershipLiveRange::convertOwnedGeneralForwardingUsesToGuaranteed() && {
   while (!ownershipForwardingUses.empty()) {
     auto *use = ownershipForwardingUses.back();
     ownershipForwardingUses = ownershipForwardingUses.drop_back();
-    auto operand = *ForwardingOperand::get(use);
-    operand.replaceOwnershipKind(ValueOwnershipKind::Owned,
-                                 ValueOwnershipKind::Guaranteed);
+    ForwardingOperand operand(use);
+    operand.replaceOwnershipKind(OwnershipKind::Owned,
+                                 OwnershipKind::Guaranteed);
   }
 }
 
@@ -254,19 +254,21 @@ void OwnershipLiveRange::convertToGuaranteedAndRAUW(
 // TODO: If this is useful, move onto OwnedValueIntroducer itself?
 static SILValue convertIntroducerToGuaranteed(OwnedValueIntroducer introducer) {
   switch (introducer.kind) {
+  case OwnedValueIntroducerKind::Invalid:
+    llvm_unreachable("Using invalid case?!");
   case OwnedValueIntroducerKind::Phi: {
     auto *phiArg = cast<SILPhiArgument>(introducer.value);
-    phiArg->setOwnershipKind(ValueOwnershipKind::Guaranteed);
+    phiArg->setOwnershipKind(OwnershipKind::Guaranteed);
     return phiArg;
   }
   case OwnedValueIntroducerKind::Struct: {
     auto *si = cast<StructInst>(introducer.value);
-    si->setOwnershipKind(ValueOwnershipKind::Guaranteed);
+    si->setForwardingOwnershipKind(OwnershipKind::Guaranteed);
     return si;
   }
   case OwnedValueIntroducerKind::Tuple: {
     auto *ti = cast<TupleInst>(introducer.value);
-    ti->setOwnershipKind(ValueOwnershipKind::Guaranteed);
+    ti->setForwardingOwnershipKind(OwnershipKind::Guaranteed);
     return ti;
   }
   case OwnedValueIntroducerKind::Copy:
@@ -281,6 +283,7 @@ static SILValue convertIntroducerToGuaranteed(OwnedValueIntroducer introducer) {
   case OwnedValueIntroducerKind::AllocRefInit:
     return SILValue();
   }
+  llvm_unreachable("covered switch");
 }
 
 void OwnershipLiveRange::convertJoinedLiveRangePhiToGuaranteed(

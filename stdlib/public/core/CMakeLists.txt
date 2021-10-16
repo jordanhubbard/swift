@@ -45,6 +45,7 @@ set(SWIFTLIB_ESSENTIAL
   CollectionAlgorithms.swift
   Comparable.swift
   CompilerProtocols.swift
+  Sendable.swift
   ContiguousArray.swift
   ContiguouslyStored.swift
   ClosedRange.swift
@@ -60,7 +61,6 @@ set(SWIFTLIB_ESSENTIAL
   DictionaryVariant.swift
   DropWhile.swift
   Dump.swift
-  EitherSequence.swift
   EmptyCollection.swift
   Equatable.swift
   ErrorType.swift
@@ -101,6 +101,8 @@ set(SWIFTLIB_ESSENTIAL
   NativeDictionary.swift
   NativeSet.swift
   NewtypeWrapper.swift
+  NFC.swift
+  NFD.swift
   ObjectIdentifier.swift
   Optional.swift
   OptionSet.swift
@@ -172,6 +174,7 @@ set(SWIFTLIB_ESSENTIAL
   ThreadLocalStorage.swift
   UIntBuffer.swift
   UnavailableStringAPIs.swift
+  UnicodeData.swift
   UnicodeEncoding.swift
   UnicodeHelpers.swift
   UnicodeParser.swift
@@ -209,14 +212,11 @@ set(SWIFTLIB_SOURCES
   Availability.swift
   CollectionDifference.swift
   CollectionOfOne.swift
-  DiscontiguousSlice.swift
   Diffing.swift
   FloatingPointRandom.swift
   Mirror.swift
   PlaygroundDisplay.swift
   CommandLine.swift
-  RangeSet.swift
-  RangeSetStorage.swift
   SliceBuffer.swift
   SIMDVector.swift
   UnfoldSequence.swift
@@ -227,6 +227,7 @@ set(SWIFTLIB_SOURCES
 
 set(SWIFTLIB_GYB_SOURCES
   ${SWIFTLIB_ESSENTIAL_GYB_SOURCES}
+  SIMDConcreteOperations.swift.gyb
   SIMDVectorTypes.swift.gyb
   Tuple.swift.gyb
   )
@@ -235,7 +236,7 @@ set(swift_core_link_flags "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}")
 set(swift_core_framework_depends)
 set(swift_core_private_link_libraries)
 set(swift_stdlib_compile_flags "${SWIFT_RUNTIME_SWIFT_COMPILE_FLAGS}")
-if(SWIFT_PRIMARY_VARIANT_SDK IN_LIST SWIFT_APPLE_PLATFORMS)
+if(SWIFT_PRIMARY_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
   list(APPEND swift_core_link_flags "-all_load")
   list(APPEND swift_core_private_link_libraries icucore)
 else()
@@ -259,19 +260,13 @@ else()
   endif()
 endif()
 
-if(SWIFT_PRIMARY_VARIANT_SDK STREQUAL ANDROID)
-  # workaround for libatomic needing to be after object files for swiftCore.so
-  list(APPEND swift_core_private_link_libraries atomic)
-elseif(SWIFT_PRIMARY_VARIANT_SDK STREQUAL CYGWIN)
+if(SWIFT_PRIMARY_VARIANT_SDK STREQUAL CYGWIN)
   # TODO(compnerd) cache this variable to permit re-configuration
   execute_process(COMMAND "cygpath" "-u" "$ENV{SYSTEMROOT}" OUTPUT_VARIABLE ENV_SYSTEMROOT)
   list(APPEND swift_core_private_link_libraries "${ENV_SYSTEMROOT}/system32/psapi.dll")
 elseif(SWIFT_PRIMARY_VARIANT_SDK STREQUAL FREEBSD)
   find_library(EXECINFO_LIBRARY execinfo)
   list(APPEND swift_core_private_link_libraries ${EXECINFO_LIBRARY})
-  # workaround for libatomic needing to be after object files for swiftCore.so
-  list(APPEND swift_core_private_link_libraries
-    ${SWIFTLIB_DIR}/clang/lib/freebsd/libclang_rt.builtins-${SWIFT_PRIMARY_VARIANT_ARCH}.a)
 elseif(SWIFT_PRIMARY_VARIANT_SDK STREQUAL LINUX)
   if(SWIFT_BUILD_STATIC_STDLIB)
     list(APPEND swift_core_private_link_libraries)
@@ -291,6 +286,9 @@ endif()
 if(SWIFT_STDLIB_ENABLE_STDLIBCORE_EXCLUSIVITY_CHECKING)
   list(APPEND swift_stdlib_compile_flags "-enforce-exclusivity=checked")
 endif()
+if(SWIFT_ENABLE_ARRAY_COW_CHECKS)
+  list(APPEND swift_stdlib_compile_flags "-DCOW_CHECKS_ENABLED")
+endif()
 
 # STAGING: Temporarily avoids having to write #fileID in Swift.swiftinterface.
 list(APPEND swift_stdlib_compile_flags "-Xfrontend" "-enable-experimental-concise-pound-file")
@@ -304,18 +302,20 @@ if(SWIFT_CHECK_ESSENTIAL_STDLIB)
   target_link_libraries(swift_stdlib_essential ${RUNTIME_DEPENDENCY})
 endif()
 
-add_swift_target_library(swiftCore
-                  ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} IS_STDLIB IS_STDLIB_CORE
+set(swift_core_incorporate_object_libraries)
+list(APPEND swift_core_incorporate_object_libraries swiftRuntime)
+list(APPEND swift_core_incorporate_object_libraries swiftLLVMSupport)
+list(APPEND swift_core_incorporate_object_libraries swiftDemangling)
+list(APPEND swift_core_incorporate_object_libraries swiftStdlibStubs)
+if(SWIFT_STDLIB_HAS_COMMANDLINE)
+  list(APPEND swift_core_incorporate_object_libraries swiftCommandLineSupport)
+endif()
+
+set(swiftCore_common_options
+                  IS_STDLIB IS_STDLIB_CORE
                     ${SWIFTLIB_SOURCES}
                   GYB_SOURCES
                     ${SWIFTLIB_GYB_SOURCES}
-                  # The copy_shim_headers target dependency is required to let the
-                  # build system know that there's a rule to produce the shims
-                  # directory, but is not sufficient to cause the object file to be rebuilt
-                  # when the shim header changes.  Therefore, we pass both the target
-                  # and the generated directory as dependencies.
-                  FILE_DEPENDS
-                    copy_shim_headers "${SWIFTLIB_DIR}/shims" ${GROUP_INFO_JSON_FILE}
                   SWIFT_COMPILE_FLAGS
                     ${swift_stdlib_compile_flags} -Xcc -DswiftCore_EXPORTS ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
                   LINK_FLAGS
@@ -323,8 +323,68 @@ add_swift_target_library(swiftCore
                   PRIVATE_LINK_LIBRARIES
                     ${swift_core_private_link_libraries}
                   INCORPORATE_OBJECT_LIBRARIES
-                    swiftRuntime swiftLLVMSupport swiftDemangling swiftStdlibStubs
+                    ${swift_core_incorporate_object_libraries}
                   FRAMEWORK_DEPENDS
-                    ${swift_core_framework_depends}
+                    ${swift_core_framework_depends})
+
+# The copy_shim_headers target dependency is required to let the
+# build system know that there's a rule to produce the shims
+# directory, but is not sufficient to cause the object file to be rebuilt
+# when the shim header changes.  Therefore, we pass both the target
+# and the generated directory as dependencies.
+set(swiftCore_common_dependencies
+    copy_shim_headers "${SWIFTLIB_DIR}/shims" ${GROUP_INFO_JSON_FILE})
+
+if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING" OR
+   ${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING-WITH-HOSTLIBS")
+
+  list(FIND SWIFT_STDLIB_LIBRARY_BUILD_TYPES "SHARED" index_of_shared)
+  if(index_of_shared EQUAL -1)
+    message(FATAL_ERROR "bootstrapping requires SHARED stdlib build type")
+  endif()
+
+  set(swiftCore_common_bootstrapping_options
+                    SHARED
+                    ${swiftCore_common_options}
+                    SDK ${SWIFT_HOST_VARIANT_SDK}
+                    ARCHITECTURE ${SWIFT_HOST_VARIANT_ARCH}
+                    INSTALL_IN_COMPONENT
+                      "never_install")
+
+  # Bootstrapping - stage 0
+
+  add_swift_target_library_single(swiftCore-bootstrapping0 swiftCore
+                    ${swiftCore_common_bootstrapping_options}
+                    FILE_DEPENDS
+                      symlink-headers-bootstrapping0 ${swiftCore_common_dependencies}
+                    MODULE_DEPENDENCY_TARGET swiftCore_module_bootstrapping0
+                    BOOTSTRAPPING 0)
+
+  # Bootstrapping - stage 1
+
+  add_swift_target_library_single(swiftCore-bootstrapping1 swiftCore
+                    ${swiftCore_common_bootstrapping_options}
+                    FILE_DEPENDS
+                      symlink-headers-bootstrapping1 ${swiftCore_common_dependencies}
+                    MODULE_DEPENDENCY_TARGET swiftCore_module_bootstrapping1
+                    BOOTSTRAPPING 1)
+
+  if(LIBSWIFT_BUILD_MODE STREQUAL "BOOTSTRAPPING-WITH-HOSTLIBS")
+    # When linking swift-frontend against the system swift libraries, it's
+    # sufficient to create the swiftmodule files for bootstrapping.
+    add_dependencies(bootstrapping0-all ${swiftCore_module_bootstrapping0})
+    add_dependencies(bootstrapping1-all ${swiftCore_module_bootstrapping1})
+  else()
+    add_dependencies(bootstrapping1-all swiftCore-bootstrapping1)
+    add_dependencies(bootstrapping0-all swiftCore-bootstrapping0)
+  endif()
+endif()
+
+add_swift_target_library(swiftCore
+                  ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES}
+                  ${swiftCore_common_options}
+                  FILE_DEPENDS
+                    ${swiftCore_common_dependencies}
                   INSTALL_IN_COMPONENT
                     stdlib)
+

@@ -22,6 +22,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/ExistentialLayout.h"
+#include "swift/AST/Import.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/TypeCheckRequests.h"
@@ -919,7 +920,29 @@ public:
     const TypeRepr *complainRepr = nullptr;
     auto downgradeToWarning = DowngradeToWarning::No;
 
+    bool hasInaccessibleParameterWrapper = false;
     for (auto *P : *fn->getParameters()) {
+      // Check for inaccessible API property wrappers attached to the parameter.
+      if (P->hasExternalPropertyWrapper()) {
+        auto wrapperAttrs = P->getAttachedPropertyWrappers();
+        for (auto index : indices(wrapperAttrs)) {
+          auto wrapperType = P->getAttachedPropertyWrapperType(index);
+          auto wrapperTypeRepr = wrapperAttrs[index]->getTypeRepr();
+          checkTypeAccess(wrapperType, wrapperTypeRepr, fn, /*mayBeInferred*/ false,
+              [&](AccessScope typeAccessScope, const TypeRepr *thisComplainRepr,
+                  DowngradeToWarning downgradeDiag) {
+                if (typeAccessScope.isChildOf(minAccessScope) ||
+                    (!complainRepr &&
+                     typeAccessScope.hasEqualDeclContextWith(minAccessScope))) {
+                  minAccessScope = typeAccessScope;
+                  complainRepr = thisComplainRepr;
+                  downgradeToWarning = downgradeDiag;
+                  hasInaccessibleParameterWrapper = true;
+                }
+              });
+        }
+      }
+
       checkTypeAccess(
           P->getInterfaceType(), P->getTypeRepr(), fn, /*mayBeInferred*/ false,
           [&](AccessScope typeAccessScope, const TypeRepr *thisComplainRepr,
@@ -969,7 +992,8 @@ public:
         diagID = diag::function_type_access_warn;
       auto diag = fn->diagnose(diagID, isExplicit, fnAccess,
                                isa<FileUnit>(fn->getDeclContext()), minAccess,
-                               functionKind, problemIsResult);
+                               functionKind, problemIsResult,
+                               hasInaccessibleParameterWrapper);
       highlightOffendingType(diag, complainRepr);
     }
   }
@@ -1393,6 +1417,26 @@ public:
       : isTypeContext ? FK_Method : FK_Function;
 
     for (auto *P : *fn->getParameters()) {
+      // Check for inaccessible API property wrappers attached to the parameter.
+      if (P->hasExternalPropertyWrapper()) {
+        auto wrapperAttrs = P->getAttachedPropertyWrappers();
+        for (auto index : indices(wrapperAttrs)) {
+          auto wrapperType = P->getAttachedPropertyWrapperType(index);
+          auto wrapperTypeRepr = wrapperAttrs[index]->getTypeRepr();
+          checkTypeAccess(wrapperType, wrapperTypeRepr, fn, /*mayBeInferred*/ false,
+              [&](AccessScope typeAccessScope, const TypeRepr *complainRepr,
+                  DowngradeToWarning downgradeDiag) {
+                auto diagID = diag::function_type_usable_from_inline;
+                if (!fn->getASTContext().isSwiftVersionAtLeast(5))
+                  diagID = diag::function_type_usable_from_inline_warn;
+                auto diag = fn->diagnose(diagID, functionKind,
+                                         /*problemIsResult=*/false,
+                                         /*inaccessibleWrapper=*/true);
+                highlightOffendingType(diag, complainRepr);
+              });
+        }
+      }
+
       checkTypeAccess(
           P->getInterfaceType(), P->getTypeRepr(), fn, /*mayBeInferred*/ false,
           [&](AccessScope typeAccessScope, const TypeRepr *complainRepr,
@@ -1401,7 +1445,8 @@ public:
             if (!fn->getASTContext().isSwiftVersionAtLeast(5))
               diagID = diag::function_type_usable_from_inline_warn;
             auto diag = fn->diagnose(diagID, functionKind,
-                                     /*problemIsResult=*/false);
+                                     /*problemIsResult=*/false,
+                                     /*inaccessibleWrapper=*/false);
             highlightOffendingType(diag, complainRepr);
           });
     }
@@ -1416,7 +1461,8 @@ public:
         if (!fn->getASTContext().isSwiftVersionAtLeast(5))
           diagID = diag::function_type_usable_from_inline_warn;
         auto diag = fn->diagnose(diagID, functionKind,
-                                 /*problemIsResult=*/true);
+                                 /*problemIsResult=*/true,
+                                 /*inaccessibleWrapper=*/false);
         highlightOffendingType(diag, complainRepr);
       });
     }
@@ -1439,7 +1485,6 @@ public:
     }
   }
 };
-
 } // end anonymous namespace
 
 /// Returns the kind of origin, implementation-only import or SPI declaration,
@@ -1459,6 +1504,40 @@ swift::getDisallowedOriginKind(const Decl *decl,
     if (where.isSPI())
       downgradeToWarning = DowngradeToWarning::Yes;
 
+    // Even if the current module is @_implementationOnly, Swift should
+    // not report an error in the cases where the decl is also exported from
+    // a non @_implementationOnly module. Thus, we check to see if there is
+    // a visible access path to the Clang decl, and only error out in case
+    // there is none.
+    auto filter = ModuleDecl::ImportFilter(
+        {ModuleDecl::ImportFilterKind::Exported,
+         ModuleDecl::ImportFilterKind::Default,
+         ModuleDecl::ImportFilterKind::SPIAccessControl,
+         ModuleDecl::ImportFilterKind::ShadowedByCrossImportOverlay});
+    SmallVector<ImportedModule, 4> sfImportedModules;
+    SF->getImportedModules(sfImportedModules, filter);
+    if (auto clangDecl = decl->getClangDecl()) {
+      for (auto redecl : clangDecl->redecls()) {
+        if (auto tagReDecl = dyn_cast<clang::TagDecl>(redecl)) {
+          // This is a forward declaration. We ignore visibility of those.
+          if (tagReDecl->getBraceRange().isInvalid()) {
+            continue;
+          }
+        }
+        auto moduleWrapper =
+            decl->getASTContext().getClangModuleLoader()->getWrapperForModule(
+                redecl->getOwningModule());
+        auto visibleAccessPath =
+            find_if(sfImportedModules, [&moduleWrapper](auto importedModule) {
+              return importedModule.importedModule == moduleWrapper ||
+                     !importedModule.importedModule
+                          ->isImportedImplementationOnly(moduleWrapper);
+            });
+        if (visibleAccessPath != sfImportedModules.end()) {
+          return DisallowedOriginKind::None;
+        }
+      }
+    }
     // Implementation-only imported, cannot be reexported.
     return DisallowedOriginKind::ImplementationOnly;
   } else if (decl->isSPI() && !where.isSPI()) {
@@ -1561,6 +1640,20 @@ public:
   // "name: TheType" form, we can get better results by diagnosing the TypeRepr.
   UNINTERESTING(Var)
 
+  static bool shouldCheck(Decl *D) {
+    if (D && D->getASTContext().LangOpts.CheckAPIAvailabilityOnly) {
+      // Skip whole decl if not API-public.
+      if (auto valueDecl = dyn_cast<const ValueDecl>(D)) {
+        AccessScope scope =
+          valueDecl->getFormalAccessScope(/*useDC*/nullptr,
+                                          /*treatUsableFromInlineAsPublic*/true);
+        if (!scope.isPublic())
+          return false;
+      }
+    }
+    return true;
+  }
+
   /// \see visitPatternBindingDecl
   void checkNamedPattern(const NamedPattern *NP,
                          const llvm::DenseSet<const VarDecl *> &seenVars) {
@@ -1606,6 +1699,9 @@ public:
   }
 
   void visitPatternBindingDecl(PatternBindingDecl *PBD) {
+    if (!shouldCheck(PBD->getAnchoringVarDecl(0)))
+      return;
+
     llvm::DenseSet<const VarDecl *> seenVars;
     for (auto idx : range(PBD->getNumPatternEntries())) {
       PBD->getPattern(idx)->forEachNode([&](const Pattern *P) {
@@ -1684,8 +1780,15 @@ public:
   void visitAbstractFunctionDecl(AbstractFunctionDecl *fn) {
     checkGenericParams(fn, fn);
 
-    for (auto *P : *fn->getParameters())
+    for (auto *P : *fn->getParameters()) {
+      auto wrapperAttrs = P->getAttachedPropertyWrappers();
+      for (auto index : indices(wrapperAttrs)) {
+        auto wrapperType = P->getAttachedPropertyWrapperType(index);
+        checkType(wrapperType, wrapperAttrs[index]->getTypeRepr(), fn);
+      }
+
       checkType(P->getInterfaceType(), P->getTypeRepr(), fn);
+    }
   }
 
   void visitFuncDecl(FuncDecl *FD) {
@@ -1763,6 +1866,12 @@ public:
   void checkPrecedenceGroup(const PrecedenceGroupDecl *PGD,
                             const Decl *refDecl, SourceLoc diagLoc,
                             SourceRange refRange) {
+    // Bail on invalid predence groups. This can happen when the user spells a
+    // relation element that doesn't actually exist.
+    if (!PGD) {
+      return;
+    }
+
     const SourceFile *SF = refDecl->getDeclContext()->getParentSourceFile();
     ModuleDecl *M = PGD->getModuleContext();
     if (!SF->isImportedImplementationOnly(M))
@@ -1782,12 +1891,10 @@ public:
   }
 
   void visitInfixOperatorDecl(InfixOperatorDecl *IOD) {
-    // FIXME: Handle operator designated types (which also applies to prefix
-    // and postfix operators).
     if (auto *precedenceGroup = IOD->getPrecedenceGroup()) {
-      if (!IOD->getIdentifiers().empty()) {
+      if (!IOD->getPrecedenceGroupName().empty()) {
         checkPrecedenceGroup(precedenceGroup, IOD, IOD->getLoc(),
-                             IOD->getIdentifiers().front().Loc);
+                             IOD->getPrecedenceGroupLoc());
       }
     }
   }
@@ -1860,6 +1967,9 @@ void swift::checkAccessControl(Decl *D) {
 
   auto where = ExportContext::forDeclSignature(D);
   if (where.isImplicit())
+    return;
+
+  if (!DeclAvailabilityChecker::shouldCheck(D))
     return;
 
   DeclAvailabilityChecker(where).visit(D);

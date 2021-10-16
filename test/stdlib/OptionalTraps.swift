@@ -10,6 +10,7 @@
 // RUN: %target-run %t/Assert_Release
 // RUN: %target-run %t/Assert_Unchecked
 // REQUIRES: executable_test
+// UNSUPPORTED: OS=wasi
 
 import StdlibUnittest
 
@@ -19,6 +20,18 @@ func returnNil() -> AnyObject? {
 }
 
 var OptionalTraps = TestSuite("OptionalTraps")
+
+func shouldCheckErrorLocation() -> Bool {
+  // Location information for runtime traps is only emitted in debug builds.
+  guard _isDebugAssertConfiguration() else { return false }
+  // The runtime error location format changed after the 5.3 release.
+  // (https://github.com/apple/swift/pull/34665)
+  if #available(macOS 11.3, iOS 14.5, tvOS 14.5, watchOS 7.4, *) {
+    return true
+  } else {
+    return false
+  }
+}
 
 OptionalTraps.test("UnwrapNone")
   .skip(.custom(
@@ -35,8 +48,8 @@ OptionalTraps.test("UnwrapNone/location")
   .skip(.custom(
     { _isFastAssertConfiguration() },
     reason: "this trap is not guaranteed to happen in -Ounchecked"))
-  .crashOutputMatches(_isDebugAssertConfiguration()
-                        ? "OptionalTraps.swift, line 45"
+  .crashOutputMatches(shouldCheckErrorLocation()
+                        ? "OptionalTraps.swift:58:"
                         : "")
   .code {
   expectCrashLater()

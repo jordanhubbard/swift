@@ -176,7 +176,12 @@ void Mangler::verify(StringRef nameStr) {
     llvm::errs() << "Can't demangle: " << nameStr << '\n';
     abort();
   }
-  std::string Remangled = mangleNode(Root);
+  auto mangling = mangleNode(Root);
+  if (!mangling.isSuccess()) {
+    llvm::errs() << "Can't remangle: " << nameStr << '\n';
+    abort();
+  }
+  std::string Remangled = mangling.result();
   if (Remangled == nameStr)
     return;
 
@@ -223,13 +228,14 @@ void Mangler::mangleSubstitution(unsigned Idx) {
     return appendOperator("A", Index(Idx - 26));
   }
 
-  char Subst = Idx + 'A';
+  char SubstChar = Idx + 'A';
+  StringRef Subst(&SubstChar, 1);
   if (SubstMerging.tryMergeSubst(*this, Subst, /*isStandardSubst*/ false)) {
 #ifndef NDEBUG
     ++mergedSubsts;
 #endif
   } else {
-    appendOperator("A", StringRef(&Subst, 1));
+    appendOperator("A", Subst);
   }
 }
 

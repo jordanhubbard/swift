@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2018 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -16,6 +16,8 @@
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/DynamicCasts.h"
+#include "swift/SIL/Consumption.h"
+#include "swift/SIL/SILInstruction.h"
 #include "llvm/Support/Debug.h"
 
 using namespace swift;
@@ -105,7 +107,7 @@ public:
   // cloned on each path. For example, two global_addr instructions may refer to
   // the same global storage. Those global_addr instructions may each be
   // converted to a RawPointer before being passed into the non-address phi.
-  void visitBase(SILValue base, AccessedStorage::Kind kind) {
+  void visitBase(SILValue base, AccessStorage::Kind kind) {
     checkVisitorResult(useDefVisitor.visitBase(base, kind));
   }
 
@@ -122,14 +124,13 @@ public:
       phiArg->getIncomingPhiValues(pointerWorklist);
   }
 
-  void visitStorageCast(SingleValueInstruction *projectedAddr,
-                        Operand *sourceOper) {
+  void visitStorageCast(SingleValueInstruction *cast, Operand *sourceOper) {
     // Allow conversions to/from pointers and addresses on disjoint phi paths
     // only if the underlying useDefVisitor allows it.
     if (storageCastTy == IgnoreStorageCast)
       pointerWorklist.push_back(sourceOper->get());
     else
-      visitNonAccess(projectedAddr);
+      visitNonAccess(cast);
   }
 
   void visitAccessProjection(SingleValueInstruction *projectedAddr,
@@ -207,8 +208,7 @@ public:
     return this->asImpl().visitNonAccess(phiArg);
   }
 
-  SILValue visitStorageCast(SingleValueInstruction *projectedAddr,
-                            Operand *sourceAddr) {
+  SILValue visitStorageCast(SingleValueInstruction *, Operand *sourceAddr) {
     assert(storageCastTy == IgnoreStorageCast);
     return sourceAddr->get();
   }
@@ -258,7 +258,15 @@ class FindAccessBaseVisitor
   using SuperTy = FindAccessVisitorImpl<FindAccessBaseVisitor>;
 
 protected:
-  Optional<SILValue> base;
+  // If the optional baseVal is set, then a result was found. If the SILValue
+  // within the optional is invalid, then there are multiple inconsistent base
+  // addresses (this may currently happen with RawPointer phis).
+  Optional<SILValue> baseVal;
+  // If the kind optional is set, then 'baseVal' is a valid
+  // AccessBase. 'baseVal' may be a valid SILValue while kind optional has no
+  // value if an invalid address producer was detected, via a call to
+  // visitNonAccess.
+  Optional<AccessBase::Kind> kindVal;
 
 public:
   FindAccessBaseVisitor(NestedAccessType nestedAccessTy,
@@ -266,49 +274,67 @@ public:
       : FindAccessVisitorImpl(nestedAccessTy, storageCastTy) {}
 
   // Returns the accessed address or an invalid SILValue.
-  SILValue findBase(SILValue sourceAddr) && {
+  SILValue findPossibleBaseAddress(SILValue sourceAddr) && {
     reenterUseDef(sourceAddr);
-    return base.getValueOr(SILValue());
+    return baseVal.getValueOr(SILValue());
+  }
+
+  AccessBase findBase(SILValue sourceAddr) && {
+    reenterUseDef(sourceAddr);
+    if (!baseVal || !kindVal)
+      return AccessBase();
+
+    return AccessBase(baseVal.getValue(), kindVal.getValue());
   }
 
   void setResult(SILValue foundBase) {
-    if (!base)
-      base = foundBase;
-    else if (base.getValue() != foundBase)
-      base = SILValue();
+    if (!baseVal)
+      baseVal = foundBase;
+    else if (baseVal.getValue() != foundBase)
+      baseVal = SILValue();
   }
 
   // MARK: AccessPhiVisitor::UseDefVisitor implementation.
 
-  bool isResultValid() const { return base && bool(base.getValue()); }
+  // Keep going as long as baseVal is valid regardless of kindVal.
+  bool isResultValid() const { return baseVal && bool(baseVal.getValue()); }
 
-  void invalidateResult() { base = SILValue(); }
+  void invalidateResult() {
+    baseVal = SILValue();
+    kindVal = None;
+  }
 
-  Optional<SILValue> saveResult() const { return base; }
+  Optional<SILValue> saveResult() const { return baseVal; }
 
-  void restoreResult(Optional<SILValue> result) { base = result; }
+  void restoreResult(Optional<SILValue> result) { baseVal = result; }
 
   void addUnknownOffset() { return; }
 
   // MARK: visitor implementation.
 
-  SILValue visitBase(SILValue base, AccessedStorage::Kind kind) {
+  SILValue visitBase(SILValue base, AccessStorage::Kind kind) {
     setResult(base);
+    if (!baseVal.getValue()) {
+      kindVal = None;
+    } else {
+      assert(!kindVal || kindVal.getValue() == kind);
+      kindVal = kind;
+    }
     return SILValue();
   }
 
   SILValue visitNonAccess(SILValue value) {
     setResult(value);
+    kindVal = None;
     return SILValue();
   }
 
   // Override visitStorageCast to avoid seeing through arbitrary address casts.
-  SILValue visitStorageCast(SingleValueInstruction *projectedAddr,
-                            Operand *sourceAddr) {
+  SILValue visitStorageCast(SingleValueInstruction *cast, Operand *sourceAddr) {
     if (storageCastTy == StopAtStorageCast)
-      return visitNonAccess(projectedAddr);
+      return visitNonAccess(cast);
 
-    return SuperTy::visitStorageCast(projectedAddr, sourceAddr);
+    return SuperTy::visitStorageCast(cast, sourceAddr);
   }
 };
 
@@ -323,7 +349,7 @@ SILValue swift::getTypedAccessAddress(SILValue address) {
   SILValue accessAddress =
       FindAccessBaseVisitor(NestedAccessType::StopAtAccessBegin,
                             StopAtStorageCast)
-          .findBase(address);
+          .findPossibleBaseAddress(address);
   assert(accessAddress->getType().isAddress());
   return accessAddress;
 }
@@ -335,21 +361,17 @@ SILValue swift::getAccessScope(SILValue address) {
   assert(address->getType().isAddress());
   return FindAccessBaseVisitor(NestedAccessType::StopAtAccessBegin,
                                IgnoreStorageCast)
-      .findBase(address);
+      .findPossibleBaseAddress(address);
 }
 
 // This is allowed to be called on a non-address pointer type.
 SILValue swift::getAccessBase(SILValue address) {
   return FindAccessBaseVisitor(NestedAccessType::IgnoreAccessBegin,
                                IgnoreStorageCast)
-      .findBase(address);
+      .findPossibleBaseAddress(address);
 }
 
-bool swift::isLetAddress(SILValue address) {
-  SILValue base = getAccessBase(address);
-  if (!base)
-    return false;
-
+static bool isLetForBase(SILValue base) {
   // Is this an address of a "let" class member?
   if (auto *rea = dyn_cast<RefElementAddrInst>(base))
     return rea->getField()->isLet();
@@ -362,9 +384,318 @@ bool swift::isLetAddress(SILValue address) {
   return false;
 }
 
+bool swift::isLetAddress(SILValue address) {
+  SILValue base = getAccessBase(address);
+  if (!base)
+    return false;
+
+  return isLetForBase(base);
+}
+
+//===----------------------------------------------------------------------===//
+//                         MARK: AccessRepresentation
+//===----------------------------------------------------------------------===//
+
+constexpr unsigned AccessRepresentation::TailIndex;
+
+const char *AccessRepresentation::getKindName(AccessStorage::Kind k) {
+  switch (k) {
+  case Box:
+    return "Box";
+  case Stack:
+    return "Stack";
+  case Nested:
+    return "Nested";
+  case Unidentified:
+    return "Unidentified";
+  case Argument:
+    return "Argument";
+  case Yield:
+    return "Yield";
+  case Global:
+    return "Global";
+  case Class:
+    return "Class";
+  case Tail:
+    return "Tail";
+  }
+  llvm_unreachable("unhandled kind");
+}
+
+// 'value' remains invalid. AccessBase or AccessStorage must initialize it
+// accordingly.
+AccessRepresentation::AccessRepresentation(SILValue base, Kind kind) : value() {
+  Bits.opaqueBits = 0;
+
+  // For kind==Unidentified, base may be an invalid, empty, or tombstone value.
+  initKind(kind, InvalidElementIndex);
+
+  switch (kind) {
+  case Box:
+    assert(isa<ProjectBoxInst>(base));
+    break;
+  case Stack:
+    assert(isa<AllocStackInst>(base));
+    break;
+  case Nested:
+    assert(isa<BeginAccessInst>(base));
+    break;
+  case Yield:
+    assert(isa<BeginApplyInst>(
+             cast<MultipleValueInstructionResult>(base)->getParent()));
+    break;
+  case Unidentified:
+    break;
+  case Global:
+    break;
+  case Tail:
+    assert(isa<RefTailAddrInst>(base));
+    setElementIndex(TailIndex);
+    break;
+  case Argument:
+    setElementIndex(cast<SILFunctionArgument>(base)->getIndex());
+    break;
+  case Class: {
+    setElementIndex(cast<RefElementAddrInst>(base)->getFieldIndex());
+    break;
+  }
+  }
+}
+
+bool AccessRepresentation::
+isDistinctFrom(const AccessRepresentation &other) const {
+  if (isUniquelyIdentified()) {
+    if (other.isUniquelyIdentified() && !hasIdenticalAccessInfo(other))
+      return true;
+
+    if (other.isObjectAccess())
+      return true;
+
+    // We currently assume that Unidentified storage may overlap with
+    // Box/Stack storage.
+    return false;
+  }
+  if (other.isUniquelyIdentified())
+    return other.isDistinctFrom(*this);
+
+  // Neither storage is uniquely identified.
+  if (isObjectAccess()) {
+    if (other.isObjectAccess()) {
+      // Property access cannot overlap with Tail access.
+      if (getKind() != other.getKind())
+        return true;
+
+      // We could also check if the object types are distinct, but that only
+      // helps if we know the relationships between class types.
+      return getKind() == Class
+        && getPropertyIndex() != other.getPropertyIndex();
+    }
+    // Any type of nested/argument address may be within the same object.
+    //
+    // We also currently assume Unidentified access may be within an object
+    // purely to handle KeyPath accesses. The deriviation of the KeyPath
+    // address must separately appear to be a Class access so that all Class
+    // accesses are accounted for.
+    return false;
+  }
+  if (other.isObjectAccess())
+    return other.isDistinctFrom(*this);
+
+  // Neither storage is from a class or tail.
+  //
+  // Unidentified values may alias with each other or with any kind of
+  // nested/argument access.
+  return false;
+}
+
+// The subclass prints Class and Global values.
+void AccessRepresentation::print(raw_ostream &os) const {
+  if (!*this) {
+    os << "INVALID\n";
+    return;
+  }
+  os << getKindName(getKind()) << " ";
+  switch (getKind()) {
+  case Box:
+  case Stack:
+  case Nested:
+  case Yield:
+  case Unidentified:
+  case Tail:
+    os << value;
+    break;
+  case Argument:
+    os << value;
+    break;
+  case Global:
+  case Class:
+    break;
+  }
+}
+
+//===----------------------------------------------------------------------===//
+//                              MARK: AccessBase
+//===----------------------------------------------------------------------===//
+
+AccessBase AccessBase::compute(SILValue sourceAddress) {
+  return FindAccessBaseVisitor(NestedAccessType::IgnoreAccessBegin,
+                               IgnoreStorageCast)
+      .findBase(sourceAddress);
+}
+
+AccessBase::AccessBase(SILValue base, Kind kind)
+  : AccessRepresentation(base, kind)
+{
+  assert(base && "invalid storage base");
+  value = base;
+  setLetAccess(isLetForBase(base));
+}
+
+static SILValue
+getReferenceFromBase(SILValue base, AccessRepresentation::Kind kind) {
+  switch (kind) {
+  case AccessBase::Stack:
+  case AccessBase::Nested:
+  case AccessBase::Yield:
+  case AccessBase::Unidentified:
+  case AccessBase::Argument:
+  case AccessBase::Global:
+    llvm_unreachable("Not object storage");
+    break;
+  case AccessBase::Box:
+    return cast<ProjectBoxInst>(base)->getOperand();
+  case AccessBase::Tail:
+    return cast<RefTailAddrInst>(base)->getOperand();
+  case AccessBase::Class:
+    return cast<RefElementAddrInst>(base)->getOperand();
+  }
+}
+
+SILValue AccessBase::getReference() const {
+  return getReferenceFromBase(value, getKind());
+}
+
+static SILGlobalVariable *getReferencedGlobal(SILInstruction *inst) {
+  if (auto *gai = dyn_cast<GlobalAddrInst>(inst)) {
+    return gai->getReferencedGlobal();
+  }
+  if (auto apply = FullApplySite::isa(inst)) {
+    if (auto *funcRef = apply.getReferencedFunctionOrNull()) {
+      return getVariableOfGlobalInit(funcRef);
+    }
+  }
+  return nullptr;
+}
+
+SILGlobalVariable *AccessBase::getGlobal() const {
+  assert(getKind() == Global);
+  return getReferencedGlobal(cast<SingleValueInstruction>(value));
+}
+
+static const ValueDecl *
+getNonRefNonGlobalDecl(SILValue base, AccessRepresentation::Kind kind) {
+  switch (kind) {
+  case AccessBase::Box:
+  case AccessBase::Class:
+  case AccessBase::Tail:
+    llvm_unreachable("Cannot handle reference access");
+
+  case AccessBase::Global:
+    llvm_unreachable("Cannot handle global access");
+
+  case AccessBase::Stack:
+    return cast<AllocStackInst>(base)->getDecl();
+
+  case AccessBase::Argument:
+    return cast<SILFunctionArgument>(base)->getDecl();
+
+  case AccessBase::Yield:
+    return nullptr;
+
+  case AccessBase::Nested:
+    return nullptr;
+
+  case AccessBase::Unidentified:
+    return nullptr;
+  }
+  llvm_unreachable("unhandled kind");
+}
+
+const ValueDecl *AccessBase::getDecl() const {
+  switch (getKind()) {
+  case Box:
+    if (auto *allocBox = dyn_cast<AllocBoxInst>(
+          findReferenceRoot(getReference()))) {
+      return allocBox->getLoc().getAsASTNode<VarDecl>();
+    }
+    return nullptr;
+  case Class: {
+    auto *classDecl = cast<RefElementAddrInst>(value)->getClassDecl();
+    return getIndexedField(classDecl, getPropertyIndex());
+  }
+  case Tail:
+    return nullptr;
+  case Global:
+    return getGlobal()->getDecl();
+  default:
+    return getNonRefNonGlobalDecl(value, getKind());
+  }
+}
+
+bool AccessBase::hasLocalOwnershipLifetime() const {
+  switch (getKind()) {
+  case AccessBase::Argument:
+  case AccessBase::Stack:
+  case AccessBase::Global:
+    return false;
+  case AccessBase::Unidentified:
+    // Unidentified storage may be nested within object access, but this is an
+    // "escaped pointer", so it is not restricted to the object's borrow scope.
+    return false;
+  case AccessBase::Yield:
+    // Yielded values have a local apply scope, but they never have the same
+    // storage as yielded values from a different scope, so there is no need to
+    // consider their local scope during substitution.
+    return false;
+  case AccessBase::Box:
+  case AccessBase::Class:
+  case AccessBase::Tail:
+    return getReference()->getOwnershipKind() != OwnershipKind::None;
+  case AccessBase::Nested:
+    llvm_unreachable("unexpected storage");
+  };
+}
+
+void AccessBase::print(raw_ostream &os) const {
+  AccessRepresentation::print(os);
+  switch (getKind()) {
+  case Global:
+    os << *getGlobal();
+    break;
+  case Class:
+    os << getReference();
+    if (auto *decl = getDecl()) {
+      os << "  Field: ";
+      decl->print(os);
+    }
+    os << " Index: " << getPropertyIndex() << "\n";
+    break;
+  default:
+    break;
+  }
+}
+
+LLVM_ATTRIBUTE_USED void AccessBase::dump() const { print(llvm::dbgs()); }
+
 //===----------------------------------------------------------------------===//
 //                          MARK: FindReferenceRoot
 //===----------------------------------------------------------------------===//
+
+bool swift::isIdentityPreservingRefCast(SingleValueInstruction *svi) {
+  // Ignore both copies and other identity and ownership preserving casts
+  return isa<CopyValueInst>(svi) || isa<BeginBorrowInst>(svi)
+         || isIdentityAndOwnershipPreservingRefCast(svi);
+}
 
 // On some platforms, casting from a metatype to a reference type dynamically
 // allocates a ref-counted box for the metatype. Naturally that is the place
@@ -372,15 +703,14 @@ bool swift::isLetAddress(SILValue address) {
 // RC-identical would confuse ARC optimization, which might eliminate a retain
 // of such an object completely.
 //
-// The SILVerifier checks that none of these operations cast a nontrivial value
-// to a reference except unconditional_checked_cast[_value].
-bool swift::isRCIdentityPreservingCast(SingleValueInstruction *svi) {
+// The SILVerifier checks that none of these operations cast a trivial value to
+// a reference except unconditional_checked_cast[_value], which is checked By
+// SILDynamicCastInst::isRCIdentityPreserving().
+bool swift::isIdentityAndOwnershipPreservingRefCast(
+    SingleValueInstruction *svi) {
   switch (svi->getKind()) {
   default:
     return false;
-  // Ignore ownership casts
-  case SILInstructionKind::CopyValueInst:
-  case SILInstructionKind::BeginBorrowInst:
   // Ignore class type casts
   case SILInstructionKind::UpcastInst:
   case SILInstructionKind::UncheckedRefCastInst:
@@ -390,6 +720,10 @@ bool swift::isRCIdentityPreservingCast(SingleValueInstruction *svi) {
   case SILInstructionKind::UnconditionalCheckedCastInst:
   case SILInstructionKind::UnconditionalCheckedCastValueInst:
     return SILDynamicCastInst(svi).isRCIdentityPreserving();
+  // Ignore markers
+  case SILInstructionKind::MarkUninitializedInst:
+  case SILInstructionKind::MarkDependenceInst:
+    return true;
   }
 }
 
@@ -410,7 +744,8 @@ protected:
   // Return an invalid value for a phi with no resolved inputs.
   SILValue recursiveFindRoot(SILValue ref) {
     while (auto *svi = dyn_cast<SingleValueInstruction>(ref)) {
-      if (!isRCIdentityPreservingCast(svi)) {
+      // If preserveOwnership is true, stop at the first owned root
+      if (!isIdentityPreservingRefCast(svi)) {
         break;
       }
       ref = svi->getOperand(0);
@@ -446,57 +781,79 @@ protected:
 
 } // end anonymous namespace
 
-static SILValue findReferenceRoot(SILValue ref) {
+SILValue swift::findReferenceRoot(SILValue ref) {
   return FindReferenceRoot().findRoot(ref);
 }
 
-//===----------------------------------------------------------------------===//
-//                            MARK: AccessedStorage
-//===----------------------------------------------------------------------===//
-
-SILGlobalVariable *getReferencedGlobal(SILInstruction *inst) {
-  if (auto *gai = dyn_cast<GlobalAddrInst>(inst)) {
-    return gai->getReferencedGlobal();
-  }
-  if (auto apply = FullApplySite::isa(inst)) {
-    if (auto *funcRef = apply.getReferencedFunctionOrNull()) {
-      return getVariableOfGlobalInit(funcRef);
+// This does not handle phis because a phis is either a consume or a
+// reborrow. In either case, the phi argument's ownership is independent from
+// the phi itself. The client assumes that the returned root is in the same
+// lifetime or borrow scope of the access.
+SILValue swift::findOwnershipReferenceRoot(SILValue ref) {
+  while (auto *svi = dyn_cast<SingleValueInstruction>(ref)) {
+    if (isIdentityAndOwnershipPreservingRefCast(svi)) {
+      ref = svi->getOperand(0);
+      continue;
     }
+    break;
   }
-  return nullptr;
+  return ref;
 }
 
-constexpr unsigned AccessedStorage::TailIndex;
+/// Find the first owned aggregate containing the reference, or simply the
+/// reference root if no aggregate is found.
+///
+/// TODO: Add a component path to a ReferenceRoot abstraction and handle
+/// that within FindReferenceRoot.
+SILValue swift::findOwnershipReferenceAggregate(SILValue ref) {
+  SILValue root = ref;
+  while(true) {
+    root = findOwnershipReferenceRoot(root);
+    if (!root)
+      return root;
+    if (isa<FirstArgOwnershipForwardingSingleValueInst>(root)
+        || isa<OwnershipForwardingConversionInst>(root)
+        || isa<OwnershipForwardingSelectEnumInstBase>(root)
+        || isa<OwnershipForwardingMultipleValueInstruction>(root)) {
+      root = root->getDefiningInstruction()->getOperand(0);
+      continue;
+    }
+    if (auto *arg = dyn_cast<SILArgument>(root)) {
+      if (auto *term = arg->getSingleTerminator()) {
+        if (term->isTransformationTerminator()) {
+          assert(OwnershipForwardingTermInst::isa(term));
+          root = term->getOperand(0);
+          continue;
+        }
+      }
+    }
+    break;
+  }
+  return root;
+}
 
-AccessedStorage::AccessedStorage(SILValue base, Kind kind) {
-  // For kind==Unidentified, base may be an invalid empty or tombstone value.
-  assert(base && "invalid storage base");
-  initKind(kind);
-  switch (kind) {
-  case Box:
-    assert(isa<AllocBoxInst>(base));
-    value = base;
-    break;
-  case Stack:
-    assert(isa<AllocStackInst>(base));
-    value = base;
-    break;
-  case Nested:
-    assert(isa<BeginAccessInst>(base));
-    value = base;
-    break;
-  case Yield:
-    assert(isa<BeginApplyResult>(base));
-    value = base;
-    break;
-  case Unidentified:
-    value = base;
-    break;
-  case Argument:
-    value = base;
-    setElementIndex(cast<SILFunctionArgument>(base)->getIndex());
-    break;
-  case Global:
+//===----------------------------------------------------------------------===//
+//                            MARK: AccessStorage
+//===----------------------------------------------------------------------===//
+
+AccessStorage::AccessStorage(SILValue base, Kind kind)
+  : AccessRepresentation(base, kind)
+{
+  if (isReference()) {
+    value = findReferenceRoot(getReferenceFromBase(base, kind));
+    // Class access is a "let" if it's base points to a stored property.
+    if (getKind() == AccessBase::Class) {
+      setLetAccess(isLetForBase(base));
+    }
+    // Box access is a "let" if it's root is from a "let" VarDecl.
+    if (getKind() == AccessBase::Box) {
+      if (auto *decl = dyn_cast_or_null<VarDecl>(getDecl())) {
+        setLetAccess(decl->isLet());
+      }
+    }
+    return;
+  }
+  if (getKind() == AccessBase::Global) {
     global = getReferencedGlobal(cast<SingleValueInstruction>(base));
     // Require a decl for all formally accessed globals defined in this
     // module. AccessEnforcementWMO requires this. Swift globals defined in
@@ -504,35 +861,24 @@ AccessedStorage::AccessedStorage(SILValue base, Kind kind) {
     // storage. Imported non-Swift globals are accessed via global_addr but have
     // no declaration.
     assert(global->getDecl() || isa<GlobalAddrInst>(base));
-    break;
-  case Class: {
-    // Do a best-effort to find the identity of the object being projected
-    // from. It is OK to be unsound here (i.e. miss when two ref_element_addrs
-    // actually refer the same address) because, when the effort fails, static
-    // analysis will be sufficiently conservative given that classes are not
-    // "uniquely identified", and these addresses will be dynamically checked.
-    auto *REA = cast<RefElementAddrInst>(base);
-    value = findReferenceRoot(REA->getOperand());
-    setElementIndex(REA->getFieldIndex());
-    break;
+
+    // It's unclear whether a global will ever be missing it's varDecl, but
+    // technically we only preserve it for debug info. So if we don't have a
+    // decl, check the flag on SILGlobalVariable, which is guaranteed valid,
+    setLetAccess(getGlobal()->isLet());
+    return;
   }
-  case Tail: {
-    auto *RTA = cast<RefTailAddrInst>(base);
-    value = findReferenceRoot(RTA->getOperand());
-    break;
+  value = base;
+  if (auto *decl = dyn_cast_or_null<VarDecl>(getDecl())) {
+    setLetAccess(decl->isLet());
   }
-  }
-  setLetAccess(base);
 }
 
-void AccessedStorage::visitRoots(
+void AccessStorage::visitRoots(
     SILFunction *function,
     llvm::function_ref<bool(SILValue)> visitor) const {
   if (SILValue root = getRoot()) {
     visitor(root);
-    return;
-  }
-  if (getKind() == Unidentified) {
     return;
   }
   assert(getKind() == Global && function);
@@ -546,105 +892,43 @@ void AccessedStorage::visitRoots(
   }
 }
 
-// Set 'isLet' to true if this storage can be determined to be a 'let' variable.
-//
-// \p base must be the access base for this storage, as passed to the
-// AccessedStorage constructor.
-void AccessedStorage::setLetAccess(SILValue base) {
-  // It's unclear whether a global will ever be missing it's varDecl, but
-  // technically we only preserve it for debug info. So if we don't have a decl,
-  // check the flag on SILGlobalVariable, which is guaranteed valid,
-  if (getKind() == AccessedStorage::Global) {
-    Bits.AccessedStorage.isLet = getGlobal()->isLet();
-    return;
-  }
-  if (auto *decl = dyn_cast_or_null<VarDecl>(getDecl(base))) {
-    Bits.AccessedStorage.isLet = decl->isLet();
-  }
-}
-
-const ValueDecl *AccessedStorage::getDecl(SILValue base) const {
+const ValueDecl *AccessStorage::getDecl() const {
   switch (getKind()) {
   case Box:
-    return cast<AllocBoxInst>(value)->getLoc().getAsASTNode<VarDecl>();
-
-  case Stack:
-    return cast<AllocStackInst>(value)->getDecl();
-
-  case Global:
-    return global->getDecl();
-
+    if (auto *allocBox = dyn_cast<AllocBoxInst>(getRoot())) {
+      return allocBox->getLoc().getAsASTNode<VarDecl>();
+    }
+    return nullptr;
   case Class: {
     // The property index is relative to the VarDecl in ref_element_addr, and
-    // can only be reliably determined when the base is avaiable. Otherwise, we
-    // can only make a best effort to extract it from the object type, which
-    // might not even be a class in the case of bridge objects.
+    // can only be reliably determined when the base is avaiable. Without the
+    // base, we can only make a best effort to extract it from the object type,
+    // which might not even be a class in the case of bridge objects.
     if (ClassDecl *classDecl =
-            base ? cast<RefElementAddrInst>(base)->getClassDecl()
-                 : getObject()->getType().getClassOrBoundGenericClass()) {
+        getObject()->getType().getClassOrBoundGenericClass()) {
       return getIndexedField(classDecl, getPropertyIndex());
     }
     return nullptr;
   }
   case Tail:
     return nullptr;
-
-  case Argument:
-    return getArgument()->getDecl();
-
-  case Yield:
-    return nullptr;
-
-  case Nested:
-    return nullptr;
-
-  case Unidentified:
-    return nullptr;
-  }
-  llvm_unreachable("unhandled kind");
-}
-
-const char *AccessedStorage::getKindName(AccessedStorage::Kind k) {
-  switch (k) {
-  case Box:
-    return "Box";
-  case Stack:
-    return "Stack";
-  case Nested:
-    return "Nested";
-  case Unidentified:
-    return "Unidentified";
-  case Argument:
-    return "Argument";
-  case Yield:
-    return "Yield";
   case Global:
-    return "Global";
-  case Class:
-    return "Class";
-  case Tail:
-    return "Tail";
+    return global->getDecl();
+  default:
+    return getNonRefNonGlobalDecl(value, getKind());
   }
-  llvm_unreachable("unhandled kind");
 }
 
-void AccessedStorage::print(raw_ostream &os) const {
-  if (!*this) {
-    os << "INVALID\n";
-    return;
-  }
-  os << getKindName(getKind()) << " ";
+const ValueDecl *AccessStorageWithBase::getDecl() const {
+  if (storage.getKind() == AccessBase::Class)
+    return getAccessBase().getDecl();
+
+  return storage.getDecl();
+}
+
+void AccessStorage::print(raw_ostream &os) const {
+  AccessRepresentation::print(os);
   switch (getKind()) {
-  case Box:
-  case Stack:
-  case Nested:
-  case Yield:
-  case Unidentified:
-    os << value;
-    break;
-  case Argument:
-    os << value;
-    break;
   case Global:
     os << *global;
     break;
@@ -656,30 +940,42 @@ void AccessedStorage::print(raw_ostream &os) const {
     }
     os << " Index: " << getPropertyIndex() << "\n";
     break;
-  case Tail:
-    os << getObject();
+  default:
+    break;
   }
 }
 
-LLVM_ATTRIBUTE_USED void AccessedStorage::dump() const { print(llvm::dbgs()); }
+LLVM_ATTRIBUTE_USED void AccessStorage::dump() const { print(llvm::dbgs()); }
+
+void AccessStorageWithBase::print(raw_ostream &os) const {
+  if (base)
+    os << "Base: " << base;
+  else
+    os << "Base: unidentified\n";
+  storage.print(os);
+}
+
+LLVM_ATTRIBUTE_USED void AccessStorageWithBase::dump() const {
+  print(llvm::dbgs());
+}
 
 namespace {
 
 // Implementation of AccessUseDefChainVisitor that looks for a single common
-// AccessedStorage object for all projection paths.
-class FindAccessedStorageVisitor
-    : public FindAccessVisitorImpl<FindAccessedStorageVisitor> {
+// AccessStorage object for all projection paths.
+class FindAccessStorageVisitor
+    : public FindAccessVisitorImpl<FindAccessStorageVisitor> {
 
 public:
   struct Result {
-    Optional<AccessedStorage> storage;
+    Optional<AccessStorage> storage;
     SILValue base;
   };
 
 private:
   Result result;
 
-  void setResult(AccessedStorage foundStorage, SILValue foundBase) {
+  void setResult(AccessStorage foundStorage, SILValue foundBase) {
     if (!result.storage) {
       result.storage = foundStorage;
       assert(!result.base);
@@ -688,22 +984,22 @@ private:
       // `storage` may still be invalid. If both `storage` and `foundStorage`
       // are invalid, this check passes, but we return an invalid storage
       // below.
-      if (!result.storage->hasIdenticalBase(foundStorage))
-        result.storage = AccessedStorage();
+      if (!result.storage->hasIdenticalStorage(foundStorage))
+        result.storage = AccessStorage();
       if (result.base != foundBase)
         result.base = SILValue();
     }
   }
 
 public:
-  FindAccessedStorageVisitor(NestedAccessType nestedAccessTy)
+  FindAccessStorageVisitor(NestedAccessType nestedAccessTy)
       : FindAccessVisitorImpl(nestedAccessTy, IgnoreStorageCast) {}
 
   // Main entry point
   void findStorage(SILValue sourceAddr) { this->reenterUseDef(sourceAddr); }
 
-  AccessedStorage getStorage() const {
-    return result.storage.getValueOr(AccessedStorage());
+  AccessStorage getStorage() const {
+    return result.storage.getValueOr(AccessStorage());
   }
   // getBase may return an invalid value for valid Global storage because there
   // may be multiple global_addr bases for identical storage.
@@ -716,7 +1012,7 @@ public:
     return result.storage && bool(result.storage.getValue());
   }
 
-  void invalidateResult() { setResult(AccessedStorage(), SILValue()); }
+  void invalidateResult() { setResult(AccessStorage(), SILValue()); }
 
   Result saveResult() const { return result; }
 
@@ -726,8 +1022,8 @@ public:
 
   // MARK: visitor implementation.
 
-  SILValue visitBase(SILValue base, AccessedStorage::Kind kind) {
-    setResult(AccessedStorage(base, kind), base);
+  SILValue visitBase(SILValue base, AccessStorage::Kind kind) {
+    setResult(AccessStorage(base, kind), base);
     return SILValue();
   }
 
@@ -739,37 +1035,50 @@ public:
 
 } // end anonymous namespace
 
-AccessedStorageWithBase
-AccessedStorageWithBase::compute(SILValue sourceAddress) {
-  FindAccessedStorageVisitor visitor(NestedAccessType::IgnoreAccessBegin);
+AccessStorageWithBase
+AccessStorageWithBase::compute(SILValue sourceAddress) {
+  FindAccessStorageVisitor visitor(NestedAccessType::IgnoreAccessBegin);
   visitor.findStorage(sourceAddress);
   return {visitor.getStorage(), visitor.getBase()};
 }
 
-AccessedStorageWithBase
-AccessedStorageWithBase::computeInScope(SILValue sourceAddress) {
-  FindAccessedStorageVisitor visitor(NestedAccessType::StopAtAccessBegin);
+AccessStorageWithBase
+AccessStorageWithBase::computeInScope(SILValue sourceAddress) {
+  FindAccessStorageVisitor visitor(NestedAccessType::StopAtAccessBegin);
   visitor.findStorage(sourceAddress);
   return {visitor.getStorage(), visitor.getBase()};
 }
 
-AccessedStorage AccessedStorage::compute(SILValue sourceAddress) {
-  return AccessedStorageWithBase::compute(sourceAddress).storage;
+AccessStorage AccessStorage::compute(SILValue sourceAddress) {
+  return AccessStorageWithBase::compute(sourceAddress).storage;
 }
 
-AccessedStorage AccessedStorage::computeInScope(SILValue sourceAddress) {
-  return AccessedStorageWithBase::computeInScope(sourceAddress).storage;
+AccessStorage AccessStorage::computeInScope(SILValue sourceAddress) {
+  return AccessStorageWithBase::computeInScope(sourceAddress).storage;
+}
+
+AccessStorage AccessStorage::forObjectTail(SILValue object) {
+  AccessStorage storage;
+  storage.initKind(Tail, TailIndex);
+  storage.value = findReferenceRoot(object);
+  return storage;
 }
 
 //===----------------------------------------------------------------------===//
 //                              MARK: AccessPath
 //===----------------------------------------------------------------------===//
 
+AccessPath AccessPath::forTailStorage(SILValue rootReference) {
+  return AccessPath(AccessStorage::forObjectTail(rootReference),
+                    PathNode(rootReference->getModule()->getIndexTrieRoot()),
+                    /*offset*/ 0);
+}
+
 bool AccessPath::contains(AccessPath subPath) const {
   if (!isValid() || !subPath.isValid()) {
     return false;
   }
-  if (!storage.hasIdenticalBase(subPath.storage)) {
+  if (!storage.hasIdenticalStorage(subPath.storage)) {
     return false;
   }
   // Does the offset index match?
@@ -803,17 +1112,17 @@ class AccessPathVisitor : public FindAccessVisitorImpl<AccessPathVisitor> {
 
   SILModule *module;
 
-  // This nested visitor holds the AccessedStorage and base results.
-  FindAccessedStorageVisitor storageVisitor;
+  // This nested visitor holds the AccessStorage and base results.
+  FindAccessStorageVisitor storageVisitor;
 
   // Save just enough information for to checkpoint before processing phis. Phis
   // can add path components and add an unknown offset.
   struct Result {
-    FindAccessedStorageVisitor::Result storageResult;
+    FindAccessStorageVisitor::Result storageResult;
     int savedOffset;
     unsigned pathLength;
 
-    Result(FindAccessedStorageVisitor::Result storageResult, int offset,
+    Result(FindAccessStorageVisitor::Result storageResult, int offset,
            unsigned pathLength)
         : storageResult(storageResult), savedOffset(offset),
           pathLength(pathLength) {}
@@ -894,7 +1203,7 @@ public:
   // MARK: visitor implementation. Return the address source as the next use-def
   // value to process. An invalid SILValue stops def-use traversal.
 
-  SILValue visitBase(SILValue base, AccessedStorage::Kind kind) {
+  SILValue visitBase(SILValue base, AccessStorage::Kind kind) {
     return storageVisitor.visitBase(base, kind);
   }
 
@@ -916,7 +1225,7 @@ public:
       if (pendingOffset) {
         LLVM_DEBUG(llvm::dbgs() << "Subobject projection with offset index: "
                                 << *projectedAddr);
-        // Return an invalid result even though findAccessedStorage() may be
+        // Return an invalid result even though findAccessStorage() may be
         // able to find valid storage, because an offset from a subobject is an
         // invalid access path.
         return visitNonAccess(projectedAddr);
@@ -927,7 +1236,10 @@ public:
       // Ignore everything in getAccessProjectionOperand that is an access
       // projection with no affect on the access path.
       assert(isa<OpenExistentialAddrInst>(projectedAddr)
+             || isa<InitEnumDataAddrInst>(projectedAddr)
              || isa<UncheckedTakeEnumDataAddrInst>(projectedAddr)
+             // project_box is not normally an access projection but we treat it
+             // as such when it operates on unchecked_take_enum_data_addr.
              || isa<ProjectBoxInst>(projectedAddr));
     }
     return sourceAddr->get();
@@ -1006,7 +1318,8 @@ LLVM_ATTRIBUTE_USED void AccessPath::dump() const { print(llvm::dbgs()); }
 void AccessPathWithBase::print(raw_ostream &os) const {
   if (base)
     os << "Base: " << base;
-
+  else
+    os << "Base: unidentified\n";
   accessPath.print(os);
 }
 
@@ -1045,7 +1358,7 @@ namespace {
 //   load %sub                              // inner use
 //
 // A use may be a BranchInst if the corresponding phi does not have common
-// AccessedStorage.
+// AccessStorage.
 //
 // For class storage, the def-use traversal starts at the reference
 // root. Eventually, traversal reach the base address of the formal access:
@@ -1057,7 +1370,7 @@ class AccessPathDefUseTraversal {
   AccessUseVisitor &visitor;
 
   // The origin of the def-use traversal.
-  AccessedStorage storage;
+  AccessStorage storage;
 
   // Remaining access path indices from the most recently visited def to any
   // exact use in def-use order.
@@ -1177,11 +1490,11 @@ void AccessPathDefUseTraversal::initializePathIndices(AccessPath accessPath) {
   }
   // The search will start from the object root, not the formal access base,
   // so add the class index to the front.
-  if (storage.getKind() == AccessedStorage::Class) {
+  if (storage.getKind() == AccessStorage::Class) {
     pathIndices.push_back(
         AccessPath::Index::forSubObjectProjection(storage.getPropertyIndex()));
   }
-  if (storage.getKind() == AccessedStorage::Tail) {
+  if (storage.getKind() == AccessStorage::Tail) {
     pathIndices.push_back(
         AccessPath::Index::forSubObjectProjection(ProjectionIndex::TailIndex));
   }
@@ -1218,7 +1531,7 @@ bool AccessPathDefUseTraversal::pushPhiUses(const SILPhiArgument *phi,
   // looking through it. If the phi input differ the its storage is invalid.
   auto phiPath = AccessPath::compute(phi);
   if (phiPath.isValid()) {
-    assert(phiPath.getStorage().hasIdenticalBase(storage)
+    assert(phiPath.getStorage().hasIdenticalStorage(storage)
            && "inconsistent phi storage");
     // If the phi paths have different offsets, its path has unknown offset.
     if (phiPath.getOffset() == AccessPath::UnknownOffset) {
@@ -1247,7 +1560,7 @@ int AccessPathDefUseTraversal::getPathOffset(const DFSEntry &dfs) const {
 bool AccessPathDefUseTraversal::checkAndUpdateOffset(DFSEntry &dfs) {
   int pathOffset = getPathOffset(dfs);
   if (dfs.offset == AccessPath::UnknownOffset) {
-    if (pathOffset > 0) {
+    if (pathOffset != 0) {
       // Pop the offset from the expected path; there should only be
       // one. Continue matching subobject indices even after seeing an unknown
       // offset. A subsequent mismatching subobject index is still considered
@@ -1323,13 +1636,13 @@ AccessPathDefUseTraversal::UseKind
 AccessPathDefUseTraversal::visitSingleValueUser(SingleValueInstruction *svi,
                                                 DFSEntry dfs) {
   if (dfs.isRef()) {
-    if (isRCIdentityPreservingCast(svi)) {
+    if (isIdentityPreservingRefCast(svi)) {
       pushUsers(svi, dfs);
       return IgnoredUse;
     }
     // 'svi' will be processed below as either RefElementAddrInst,
     // RefTailAddrInst, or some unknown LeafUse.
-  } else if (isAccessedStorageCast(svi)) {
+  } else if (isAccessStorageCast(svi)) {
     pushUsers(svi, dfs);
     return IgnoredUse;
   }
@@ -1344,8 +1657,8 @@ AccessPathDefUseTraversal::visitSingleValueUser(SingleValueInstruction *svi,
     pushUsers(svi, dfs);
     return IgnoredUse;
 
-  // Handle ref_element_addr since we start at the object root instead of
-  // the access base.
+  // Handle ref_element_addr, ref_tail_addr, and project_box since we start at
+  // the object root instead of the access base.
   case SILInstructionKind::RefElementAddrInst:
     assert(dfs.isRef());
     assert(dfs.pathCursor > 0 && "ref_element_addr cannot occur within access");
@@ -1360,9 +1673,16 @@ AccessPathDefUseTraversal::visitSingleValueUser(SingleValueInstruction *svi,
     --dfs.pathCursor;
     AccessPath::Index pathIndex = pathIndices[dfs.pathCursor];
     assert(pathIndex.isSubObjectProjection());
-    if (pathIndex.getSubObjectIndex() == AccessedStorage::TailIndex)
+    if (pathIndex.getSubObjectIndex() == AccessStorage::TailIndex)
       pushUsers(svi, dfs);
 
+    return IgnoredUse;
+  }
+
+  case SILInstructionKind::ProjectBoxInst: {
+    assert(dfs.isRef());
+    dfs.useAndIsRef.setInt(false);
+    pushUsers(svi, dfs);
     return IgnoredUse;
   }
 
@@ -1389,6 +1709,10 @@ AccessPathDefUseTraversal::visitSingleValueUser(SingleValueInstruction *svi,
     pushUsers(svi, dfs);
     return IgnoredUse;
   }
+
+  case SILInstructionKind::InitEnumDataAddrInst:
+    pushUsers(svi, dfs);
+    return IgnoredUse;
 
   // open_existential_addr and unchecked_take_enum_data_addr are classified as
   // access projections, but they also modify memory. Both see through them and
@@ -1420,8 +1744,10 @@ AccessPathDefUseTraversal::visitSingleValueUser(SingleValueInstruction *svi,
       assert(isa<UncheckedTakeEnumDataAddrInst>(addrOper->get()));
       // Push the project_box uses
       for (auto *use : svi->getUses()) {
-        if (isa<ProjectBoxInst>(use->getUser()))
-          pushUser(DFSEntry(use, dfs.isRef(), dfs.pathCursor, dfs.offset));
+        if (auto *projectBox = dyn_cast<ProjectBoxInst>(use->getUser())) {
+          assert(!dfs.isRef() && "originates from an enum address");
+          pushUsers(projectBox, dfs);
+        }
       }
     }
     return LeafUse;
@@ -1436,6 +1762,9 @@ bool AccessPathDefUseTraversal::visitUser(DFSEntry dfs) {
         && visitSingleValueUser(svi, dfs) == IgnoredUse) {
       return true;
     }
+  }
+  if (isa<EndBorrowInst>(use->getUser())) {
+    return true;
   }
   // We weren't able to "see through" any more address conversions; so
   // record this as a use.
@@ -1459,8 +1788,8 @@ bool swift::visitAccessPathUses(AccessUseVisitor &visitor,
   return AccessPathDefUseTraversal(visitor, accessPath, function).visitUses();
 }
 
-bool swift::visitAccessedStorageUses(AccessUseVisitor &visitor,
-                                     AccessedStorage storage,
+bool swift::visitAccessStorageUses(AccessUseVisitor &visitor,
+                                     AccessStorage storage,
                                      SILFunction *function) {
   IndexTrieNode *emptyPath = function->getModule().getIndexTrieRoot();
   return visitAccessPathUses(visitor, AccessPath(storage, emptyPath, 0),
@@ -1479,7 +1808,7 @@ public:
     : AccessUseVisitor(useTy, NestedAccessType::IgnoreAccessBegin), uses(uses),
       useLimit(useLimit) {}
 
-  bool visitUse(Operand *use, AccessUseType useTy) {
+  bool visitUse(Operand *use, AccessUseType useTy) override {
     if (uses.size() == useLimit) {
       return false;
     }
@@ -1532,12 +1861,13 @@ bool swift::memInstMustInitialize(Operand *memOper) {
   }
 }
 
-bool swift::isSingleInitAllocStack(AllocStackInst *asi,
-                                   SmallVectorImpl<Operand *> &destroyingUses) {
+Operand *
+swift::getSingleInitAllocStackUse(AllocStackInst *asi,
+                                  SmallVectorImpl<Operand *> *destroyingUses) {
   // For now, we just look through projections and rely on memInstMustInitialize
   // to classify all other uses as init or not.
   SmallVector<Operand *, 32> worklist(asi->getUses());
-  bool foundInit = false;
+  Operand *singleInit = nullptr;
 
   while (!worklist.empty()) {
     auto *use = worklist.pop_back_val();
@@ -1558,39 +1888,70 @@ bool swift::isSingleInitAllocStack(AllocStackInst *asi,
         continue;
       }
       // Treat load [take] as a write.
-      return false;
+      return nullptr;
     }
 
     switch (user->getKind()) {
     default:
       break;
-    case SILInstructionKind::DestroyAddrInst:
-      destroyingUses.push_back(use);
+    case SILInstructionKind::UnconditionalCheckedCastAddrInst: {
+      auto *uccai = cast<UnconditionalCheckedCastAddrInst>(user);
+      // Only handle the case where we are doing a take of our alloc_stack as a
+      // source value. If we are the dest, then something else is happening!
+      // Break!
+      if (use->get() == uccai->getDest())
+        break;
+      // Ok, we are the Src and are performing a take. Treat it as a destroy!
+      if (destroyingUses)
+        destroyingUses->push_back(use);
       continue;
+    }
+    case SILInstructionKind::CheckedCastAddrBranchInst: {
+      auto *ccabi = cast<CheckedCastAddrBranchInst>(user);
+      // We only handle the case where we are doing a take of our alloc_stack as
+      // a source.
+      //
+      // TODO: Can we expand this?
+      if (use->get() == ccabi->getDest())
+        break;
+      if (ccabi->getConsumptionKind() != CastConsumptionKind::TakeAlways)
+        break;
+      // Ok, we are the Src and are performing a take. Treat it as a destroy!
+      if (destroyingUses)
+        destroyingUses->push_back(use);
+      continue;
+    }
+    case SILInstructionKind::DestroyAddrInst:
+      if (destroyingUses)
+        destroyingUses->push_back(use);
+      continue;
+    case SILInstructionKind::DebugValueInst:
+      if (cast<DebugValueInst>(user)->hasAddrVal())
+        continue;
+      break;
     case SILInstructionKind::DeallocStackInst:
     case SILInstructionKind::LoadBorrowInst:
-    case SILInstructionKind::DebugValueAddrInst:
       continue;
     }
 
     // See if we have an initializer and that such initializer is in the same
     // block.
     if (memInstMustInitialize(use)) {
-      if (user->getParent() != asi->getParent() || foundInit) {
-        return false;
+      if (user->getParent() != asi->getParent() || singleInit) {
+        return nullptr;
       }
 
-      foundInit = true;
+      singleInit = use;
       continue;
     }
 
     // Otherwise, if we have found something not in our allowlist, return false.
-    return false;
+    return nullptr;
   }
 
   // We did not find any users that we did not understand. So we can
-  // conservatively return true here.
-  return true;
+  // conservatively return the single initializing write that we found.
+  return singleInit;
 }
 
 /// Return true if the given address value is produced by a special address
@@ -1611,8 +1972,6 @@ bool swift::isAddressForLocalInitOnly(SILValue sourceAddr) {
   case ValueKind::InitEnumDataAddrInst:
   case ValueKind::InitExistentialAddrInst:
   case ValueKind::AllocExistentialBoxInst:
-  case ValueKind::AllocValueBufferInst:
-  case ValueKind::ProjectValueBufferInst:
     return true;
   }
 }
@@ -1633,11 +1992,11 @@ bool swift::isExternalGlobalAddressor(ApplyInst *AI) {
 bool swift::isUnsafePointerExtraction(StructExtractInst *SEI) {
   if (!isa<BuiltinRawPointerType>(SEI->getType().getASTType()))
     return false;
-  
+
   auto &C = SEI->getModule().getASTContext();
   auto *decl = SEI->getStructDecl();
-  return decl == C.getUnsafeMutablePointerDecl()
-         || decl == C.getUnsafePointerDecl();
+  return decl == C.getUnsafeMutablePointerDecl() ||
+         decl == C.getUnsafePointerDecl();
 }
 
 // Given a block argument address base, check if it is actually a box projected
@@ -1653,33 +2012,33 @@ void swift::checkSwitchEnumBlockArg(SILPhiArgument *arg) {
   }
 }
 
-bool swift::isPossibleFormalAccessBase(const AccessedStorage &storage,
-                                       SILFunction *F) {
+bool swift::isPossibleFormalAccessStorage(const AccessStorage &storage,
+                                          SILFunction *F) {
   switch (storage.getKind()) {
-  case AccessedStorage::Nested:
+  case AccessStorage::Nested:
     assert(false && "don't pass nested storage to this helper");
     return false;
 
-  case AccessedStorage::Box:
-  case AccessedStorage::Stack:
+  case AccessStorage::Box:
+  case AccessStorage::Stack:
     if (isScratchBuffer(storage.getValue()))
       return false;
     break;
-  case AccessedStorage::Global:
+  case AccessStorage::Global:
     break;
-  case AccessedStorage::Class:
+  case AccessStorage::Class:
     break;
-  case AccessedStorage::Tail:
+  case AccessStorage::Tail:
     return false;
 
-  case AccessedStorage::Yield:
+  case AccessStorage::Yield:
     // Yields are accessed by the caller.
     return false;
-  case AccessedStorage::Argument:
+  case AccessStorage::Argument:
     // Function arguments are accessed by the caller.
     return false;
 
-  case AccessedStorage::Unidentified:
+  case AccessStorage::Unidentified:
     if (isAddressForLocalInitOnly(storage.getValue()))
       return false;
 
@@ -1722,7 +2081,9 @@ SILBasicBlock::iterator swift::removeBeginAccess(BeginAccessInst *beginAccess) {
       op->set(beginAccess->getSource());
     }
   }
-  return beginAccess->getParent()->erase(beginAccess);
+  auto nextIter = std::next(beginAccess->getIterator());
+  beginAccess->getParent()->erase(beginAccess);
+  return nextIter;
 }
 
 //===----------------------------------------------------------------------===//
@@ -1774,6 +2135,13 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
       visitor(&builtin->getAllOperands()[2]);
       return;
 
+    // These consume values out of their second operand.
+    case BuiltinValueKind::ResumeNonThrowingContinuationReturning:
+    case BuiltinValueKind::ResumeThrowingContinuationReturning:
+    case BuiltinValueKind::ResumeThrowingContinuationThrowing:
+      visitor(&builtin->getAllOperands()[1]);
+      return;
+
     // WillThrow exists for the debugger, does nothing.
     case BuiltinValueKind::WillThrow:
       return;
@@ -1801,6 +2169,19 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
     case BuiltinValueKind::TSanInoutAccess:
     case BuiltinValueKind::CancelAsyncTask:
     case BuiltinValueKind::CreateAsyncTask:
+    case BuiltinValueKind::CreateAsyncTaskInGroup:
+    case BuiltinValueKind::AutoDiffCreateLinearMapContext:
+    case BuiltinValueKind::AutoDiffAllocateSubcontext:
+    case BuiltinValueKind::InitializeDefaultActor:
+    case BuiltinValueKind::InitializeDistributedRemoteActor:
+    case BuiltinValueKind::DestroyDefaultActor:
+    case BuiltinValueKind::GetCurrentExecutor:
+    case BuiltinValueKind::StartAsyncLet:
+    case BuiltinValueKind::StartAsyncLetWithLocalBuffer:
+    case BuiltinValueKind::EndAsyncLet:
+    case BuiltinValueKind::EndAsyncLetLifetime:
+    case BuiltinValueKind::CreateTaskGroup:
+    case BuiltinValueKind::DestroyTaskGroup:
       return;
 
     // General memory access to a pointer in first operand position.
@@ -1959,6 +2340,8 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::ExistentialMetatypeInst:
   case SILInstructionKind::FixLifetimeInst:
   case SILInstructionKind::GlobalAddrInst:
+  case SILInstructionKind::HopToExecutorInst:
+  case SILInstructionKind::ExtractExecutorInst:
   case SILInstructionKind::InitExistentialValueInst:
   case SILInstructionKind::IsUniqueInst:
   case SILInstructionKind::IsEscapingClosureInst:
@@ -1967,7 +2350,6 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::OpenExistentialBoxValueInst:
   case SILInstructionKind::OpenExistentialValueInst:
   case SILInstructionKind::PartialApplyInst:
-  case SILInstructionKind::ProjectValueBufferInst:
   case SILInstructionKind::YieldInst:
   case SILInstructionKind::UnwindInst:
   case SILInstructionKind::UncheckedOwnershipConversionInst:
@@ -1975,6 +2357,10 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::UnconditionalCheckedCastAddrInst:
   case SILInstructionKind::UnconditionalCheckedCastValueInst:
   case SILInstructionKind::ValueMetatypeInst:
+  // TODO: Is this correct?
+  case SILInstructionKind::GetAsyncContinuationInst:
+  case SILInstructionKind::GetAsyncContinuationAddrInst:
+  case SILInstructionKind::AwaitAsyncContinuationInst:
     return;
   }
 }

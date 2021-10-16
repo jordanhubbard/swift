@@ -13,6 +13,7 @@
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/NameLookup.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -90,9 +91,8 @@ std::vector<ResolvedLoc> NameMatcher::resolve(ArrayRef<UnresolvedLoc> Locs, Arra
 
   // Add the locs themselves
   LocsToResolve.clear();
-  std::transform(MapToOriginalIndex.begin(), MapToOriginalIndex.end(),
-                 std::back_inserter(LocsToResolve),
-                 [&](size_t index){ return Locs[index]; });
+  llvm::transform(MapToOriginalIndex, std::back_inserter(LocsToResolve),
+                  [&](size_t index) { return Locs[index]; });
 
   InactiveConfigRegionNestings = 0;
   SelectorNestings = 0;
@@ -177,19 +177,19 @@ bool NameMatcher::handleCustomAttrs(Decl *D) {
   for (auto *customAttr : D->getAttrs().getAttributes<CustomAttr, true>()) {
     if (shouldSkip(customAttr->getRangeWithAt()))
       continue;
-    auto *Arg = customAttr->getArg();
+    auto *Args = customAttr->getArgs();
     if (auto *Repr = customAttr->getTypeRepr()) {
       // Note the associated call arguments of the semantic initializer call
       // in case we're resolving an explicit initializer call within the
       // CustomAttr's type, e.g. on `Wrapper` in `@Wrapper(wrappedValue: 10)`.
-      SWIFT_DEFER { CustomAttrArg = None; };
-      if (Arg && !Arg->isImplicit())
-        CustomAttrArg = Located<Expr*>(Arg, Repr->getLoc());
+      SWIFT_DEFER { CustomAttrArgList = None; };
+      if (Args && !Args->isImplicit())
+        CustomAttrArgList = Located<ArgumentList *>(Args, Repr->getLoc());
       if (!Repr->walk(*this))
         return false;
     }
-    if (Arg && !Arg->isImplicit()) {
-      if (!Arg->walk(*this))
+    if (Args && !customAttr->isImplicit()) {
+      if (!Args->walk(*this))
         return false;
     }
   }
@@ -198,7 +198,7 @@ bool NameMatcher::handleCustomAttrs(Decl *D) {
 
 bool NameMatcher::walkToDeclPre(Decl *D) {
   // Handle occurrences in any preceding doc comments
-  RawComment R = D->getRawComment();
+  RawComment R = D->getRawComment(/*SerializedOK=*/false);
   if (!R.isEmpty()) {
     for(SingleRawComment C: R.Comments) {
       while(!shouldSkip(C.Range))
@@ -282,11 +282,11 @@ Stmt *NameMatcher::walkToStmtPost(Stmt *S) {
   return S;
 }
 
-Expr *NameMatcher::getApplicableArgFor(Expr *E) {
+ArgumentList *NameMatcher::getApplicableArgsFor(Expr *E) {
   if (ParentCalls.empty())
     return nullptr;
   auto &Last = ParentCalls.back();
-  return Last.ApplicableTo == E ? Last.Call->getArg() : nullptr;
+  return Last.ApplicableTo == E ? Last.Call->getArgs() : nullptr;
 }
 
 static Expr *extractNameExpr(Expr *Fn) {
@@ -306,6 +306,34 @@ static Expr *extractNameExpr(Expr *Fn) {
     if (auto *Unwrapped = ACE->getUnwrappedCurryThunkExpr())
       return extractNameExpr(Unwrapped);
   return nullptr;
+}
+
+std::pair<bool, ArgumentList *>
+NameMatcher::walkToArgumentListPre(ArgumentList *ArgList) {
+  auto Labels = getCallArgLabelRanges(getSourceMgr(), ArgList,
+                                      LabelRangeEndAt::BeforeElemStart);
+  tryResolve(Parent, ArgList->getStartLoc(), LabelRangeType::CallArg,
+             Labels.first, Labels.second);
+  if (isDone())
+    return {false, ArgList};
+
+  // Handle arg label locations (the index reports property occurrences on them
+  // for memberwise inits).
+  for (auto Arg : *ArgList) {
+    auto Name = Arg.getLabel();
+    auto *E = Arg.getExpr();
+    if (!Name.empty()) {
+      tryResolve(Parent, Arg.getLabelLoc());
+      if (isDone())
+        return {false, ArgList};
+    }
+    if (!E->walk(*this))
+      return {false, ArgList};
+  }
+  // We already visited the children.
+  if (!walkToArgumentListPost(ArgList))
+    return {false, nullptr};
+  return {false, ArgList};
 }
 
 std::pair<bool, Expr*> NameMatcher::walkToExprPre(Expr *E) {
@@ -333,16 +361,19 @@ std::pair<bool, Expr*> NameMatcher::walkToExprPre(Expr *E) {
     switch (E->getKind()) {
       case ExprKind::UnresolvedMember: {
         auto UME = cast<UnresolvedMemberExpr>(E);
-        tryResolve(ASTWalker::ParentTy(E), UME->getNameLoc(), getApplicableArgFor(E));
+        tryResolve(ASTWalker::ParentTy(E), UME->getNameLoc(),
+                   getApplicableArgsFor(E));
       } break;
       case ExprKind::DeclRef: {
         auto DRE = cast<DeclRefExpr>(E);
-        tryResolve(ASTWalker::ParentTy(E), DRE->getNameLoc(), getApplicableArgFor(E));
+        tryResolve(ASTWalker::ParentTy(E), DRE->getNameLoc(),
+                   getApplicableArgsFor(E));
         break;
       }
       case ExprKind::UnresolvedDeclRef: {
         auto UDRE = cast<UnresolvedDeclRefExpr>(E);
-        tryResolve(ASTWalker::ParentTy(E), UDRE->getNameLoc(), getApplicableArgFor(E));
+        tryResolve(ASTWalker::ParentTy(E), UDRE->getNameLoc(),
+                   getApplicableArgsFor(E));
         break;
       }
       case ExprKind::StringLiteral:
@@ -351,78 +382,51 @@ std::pair<bool, Expr*> NameMatcher::walkToExprPre(Expr *E) {
           tryResolve(ASTWalker::ParentTy(E), nextLoc());
         } while (!shouldSkip(E));
         break;
-      case ExprKind::Subscript: {
-        auto SubExpr = cast<SubscriptExpr>(E);
-        // visit and check in source order
-        if (!SubExpr->getBase()->walk(*this))
-          return {false, nullptr};
-
-        auto Labels = getCallArgLabelRanges(getSourceMgr(), SubExpr->getIndex(),
-                                            LabelRangeEndAt::BeforeElemStart);
-        tryResolve(ASTWalker::ParentTy(E), E->getLoc(), LabelRangeType::CallArg,
-                   Labels.first, Labels.second);
-        if (isDone())
-            break;
-        if (!SubExpr->getIndex()->walk(*this))
-          return {false, nullptr};
-
-        // We already visited the children.
-        if (!walkToExprPost(E))
-          return {false, nullptr};
-        return {false, E};
-      }
-      case ExprKind::Paren: {
-        ParenExpr *P = cast<ParenExpr>(E);
-        // Handle implicit callAsFunction reference on opening paren
-        auto Labels = getCallArgLabelRanges(getSourceMgr(), P,
-                                            LabelRangeEndAt::BeforeElemStart);
-        tryResolve(ASTWalker::ParentTy(E), P->getLParenLoc(),
-                   LabelRangeType::CallArg, Labels.first, Labels.second);
-        break;
-      }
-      case ExprKind::Tuple: {
-        TupleExpr *T = cast<TupleExpr>(E);
-        // Handle implicit callAsFunction reference on opening paren
-        auto Labels = getCallArgLabelRanges(getSourceMgr(), T,
-                                            LabelRangeEndAt::BeforeElemStart);
-        tryResolve(ASTWalker::ParentTy(E), T->getLParenLoc(),
-                   LabelRangeType::CallArg, Labels.first, Labels.second);
-        if (isDone())
-          break;
-
-        // Handle arg label locations (the index reports property occurrences
-        // on them for memberwise inits)
-        for (unsigned i = 0, e = T->getNumElements(); i != e; ++i) {
-          auto Name = T->getElementName(i);
-          if (!Name.empty()) {
-            tryResolve(ASTWalker::ParentTy(E), T->getElementNameLoc(i));
-            if (isDone())
-              break;
-          }
-          if (auto *Elem = T->getElement(i)) {
-            if (!Elem->walk(*this))
-              return {false, nullptr};
-          }
-        }
-        // We already visited the children.
-        if (!walkToExprPost(E))
-          return {false, nullptr};
-        return {false, E};
-      }
       case ExprKind::Binary: {
         BinaryExpr *BinE = cast<BinaryExpr>(E);
         // Visit in source order.
-        if (!BinE->getArg()->getElement(0)->walk(*this))
+        if (!BinE->getLHS()->walk(*this))
           return {false, nullptr};
         if (!BinE->getFn()->walk(*this))
           return {false, nullptr};
-        if (!BinE->getArg()->getElement(1)->walk(*this))
+        if (!BinE->getRHS()->walk(*this))
           return {false, nullptr};
 
         // We already visited the children.
         if (!walkToExprPost(E))
           return {false, nullptr};
         return {false, E};
+      }
+      case ExprKind::KeyPath: {
+        KeyPathExpr *KP = cast<KeyPathExpr>(E);
+
+        // Swift keypath components are visited already, so there's no need to
+        // handle them specially.
+        if (!KP->isObjC())
+          break;
+
+        for (auto Component: KP->getComponents()) {
+          switch (Component.getKind()) {
+          case KeyPathExpr::Component::Kind::UnresolvedProperty:
+          case KeyPathExpr::Component::Kind::Property:
+            tryResolve(ASTWalker::ParentTy(E), Component.getLoc());
+            break;
+          case KeyPathExpr::Component::Kind::DictionaryKey:
+          case KeyPathExpr::Component::Kind::Invalid:
+          case KeyPathExpr::Component::Kind::CodeCompletion:
+            break;
+          case KeyPathExpr::Component::Kind::OptionalForce:
+          case KeyPathExpr::Component::Kind::OptionalChain:
+          case KeyPathExpr::Component::Kind::OptionalWrap:
+          case KeyPathExpr::Component::Kind::UnresolvedSubscript:
+          case KeyPathExpr::Component::Kind::Subscript:
+          case KeyPathExpr::Component::Kind::Identity:
+          case KeyPathExpr::Component::Kind::TupleElement:
+            llvm_unreachable("Unexpected component in ObjC KeyPath expression");
+            break;
+          }
+        }
+        break;
       }
       default: // ignored
         break;
@@ -444,7 +448,8 @@ Expr *NameMatcher::walkToExprPost(Expr *E) {
         break;
       case ExprKind::UnresolvedDot: {
         auto UDE = cast<UnresolvedDotExpr>(E);
-        tryResolve(ASTWalker::ParentTy(E), UDE->getNameLoc(), getApplicableArgFor(E));
+        tryResolve(ASTWalker::ParentTy(E), UDE->getNameLoc(),
+                   getApplicableArgsFor(E));
         break;
       }
       default:
@@ -472,9 +477,10 @@ bool NameMatcher::walkToTypeReprPre(TypeRepr *T) {
   if (isa<ComponentIdentTypeRepr>(T)) {
     // If we're walking a CustomAttr's type we may have an associated call
     // argument to resolve with from its semantic initializer.
-    if (CustomAttrArg.hasValue() && CustomAttrArg->Loc == T->getLoc()) {
-      auto Labels = getCallArgLabelRanges(getSourceMgr(), CustomAttrArg->Item,
-                                          LabelRangeEndAt::BeforeElemStart);
+    if (CustomAttrArgList.hasValue() && CustomAttrArgList->Loc == T->getLoc()) {
+      auto Labels =
+          getCallArgLabelRanges(getSourceMgr(), CustomAttrArgList->Item,
+                                LabelRangeEndAt::BeforeElemStart);
       tryResolve(ASTWalker::ParentTy(T), T->getLoc(), LabelRangeType::CallArg,
                  Labels.first, Labels.second);
     } else {
@@ -575,7 +581,7 @@ std::vector<CharSourceRange> getSelectorLabelRanges(SourceManager &SM,
 }
 
 bool NameMatcher::tryResolve(ASTWalker::ParentTy Node, DeclNameLoc NameLoc,
-                             Expr *Arg) {
+                             ArgumentList *Args) {
   if (NameLoc.isInvalid())
     return false;
 
@@ -596,8 +602,8 @@ bool NameMatcher::tryResolve(ASTWalker::ParentTy Node, DeclNameLoc NameLoc,
   }
 
   if (LocsToResolve.back().ResolveArgLocs) {
-    if (Arg) {
-      auto Labels = getCallArgLabelRanges(getSourceMgr(), Arg,
+    if (Args) {
+      auto Labels = getCallArgLabelRanges(getSourceMgr(), Args,
                                           LabelRangeEndAt::BeforeElemStart);
       return tryResolve(Node, NameLoc.getBaseNameLoc(), LabelRangeType::CallArg,
                         Labels.first, Labels.second);
@@ -694,8 +700,11 @@ void ResolvedRangeInfo::print(llvm::raw_ostream &OS) const {
     OS << "<Entry>Multi</Entry>\n";
   }
 
-  if (ThrowingUnhandledError) {
+  if (UnhandledEffects.contains(EffectKind::Throws)) {
     OS << "<Error>Throwing</Error>\n";
+  }
+  if (UnhandledEffects.contains(EffectKind::Async)) {
+    OS << "<Effect>Async</Effect>\n";
   }
 
   if (Orphan != OrphanKind::None) {
@@ -768,83 +777,6 @@ ReturnInfo(ASTContext &Ctx, ArrayRef<ReturnInfo> Branches):
   }
 }
 
-void swift::ide::getLocationInfoForClangNode(ClangNode ClangNode,
-                                             ClangImporter *Importer,
-                  llvm::Optional<std::pair<unsigned, unsigned>> &DeclarationLoc,
-                                             StringRef &Filename) {
-  clang::ASTContext &ClangCtx = Importer->getClangASTContext();
-  clang::SourceManager &ClangSM = ClangCtx.getSourceManager();
-
-  clang::SourceRange SR = ClangNode.getLocation();
-  if (auto MD = dyn_cast_or_null<clang::ObjCMethodDecl>(ClangNode.getAsDecl())) {
-    SR = clang::SourceRange(MD->getSelectorStartLoc(),
-                            MD->getDeclaratorEndLoc());
-  }
-
-  clang::CharSourceRange CharRange =
-      clang::Lexer::makeFileCharRange(clang::CharSourceRange::getTokenRange(SR),
-                                      ClangSM, ClangCtx.getLangOpts());
-  if (CharRange.isInvalid())
-    return;
-
-  std::pair<clang::FileID, unsigned>
-      Decomp = ClangSM.getDecomposedLoc(CharRange.getBegin());
-  if (!Decomp.first.isInvalid()) {
-    if (auto FE = ClangSM.getFileEntryForID(Decomp.first)) {
-      Filename = FE->getName();
-
-      std::pair<clang::FileID, unsigned>
-          EndDecomp = ClangSM.getDecomposedLoc(CharRange.getEnd());
-
-      DeclarationLoc = { Decomp.second, EndDecomp.second-Decomp.second };
-    }
-  }
-}
-
-static unsigned getCharLength(SourceManager &SM, SourceRange TokenRange) {
-  SourceLoc CharEndLoc = Lexer::getLocForEndOfToken(SM, TokenRange.End);
-  return SM.getByteDistance(TokenRange.Start, CharEndLoc);
-}
-
-void swift::ide::getLocationInfo(const ValueDecl *VD,
-                  llvm::Optional<std::pair<unsigned, unsigned>> &DeclarationLoc,
-                                 StringRef &Filename) {
-  ASTContext &Ctx = VD->getASTContext();
-  SourceManager &SM = Ctx.SourceMgr;
-
-  auto ClangNode = VD->getClangNode();
-
-  if (VD->getLoc().isValid()) {
-    auto getSignatureRange = [&](const ValueDecl *VD) -> Optional<unsigned> {
-      if (auto FD = dyn_cast<AbstractFunctionDecl>(VD)) {
-        SourceRange R = FD->getSignatureSourceRange();
-        if (R.isValid())
-          return getCharLength(SM, R);
-      }
-      return None;
-    };
-    unsigned NameLen;
-    if (auto SigLen = getSignatureRange(VD)) {
-      NameLen = SigLen.getValue();
-    } else if (VD->hasName()) {
-      NameLen = VD->getBaseName().userFacingName().size();
-    } else {
-      NameLen = getCharLength(SM, VD->getLoc());
-    }
-
-    unsigned DeclBufID = SM.findBufferContainingLoc(VD->getLoc());
-    DeclarationLoc = { SM.getLocOffsetInBuffer(VD->getLoc(), DeclBufID),
-                       NameLen };
-    Filename = SM.getIdentifierForBuffer(DeclBufID);
-
-  } else if (ClangNode) {
-    ClangImporter *Importer =
-        static_cast<ClangImporter*>(Ctx.getClangModuleLoader());
-    return getLocationInfoForClangNode(ClangNode, Importer,
-                                       DeclarationLoc, Filename);
-  }
-}
-
 CharSourceRange CallArgInfo::getEntireCharRange(const SourceManager &SM) const {
   return CharSourceRange(SM, LabelRange.getStart(),
                          Lexer::getLocForEndOfToken(SM, ArgExp->getEndLoc()));
@@ -871,44 +803,35 @@ static Expr* getSingleNonImplicitChild(Expr *Parent) {
 }
 
 std::vector<CallArgInfo> swift::ide::
-getCallArgInfo(SourceManager &SM, Expr *Arg, LabelRangeEndAt EndKind) {
+getCallArgInfo(SourceManager &SM, ArgumentList *Args, LabelRangeEndAt EndKind) {
   std::vector<CallArgInfo> InfoVec;
-  if (auto *TE = dyn_cast<TupleExpr>(Arg)) {
-    auto FirstTrailing = TE->getUnlabeledTrailingClosureIndexOfPackedArgument();
-    for (size_t ElemIndex: range(TE->getNumElements())) {
-      Expr *Elem = TE->getElement(ElemIndex);
-      if (isa<DefaultArgumentExpr>(Elem))
-        continue;
+  auto *OriginalArgs = Args->getOriginalArgs();
+  for (auto ElemIndex : indices(*OriginalArgs)) {
+    auto *Elem = OriginalArgs->getExpr(ElemIndex);
 
-      SourceLoc LabelStart(Elem->getStartLoc());
-      SourceLoc LabelEnd(LabelStart);
+    SourceLoc LabelStart(Elem->getStartLoc());
+    SourceLoc LabelEnd(LabelStart);
 
-      bool IsTrailingClosure = FirstTrailing && ElemIndex >= *FirstTrailing;
-      SourceLoc NameLoc = TE->getElementNameLoc(ElemIndex);
-      if (NameLoc.isValid()) {
-        LabelStart = NameLoc;
-        if (EndKind == LabelRangeEndAt::LabelNameOnly || IsTrailingClosure) {
-          LabelEnd = Lexer::getLocForEndOfToken(SM, NameLoc);
-        }
+    bool IsTrailingClosure = OriginalArgs->isTrailingClosureIndex(ElemIndex);
+    auto NameLoc = OriginalArgs->getLabelLoc(ElemIndex);
+    if (NameLoc.isValid()) {
+      LabelStart = NameLoc;
+      if (EndKind == LabelRangeEndAt::LabelNameOnly || IsTrailingClosure) {
+        LabelEnd = Lexer::getLocForEndOfToken(SM, NameLoc);
       }
-      InfoVec.push_back({getSingleNonImplicitChild(Elem),
-        CharSourceRange(SM, LabelStart, LabelEnd), IsTrailingClosure});
     }
-  } else if (auto *PE = dyn_cast<ParenExpr>(Arg)) {
-    Expr *Sub = PE->getSubExpr();
-    if (Sub && !isa<DefaultArgumentExpr>(Sub))
-      InfoVec.push_back({getSingleNonImplicitChild(Sub),
-        CharSourceRange(Sub->getStartLoc(), 0),
-        PE->hasTrailingClosure()
-      });
+    InfoVec.push_back({getSingleNonImplicitChild(Elem),
+                       CharSourceRange(SM, LabelStart, LabelEnd),
+                       IsTrailingClosure});
   }
   return InfoVec;
 }
 
-std::pair<std::vector<CharSourceRange>, Optional<unsigned>> swift::ide::
-getCallArgLabelRanges(SourceManager &SM, Expr *Arg, LabelRangeEndAt EndKind) {
+std::pair<std::vector<CharSourceRange>, Optional<unsigned>>
+swift::ide::getCallArgLabelRanges(SourceManager &SM, ArgumentList *Args,
+                                  LabelRangeEndAt EndKind) {
   std::vector<CharSourceRange> Ranges;
-  auto InfoVec = getCallArgInfo(SM, Arg, EndKind);
+  auto InfoVec = getCallArgInfo(SM, Args, EndKind);
 
   Optional<unsigned> FirstTrailing;
   auto I = std::find_if(InfoVec.begin(), InfoVec.end(), [](CallArgInfo &Info) {
@@ -917,7 +840,7 @@ getCallArgLabelRanges(SourceManager &SM, Expr *Arg, LabelRangeEndAt EndKind) {
   if (I != InfoVec.end())
     FirstTrailing = std::distance(InfoVec.begin(), I);
 
-  std::transform(InfoVec.begin(), InfoVec.end(), std::back_inserter(Ranges),
-                 [](CallArgInfo &Info) { return Info.LabelRange; });
+  llvm::transform(InfoVec, std::back_inserter(Ranges),
+                  [](CallArgInfo &Info) { return Info.LabelRange; });
   return {Ranges, FirstTrailing};
 }

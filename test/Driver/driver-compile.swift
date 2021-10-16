@@ -63,6 +63,9 @@
 
 // REQUIRES: CODEGENERATOR=X86
 
+// swift-frontend cannot be copied to another location with bootstrapping because
+// it will not find the libswiftCore library with its relative RPATH.
+// UNSUPPORTED: libswift_bootstrapping
 
 // CHECK: bin{{/|\\\\}}swift
 // CHECK: Driver{{/|\\\\}}driver-compile.swift
@@ -78,7 +81,7 @@
 // COMPLEX-DAG: -F /path/to/frameworks -Fsystem /path/to/systemframeworks -F /path/to/more/frameworks
 // COMPLEX-DAG: -I /path/to/headers -I path/to/more/headers
 // COMPLEX-DAG: -module-cache-path /tmp/modules
-// COMPLEX-DAG: -emit-reference-dependencies-path {{(.*(/|\\))?driver-compile[^ /]+}}.swiftdeps
+// COMPLEX-DAG: -emit-reference-dependencies-path {{(.*(/|\\))?driver-compile[^ /]*}}.swiftdeps
 // COMPLEX: -o {{.+}}.o
 
 

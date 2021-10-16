@@ -12,8 +12,7 @@
 
 import SwiftShims
 
-#if INTERNAL_CHECKS_ENABLED
-@available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *)
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
 @_silgen_name("swift_COWChecksEnabled")
 public func _COWChecksEnabled() -> Bool
 #endif
@@ -254,6 +253,8 @@ internal final class _ContiguousArrayStorage<
 @usableFromInline
 @frozen
 internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
+  @usableFromInline
+  internal var _storage: __ContiguousArrayStorageBase
 
   /// Make a buffer with uninitialized elements.  After using this
   /// method, you must either initialize the `count` elements at the
@@ -425,7 +426,7 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   @_alwaysEmitIntoClient
   @inline(__always)
   internal var immutableStorage : __ContiguousArrayStorageBase {
-#if INTERNAL_CHECKS_ENABLED
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
     _internalInvariant(isImmutable, "Array storage is not immutable")
 #endif
     return Builtin.COWBufferForReading(_storage)
@@ -437,7 +438,7 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   @_alwaysEmitIntoClient
   @inline(__always)
   internal var mutableStorage : __ContiguousArrayStorageBase {
-#if INTERNAL_CHECKS_ENABLED
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
     _internalInvariant(isMutable, "Array storage is immutable")
 #endif
     return _storage
@@ -449,38 +450,34 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   @_alwaysEmitIntoClient
   @inline(__always)
   internal var mutableOrEmptyStorage : __ContiguousArrayStorageBase {
-#if INTERNAL_CHECKS_ENABLED
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
     _internalInvariant(isMutable || _storage.countAndCapacity.capacity == 0,
                        "Array storage is immutable and not empty")
 #endif
     return _storage
   }
 
-#if INTERNAL_CHECKS_ENABLED
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
   @_alwaysEmitIntoClient
   internal var isImmutable: Bool {
     get {
-      if #available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *) {
-        if (_COWChecksEnabled()) {
-          return capacity == 0 || _swift_isImmutableCOWBuffer(_storage)
-        }
+      if (_COWChecksEnabled()) {
+        return capacity == 0 || _swift_isImmutableCOWBuffer(_storage)
       }
       return true
     }
     nonmutating set {
-      if #available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *) {
-        if (_COWChecksEnabled()) {
-          // Make sure to not modify the empty array singleton (which has a
-          // capacity of 0).
-          if capacity > 0 {
-            let wasImmutable = _swift_setImmutableCOWBuffer(_storage, newValue)
-            if newValue {
-              _internalInvariant(!wasImmutable,
-                "re-setting immutable array buffer to immutable")
-            } else {
-              _internalInvariant(wasImmutable,
-                "re-setting mutable array buffer to mutable")
-            }
+      if (_COWChecksEnabled()) {
+        // Make sure to not modify the empty array singleton (which has a
+        // capacity of 0).
+        if capacity > 0 {
+          let wasImmutable = _swift_setImmutableCOWBuffer(_storage, newValue)
+          if newValue {
+            _internalInvariant(!wasImmutable,
+              "re-setting immutable array buffer to immutable")
+          } else {
+            _internalInvariant(wasImmutable,
+              "re-setting mutable array buffer to mutable")
           }
         }
       }
@@ -489,10 +486,8 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   
   @_alwaysEmitIntoClient
   internal var isMutable: Bool {
-    if #available(macOS 9999, iOS 9999, watchOS 9999, tvOS 9999, *) {
-      if (_COWChecksEnabled()) {
-        return !_swift_isImmutableCOWBuffer(_storage)
-      }
+    if (_COWChecksEnabled()) {
+      return !_swift_isImmutableCOWBuffer(_storage)
     }
     return true
   }
@@ -644,12 +639,17 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
     return target + initializedCount
   }
 
-  public __consuming func _copyContents(
+  @inlinable
+  internal __consuming func _copyContents(
     initializing buffer: UnsafeMutableBufferPointer<Element>
-  ) -> (Iterator,UnsafeMutableBufferPointer<Element>.Index) {
-    // This customization point is not implemented for internal types.
-    // Accidentally calling it would be a catastrophic performance bug.
-    fatalError("unsupported")
+  ) -> (Iterator, UnsafeMutableBufferPointer<Element>.Index) {
+    guard buffer.count > 0 else { return (makeIterator(), 0) }
+    let c = Swift.min(self.count, buffer.count)
+    buffer.baseAddress!.initialize(
+      from: firstElementAddress,
+      count: c)
+    _fixLifetime(owner)
+    return (IndexingIterator(_elements: self, _position: c), c)
   }
 
   /// Returns a `_SliceBuffer` containing the given `bounds` of values
@@ -687,7 +687,7 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   @_alwaysEmitIntoClient
   internal mutating func beginCOWMutation() -> Bool {
     if Bool(Builtin.beginCOWMutation(&_storage)) {
-#if INTERNAL_CHECKS_ENABLED
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
       isImmutable = false
 #endif
       return true
@@ -704,7 +704,7 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
   @_alwaysEmitIntoClient
   @inline(__always)
   internal mutating func endCOWMutation() {
-#if INTERNAL_CHECKS_ENABLED
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
     isImmutable = true
 #endif
     Builtin.endCOWMutation(&_storage)
@@ -848,9 +848,6 @@ internal struct _ContiguousArrayBuffer<Element>: _ArrayBufferProtocol {
     }
     return true
   }
-
-  @usableFromInline
-  internal var _storage: __ContiguousArrayStorageBase
 }
 
 /// Append the elements of `rhs` to `lhs`.

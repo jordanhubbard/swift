@@ -25,6 +25,9 @@ namespace llvm {
   class Triple;
   class FileCollectorBase;
   template<typename Fn> class function_ref;
+  namespace vfs {
+    class FileSystem;
+  }
 }
 
 namespace clang {
@@ -59,12 +62,14 @@ class ClangModuleUnit;
 class ClangNode;
 class Decl;
 class DeclContext;
+class EffectiveClangContext;
 class EnumDecl;
 class ImportDecl;
 class IRGenOptions;
 class ModuleDecl;
 class NominalTypeDecl;
 class StructDecl;
+class SwiftLookupTable;
 class TypeDecl;
 class VisibleDeclConsumer;
 enum class SelectorSplitKind;
@@ -158,6 +163,7 @@ public:
   static std::unique_ptr<clang::CompilerInvocation>
   createClangInvocation(ClangImporter *importer,
                         const ClangImporterOptions &importerOpts,
+                        llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> VFS,
                         ArrayRef<std::string> invocationArgStrs,
                         std::vector<std::string> *CC1Args = nullptr);
   ClangImporter(const ClangImporter &) = delete;
@@ -186,7 +192,8 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  virtual bool canImportModule(ImportPath::Element named) override;
+  virtual bool canImportModule(ImportPath::Element named, llvm::VersionTuple version,
+                               bool underlyingVersion) override;
 
   /// Import a module with the given module path.
   ///
@@ -239,6 +246,10 @@ public:
   lookupRelatedEntity(StringRef clangName, ClangTypeKind kind,
                       StringRef relatedEntityKind,
                       llvm::function_ref<void(TypeDecl *)> receiver) override;
+
+  StructDecl *
+  instantiateCXXClassTemplate(clang::ClassTemplateDecl *decl,
+                      ArrayRef<clang::TemplateArgument> arguments) override;
 
   /// Just like Decl::getClangNode() except we look through to the 'Code'
   /// enum of an error wrapper struct.
@@ -401,7 +412,9 @@ public:
   ///
   /// \returns \c true if an error occurred, \c false otherwise
   bool addBridgingHeaderDependencies(
-      StringRef moduleName, ModuleDependenciesCache &cache);
+      StringRef moduleName,
+      ModuleDependenciesKind moduleKind,
+      ModuleDependenciesCache &cache);
 
   clang::TargetInfo &getTargetInfo() const override;
   clang::ASTContext &getClangASTContext() const override;
@@ -446,8 +459,12 @@ public:
   /// Given a Clang module, decide whether this module is imported already.
   static bool isModuleImported(const clang::Module *M);
 
-  DeclName importName(const clang::NamedDecl *D,
-                      clang::DeclarationName givenName);
+  DeclName importName(
+      const clang::NamedDecl *D,
+      clang::DeclarationName givenName = clang::DeclarationName()) override;
+
+  Type importFunctionReturnType(const clang::FunctionDecl *clangDecl,
+                                 DeclContext *dc) override;
 
   Optional<std::string>
   getOrCreatePCH(const ClangImporterOptions &ImporterOptions,
@@ -477,6 +494,21 @@ public:
   instantiateCXXFunctionTemplate(ASTContext &ctx,
                                  clang::FunctionTemplateDecl *func,
                                  SubstitutionMap subst) override;
+
+  bool isCXXMethodMutating(const clang::CXXMethodDecl *method) override;
+
+  /// Find the lookup table that corresponds to the given Clang module.
+  ///
+  /// \param clangModule The module, or null to indicate that we're talking
+  /// about the directly-parsed headers.
+  SwiftLookupTable *findLookupTable(const clang::Module *clangModule) override;
+
+  /// Determine the effective Clang context for the given Swift nominal type.
+  EffectiveClangContext
+  getEffectiveClangContext(const NominalTypeDecl *nominal) override;
+
+  /// Imports a clang decl directly, rather than looking up it's name.
+  Decl *importDeclDirectly(const clang::NamedDecl *decl) override;
 };
 
 ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
@@ -487,6 +519,9 @@ ImportDecl *createImportDecl(ASTContext &Ctx, DeclContext *DC, ClangNode ClangN,
 /// building a ModuleInterfaceLoader.
 std::string
 getModuleCachePathFromClang(const clang::CompilerInstance &Instance);
+
+/// Whether the given parameter name identifies a completion handler.
+bool isCompletionHandlerParamName(StringRef paramName);
 
 } // end namespace swift
 

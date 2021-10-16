@@ -35,6 +35,8 @@ static constexpr bool hasSwiftPrefix(const char *str) {
   static_assert(hasSwiftPrefix(#name), "Names must start with SWIFT");
 #include "EnvironmentVariables.def"
 
+#if SWIFT_STDLIB_HAS_ENVIRON
+
 // Value parsers. Add new functions named parse_<type> to accommodate more
 // debug variable types.
 static bool parse_bool(const char *name, const char *value, bool defaultValue) {
@@ -108,6 +110,8 @@ void printHelp(const char *extra) {
   swift::warning(RuntimeErrorFlagNone, "SWIFT_DEBUG_HELP=YES - Print this help.");
 }
 
+#endif  // SWIFT_STDLIB_HAS_ENVIRON
+
 } // end anonymous namespace
 
 // Define backing variables.
@@ -118,12 +122,22 @@ void printHelp(const char *extra) {
 // Initialization code.
 OnceToken_t swift::runtime::environment::initializeToken;
 
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__linux__)
+#if SWIFT_STDLIB_HAS_ENVIRON && (defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__linux__))
 extern "C" char **environ;
 #define ENVIRON environ
 #elif defined(_WIN32)
+// `_environ` is DLL-imported unless we are linking against the static C runtime
+// (via `/MT` or `/MTd`).
+#if defined(_DLL)
+extern "C" __declspec(dllimport) char **_environ;
+#else
 extern "C" char **_environ;
+#endif
+// `_environ` is unavailable in the Windows Runtime environment.
+// https://docs.microsoft.com/en-us/cpp/c-runtime-library/environ-wenviron?view=msvc-160
+#if !defined(_WINRT_DLL)
 #define ENVIRON _environ
+#endif
 #endif
 
 #ifdef ENVIRON
@@ -174,7 +188,7 @@ void swift::runtime::environment::initialize(void *context) {
   if (SWIFT_DEBUG_HELP_variable)
     printHelp(nullptr);
 }
-#else
+#elif SWIFT_STDLIB_HAS_ENVIRON
 void swift::runtime::environment::initialize(void *context) {
   // Emit a getenv call for each variable. This is less efficient but works
   // everywhere.
@@ -187,6 +201,10 @@ void swift::runtime::environment::initialize(void *context) {
     printHelp("Using getenv to read variables. Unknown SWIFT_DEBUG_ variables "
               "will not be flagged.");
 }
+#else
+void swift::runtime::environment::initialize(void *context) {
+  (void)context;
+}
 #endif
 
 SWIFT_RUNTIME_EXPORT
@@ -194,3 +212,7 @@ bool swift_COWChecksEnabled() {
   return runtime::environment::SWIFT_DEBUG_ENABLE_COW_CHECKS();
 }
 
+SWIFT_RUNTIME_STDLIB_SPI bool concurrencyEnableJobDispatchIntegration() {
+  return runtime::environment::
+      SWIFT_ENABLE_ASYNC_JOB_DISPATCH_INTEGRATION();
+}

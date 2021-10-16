@@ -96,8 +96,7 @@ void MapOpaqueArchetypes::replace() {
   cloneFunctionBody(&fn, clonedEntryBlock, entryArgs,
                     true /*replaceOriginalFunctionInPlace*/);
   // Insert the new entry block at the beginning.
-  fn.getBlocks().splice(fn.getBlocks().begin(), fn.getBlocks(),
-                        clonedEntryBlock);
+  fn.moveBlockBefore(clonedEntryBlock, fn.begin());
   removeUnreachableBlocks(fn);
 }
 
@@ -150,7 +149,6 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::AllocRefInst:
   case SILInstructionKind::AllocRefDynamicInst:
-  case SILInstructionKind::AllocValueBufferInst:
   case SILInstructionKind::AllocBoxInst:
   case SILInstructionKind::AllocExistentialBoxInst:
   case SILInstructionKind::IndexAddrInst:
@@ -205,6 +203,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::CopyBlockInst:
   case SILInstructionKind::CopyBlockWithoutEscapingInst:
   case SILInstructionKind::CopyValueInst:
+  case SILInstructionKind::MoveValueInst:
 #define UNCHECKED_REF_STORAGE(Name, ...)                                       \
   case SILInstructionKind::StrongCopy##Name##ValueInst:
 #define ALWAYS_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)            \
@@ -225,7 +224,6 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
 #include "swift/AST/ReferenceStorage.def"
 #undef NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE
   case SILInstructionKind::MarkUninitializedInst:
-  case SILInstructionKind::ProjectValueBufferInst:
   case SILInstructionKind::ProjectBoxInst:
   case SILInstructionKind::ProjectExistentialBoxInst:
   case SILInstructionKind::BuiltinInst:
@@ -279,7 +277,6 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::DeallocStackInst:
   case SILInstructionKind::DeallocRefInst:
   case SILInstructionKind::DeallocPartialRefInst:
-  case SILInstructionKind::DeallocValueBufferInst:
   case SILInstructionKind::DeallocBoxInst:
   case SILInstructionKind::DeallocExistentialBoxInst:
   case SILInstructionKind::StrongRetainInst:
@@ -311,7 +308,6 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::AssignByWrapperInst:
   case SILInstructionKind::MarkFunctionEscapeInst:
   case SILInstructionKind::DebugValueInst:
-  case SILInstructionKind::DebugValueAddrInst:
 #define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, ...)             \
   case SILInstructionKind::Store##Name##Inst:
 #include "swift/AST/ReferenceStorage.def"
@@ -340,6 +336,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::GetAsyncContinuationAddrInst:
   case SILInstructionKind::AwaitAsyncContinuationInst:
   case SILInstructionKind::HopToExecutorInst:
+  case SILInstructionKind::ExtractExecutorInst:
     // Handle by operand and result check.
     break;
 
@@ -452,21 +449,9 @@ public:
         !M.getOptions().CrossModuleOptimization)
       return;
 
-    // Mark all reachable functions as "anchors" so that they are not
-    // removed later by the dead function elimination pass. This
-    // is required, because clients may reference any of the
-    // serialized functions or anything referenced from them. Therefore,
-    // to avoid linker errors, the object file of the current module should
-    // contain all the symbols which were alive at the time of serialization.
     LLVM_DEBUG(llvm::dbgs() << "Serializing SILModule in SerializeSILPass\n");
     M.serialize();
 
-    // If we are not optimizing, do not strip the [serialized] flag. We *could*
-    // do this since after serializing [serialized] is irrelevent. But this
-    // would incur an unnecessary compile time cost since if we are not
-    // optimizing we are not going to perform any sort of DFE.
-    if (!getOptions().shouldOptimize())
-      return;
     removeSerializedFlagFromAllFunctions(M);
   }
 };

@@ -1,25 +1,33 @@
-template <class T> T add(T a, T b) { return a + b; }
+#ifndef TEST_INTEROP_CXX_TEMPLATES_INPUTS_FUNCTION_TEMPLATES_H
+#define TEST_INTEROP_CXX_TEMPLATES_INPUTS_FUNCTION_TEMPLATES_H
 
-template <class A, class B> A addTwoTemplates(A a, B b) { return a + b; }
+template <class T> T addSameTypeParams(T a, T b) { return a + b; }
+
+template <class A, class B> A addMixedTypeParams(A a, B b) { return a + b; }
 
 template <class T> T passThrough(T value) { return value; }
 
 template <class T> const T passThroughConst(const T value) { return value; }
 
 void takesString(const char *) {}
-template <class T> void expectsString(T str) { takesString(str); }
+template <class T> void expectsConstCharPtr(T str) { takesString(str); }
 
-template <long x> void integerTemplate() {}
-template <long x = 0> void defaultIntegerTemplate() {}
+template <long x> void hasNonTypeTemplateParameter() {}
+template <long x = 0> void hasDefaultedNonTypeTemplateParameter() {}
 
-// We cannot yet use this in swift but, make sure we don't crash when parsing
+// We cannot yet use this in Swift but, make sure we don't crash when parsing
 // it.
-template <class R, class T, class U> R returns_template(T a, U b) {
+template <class R, class T, class U> R templateParameterReturnType(T a, U b) {
   return a + b;
 }
 
 // Same here:
-template <class T> void cannot_infer_template() {}
+template <class T> void cannotInferTemplate() {}
+
+struct HasVariadicMemeber {
+  void test1(...) {}
+  void test2(int, ...) {}
+};
 
 // TODO: We should support these types. Until then, make sure we don't crash when importing.
 template<class... Ts>
@@ -52,3 +60,33 @@ template <class T> void lvalueReference(T &ref) { ref = 42; }
 template <class T> void constLvalueReference(const T &) {}
 
 template <class T> void forwardingReference(T &&) {}
+
+namespace Orbiters {
+
+template<class T>
+void galileo(T) { }
+
+template<class T, class U>
+void cassini(T, U) { }
+
+template<class T>
+void magellan(T&) { }
+
+} // namespace Orbiters
+
+// We can't import these (and may never be able to in the case of "_Atomic"),
+// but don't crash while trying.
+namespace Unimportable {
+
+template <class> struct Dependent {};
+template <class T> void takesDependent(Dependent<T> d) {}
+
+void takesAtomic(_Atomic(int) a) {}
+
+struct HasImposibleMember {
+  void memberTakesAtomic(_Atomic(int) a) {}
+};
+
+} // namespace Unimportable
+
+#endif // TEST_INTEROP_CXX_TEMPLATES_INPUTS_FUNCTION_TEMPLATES_H

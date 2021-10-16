@@ -21,32 +21,26 @@
 using namespace swift;
 
 llvm::Expected<OutputFileMap>
-OutputFileMap::loadFromPath(StringRef Path, StringRef workingDirectory,
-                            const bool addEntriesForSourceRangeDependencies) {
+OutputFileMap::loadFromPath(StringRef Path, StringRef workingDirectory) {
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
       llvm::MemoryBuffer::getFile(Path);
   if (!FileBufOrErr) {
     return llvm::errorCodeToError(FileBufOrErr.getError());
   }
-  return loadFromBuffer(std::move(FileBufOrErr.get()), workingDirectory,
-                        addEntriesForSourceRangeDependencies);
+  return loadFromBuffer(std::move(FileBufOrErr.get()), workingDirectory);
 }
 
 llvm::Expected<OutputFileMap>
-OutputFileMap::loadFromBuffer(StringRef Data, StringRef workingDirectory,
-                              bool addEntriesForSourceRangeDependencies) {
+OutputFileMap::loadFromBuffer(StringRef Data, StringRef workingDirectory) {
   std::unique_ptr<llvm::MemoryBuffer> Buffer{
       llvm::MemoryBuffer::getMemBuffer(Data)};
-  return loadFromBuffer(std::move(Buffer), workingDirectory,
-                        addEntriesForSourceRangeDependencies);
+  return loadFromBuffer(std::move(Buffer), workingDirectory);
 }
 
 llvm::Expected<OutputFileMap>
 OutputFileMap::loadFromBuffer(std::unique_ptr<llvm::MemoryBuffer> Buffer,
-                              StringRef workingDirectory,
-                              bool addEntriesForSourceRangeDependencies) {
-  return parse(std::move(Buffer), workingDirectory,
-               addEntriesForSourceRangeDependencies);
+                              StringRef workingDirectory) {
+  return parse(std::move(Buffer), workingDirectory);
 }
 
 const TypeToPathMap *OutputFileMap::getOutputMapForInput(StringRef Input) const{
@@ -94,7 +88,10 @@ void OutputFileMap::dump(llvm::raw_ostream &os, bool Sort) const {
       const TypeToPathMap &Map = InputPair.second;
       std::vector<TypePathPair> Pairs;
       Pairs.insert(Pairs.end(), Map.begin(), Map.end());
-      std::sort(Pairs.begin(), Pairs.end());
+      std::sort(Pairs.begin(), Pairs.end(), [](const TypePathPair &LHS,
+                                               const TypePathPair &RHS) -> bool {
+        return LHS < RHS;
+      });
       for (auto &OutputPair : Pairs) {
         printOutputPair(InputPair.first, OutputPair);
       }
@@ -143,8 +140,7 @@ void OutputFileMap::write(llvm::raw_ostream &os,
 
 llvm::Expected<OutputFileMap>
 OutputFileMap::parse(std::unique_ptr<llvm::MemoryBuffer> Buffer,
-                     StringRef workingDirectory,
-                     const bool addEntriesForSourceRangeDependencies) {
+                     StringRef workingDirectory) {
   auto constructError =
       [](const char *errorString) -> llvm::Expected<OutputFileMap> {
     return llvm::make_error<llvm::StringError>(errorString,
@@ -233,25 +229,6 @@ OutputFileMap::parse(std::unique_ptr<llvm::MemoryBuffer> Buffer,
       llvm::SmallString<128> PathStorage;
       OutputMap.insert(std::pair<file_types::ID, std::string>(
           Kind, resolvePath(Path, PathStorage).str()));
-
-      // HACK: fake up an SwiftRanges & CompiledSource output filenames
-      if (addEntriesForSourceRangeDependencies &&
-          Kind == file_types::TY_SwiftDeps) {
-        // Not for the master-swiftdeps
-        llvm::SmallString<128> Storage;
-        if (!InputPath->getValue(Storage).empty()) {
-          std::string baseName = OutputMap[Kind];
-          baseName.resize(baseName.size() -
-                          getExtension(file_types::TY_SwiftDeps).size());
-          auto insertFilename = [&](file_types::ID type) {
-            std::string s = baseName;
-            s += getExtension(type);
-            OutputMap.insert({type, s});
-          };
-          insertFilename(file_types::TY_SwiftRanges);
-          insertFilename(file_types::TY_CompiledSource);
-        }
-      }
     }
 
     llvm::SmallString<128> InputStorage;

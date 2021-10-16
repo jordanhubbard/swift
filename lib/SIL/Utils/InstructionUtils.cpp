@@ -14,6 +14,7 @@
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/NullablePtr.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/DebugUtils.h"
@@ -25,7 +26,7 @@
 
 using namespace swift;
 
-SILValue swift::stripOwnershipInsts(SILValue v) {
+SILValue swift::lookThroughOwnershipInsts(SILValue v) {
   while (true) {
     switch (v->getKind()) {
     default:
@@ -37,6 +38,14 @@ SILValue swift::stripOwnershipInsts(SILValue v) {
   }
 }
 
+SILValue swift::lookThroughCopyValueInsts(SILValue val) {
+  while (auto *cvi =
+             dyn_cast_or_null<CopyValueInst>(val->getDefiningInstruction())) {
+    val = cvi->getOperand();
+  }
+  return val;
+}
+
 /// Strip off casts/indexing insts/address projections from V until there is
 /// nothing left to strip.
 ///
@@ -46,7 +55,7 @@ SILValue swift::getUnderlyingObject(SILValue v) {
     SILValue v2 = stripCasts(v);
     v2 = stripAddressProjections(v2);
     v2 = stripIndexingInsts(v2);
-    v2 = stripOwnershipInsts(v2);
+    v2 = lookThroughOwnershipInsts(v2);
     if (v2 == v)
       return v2;
     v = v2;
@@ -58,7 +67,7 @@ SILValue swift::getUnderlyingObjectStopAtMarkDependence(SILValue v) {
     SILValue v2 = stripCastsWithoutMarkDependence(v);
     v2 = stripAddressProjections(v2);
     v2 = stripIndexingInsts(v2);
-    v2 = stripOwnershipInsts(v2);
+    v2 = lookThroughOwnershipInsts(v2);
     if (v2 == v)
       return v2;
     v = v2;
@@ -112,11 +121,13 @@ SILValue swift::stripSinglePredecessorArgs(SILValue V) {
 SILValue swift::stripCastsWithoutMarkDependence(SILValue v) {
   while (true) {
     v = stripSinglePredecessorArgs(v);
+    if (isa<MarkDependenceInst>(v))
+      return v;
+
     if (auto *svi = dyn_cast<SingleValueInstruction>(v)) {
-      if (isRCIdentityPreservingCast(svi)
-          || isa<UncheckedTrivialBitCastInst>(v)
-          || isa<BeginAccessInst>(v)
-          || isa<EndCOWMutationInst>(v)) {
+      if (isIdentityPreservingRefCast(svi) ||
+          isa<UncheckedTrivialBitCastInst>(v) || isa<BeginAccessInst>(v) ||
+          isa<EndCOWMutationInst>(v)) {
         v = svi->getOperand(0);
         continue;
       }
@@ -129,15 +140,14 @@ SILValue swift::stripCasts(SILValue v) {
   while (true) {
     v = stripSinglePredecessorArgs(v);
     if (auto *svi = dyn_cast<SingleValueInstruction>(v)) {
-      if (isRCIdentityPreservingCast(svi)
-          || isa<UncheckedTrivialBitCastInst>(v)
-          || isa<MarkDependenceInst>(v)
-          || isa<BeginAccessInst>(v)) {
+      if (isIdentityPreservingRefCast(svi) ||
+          isa<UncheckedTrivialBitCastInst>(v) || isa<MarkDependenceInst>(v) ||
+          isa<BeginAccessInst>(v)) {
         v = cast<SingleValueInstruction>(v)->getOperand(0);
         continue;
       }
     }
-    SILValue v2 = stripOwnershipInsts(v);
+    SILValue v2 = lookThroughOwnershipInsts(v);
     if (v2 != v) {
       v = v2;
       continue;
@@ -159,7 +169,7 @@ SILValue swift::stripUpCasts(SILValue v) {
     }
 
     SILValue v2 = stripSinglePredecessorArgs(v);
-    v2 = stripOwnershipInsts(v2);
+    v2 = lookThroughOwnershipInsts(v2);
     if (v2 == v) {
       return v2;
     }
@@ -179,7 +189,7 @@ SILValue swift::stripClassCasts(SILValue v) {
       continue;
     }
 
-    SILValue v2 = stripOwnershipInsts(v);
+    SILValue v2 = lookThroughOwnershipInsts(v);
     if (v2 != v) {
       v = v2;
       continue;
@@ -195,6 +205,15 @@ SILValue swift::stripAddressProjections(SILValue V) {
     if (!Projection::isAddressProjection(V))
       return V;
     V = cast<SingleValueInstruction>(V)->getOperand(0);
+  }
+}
+
+SILValue swift::lookThroughAddressToAddressProjections(SILValue v) {
+  while (true) {
+    v = stripSinglePredecessorArgs(v);
+    if (!Projection::isAddressToAddressProjection(v))
+      return v;
+    v = cast<SingleValueInstruction>(v)->getOperand(0);
   }
 }
 
@@ -259,14 +278,13 @@ bool swift::isEndOfScopeMarker(SILInstruction *user) {
     return false;
   case SILInstructionKind::EndAccessInst:
   case SILInstructionKind::EndBorrowInst:
-  case SILInstructionKind::EndLifetimeInst:
     return true;
   }
 }
 
 bool swift::isIncidentalUse(SILInstruction *user) {
   return isEndOfScopeMarker(user) || user->isDebugInstruction() ||
-         isa<FixLifetimeInst>(user);
+         isa<FixLifetimeInst>(user) || isa<EndLifetimeInst>(user);
 }
 
 bool swift::onlyAffectsRefCount(SILInstruction *user) {

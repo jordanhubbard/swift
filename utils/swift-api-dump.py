@@ -104,6 +104,8 @@ def create_parser():
                         'member.')
     parser.add_argument('--enable-experimental-concurrency', action='store_true',
                         help='Enable experimental concurrency model.')
+    parser.add_argument('--enable-experimental-distributed', action='store_true',
+                        help='Enable experimental distributed actors.')
     parser.add_argument('-swift-version', metavar='N',
                         help='the Swift version to use')
     parser.add_argument('-show-overlay', action='store_true',
@@ -328,10 +330,10 @@ def main():
 
     # Determine the set of extra arguments we'll use.
     extra_args = ['-skip-imports']
-    if args.enable_infer_import_as_member:
-        extra_args = extra_args + ['-enable-infer-import-as-member']
     if args.enable_experimental_concurrency:
         extra_args = extra_args + ['-enable-experimental-concurrency']
+    if args.enable_experimental_distributed:
+        extra_args = extra_args + ['-enable-experimental-distributed']
     if args.swift_version:
         extra_args = extra_args + ['-swift-version', '%s' % args.swift_version]
 

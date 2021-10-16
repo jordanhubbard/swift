@@ -35,6 +35,8 @@
 using namespace swift;
 using namespace Lowering;
 
+STATISTIC(NumSlabsAllocated, "number of slabs allocated in SILModule");
+
 class SILModule::SerializationCallback final
     : public DeserializationNotificationHandler {
   void didDeserialize(ModuleDecl *M, SILFunction *fn) override {
@@ -77,12 +79,10 @@ class SILModule::SerializationCallback final
       decl->setLinkage(SILLinkage::SharedExternal);
       return;
     case SILLinkage::Private:
-      decl->setLinkage(SILLinkage::PrivateExternal);
-      return;
+      llvm_unreachable("cannot make a private external symbol");
     case SILLinkage::PublicExternal:
     case SILLinkage::HiddenExternal:
     case SILLinkage::SharedExternal:
-    case SILLinkage::PrivateExternal:
       return;
     }
   }
@@ -98,7 +98,8 @@ SILModule::SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
       Options(Options), serialized(false),
       regDeserializationNotificationHandlerForNonTransparentFuncOME(false),
       regDeserializationNotificationHandlerForAllFuncOME(false),
-      SerializeSILAction(), Types(TC) {
+      prespecializedFunctionDeclsImported(false), SerializeSILAction(),
+      Types(TC) {
   assert(!context.isNull());
   if (auto *file = context.dyn_cast<FileUnit *>()) {
     AssociatedDeclContext = file;
@@ -116,11 +117,17 @@ SILModule::SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
 SILModule::~SILModule() {
 #ifndef NDEBUG
   checkForLeaks();
+
+  NumSlabsAllocated += numAllocatedSlabs;
+  assert(numAllocatedSlabs == freeSlabs.size() && "leaking slabs in SILModule");
 #endif
 
+  assert(!hasUnresolvedOpenedArchetypeDefinitions());
+
   // Decrement ref count for each SILGlobalVariable with static initializers.
-  for (SILGlobalVariable &v : silGlobals)
-    v.dropAllReferences();
+  for (SILGlobalVariable &v : silGlobals) {
+    v.clear();
+  }
 
   for (auto vt : vtables)
     vt->~SILVTable();
@@ -136,10 +143,16 @@ SILModule::~SILModule() {
     F.dropDynamicallyReplacedFunction();
     F.clearSpecializeAttrs();
   }
+
+  for (SILFunction &F : *this) {
+    F.eraseAllBlocks();
+  }
+  flushDeletedInsts();
 }
 
 void SILModule::checkForLeaks() const {
-  int instsInModule = 0;
+  int instsInModule = std::distance(scheduledForDeletion.begin(),
+                                    scheduledForDeletion.end());
   for (const SILFunction &F : *this) {
     for (const SILBasicBlock &block : F) {
       instsInModule += std::distance(block.begin(), block.end());
@@ -164,9 +177,15 @@ void SILModule::checkForLeaks() const {
     llvm::errs() << "Instructions in module: " << instsInModule << '\n';
     llvm_unreachable("leaking instructions");
   }
+  
+  assert(PlaceholderValue::getNumPlaceholderValuesAlive() == 0 &&
+         "leaking placeholders");
 }
 
 void SILModule::checkForLeaksAfterDestruction() {
+// Disabled in release (non-assert) builds because this check fails in rare
+// cases in lldb, causing crashes. rdar://70826934
+#ifndef NDEBUG
   int numAllocated = SILInstruction::getNumCreatedInstructions() -
                      SILInstruction::getNumDeletedInstructions();
 
@@ -174,6 +193,7 @@ void SILModule::checkForLeaksAfterDestruction() {
     llvm::errs() << "Leaking " << numAllocated << " instructions!\n";
     llvm_unreachable("leaking instructions");
   }
+#endif
 }
 
 std::unique_ptr<SILModule> SILModule::createEmptyModule(
@@ -193,12 +213,54 @@ void *SILModule::allocate(unsigned Size, unsigned Align) const {
   return BPA.Allocate(Size, Align);
 }
 
+FixedSizeSlab *SILModule::allocSlab() {
+  if (freeSlabs.empty()) {
+    numAllocatedSlabs++;
+    return new (*this) FixedSizeSlab();
+  }
+
+  FixedSizeSlab *slab = &*freeSlabs.rbegin();
+  freeSlabs.remove(*slab);
+  return slab;
+}
+
+void SILModule::freeSlab(FixedSizeSlab *slab) {
+  freeSlabs.push_back(*slab);
+  assert(slab->overflowGuard == FixedSizeSlab::magicNumber);
+}
+
+void SILModule::freeAllSlabs(SlabList &slabs) {
+  freeSlabs.splice(freeSlabs.end(), slabs);
+}
+
 void *SILModule::allocateInst(unsigned Size, unsigned Align) const {
   return AlignedAlloc(Size, Align);
 }
 
-void SILModule::deallocateInst(SILInstruction *I) {
-  AlignedFree(I);
+void SILModule::willDeleteInstruction(SILInstruction *I) {
+  // Update openedArchetypeDefs.
+  if (auto *svi = dyn_cast<SingleValueInstruction>(I)) {
+    if (CanArchetypeType archeTy = svi->getOpenedArchetype()) {
+      OpenedArchetypeKey key = {archeTy, svi->getFunction()};
+      assert(openedArchetypeDefs.lookup(key) == svi &&
+             "archetype def was not registered");
+      openedArchetypeDefs.erase(key);
+    }
+  }
+}
+
+void SILModule::scheduleForDeletion(SILInstruction *I) {
+  I->dropAllReferences();
+  scheduledForDeletion.push_back(I);
+  I->ParentBB = nullptr;
+}
+
+void SILModule::flushDeletedInsts() {
+  while (!scheduledForDeletion.empty()) {
+    SILInstruction *inst = &*scheduledForDeletion.begin();
+    scheduledForDeletion.erase(inst);
+    AlignedFree(inst);
+  }
 }
 
 SILWitnessTable *
@@ -316,6 +378,7 @@ SILModule::createDefaultWitnessTableDeclaration(const ProtocolDecl *Protocol,
 void SILModule::deleteWitnessTable(SILWitnessTable *Wt) {
   auto Conf = Wt->getConformance();
   assert(lookUpWitnessTable(Conf, false) == Wt);
+  getSILLoader()->invalidateWitnessTable(Wt);
   WitnessTableMap.erase(Conf);
   witnessTables.erase(Wt);
 }
@@ -366,10 +429,6 @@ const BuiltinInfo &SILModule::getBuiltinInfo(Identifier ID) {
     Info.ID = BuiltinValueKind::ApplyDerivative;
   else if (OperationName.startswith("applyTranspose_"))
     Info.ID = BuiltinValueKind::ApplyTranspose;
-  else if (OperationName.startswith("differentiableFunction_"))
-    Info.ID = BuiltinValueKind::DifferentiableFunction;
-  else if (OperationName.startswith("linearFunction_"))
-    Info.ID = BuiltinValueKind::LinearFunction;
   else
     Info.ID = llvm::StringSwitch<BuiltinValueKind>(OperationName)
 #define BUILTIN(id, name, attrs) .Case(name, BuiltinValueKind::id)
@@ -474,7 +533,7 @@ bool SILModule::hasFunction(StringRef Name) {
 }
 
 void SILModule::invalidateSILLoaderCaches() {
-  getSILLoader()->invalidateCaches();
+  getSILLoader()->invalidateAllCaches();
 }
 
 SILFunction *SILModule::removeFromZombieList(StringRef Name) {
@@ -515,9 +574,8 @@ void SILModule::eraseFunction(SILFunction *F) {
 
   // This opens dead-function-removal opportunities for called functions.
   // (References are not needed anymore.)
-  F->dropAllReferences();
+  F->clear();
   F->dropDynamicallyReplacedFunction();
-  F->getBlocks().clear();
   // Drop references for any _specialize(target:) functions.
   F->clearSpecializeAttrs();
 }
@@ -527,9 +585,10 @@ void SILModule::invalidateFunctionInSILCache(SILFunction *F) {
 }
 
 /// Erase a global SIL variable from the module.
-void SILModule::eraseGlobalVariable(SILGlobalVariable *G) {
-  GlobalVariableMap.erase(G->getName());
-  getSILGlobalList().erase(G);
+void SILModule::eraseGlobalVariable(SILGlobalVariable *gv) {
+  getSILLoader()->invalidateGlobalVariable(gv);
+  GlobalVariableMap.erase(gv->getName());
+  getSILGlobalList().erase(gv);
 }
 
 SILVTable *SILModule::lookUpVTable(const ClassDecl *C,
@@ -670,7 +729,8 @@ SILDifferentiabilityWitness *
 SILModule::lookUpDifferentiabilityWitness(SILDifferentiabilityWitnessKey key) {
   Mangle::ASTMangler mangler;
   return lookUpDifferentiabilityWitness(
-      mangler.mangleSILDifferentiabilityWitnessKey(key));
+      mangler.mangleSILDifferentiabilityWitness(
+          key.originalFunctionName, key.kind, key.config));
 }
 
 /// Look up the differentiability witness corresponding to the given indices.
@@ -692,23 +752,58 @@ void SILModule::registerDeserializationNotificationHandler(
   deserializationNotificationHandlers.add(std::move(handler));
 }
 
-void SILModule::registerDeleteNotificationHandler(
-    DeleteNotificationHandler *handler) {
-  // Ask the handler (that can be an analysis, a pass, or some other data
-  // structure) if it wants to receive delete notifications.
-  if (handler->needsNotifications()) {
-    NotificationHandlers.insert(handler);
+SILValue SILModule::getOpenedArchetypeDef(CanArchetypeType archetype,
+                                          SILFunction *inFunction) {
+  SILValue &def = openedArchetypeDefs[{archetype, inFunction}];
+  if (!def) {
+    numUnresolvedOpenedArchetypes++;
+    def = ::new PlaceholderValue(SILType::getPrimitiveAddressType(archetype));
+  }
+
+  return def;
+}
+
+bool SILModule::hasUnresolvedOpenedArchetypeDefinitions() {
+  return numUnresolvedOpenedArchetypes != 0;
+}
+
+void SILModule::notifyAddedInstruction(SILInstruction *inst) {
+  if (auto *svi = dyn_cast<SingleValueInstruction>(inst)) {
+    if (CanArchetypeType archeTy = svi->getOpenedArchetype()) {
+      SILValue &val = openedArchetypeDefs[{archeTy, inst->getFunction()}];
+      if (val) {
+        if (!isa<PlaceholderValue>(val)) {
+          // Print a useful error message (and not just abort with an assert).
+          llvm::errs() << "re-definition of opened archetype in function "
+                       << svi->getFunction()->getName() << ":\n";
+          svi->print(llvm::errs());
+          llvm::errs() << "previously defined in function "
+                       << val->getFunction()->getName() << ":\n";
+          val->print(llvm::errs());
+          abort();
+        }
+        // The opened archetype was unresolved so far. Replace the placeholder
+        // by inst.
+        auto *placeholder = cast<PlaceholderValue>(val);
+        placeholder->replaceAllUsesWith(svi);
+        ::delete placeholder;
+        numUnresolvedOpenedArchetypes--;
+      }
+      val = svi;
+    }
   }
 }
 
-void SILModule::
-removeDeleteNotificationHandler(DeleteNotificationHandler* Handler) {
-  NotificationHandlers.remove(Handler);
-}
-
-void SILModule::notifyDeleteHandlers(SILNode *node) {
-  for (auto *Handler : NotificationHandlers) {
-    Handler->handleDeleteNotification(node);
+void SILModule::notifyMovedInstruction(SILInstruction *inst,
+                                       SILFunction *fromFunction) {
+  if (auto *svi = dyn_cast<SingleValueInstruction>(inst)) {
+    if (CanArchetypeType archeTy = svi->getOpenedArchetype()) {
+      OpenedArchetypeKey key = {archeTy, fromFunction};
+      assert(openedArchetypeDefs.lookup(key) == svi &&
+             "archetype def was not registered");
+      openedArchetypeDefs.erase(key);
+      openedArchetypeDefs[{archeTy, svi->getFunction()}] = svi;
+    }
   }
 }
 
@@ -779,6 +874,42 @@ void SILModule::installSILRemarkStreamer() {
 
 bool SILModule::isStdlibModule() const {
   return TheSwiftModule->isStdlibModule();
+}
+void SILModule::performOnceForPrespecializedImportedExtensions(
+    llvm::function_ref<void(AbstractFunctionDecl *)> action) {
+  if (prespecializedFunctionDeclsImported)
+    return;
+
+  SmallVector<ModuleDecl *, 8> importedModules;
+  // Add the Swift module.
+  if (!isStdlibModule()) {
+    auto *SwiftStdlib = getASTContext().getStdlibModule(true);
+    if (SwiftStdlib)
+      importedModules.push_back(SwiftStdlib);
+  }
+
+  // Add explicitly imported modules.
+  SmallVector<Decl *, 32> topLevelDecls;
+  getSwiftModule()->getTopLevelDecls(topLevelDecls);
+  for (const Decl *D : topLevelDecls) {
+    if (auto importDecl = dyn_cast<ImportDecl>(D)) {
+      if (!importDecl->getModule() ||
+          importDecl->getModule()->isNonSwiftModule())
+        continue;
+      importedModules.push_back(importDecl->getModule());
+    }
+  }
+
+  for (auto *module : importedModules) {
+    SmallVector<Decl *, 16> prespecializations;
+    module->getExportedPrespecializations(prespecializations);
+    for (auto *p : prespecializations) {
+      if (auto *vd = dyn_cast<AbstractFunctionDecl>(p)) {
+        action(vd);
+      }
+    }
+  }
+  prespecializedFunctionDeclsImported = true;
 }
 
 SILProperty *SILProperty::create(SILModule &M,

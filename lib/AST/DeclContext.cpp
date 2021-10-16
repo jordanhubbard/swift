@@ -39,12 +39,6 @@ STATISTIC(NumLazyIterableDeclContexts,
 STATISTIC(NumUnloadedLazyIterableDeclContexts,
           "# of serialized iterable declaration contexts never loaded");
 
-// Only allow allocation of DeclContext using the allocator in ASTContext.
-void *DeclContext::operator new(size_t Bytes, ASTContext &C,
-                                unsigned Alignment) {
-  return C.Allocate(Bytes, Alignment);
-}
-
 ASTContext &DeclContext::getASTContext() const {
   return getParentModule()->getASTContext();
 }
@@ -145,7 +139,7 @@ void DeclContext::forEachGenericContext(
         if (auto *gpList = genericCtx->getGenericParams())
           fn(gpList);
     }
-  } while ((dc = dc->getParent()));
+  } while ((dc = dc->getParentForLookup()));
 }
 
 unsigned DeclContext::getGenericContextDepth() const {
@@ -532,12 +526,17 @@ void AccessScope::dump() const {
 
   if (auto *decl = getDeclContext()->getAsDecl()) {
     llvm::errs() << Decl::getKindName(decl->getKind()) << " ";
-    if (auto *ext = dyn_cast<ExtensionDecl>(decl))
-      llvm::errs() << ext->getExtendedNominal()->getName();
-    else if (auto *named = dyn_cast<ValueDecl>(decl))
+    if (auto *ext = dyn_cast<ExtensionDecl>(decl)) {
+      auto *extended = ext->getExtendedNominal();
+      if (extended)
+        llvm::errs() << extended->getName();
+      else
+        llvm::errs() << "(null)";
+    } else if (auto *named = dyn_cast<ValueDecl>(decl)) {
       llvm::errs() << named->getName();
-    else
+    } else {
       llvm::errs() << (const void *)decl;
+    }
 
     SourceLoc loc = decl->getLoc();
     if (loc.isValid()) {
@@ -672,6 +671,19 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
       OS << " DefaultArgument index=" << init->getIndex();
       break;
     }
+    case InitializerKind::PropertyWrapper: {
+      auto init = cast<PropertyWrapperInitializer>(this);
+      OS << "PropertyWrapper 0x" << (void*)init->getWrappedVar() << ", kind=";
+      switch (init->getKind()) {
+      case PropertyWrapperInitializer::Kind::WrappedValue:
+        OS << "wrappedValue";
+        break;
+      case PropertyWrapperInitializer::Kind::ProjectedValue:
+          OS << "projectedValue";
+        break;
+      }
+      break;
+    }
     }
     break;
 
@@ -753,11 +765,19 @@ ArrayRef<Decl *> IterableDeclContext::getParsedMembers() const {
     .members;
 }
 
-ArrayRef<Decl *> IterableDeclContext::getSemanticMembers() const {
+ArrayRef<Decl *> IterableDeclContext::getABIMembers() const {
   ASTContext &ctx = getASTContext();
   return evaluateOrDefault(
       ctx.evaluator,
-      SemanticMembersRequest{const_cast<IterableDeclContext *>(this)},
+      ABIMembersRequest{const_cast<IterableDeclContext *>(this)},
+      ArrayRef<Decl *>());
+}
+
+ArrayRef<Decl *> IterableDeclContext::getAllMembers() const {
+  ASTContext &ctx = getASTContext();
+  return evaluateOrDefault(
+      ctx.evaluator,
+      AllMembersRequest{const_cast<IterableDeclContext *>(this)},
       ArrayRef<Decl *>());
 }
 
@@ -845,6 +865,10 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
 
       // Ignore source location information of implicit declarations.
       if (d->isImplicit())
+        return true;
+
+      // Imported decls won't have complete location info.
+      if (d->hasClangNode())
         return true;
 
       return false;
@@ -1011,25 +1035,23 @@ IterableDeclContext::castDeclToIterableDeclContext(const Decl *D) {
   }
 }
 
-Optional<std::string> IterableDeclContext::getBodyFingerprint() const {
-  // Only makes sense for contexts in a source file
-  if (!getAsGenericContext()->getParentSourceFile())
+Optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
+  auto fileUnit = dyn_cast<FileUnit>(getAsGenericContext()->getModuleScopeContext());
+  if (!fileUnit)
     return None;
-  auto mutableThis = const_cast<IterableDeclContext *>(this);
-  return evaluateOrDefault(getASTContext().evaluator,
-                           ParseMembersRequest{mutableThis},
-                           FingerprintAndMembers())
-      .fingerprint;
-}
 
-bool IterableDeclContext::areTokensHashedForThisBodyInsteadOfInterfaceHash()
-    const {
-  // Do not keep separate hashes for extension bodies because the dependencies
-  // can miss the addition of a member in an extension because there is nothing
-  // corresponding to the fingerprinted nominal dependency node.
-  if (isa<ExtensionDecl>(this))
-    return false;
-  return true;
+  if (isa<SourceFile>(fileUnit)) {
+    auto mutableThis = const_cast<IterableDeclContext *>(this);
+    return evaluateOrDefault(getASTContext().evaluator,
+                             ParseMembersRequest{mutableThis},
+                             FingerprintAndMembers())
+        .fingerprint;
+  }
+
+  if (getDecl()->isImplicit())
+    return None;
+
+  return fileUnit->loadFingerprint(this);
 }
 
 /// Return the DeclContext to compare when checking private access in
@@ -1058,16 +1080,14 @@ getPrivateDeclContext(const DeclContext *DC, const SourceFile *useSF) {
   return lastExtension ? lastExtension : DC;
 }
 
-AccessScope::AccessScope(const DeclContext *DC, bool isPrivate, bool isSPI)
-    : Value(DC, isPrivate || isSPI) {
+AccessScope::AccessScope(const DeclContext *DC, bool isPrivate)
+    : Value(DC, isPrivate) {
   if (isPrivate) {
     DC = getPrivateDeclContext(DC, DC->getParentSourceFile());
     Value.setPointer(DC);
   }
   if (!DC || isa<ModuleDecl>(DC))
     assert(!isPrivate && "public or internal scope can't be private");
-  if (DC)
-    assert(!isSPI && "only public scopes can be SPI");
 }
 
 bool AccessScope::isFileScope() const {
@@ -1177,7 +1197,9 @@ bool DeclContext::hasValueSemantics() const {
 bool DeclContext::isClassConstrainedProtocolExtension() const {
   if (getExtendedProtocolDecl()) {
     auto ED = cast<ExtensionDecl>(this);
-    return ED->getGenericSignature()->requiresClass(ED->getSelfInterfaceType());
+    if (auto sig = ED->getGenericSignature()) {
+      return sig->requiresClass(ED->getSelfInterfaceType());
+    }
   }
   return false;
 }
@@ -1280,4 +1302,23 @@ static bool isSpecializeExtensionContext(const DeclContext *dc) {
 
 bool DeclContext::isInSpecializeExtensionContext() const {
    return isSpecializeExtensionContext(this);
+}
+
+bool DeclContext::isAlwaysAvailableConformanceContext() const {
+  auto *ext = dyn_cast<ExtensionDecl>(this);
+  if (ext == nullptr)
+    return true;
+
+  if (AvailableAttr::isUnavailable(ext))
+    return false;
+
+  auto &ctx = getASTContext();
+
+  AvailabilityContext conformanceAvailability{
+      AvailabilityInference::availableRange(ext, ctx)};
+
+  auto deploymentTarget =
+      AvailabilityContext::forDeploymentTarget(ctx);
+
+  return deploymentTarget.isContainedIn(conformanceAvailability);
 }

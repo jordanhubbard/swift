@@ -26,6 +26,7 @@
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/raw_ostream.h"
 #include <memory>
 
@@ -294,6 +295,11 @@ class DependentComponentSplitterStep final : public SolverStep {
   /// Array containing all of the partial solutions for the parent split.
   MutableArrayRef<SmallVector<Solution, 4>> AllPartialSolutions;
 
+  /// The solutions computed the \c ComponentSteps created for each partial
+  /// solution combinations. Will be merged into the final \c Solutions vector
+  /// in \c resume.
+  std::vector<std::unique_ptr<SmallVector<Solution, 2>>> ContextualSolutions;
+
   /// Take all of the constraints in this component and put them into
   /// \c Constraints.
   void injectConstraints() {
@@ -477,11 +483,11 @@ private:
 };
 
 template <typename P> class BindingStep : public SolverStep {
+protected:
   using Scope = ConstraintSystem::SolverScope;
 
   P Producer;
 
-protected:
   /// Indicates whether any of the attempted bindings
   /// produced a solution.
   bool AnySolved = false;
@@ -565,14 +571,10 @@ protected:
 };
 
 class TypeVariableStep final : public BindingStep<TypeVarBindingProducer> {
-  using BindingContainer = ConstraintSystem::PotentialBindings;
-  using Binding = ConstraintSystem::PotentialBinding;
+  using BindingContainer = inference::BindingSet;
+  using Binding = inference::PotentialBinding;
 
   TypeVariableType *TypeVar;
-  // A set of the initial bindings to consider, which is
-  // also a source of follow-up "computed" bindings such
-  // as supertypes, defaults etc.
-  SmallVector<Binding, 4> InitialBindings;
 
   /// Indicates whether source of one of the previously
   /// attempted bindings was a literal constraint. This
@@ -581,10 +583,10 @@ class TypeVariableStep final : public BindingStep<TypeVarBindingProducer> {
   bool SawFirstLiteralConstraint = false;
 
 public:
-  TypeVariableStep(ConstraintSystem &cs, BindingContainer &bindings,
+  TypeVariableStep(BindingContainer &bindings,
                    SmallVectorImpl<Solution> &solutions)
-      : BindingStep(cs, {cs, bindings}, solutions), TypeVar(bindings.TypeVar),
-        InitialBindings(bindings.Bindings.begin(), bindings.Bindings.end()) {}
+      : BindingStep(bindings.getConstraintSystem(), {bindings}, solutions),
+        TypeVar(bindings.getTypeVariable()) {}
 
   void setup() override;
 
@@ -593,8 +595,7 @@ public:
   void print(llvm::raw_ostream &Out) override {
     PrintOptions PO;
     PO.PrintTypesForDebugging = true;
-    Out << "TypeVariableStep for " << TypeVar->getString(PO) << " with #"
-        << InitialBindings.size() << " initial bindings\n";
+    Out << "TypeVariableStep for " << TypeVar->getString(PO) << '\n';
   }
 
 protected:
@@ -688,6 +689,20 @@ private:
   bool shortCircuitDisjunctionAt(Constraint *currentChoice,
                                  Constraint *lastSuccessfulChoice) const;
 
+  bool shouldSkipGenericOperators() const {
+    if (!BestNonGenericScore)
+      return false;
+
+    // Let's skip generic overload choices only in case if
+    // non-generic score indicates that there were no forced
+    // unwrappings of optional(s), no unavailable overload
+    // choices present in the solution, no fixes required,
+    // and there are no non-trivial function conversions.
+    auto &score = BestNonGenericScore->Data;
+    return (score[SK_ForceUnchecked] == 0 && score[SK_Unavailable] == 0 &&
+            score[SK_Fix] == 0 && score[SK_FunctionConversion] == 0);
+  }
+
   /// Attempt to apply given disjunction choice to constraint system.
   /// This action is going to establish "active choice" of this disjunction
   /// to point to a given choice.
@@ -704,6 +719,9 @@ private:
   // from currently selected representative.
   void pruneOverloadSet(Constraint *disjunction) {
     auto *choice = disjunction->getNestedConstraints().front();
+    if (choice->getKind() != ConstraintKind::BindOverload)
+      return;
+
     auto *typeVar = choice->getFirstType()->getAs<TypeVariableType>();
     if (!typeVar)
       return;
@@ -737,7 +755,9 @@ private:
 
   // Figure out which of the solutions has the smallest score.
   static Optional<Score> getBestScore(SmallVectorImpl<Solution> &solutions) {
-    assert(!solutions.empty());
+    if (solutions.empty())
+      return None;
+
     Score bestScore = solutions.front().getFixedScore();
     if (solutions.size() == 1)
       return bestScore;
@@ -749,6 +769,196 @@ private:
     }
     return bestScore;
   }
+};
+
+class ConjunctionStep : public BindingStep<ConjunctionElementProducer> {
+  /// Snapshot of the constraint system before conjunction.
+  class SolverSnapshot {
+    ConstraintSystem &CS;
+
+    Optional<llvm::SaveAndRestore<DeclContext *>> DC = None;
+
+    llvm::SetVector<TypeVariableType *> TypeVars;
+    ConstraintList Constraints;
+
+    /// If this conjunction has to be solved in isolation,
+    /// this scope would be initialized once all of the
+    /// elements are successfully solved to continue solving
+    /// along the current path as-if there was no conjunction.
+    std::unique_ptr<Scope> IsolationScope = nullptr;
+
+  public:
+    SolverSnapshot(ConstraintSystem &cs, Constraint *conjunction)
+        : CS(cs), TypeVars(std::move(cs.TypeVariables)) {
+      auto *locator = conjunction->getLocator();
+      // If this conjunction represents a closure, we need to
+      // switch declaration context over to it.
+      if (locator->directlyAt<ClosureExpr>()) {
+        DC.emplace(CS.DC, castToExpr<ClosureExpr>(locator->getAnchor()));
+      }
+
+      auto &CG = CS.getConstraintGraph();
+      // Remove all of the current inactive constraints.
+      Constraints.splice(Constraints.end(), CS.InactiveConstraints);
+      // Clear constraint graph.
+      for (auto &constraint : Constraints)
+        CG.removeConstraint(&constraint);
+    }
+
+    void setupOuterContext(Solution solution) {
+      // Re-add type variables and constraints back
+      // to the constraint system.
+      restore();
+
+      // Establish isolation scope so that conjunction solution
+      // and follow-up steps could be rolled back.
+      IsolationScope = std::make_unique<Scope>(CS);
+
+      // Apply solution inferred for the conjunction.
+      CS.applySolution(solution);
+
+      // Add constraints to the graph after solution
+      // has been applied to make sure that all type
+      // information is available to incremental inference.
+      for (auto &constraint : CS.InactiveConstraints)
+        CS.CG.addConstraint(&constraint);
+    }
+
+    bool isScoped() const { return bool(IsolationScope); }
+
+    ~SolverSnapshot() {
+      if (!IsolationScope)
+        restore();
+
+      IsolationScope.reset();
+      // Re-add all of the constraint to the constraint
+      // graph after scope has been rolled back, to make
+      // make sure the original (before conjunction)
+      // state is completely restored.
+      updateConstraintGraph();
+    }
+
+  private:
+    void restore() {
+      DC.reset();
+      CS.TypeVariables = std::move(TypeVars);
+      CS.InactiveConstraints.splice(CS.InactiveConstraints.end(), Constraints);
+    }
+
+    void updateConstraintGraph() {
+      auto &CG = CS.getConstraintGraph();
+      for (auto &constraint : CS.InactiveConstraints)
+        CG.addConstraint(&constraint);
+    }
+  };
+
+  /// Best solution solver reached so far.
+  Optional<Score> BestScore;
+  /// The score established before conjunction is attempted.
+  Score CurrentScore;
+
+  /// Conjunction constraint associated with this step.
+  Constraint *Conjunction;
+  /// Position of the conjunction in the inactive constraints
+  /// list which is required to re-instate it to the system
+  /// after this step is done.
+  ConstraintList::iterator AfterConjunction;
+
+  /// Indicates that one of the elements failed inference.
+  bool HadFailure = false;
+
+  /// If conjunction has to be solved in isolation, this
+  /// variable would capture the snapshot of the constraint
+  /// system step before conjunction step.
+  Optional<SolverSnapshot> Snapshot;
+
+  /// A set of previously deduced solutions. This is used upon
+  /// successful solution of an isolated conjunction to introduce
+  /// all of the inferred information back into the outer context.
+  SmallVectorImpl<Solution> &OuterSolutions;
+
+  /// Solutions produced while attempting elements of an isolated conjunction.
+  ///
+  /// Note that this is what `BindingStep` is initialized with
+  /// in isolated mode.
+  SmallVector<Solution, 4> IsolatedSolutions;
+
+public:
+  ConjunctionStep(ConstraintSystem &cs, Constraint *conjunction,
+                  SmallVectorImpl<Solution> &solutions)
+      : BindingStep(cs, {cs, conjunction},
+                    conjunction->isIsolated() ? IsolatedSolutions : solutions),
+        BestScore(getBestScore()), CurrentScore(getCurrentScore()),
+        Conjunction(conjunction), AfterConjunction(erase(conjunction)),
+        OuterSolutions(solutions) {
+    assert(conjunction->getKind() == ConstraintKind::Conjunction);
+
+    // Make a snapshot of the constraint system state before conjunction.
+    if (conjunction->isIsolated())
+      Snapshot.emplace(cs, conjunction);
+  }
+
+  ~ConjunctionStep() override {
+    assert(!bool(ActiveChoice));
+
+    // Return all of the type variables and constraints back.
+    Snapshot.reset();
+
+    // Restore conjunction constraint.
+    restore(AfterConjunction, Conjunction);
+
+    // Restore best score.
+    CS.solverState->BestScore = BestScore;
+    CS.CurrentScore = CurrentScore;
+  }
+
+  StepResult resume(bool prevFailed) override;
+
+  void print(llvm::raw_ostream &Out) override {
+    Out << "ConjunctionStep for ";
+    Conjunction->print(Out, &CS.getASTContext().SourceMgr);
+    Out << '\n';
+  }
+
+protected:
+  bool attempt(const ConjunctionElement &element) override;
+
+  /// Conjunction can't skip elements.
+  bool shouldSkip(const ConjunctionElement &element) const override {
+    return false;
+  }
+
+  /// Conjunction can't reject attempting any of its elements.
+  bool shouldStopAt(const ConjunctionElement &element) const override {
+    return false;
+  }
+
+  /// Conjunctions only stop after first failure.
+  ///
+  /// TODO: In diagnostic mode conjunction evaluation should stop
+  ///       after first element failure and consider the rest to
+  ///       be solved, in order to produce good diagnostics.
+  bool shouldStopAfter(const ConjunctionElement &element) const override {
+    return HadFailure;
+  }
+
+  void markAsFailed() {
+    HadFailure = true;
+    // During performance mode, failure to infer a type for one
+    // of the elements automatically fails whole conjunction.
+    //
+    // TODO: In diagnostic mode, let's consider this conjunction
+    // a success if at least one of its elements was solved
+    // successfully by use of fixes, and ignore the rest.
+    AnySolved = false;
+  }
+
+private:
+  // Restore constraint system state before conjunction.
+  //
+  // Note that this doesn't include conjunction constraint
+  // itself because we don't want to re-solve it.
+  void restoreOuterState() const;
 };
 
 } // end namespace constraints

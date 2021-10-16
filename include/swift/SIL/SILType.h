@@ -39,6 +39,16 @@ namespace Lowering {
   
 namespace swift {
 
+/// Find an opened archetype represented by this type.
+/// It is assumed by this method that the type contains
+/// at most one opened archetype.
+/// Typically, it would be called from a type visitor.
+/// It checks only the type itself, but does not try to
+/// recursively check any children of this type, because
+/// this is the task of the type visitor invoking it.
+/// \returns The found archetype or empty type otherwise.
+CanArchetypeType getOpenedArchetypeOf(CanType Ty);
+
 /// How an existential type container is represented.
 enum class ExistentialRepresentation {
   /// The type is not existential.
@@ -284,6 +294,10 @@ public:
   /// even though they are technically trivial.
   bool isTrivial(const SILFunction &F) const;
 
+  /// True if the type is an empty tuple or an empty struct or a tuple or
+  /// struct containing only empty types.
+  bool isEmpty(const SILFunction &F) const;
+
   /// True if the type, or the referenced type of an address type, is known to
   /// be a scalar reference-counted type such as a class, box, or thick function
   /// type. Returns false for non-trivial aggregates.
@@ -429,6 +443,13 @@ public:
   SILType getEnumElementType(EnumElementDecl *elt, SILModule &M,
                              TypeExpansionContext context) const;
 
+  /// Given that this is an enum type, return the lowered type of the
+  /// data for the given element.  Applies substitutions as necessary.
+  /// The result will have the same value category as the base type.
+  ///
+  /// NOTE: Takes the type expansion context from \p fn.
+  SILType getEnumElementType(EnumElementDecl *elt, SILFunction *fn) const;
+
   /// Given that this is an enum type, return true if this type is effectively
   /// exhausted.
   bool isEffectivelyExhaustiveEnumType(SILFunction *f);
@@ -557,6 +578,13 @@ public:
 
   /// Returns true if this SILType is a differentiable type.
   bool isDifferentiable(SILModule &M) const;
+
+  /// If this is a SILBoxType, return getSILBoxFieldType(). Otherwise, return
+  /// SILType().
+  ///
+  /// \p field Return the type of the ith field of the box. Default set to 0
+  /// since we only support one field today. This is just future proofing.
+  SILType getSILBoxFieldType(const SILFunction *f, unsigned field = 0);
 
   /// Returns the hash code for the SILType.
   llvm::hash_code getHashCode() const {

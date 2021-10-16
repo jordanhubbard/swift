@@ -136,11 +136,6 @@ namespace swift {
   /// Type check a function body element which is at \p TagetLoc .
   bool typeCheckASTNodeAtLoc(DeclContext *DC, SourceLoc TargetLoc);
 
-  /// Typecheck top-level code parsed during code completion.
-  ///
-  /// \returns true on success, false on error.
-  bool typeCheckTopLevelCodeDecl(TopLevelCodeDecl *TLCD);
-
   LookupResult
   lookupSemanticMember(DeclContext *DC, Type ty, DeclName name);
 
@@ -211,24 +206,32 @@ namespace swift {
   /// the decl context.
   ProtocolDecl *resolveProtocolName(DeclContext *dc, StringRef Name);
 
-  /// FIXME: All of the below goes away once CallExpr directly stores its
-  /// arguments.
+  /// Reported type of a variable declaration.
+  struct VariableTypeInfo {
+    /// The start of the variable identifier.
+    uint32_t Offset;
 
-  /// Return value for getOriginalArgumentList().
-  struct OriginalArgumentList {
-    SmallVector<Expr *, 4> args;
-    SmallVector<Identifier, 4> labels;
-    SmallVector<SourceLoc, 4> labelLocs;
-    SourceLoc lParenLoc;
-    SourceLoc rParenLoc;
-    bool hasTrailingClosure = false;
+    /// The length of the variable identifier.
+    uint32_t Length;
+
+    /// Whether the variable has an explicit type annotation.
+    bool HasExplicitType;
+
+    /// The start of the printed type in a separate string buffer.
+    uint32_t TypeOffset;
+
+    VariableTypeInfo(uint32_t Offset, uint32_t Length, bool HasExplicitType,
+                     uint32_t TypeOffset);
   };
 
-  /// When applying a solution to a constraint system, the type checker rewrites
-  /// argument lists of calls to insert default arguments and collect varargs.
-  /// Sometimes for diagnostics we want to work on the original argument list as
-  /// written by the user; this performs the reverse transformation.
-  OriginalArgumentList getOriginalArgumentList(Expr *expr);
+  /// Collect type information for every variable declaration in \c SF
+  /// within the given range into \c VariableTypeInfos.
+  /// All types will be printed to \c OS and the type offsets of the
+  /// \c VariableTypeInfos will index into the string that backs this
+  /// stream.
+  void collectVariableType(SourceFile &SF, SourceRange Range,
+                           std::vector<VariableTypeInfo> &VariableTypeInfos,
+                           llvm::raw_ostream &OS);
 
   /// Returns the root type and result type of the keypath type in a keypath
   /// dynamic member lookup subscript, or \c None if it cannot be determined.
@@ -283,6 +286,9 @@ namespace swift {
   /// for a Fix-It that adds a new build* function to a result builder.
   std::tuple<SourceLoc, std::string, Type>
   determineResultBuilderBuildFixItInfo(NominalTypeDecl *builder);
+
+  /// Just a proxy to swift::contextUsesConcurrencyFeatures() from lib/IDE code.
+  bool completionContextUsesConcurrencyFeatures(const DeclContext *dc);
 }
 
 #endif

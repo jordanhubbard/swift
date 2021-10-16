@@ -345,7 +345,7 @@ internal func _class_getInstancePositiveExtentSize(_ theClass: AnyClass) -> Int 
 #endif
 }
 
-#if INTERNAL_CHECKS_ENABLED
+#if INTERNAL_CHECKS_ENABLED && COW_CHECKS_ENABLED
 @usableFromInline
 @_silgen_name("_swift_isImmutableCOWBuffer")
 internal func _swift_isImmutableCOWBuffer(_ object: AnyObject) -> Bool
@@ -389,7 +389,7 @@ internal var _objectPointerLowSpareBitShift: UInt {
 }
 
 #if arch(i386) || arch(arm) || arch(wasm32) || arch(powerpc64) || arch(
-  powerpc64le) || arch(s390x)
+  powerpc64le) || arch(s390x) || arch(arm64_32)
 @inlinable
 internal var _objectPointerIsObjCBit: UInt {
     @inline(__always) get { return 0x0000_0002 }

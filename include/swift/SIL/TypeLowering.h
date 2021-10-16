@@ -734,6 +734,9 @@ class TypeConverter {
   ///
   /// Second element is a ResilienceExpansion.
   llvm::DenseMap<std::pair<SILType, unsigned>, unsigned> TypeFields;
+  
+  llvm::DenseMap<AbstractClosureExpr *, Optional<AbstractionPattern>>
+    ClosureAbstractionPatterns;
 
   CanAnyFunctionType makeConstantInterfaceType(SILDeclRef constant);
   
@@ -813,6 +816,9 @@ public:
 
   /// True if a protocol uses witness tables for dynamic dispatch.
   static bool protocolRequiresWitnessTable(ProtocolDecl *P) {
+    if (P->isMarkerProtocol())
+      return false;
+
     return swift::protocolRequiresWitnessTable(getProtocolDispatchStrategy(P));
   }
   
@@ -1103,6 +1109,22 @@ public:
                                          SILType enumType,
                                          EnumElementDecl *elt);
 
+  /// Get the preferred abstraction pattern, if any, by which to lower a
+  /// declaration.
+  ///
+  /// This can be set using \c setAbstractionPattern , but only before
+  /// the abstraction pattern is queried using this function. Once the
+  /// abstraction pattern has been asked for, it may not be changed.
+  Optional<AbstractionPattern> getConstantAbstractionPattern(SILDeclRef constant);
+  
+  /// Set the preferred abstraction pattern for a closure.
+  ///
+  /// The abstraction pattern can only be set before any calls to
+  /// \c getConstantAbstractionPattern on the same closure. It may not be
+  /// changed once it has been read.
+  void setAbstractionPattern(AbstractClosureExpr *closure,
+                             AbstractionPattern pattern);
+  
 private:
   CanType computeLoweredRValueType(TypeExpansionContext context,
                                    AbstractionPattern origType,

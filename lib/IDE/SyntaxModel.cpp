@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/IDE/SyntaxModel.h"
+#include "swift/Basic/Defer.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
@@ -304,7 +305,7 @@ static const std::vector<std::string> URLProtocols = {
   // Use RegexStrURL:
   "acap", "afp", "afs", "cid", "data", "fax", "feed", "file", "ftp", "go",
   "gopher", "http", "https", "imap", "ldap", "mailserver", "mid", "modem",
-  "news", "nntp", "opaquelocktoken", "pop", "prospero", "rdar", "rtsp", "service"
+  "news", "nntp", "opaquelocktoken", "pop", "prospero", "rdar", "rtsp", "service",
   "sip", "soap.beep", "soap.beeps", "tel", "telnet", "tip", "tn3270", "urn",
   "vemmi", "wais", "xcdoc", "z39.50r","z39.50s",
 
@@ -360,6 +361,12 @@ class ModelASTWalker : public ASTWalker {
   friend class InactiveClauseRAII;
   bool inInactiveClause = false;
 
+  /// A mapping of argument expressions to their full argument info.
+  llvm::DenseMap<Expr *, Argument> ArgumentInfo;
+
+  /// The number of ArgumentList parents in the walk.
+  unsigned ArgumentListDepth = 0;
+
 public:
   SyntaxModelWalker &Walker;
   ArrayRef<SyntaxNode> TokenNodes;
@@ -376,6 +383,10 @@ public:
   bool shouldWalkAccessorsTheOldWay() override { return true; }
 
   void visitSourceFile(SourceFile &SrcFile, ArrayRef<SyntaxNode> Tokens);
+
+  std::pair<bool, ArgumentList *>
+  walkToArgumentListPre(ArgumentList *ArgList) override;
+  ArgumentList *walkToArgumentListPost(ArgumentList *ArgList) override;
 
   std::pair<bool, Expr *> walkToExprPre(Expr *E) override;
   Expr *walkToExprPost(Expr *E) override;
@@ -421,7 +432,6 @@ private:
   bool pushStructureNode(const SyntaxStructureNode &Node,
                          const ASTNodeType& ASTNode);
   bool popStructureNode();
-  bool isCurrentCallArgExpr(const Expr *E);
 
   bool processComment(CharSourceRange Range);
   bool searchForURL(CharSourceRange Range);
@@ -483,36 +493,10 @@ CharSourceRange innerCharSourceRangeFromSourceRange(const SourceManager &SM,
   return CharSourceRange(SM, SRS, (SR.End != SR.Start) ? SR.End : SRS);
 }
 
-CharSourceRange parameterNameRangeOfCallArg(const TupleExpr *TE,
-                                            const Expr *Arg) {
-  if (!TE->hasElementNameLocs() || !TE->hasElementNames())
-    return CharSourceRange();
-
-  // Loop over the elements to find the index representing Arg.
-  // This is somewhat inefficient but the only way to find the corresponding
-  // name without the index, and the number of parameters in a call is normally
-  // very low. If this becomes a performance problem, we could perhaps have
-  // ASTWalker visit the element name as well.
-  unsigned i = 0;
-  for (auto E : TE->getElements()) {
-    if (E == Arg) {
-      SourceLoc NL = TE->getElementNameLoc(i);
-      Identifier Name = TE->getElementName(i);
-      if (NL.isValid() && !Name.empty())
-        return CharSourceRange(NL, Name.getLength());
-
-      return CharSourceRange();
-    }
-    ++i;
-  }
-
-  return CharSourceRange();
-}
-
 static void setDecl(SyntaxStructureNode &N, Decl *D) {
   N.Dcl = D;
   N.Attrs = D->getAttrs();
-  N.DocRange = D->getRawComment().getCharSourceRange();
+  N.DocRange = D->getRawComment(/*SerializedOK=*/false).getCharSourceRange();
 }
 
 } // anonymous namespace
@@ -542,16 +526,41 @@ static bool shouldTreatAsSingleToken(const SyntaxStructureNode &Node,
              SM.getLineAndColumnInBuffer(Node.Range.getEnd()).first;
 }
 
+std::pair<bool, ArgumentList *>
+ModelASTWalker::walkToArgumentListPre(ArgumentList *ArgList) {
+  for (auto Arg : *ArgList) {
+    auto res = ArgumentInfo.insert({Arg.getExpr(), Arg});
+    assert(res.second && "Duplicate arguments?");
+    (void)res;
+  }
+  ArgumentListDepth += 1;
+  return {true, ArgList};
+}
+
+ArgumentList *ModelASTWalker::walkToArgumentListPost(ArgumentList *ArgList) {
+  // If there are no more argument lists above us, we can clear out the argument
+  // mapping to save memory.
+  ArgumentListDepth -= 1;
+  if (ArgumentListDepth == 0)
+    ArgumentInfo.clear();
+  return ArgList;
+}
+
 std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
   if (isVisitedBefore(E))
     return {false, E};
 
-  auto addCallArgExpr = [&](Expr *Elem, TupleExpr *ParentTupleExpr) {
-    if (isa<DefaultArgumentExpr>(Elem) ||
-        !isCurrentCallArgExpr(ParentTupleExpr))
+  auto addCallArgExpr = [&](const Argument &Arg) {
+    auto *Elem = Arg.getExpr();
+    if (isa<DefaultArgumentExpr>(Elem))
       return;
 
-    CharSourceRange NR = parameterNameRangeOfCallArg(ParentTupleExpr, Elem);
+    CharSourceRange NR;
+    auto NL = Arg.getLabelLoc();
+    auto Name = Arg.getLabel();
+    if (NL.isValid() && !Name.empty())
+      NR = CharSourceRange(NL, Name.getLength());
+
     SyntaxStructureNode SN;
     SN.Kind = SyntaxStructureKind::Argument;
     SN.NameRange = NR;
@@ -567,16 +576,9 @@ std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
     pushStructureNode(SN, Elem);
   };
 
-  if (auto *ParentTupleExpr = dyn_cast_or_null<TupleExpr>(Parent.getAsExpr())) {
-    // the argument value is a tuple expression already, we can just extract it
-    addCallArgExpr(E, ParentTupleExpr);
-  } else if (auto *ParentOptionalExpr = dyn_cast_or_null<OptionalEvaluationExpr>(Parent.getAsExpr())) {
-    // if an argument value is an optional expression, we should extract the
-    // argument from the subexpression
-    if (auto *ParentTupleExpr = dyn_cast_or_null<TupleExpr>(ParentOptionalExpr->getSubExpr())) {
-      addCallArgExpr(E, ParentTupleExpr);
-    }
-  }
+  auto Arg = ArgumentInfo.find(E);
+  if (Arg != ArgumentInfo.end())
+    addCallArgExpr(Arg->second);
 
   if (E->isImplicit())
     return { true, E };
@@ -598,9 +600,9 @@ std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
     if (CE->getFn() && CE->getFn()->getSourceRange().isValid())
       SN.NameRange = charSourceRangeFromSourceRange(SM,
                                                  CE->getFn()->getSourceRange());
-    if (CE->getArg() && CE->getArg()->getSourceRange().isValid())
-      SN.BodyRange = innerCharSourceRangeFromSourceRange(SM,
-                                                CE->getArg()->getSourceRange());
+    if (CE->getArgs()->getSourceRange().isValid())
+      SN.BodyRange = innerCharSourceRangeFromSourceRange(
+          SM, CE->getArgs()->getSourceRange());
     pushStructureNode(SN, CE);
 
   } else if (auto *ObjectE = dyn_cast<ObjectLiteralExpr>(E)) {
@@ -642,20 +644,15 @@ std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
     SN.BodyRange = innerCharSourceRangeFromSourceRange(SM, E->getSourceRange());
     pushStructureNode(SN, E);
   } else if (auto *Tup = dyn_cast<TupleExpr>(E)) {
-    auto *ParentE = Parent.getAsExpr();
-    if (!isCurrentCallArgExpr(Tup) && (!ParentE || !isa<InterpolatedStringLiteralExpr>(ParentE))) {
-      SyntaxStructureNode SN;
-      SN.Kind = SyntaxStructureKind::TupleExpression;
-      SN.Range = charSourceRangeFromSourceRange(SM, Tup->getSourceRange());
-      SN.BodyRange = innerCharSourceRangeFromSourceRange(SM,
-                                                         Tup->getSourceRange());
-
-      for (auto *Elem : Tup->getElements()) {
-        addExprElem(Elem, SN);
-      }
-
-      pushStructureNode(SN, Tup);
+    SyntaxStructureNode SN;
+    SN.Kind = SyntaxStructureKind::TupleExpression;
+    SN.Range = charSourceRangeFromSourceRange(SM, Tup->getSourceRange());
+    SN.BodyRange =
+        innerCharSourceRangeFromSourceRange(SM, Tup->getSourceRange());
+    for (auto *Elem : Tup->getElements()) {
+      addExprElem(Elem, SN);
     }
+    pushStructureNode(SN, Tup);
   } else if (auto *Closure = dyn_cast<ClosureExpr>(E)) {
     SyntaxStructureNode SN;
     SN.Kind = SyntaxStructureKind::ClosureExpression;
@@ -666,23 +663,6 @@ std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
                           Closure->getExplicitResultTypeRepr()->getSourceRange());
 
     pushStructureNode(SN, Closure);
-
-  } else if (auto *CLE = dyn_cast<CaptureListExpr>(E)) {
-    // The ASTWalker visits captured variables twice, from a `CaptureListEntry` they are visited
-    // from the `VarDecl` and the `PatternBindingDecl` entries.
-    // We take over visitation here to avoid walking the `PatternBindingDecl` ones.
-    for (auto c : CLE->getCaptureList()) {
-      if (auto *VD = c.Var) {
-        // We're skipping over the PatternBindingDecl so we need to handle the
-        // the VarDecl's attributes that we'd normally process visiting the PBD.
-        if (!handleAttrs(VD->getAttrs()))
-          return { false, nullptr };
-        VD->walk(*this);
-      }
-    }
-    if (auto *CE = CLE->getClosureBody())
-      CE->walk(*this);
-    return { false, walkToExprPost(E) };
 
   } else if (auto SE = dyn_cast<SequenceExpr>(E)) {
     // In SequenceExpr, explicit cast expressions (e.g. 'as', 'is') appear
@@ -703,8 +683,8 @@ std::pair<bool, Expr *> ModelASTWalker::walkToExprPre(Expr *E) {
     llvm::SaveAndRestore<ASTWalker::ParentTy> SetParent(Parent, E);
     ISL->forEachSegment(Ctx, [&](bool isInterpolation, CallExpr *CE) {
       if (isInterpolation) {
-        if (auto *Arg = CE->getArg())
-          Arg->walk(*this);
+        for (auto arg : *CE->getArgs())
+          arg.getExpr()->walk(*this);
       }
     });
     return { false, walkToExprPost(E) };
@@ -1205,8 +1185,8 @@ bool ModelASTWalker::handleSpecialDeclAttribute(const DeclAttribute *D,
         if (!Repr->walk(*this))
           return false;
       }
-      if (auto *Arg = CA->getArg()) {
-        if (!Arg->walk(*this))
+      if (auto *Args = CA->getArgs()) {
+        if (!Args->walk(*this))
           return false;
       }
     } else if (!TokenNodes.empty()) {
@@ -1453,20 +1433,6 @@ bool ModelASTWalker::popStructureNode() {
   return true;
 }
 
-bool ModelASTWalker::isCurrentCallArgExpr(const Expr *E) {
-  if (SubStructureStack.empty())
-    return false;
-  auto Current = SubStructureStack.back();
-
-  if (Current.StructureNode.Kind ==
-        SyntaxStructureKind::ObjectLiteralExpression &&
-      cast<ObjectLiteralExpr>(Current.ASTNode.getAsExpr())->getArg() == E)
-    return true;
-
-  return Current.StructureNode.Kind == SyntaxStructureKind::CallExpression &&
-         cast<CallExpr>(Current.ASTNode.getAsExpr())->getArg() == E;
-}
-
 bool ModelASTWalker::processComment(CharSourceRange Range) {
   StringRef Text = SM.extractText(Range, BufferID);
   SourceLoc Loc = Range.getStart();
@@ -1619,8 +1585,7 @@ class DocFieldParser {
 
 public:
   DocFieldParser(StringRef text) : ptr(text.begin()), end(text.end()) {
-    assert(text.rtrim().find('\n') == StringRef::npos &&
-           "expected single line");
+    assert(!text.rtrim().contains('\n') && "expected single line");
   }
 
   // Case-insensitively match one of the following patterns:
@@ -1641,7 +1606,7 @@ public:
       ;
     StringRef ident(identStart, ptr - identStart);
 
-    if (ident.equals_lower("parameter")) {
+    if (ident.equals_insensitive("parameter")) {
       if (numSpaces > 1 || !advanceIf(' '))
         return None;
       while (advanceIf([](char c) { return c != ':'; }))
@@ -1651,7 +1616,7 @@ public:
       return ident;
 
     } else if (advanceIf(':')) {
-      if (ident.equals_lower("parameters") && numSpaces > 1)
+      if (ident.equals_insensitive("parameters") && numSpaces > 1)
         return None;
       auto lowerIdent = ident.lower();
       bool isField = llvm::StringSwitch<bool>(lowerIdent)

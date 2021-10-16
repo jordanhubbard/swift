@@ -28,6 +28,7 @@ using ValueIDField = DeclIDField;
 
 using SILInstOpCodeField = BCFixed<8>;
 using SILTypeCategoryField = BCFixed<2>;
+using SILValueOwnershipField = BCFixed<2>;
 
 enum SILStringEncoding : uint8_t {
   SIL_UTF8,
@@ -44,7 +45,6 @@ enum SILLinkageEncoding : uint8_t {
   SIL_LINKAGE_PUBLIC_EXTERNAL,
   SIL_LINKAGE_HIDDEN_EXTERNAL,
   SIL_LINKAGE_SHARED_EXTERNAL,
-  SIL_LINKAGE_PRIVATE_EXTERNAL,
 };
 using SILLinkageField = BCFixed<4>;
 
@@ -126,6 +126,7 @@ namespace sil_block {
     SIL_ONE_OPERAND,
     SIL_ONE_TYPE_ONE_OPERAND,
     SIL_ONE_TYPE_VALUES,
+    SIL_ONE_TYPE_OWNERSHIP_VALUES,
     SIL_TWO_OPERANDS,
     SIL_TAIL_ADDR,
     SIL_INST_APPLY,
@@ -147,6 +148,7 @@ namespace sil_block {
     SIL_SPECIALIZE_ATTR,
     SIL_PROPERTY,
     SIL_ONE_OPERAND_EXTRA_ATTR,
+    SIL_ONE_TYPE_ONE_OPERAND_EXTRA_ATTR,
     SIL_TWO_OPERANDS_EXTRA_ATTR,
     SIL_INST_DIFFERENTIABLE_FUNCTION,
     SIL_INST_LINEAR_FUNCTION,
@@ -259,16 +261,17 @@ namespace sil_block {
 
   using DifferentiabilityWitnessLayout = BCRecordLayout<
     SIL_DIFFERENTIABILITY_WITNESS,
-    DeclIDField,             // Original function name
-    SILLinkageField,         // Linkage
-    BCFixed<1>,              // Is declaration?
-    BCFixed<1>,              // Is serialized?
-    GenericSignatureIDField, // Derivative function generic signature
-    DeclIDField,             // JVP function name
-    DeclIDField,             // VJP function name
-    BCVBR<8>,                // Number of parameter indices
-    BCVBR<8>,                // Number of result indices
-    BCArray<ValueIDField>    // Parameter and result indices
+    DeclIDField,                // Original function name
+    SILLinkageField,            // Linkage
+    BCFixed<1>,                 // Is declaration?
+    BCFixed<1>,                 // Is serialized?
+    DifferentiabilityKindField, // Differentiability kind
+    GenericSignatureIDField,    // Derivative function generic signature
+    DeclIDField,                // JVP function name
+    DeclIDField,                // VJP function name
+    BCVBR<8>,                   // Number of parameter indices
+    BCVBR<8>,                   // Number of result indices
+    BCArray<ValueIDField>       // Parameter and result indices
   >;
 
   using SILFunctionLayout =
@@ -305,7 +308,8 @@ namespace sil_block {
                      GenericSignatureIDField, // specialized signature
                      DeclIDField, // Target SILFunction name or 0.
                      DeclIDField,  // SPIGroup or 0.
-                     DeclIDField // SPIGroup Module name id.
+                     DeclIDField, // SPIGroup Module name id.
+                     BC_AVAIL_TUPLE // Availability
                      >;
 
   // Has an optional argument list where each argument is a typed valueref.
@@ -330,7 +334,7 @@ namespace sil_block {
   using SILOneTypeOneOperandLayout = BCRecordLayout<
     SIL_ONE_TYPE_ONE_OPERAND,
     SILInstOpCodeField,
-    BCFixed<2>,          // Optional attributes
+    BCFixed<1>,          // Optional attribute
     TypeIDField,
     SILTypeCategoryField,
     TypeIDField,
@@ -361,19 +365,28 @@ namespace sil_block {
     BCArray<ValueIDField>
   >;
 
+  // SIL instructions with one type, forwarding ownership, and a list of values.
+  // For OwnershipForwardingTermInst.
+  using SILOneTypeOwnershipValuesLayout = BCRecordLayout<
+    SIL_ONE_TYPE_OWNERSHIP_VALUES,
+    SILInstOpCodeField,
+    SILValueOwnershipField,
+    TypeIDField,
+    SILTypeCategoryField,
+    BCArray<ValueIDField>>;
+
   enum ApplyKind : unsigned {
     SIL_APPLY = 0,
     SIL_PARTIAL_APPLY,
     SIL_BUILTIN,
     SIL_TRY_APPLY,
-    SIL_NON_THROWING_APPLY,
-    SIL_BEGIN_APPLY,
-    SIL_NON_THROWING_BEGIN_APPLY
+    SIL_BEGIN_APPLY
   };
 
   using SILInstApplyLayout = BCRecordLayout<
     SIL_INST_APPLY,
     BCFixed<3>,           // ApplyKind
+    BCFixed<2>,           // ApplyOptions
     SubstitutionMapIDField,  // substitution map
     TypeIDField,          // callee unsubstituted type
     TypeIDField,          // callee substituted type
@@ -406,6 +419,13 @@ namespace sil_block {
     BCFixed<6>, // Optional attributes
     TypeIDField, SILTypeCategoryField, ValueIDField
   >;
+
+  // SIL instructions with one type, one typed valueref, and extra bits.
+  using SILOneTypeOneOperandExtraAttributeLayout =
+      BCRecordLayout<SIL_ONE_TYPE_ONE_OPERAND_EXTRA_ATTR, SILInstOpCodeField,
+                     BCFixed<10>, // Optional attributes
+                     TypeIDField, SILTypeCategoryField, TypeIDField,
+                     SILTypeCategoryField, ValueIDField>;
 
   // SIL instructions with two typed values.
   using SILTwoOperandsLayout = BCRecordLayout<
@@ -478,8 +498,9 @@ namespace sil_block {
     TypeIDField,
     SILTypeCategoryField,
     ValueIDField,
-    BCFixed<2>, // extractee
-    BCFixed<1>  // has explicit extractee type?
+    BCFixed<2>,  // extractee
+    BCFixed<1>,  // has explicit extractee type?
+    TypeIDField  // explicit extractee type
   >;
 
   using SILInstLinearFunctionExtractLayout = BCRecordLayout<

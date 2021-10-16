@@ -310,7 +310,7 @@ bb0(%0 : $*Runcible, %1 : $*Bendable & Runcible):
   return %7 : $()
 }
 
-protocol ClassBound : class {
+protocol ClassBound : AnyObject {
   func classBoundMethod()
 }
 
@@ -837,7 +837,7 @@ bb0(%t : $T):
   return %1 : $()
 }
 
-protocol ClassP : class {}
+protocol ClassP : AnyObject {}
 
 enum MaybePair {
   case Neither
@@ -1230,6 +1230,27 @@ bb0:
   return %2 : $()
 }
 
+// CHECK-LABEL: sil @test_alloc_stack_flags
+sil @test_alloc_stack_flags : $() -> () {
+  // CHECK: alloc_stack $Builtin.NativeObjec
+  %instance = alloc_stack $Builtin.NativeObject
+  dealloc_stack %instance : $*Builtin.NativeObject
+  // CHECK: alloc_stack [dynamic_lifetime]
+  %instance2 = alloc_stack [dynamic_lifetime] $Builtin.NativeObject
+  dealloc_stack %instance2 : $*Builtin.NativeObject
+  // CHECK: alloc_stack [lexical]
+  %instance3 = alloc_stack [lexical] $Builtin.NativeObject
+  dealloc_stack %instance3 : $*Builtin.NativeObject
+  // CHECK: alloc_stack [dynamic_lifetime] [lexical]
+  %instance4 = alloc_stack [dynamic_lifetime] [lexical] $Builtin.NativeObject
+  dealloc_stack %instance4 : $*Builtin.NativeObject
+  // CHECK: alloc_stack [dynamic_lifetime] [lexical]
+  %instance5 = alloc_stack [lexical] [dynamic_lifetime] $Builtin.NativeObject
+  dealloc_stack %instance5 : $*Builtin.NativeObject
+  %res = tuple ()
+  return %res : $()
+}
+
 sil_global @staticProp: $Int
 
 // CHECK-LABEL: sil private @globalinit_func0 : $@convention(thin) () -> () {
@@ -1267,10 +1288,11 @@ bb0:
 }
 
 // CHECK-LABEL: sil @debug_value
-sil @debug_value : $@convention(thin) (Int, @in P) -> () {
-bb0(%0 : $Int, %1 : $*P):
-  debug_value %0 : $Int        // CHECK: debug_value %0 : $Int
-  debug_value_addr %1 : $*P    // CHECK: debug_value_addr %1 : $*P
+sil @debug_value : $@convention(thin) (Int, @in P, AnyObject) -> () {
+bb0(%0 : $Int, %1 : $*P, %2 : $AnyObject):
+  debug_value %0 : $Int         // CHECK: debug_value %0 : $Int
+  debug_value [poison] %2 : $AnyObject // CHECK: debug_value [poison] %2 : $AnyObject
+  debug_value %1 : $*P, expr op_deref // CHECK: debug_value %1 : $*P, expr op_deref
   unreachable
 }
 
@@ -1570,6 +1592,18 @@ bb0(%0 : $Builtin.RawPointer, %1 : $X):
   store %1 to %3 : $*X
   // CHECK: [[T3:%.*]] = pointer_to_address {{%.*}} : $Builtin.RawPointer to [strict] $*X
   // CHECK-NEXT: store %1 to [[T3]] : $*X
+  %5 = pointer_to_address %0 : $Builtin.RawPointer to [align=1] $*X
+  store %1 to %5 : $*X
+  // CHECK: [[T4:%.*]] = pointer_to_address {{%.*}} : $Builtin.RawPointer to [align=1] $*X
+  // CHECK-NEXT: store %1 to [[T4]] : $*X
+  %7 = pointer_to_address %0 : $Builtin.RawPointer to [align=8] $*X
+  store %1 to %7 : $*X
+  // CHECK: [[T5:%.*]] = pointer_to_address {{%.*}} : $Builtin.RawPointer to [align=8] $*X
+  // CHECK-NEXT: store %1 to [[T5]] : $*X
+  %9 = pointer_to_address %0 : $Builtin.RawPointer to [align=4294967296] $*X
+  store %1 to %9 : $*X
+  // CHECK: [[T6:%.*]] = pointer_to_address {{%.*}} : $Builtin.RawPointer to [align=4294967296] $*X
+  // CHECK-NEXT: store %1 to [[T6]] : $*X
   %28 = tuple ()
   return %28 : $()
 }
@@ -1583,19 +1617,20 @@ bb0(%0 : $Builtin.RawPointer, %1 : $Builtin.Word):
   return %28 : $()
 }
 
-// CHECK-LABEL: sil @test_end_lifetime : $@convention(thin) (@owned Builtin.NativeObject) -> () {
+// CHECK-LABEL: sil [ossa] @test_end_lifetime : $@convention(thin) (@owned Builtin.NativeObject) -> () {
 // CHECK: end_lifetime {{%.*}} : $Builtin.NativeObject
-sil @test_end_lifetime : $@convention(thin) (@owned Builtin.NativeObject) -> () {
-bb0(%0 : $Builtin.NativeObject):
+sil [ossa] @test_end_lifetime : $@convention(thin) (@owned Builtin.NativeObject) -> () {
+bb0(%0 : @owned $Builtin.NativeObject):
   end_lifetime %0 : $Builtin.NativeObject
   return undef : $()
 }
 
-// CHECK-LABEL: sil @test_unchecked_ownership_conversion : $@convention(thin) (@guaranteed Builtin.NativeObject) -> () {
+// CHECK-LABEL: sil [ossa] @test_unchecked_ownership_conversion : $@convention(thin) (@guaranteed Builtin.NativeObject) -> () {
 // CHECK: unchecked_ownership_conversion {{%.*}} : $Builtin.NativeObject, @guaranteed to @owned
-sil @test_unchecked_ownership_conversion : $@convention(thin) (@guaranteed Builtin.NativeObject) -> () {
-bb0(%0 : $Builtin.NativeObject):
+sil [ossa] @test_unchecked_ownership_conversion : $@convention(thin) (@guaranteed Builtin.NativeObject) -> () {
+bb0(%0 : @guaranteed $Builtin.NativeObject):
   %1 = unchecked_ownership_conversion %0 : $Builtin.NativeObject, @guaranteed to @owned
+  end_lifetime %1 : $Builtin.NativeObject
   return undef : $()
 }
 

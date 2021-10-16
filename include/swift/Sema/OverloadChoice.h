@@ -60,6 +60,16 @@ enum class OverloadChoiceKind : int {
   TupleIndex,
 };
 
+/// The kind of implicitly unwrapped optional for an overload reference.
+enum class IUOReferenceKind : uint8_t {
+  /// This overload references an IUO value which may be directly unwrapped.
+  Value,
+
+  /// This overload references a function, the return value of which may be
+  /// unwrapped.
+  ReturnValue,
+};
+
 /// Describes a particular choice within an overload set.
 ///
 class OverloadChoice {
@@ -73,9 +83,14 @@ class OverloadChoice {
     /// optional context type, turning a "Decl" kind into
     /// "DeclViaUnwrappedOptional".
     IsDeclViaUnwrappedOptional = 0x02,
+    /// Indicates that there are viable members found on `Optional`
+    /// type and its underlying type. And current overload choice
+    /// is a backup one, which should be picked only if members
+    /// found directly on `Optional` do not match.
+    IsFallbackDeclViaUnwrappedOptional = 0x03,
     /// Indicates that this declaration was dynamic, turning a
     /// "Decl" kind into "DeclViaDynamic" kind.
-    IsDeclViaDynamic = 0x03,
+    IsDeclViaDynamic = 0x07,
   };
 
   /// The base type to be used when referencing the declaration
@@ -175,17 +190,23 @@ public:
 
   /// Retrieve an overload choice for a declaration that was found
   /// by unwrapping an optional context type.
+  ///
+  /// \param isFallback Indicates that this result should be used
+  /// as a backup, if member found directly on `Optional` doesn't
+  /// match.
   static OverloadChoice
-  getDeclViaUnwrappedOptional(Type base, ValueDecl *value,
+  getDeclViaUnwrappedOptional(Type base, ValueDecl *value, bool isFallback,
                               FunctionRefKind functionRefKind) {
     OverloadChoice result;
     result.BaseAndDeclKind.setPointer(base);
-    result.BaseAndDeclKind.setInt(IsDeclViaUnwrappedOptional);
+    result.BaseAndDeclKind.setInt(isFallback
+                                      ? IsFallbackDeclViaUnwrappedOptional
+                                      : IsDeclViaUnwrappedOptional);
     result.DeclOrKind = value;
     result.TheFunctionRefKind = functionRefKind;
     return result;
   }
-  
+
   /// Retrieve an overload choice for a declaration that was found via
   /// dynamic member lookup. The `ValueDecl` is a `subscript(dynamicMember:)`
   /// method.
@@ -219,6 +240,7 @@ public:
       case IsDeclViaBridge: return OverloadChoiceKind::DeclViaBridge;
       case IsDeclViaDynamic: return OverloadChoiceKind::DeclViaDynamic;
       case IsDeclViaUnwrappedOptional:
+      case IsFallbackDeclViaUnwrappedOptional:
         return OverloadChoiceKind::DeclViaUnwrappedOptional;
       default: return OverloadChoiceKind::Decl;
       }
@@ -246,14 +268,26 @@ public:
     return isDecl() ? getDecl() : nullptr;
   }
 
-  /// Returns true if this is either a decl for an optional that was
-  /// declared as one that can be implicitly unwrapped, or is a
-  /// function-typed decl that has a return value that is implicitly
-  /// unwrapped.
-  bool isImplicitlyUnwrappedValueOrReturnValue() const;
+  /// Retrieve the type of implicitly unwrapped optional for a reference to this
+  /// overload choice, or \c None if the choice is not for an IUO decl.
+  Optional<IUOReferenceKind>
+  getIUOReferenceKind(ConstraintSystem &cs,
+                      bool forSecondApplication = false) const;
 
   bool isKeyPathDynamicMemberLookup() const {
     return getKind() == OverloadChoiceKind::KeyPathDynamicMemberLookup;
+  }
+
+  /// Determine whether this member is a backup in case
+  /// members found directly on `Optional` didn't match.
+  bool isFallbackMemberOnUnwrappedBase() const {
+    return BaseAndDeclKind.getInt() == IsFallbackDeclViaUnwrappedOptional;
+  }
+
+  /// Whether this choice is for any kind of dynamic member lookup.
+  bool isAnyDynamicMemberLookup() const {
+    return getKind() == OverloadChoiceKind::DynamicMemberLookup ||
+           isKeyPathDynamicMemberLookup();
   }
 
   /// Get the name of the overload choice.

@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 
 # Note that this test should still "pass" when no swiftinterfaces have been
 # generated.
@@ -16,9 +16,7 @@
 
 # Expected failures by platform
 # -----------------------------
-# macosx: XCTest
-# ios: XCTest
-# tvos: XCTest
+# (none)
 
 from __future__ import print_function
 

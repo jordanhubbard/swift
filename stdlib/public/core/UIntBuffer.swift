@@ -37,9 +37,11 @@ public struct _UIntBuffer<Element: UnsignedInteger & FixedWidthInteger> {
 
 extension _UIntBuffer: Sequence {
   public typealias SubSequence = Slice<_UIntBuffer>
-  
+
   @frozen
   public struct Iterator: IteratorProtocol, Sequence {
+    public var _impl: _UIntBuffer
+
     @inlinable
     @inline(__always)
     public init(_ x: _UIntBuffer) { _impl = x }
@@ -54,8 +56,6 @@ extension _UIntBuffer: Sequence {
       }
       return Element(truncatingIfNeeded: _impl._storage)
     }
-    public
-    var _impl: _UIntBuffer
   }
   
   @inlinable
@@ -230,3 +230,5 @@ extension _UIntBuffer: RangeReplaceableCollection {
       truncatingIfNeeded: Int(_bitCount) &+ growth &* w)
   }
 }
+
+extension _UIntBuffer: Sendable where Element: Sendable { }

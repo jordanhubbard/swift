@@ -99,7 +99,7 @@ extension String {
   ///     }
   ///     // Prints "Let it snow!"
   @frozen
-  public struct UTF16View {
+  public struct UTF16View: Sendable {
     @usableFromInline
     internal var _guts: _StringGuts
 
@@ -259,7 +259,7 @@ extension String.UTF16View: BidirectionalCollection {
 
 extension String.UTF16View {
   @frozen
-  public struct Iterator: IteratorProtocol {
+  public struct Iterator: IteratorProtocol, Sendable {
     @usableFromInline
     internal var _guts: _StringGuts
 
@@ -405,6 +405,7 @@ extension String.UTF16View.Index {
   }
 }
 
+#if SWIFT_ENABLE_REFLECTION
 // Reflection
 extension String.UTF16View: CustomReflectable {
   /// Returns a mirror that reflects the UTF-16 view of a string.
@@ -412,6 +413,7 @@ extension String.UTF16View: CustomReflectable {
     return Mirror(self, unlabeledChildren: self)
   }
 }
+#endif
 
 // Slicing
 extension String.UTF16View {

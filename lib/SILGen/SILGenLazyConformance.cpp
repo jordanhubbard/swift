@@ -155,10 +155,6 @@ public:
     SGM.useConformancesFromType(ASI->getType().getASTType());
   }
 
-  void visitAllocValueBufferInst(AllocValueBufferInst *AVBI) {
-    SGM.useConformancesFromType(AVBI->getType().getASTType());
-  }
-
   void visitApplyInst(ApplyInst *AI) {
     SGM.useConformancesFromObjectiveCType(AI->getSubstCalleeType());
     SGM.useConformancesFromSubstitutions(AI->getSubstitutionMap());
@@ -324,11 +320,9 @@ void SILGenModule::emitLazyConformancesForFunction(SILFunction *F) {
 void SILGenModule::emitLazyConformancesForType(NominalTypeDecl *NTD) {
   auto genericSig = NTD->getGenericSignature();
 
-  if (genericSig) {
-    for (auto reqt : genericSig->getRequirements()) {
-      if (reqt.getKind() != RequirementKind::Layout)
-        useConformancesFromType(reqt.getSecondType()->getCanonicalType());
-    }
+  for (auto reqt : genericSig.getRequirements()) {
+    if (reqt.getKind() != RequirementKind::Layout)
+      useConformancesFromType(reqt.getSecondType()->getCanonicalType());
   }
 
   if (auto *ED = dyn_cast<EnumDecl>(NTD)) {

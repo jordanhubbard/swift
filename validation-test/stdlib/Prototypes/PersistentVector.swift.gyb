@@ -4,6 +4,7 @@
 // RUN: %target-codesign %t/a.out
 // RUN: %line-directive %t/PersistentVector.swift -- %target-run %t/a.out
 // REQUIRES: executable_test
+// REQUIRES: reflection
 
 /*
 
@@ -192,7 +193,7 @@ struct _${name}Bitmap {
 
   var setBitCount: Int {
 %   if underlyingType == 'UInt':
-#if arch(i386) || arch(arm)
+#if arch(i386) || arch(arm) || arch(arm64_32)
     return Int(Builtin.int_ctpop_Int32(_bits._value))
 #elseif arch(x86_64) || arch(arm64) || arch(powerpc64) || arch(powerpc64le) || arch(s390x)
     return Int(Builtin.int_ctpop_Int64(_bits._value))

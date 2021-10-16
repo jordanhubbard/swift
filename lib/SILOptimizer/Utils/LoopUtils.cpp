@@ -32,7 +32,7 @@ static SILBasicBlock *createInitialPreheader(SILBasicBlock *Header) {
   llvm::SmallVector<SILValue, 8> Args;
   for (auto *HeaderArg : Header->getArguments()) {
     Args.push_back(Preheader->createPhiArgument(HeaderArg->getType(),
-                                                ValueOwnershipKind::Owned));
+                                                OwnershipKind::Owned));
   }
 
   // Create the branch to the header.
@@ -127,8 +127,8 @@ static SILBasicBlock *insertBackedgeBlock(SILLoop *L, DominanceInfo *DT,
   // the backedge block which correspond to any PHI nodes in the header block.
   SmallVector<SILValue, 6> BBArgs;
   for (auto *BBArg : Header->getArguments()) {
-    BBArgs.push_back(BEBlock->createPhiArgument(BBArg->getType(),
-                                                ValueOwnershipKind::Owned));
+    BBArgs.push_back(
+        BEBlock->createPhiArgument(BBArg->getType(), OwnershipKind::Owned));
   }
 
   // Arbitrarily pick one of the predecessor's branch locations.
@@ -194,7 +194,7 @@ bool swift::canonicalizeAllLoops(DominanceInfo *DT, SILLoopInfo *LI) {
   bool MadeChange = false;
   llvm::SmallVector<std::pair<SILLoop *, bool>, 16> Worklist;
   for (auto *L : LI->getTopLevelLoops())
-    Worklist.push_back({L, L->empty()});
+    Worklist.push_back({L, L->isInnermost()});
 
   while (Worklist.size()) {
     SILLoop *L;
@@ -204,7 +204,7 @@ bool swift::canonicalizeAllLoops(DominanceInfo *DT, SILLoopInfo *LI) {
     if (!VisitedAlready) {
       Worklist.push_back({L, true});
       for (auto *Subloop : L->getSubLoopRange()) {
-        Worklist.push_back({Subloop, Subloop->empty()});
+        Worklist.push_back({Subloop, Subloop->isInnermost()});
       }
       continue;
     }
@@ -225,7 +225,7 @@ void SILLoopVisitor::run() {
   // worklist.
   llvm::SmallVector<std::pair<SILLoop *, bool>, 32> Worklist;
   for (auto *L : LI->getTopLevelLoops()) {
-    Worklist.push_back({L, L->empty()});
+    Worklist.push_back({L, L->isInnermost()});
   }
 
   while (Worklist.size()) {
@@ -236,7 +236,7 @@ void SILLoopVisitor::run() {
     if (!Visited) {
       Worklist.push_back({L, true});
       for (auto *SubLoop : L->getSubLoops()) {
-        Worklist.push_back({SubLoop, SubLoop->empty()});
+        Worklist.push_back({SubLoop, SubLoop->isInnermost()});
       }
       continue;
     }

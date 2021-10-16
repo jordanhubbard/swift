@@ -27,8 +27,8 @@ func h() {}
 #else /* aaa */
 #endif /* bbb */
 
-#if foo.bar() 
-      .baz() // expected-error {{unexpected platform condition (expected 'os', 'arch', or 'swift')}}
+#if foo.bar() // expected-error {{unexpected platform condition (expected 'os', 'arch', or 'swift')}}
+      .baz()
 
 #endif
 
@@ -98,7 +98,7 @@ func fn_j() {}
 #endif
 fn_j() // OK
 
-#if foo || bar || nonExistent() // expected-error {{expected only one argument to platform condition}}
+#if foo || bar || nonExistent() // expected-error {{expected argument to platform condition}}
 #endif
 
 #if FOO = false
@@ -168,3 +168,8 @@ undefinedFunc() // expected-error {{cannot find 'undefinedFunc' in scope}}
 #else
 if true {}
 #endif // OK
+
+// rdar://83017601 Make sure we don't crash
+#if canImport()
+// expected-error@-1 {{expected argument to platform condition}}
+#endif

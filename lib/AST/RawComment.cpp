@@ -22,7 +22,9 @@
 #include "swift/AST/FileUnit.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/PrimitiveParsing.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Markup/Markup.h"
@@ -59,71 +61,70 @@ SingleRawComment::SingleRawComment(CharSourceRange Range,
                                    const SourceManager &SourceMgr)
     : Range(Range), RawText(SourceMgr.extractText(Range)),
       Kind(static_cast<unsigned>(getCommentKind(RawText))) {
-  auto StartLineAndColumn =
-      SourceMgr.getPresumedLineAndColumnForLoc(Range.getStart());
-  StartLine = StartLineAndColumn.first;
-  StartColumn = StartLineAndColumn.second;
-  EndLine = SourceMgr.getLineAndColumnInBuffer(Range.getEnd()).first;
+  ColumnIndent = SourceMgr.getLineAndColumnInBuffer(Range.getStart()).second;
 }
 
-SingleRawComment::SingleRawComment(StringRef RawText, unsigned StartColumn)
+SingleRawComment::SingleRawComment(StringRef RawText, unsigned ColumnIndent)
     : RawText(RawText), Kind(static_cast<unsigned>(getCommentKind(RawText))),
-      StartColumn(StartColumn), StartLine(0), EndLine(0) {}
+      ColumnIndent(ColumnIndent) {}
 
-static void addCommentToList(SmallVectorImpl<SingleRawComment> &Comments,
-                             const SingleRawComment &SRC) {
-  // TODO: consider producing warnings when we decide not to merge comments.
-
-  if (SRC.isOrdinary()) {
-    // Skip gyb comments that are line number markers.
-    if (SRC.RawText.startswith("// ###"))
-      return;
-
-    Comments.clear();
-    return;
-  }
-
-  // If this is the first documentation comment, save it (because there isn't
-  // anything to merge it with).
-  if (Comments.empty()) {
-    Comments.push_back(SRC);
-    return;
-  }
-
-  auto &Last = Comments.back();
-
-  // Merge comments if they are on same or consecutive lines.
-  if (Last.EndLine + 1 < SRC.StartLine) {
-    Comments.clear();
-    return;
-  }
-
-  Comments.push_back(SRC);
-}
-
+/// Converts a range of comments (ordinary or doc) to a \c RawComment with
+/// only the last range of doc comments. Gyb comments, ie. "// ###" are skipped
+/// entirely as if they did not exist (so two doc comments would still be
+/// merged if there was a gyb comment inbetween).
 static RawComment toRawComment(ASTContext &Context, CharSourceRange Range) {
   if (Range.isInvalid())
     return RawComment();
 
-  auto &SourceMgr = Context.SourceMgr;
-  unsigned BufferID = SourceMgr.findBufferContainingLoc(Range.getStart());
-  unsigned Offset = SourceMgr.getLocOffsetInBuffer(Range.getStart(), BufferID);
-  unsigned EndOffset = SourceMgr.getLocOffsetInBuffer(Range.getEnd(), BufferID);
+  auto &SM = Context.SourceMgr;
+  unsigned BufferID = SM.findBufferContainingLoc(Range.getStart());
+  unsigned Offset = SM.getLocOffsetInBuffer(Range.getStart(), BufferID);
+  unsigned EndOffset = SM.getLocOffsetInBuffer(Range.getEnd(), BufferID);
   LangOptions FakeLangOpts;
-  Lexer L(FakeLangOpts, SourceMgr, BufferID, nullptr, LexerMode::Swift,
-          HashbangMode::Disallowed,
-          CommentRetentionMode::ReturnAsTokens,
-          TriviaRetentionMode::WithoutTrivia,
-          Offset, EndOffset);
+  Lexer L(FakeLangOpts, SM, BufferID, nullptr, LexerMode::Swift,
+          HashbangMode::Disallowed, CommentRetentionMode::ReturnAsTokens,
+          TriviaRetentionMode::WithoutTrivia, Offset, EndOffset);
+
   SmallVector<SingleRawComment, 16> Comments;
   Token Tok;
+  unsigned LastEnd = 0;
   while (true) {
     L.lex(Tok);
     if (Tok.is(tok::eof))
       break;
     assert(Tok.is(tok::comment));
-    addCommentToList(Comments, SingleRawComment(Tok.getRange(), SourceMgr));
+
+    auto SRC = SingleRawComment(Tok.getRange(), SM);
+    unsigned Start =
+        SM.getLineAndColumnInBuffer(Tok.getRange().getStart()).first;
+    unsigned End = SM.getLineAndColumnInBuffer(Tok.getRange().getEnd()).first;
+    if (SRC.RawText.back() == '\n')
+      End--;
+
+    if (SRC.isOrdinary()) {
+      // If there's a normal comment then reset the current group, unless it's
+      // a gyb comment in which case we should just skip it.
+      if (SRC.isGyb())
+        LastEnd = End;
+      else
+        Comments.clear();
+      continue;
+    }
+
+    // Merge and keep the *last* group, ie. if there's:
+    //   <comment1>
+    //   <whitespace>
+    //   <comment2>
+    //   <comment3>
+    // Only keep <comment2/3> and group into the one RawComment.
+
+    if (!Comments.empty() && Start > LastEnd + 1)
+      Comments.clear();
+    Comments.push_back(SRC);
+
+    LastEnd = End;
   }
+
   RawComment Result;
   Result.Comments = Context.AllocateCopy(Comments);
   return Result;
@@ -135,44 +136,65 @@ RawComment Decl::getRawComment(bool SerializedOK) const {
 
   // Check the cache in ASTContext.
   auto &Context = getASTContext();
-  if (Optional<RawComment> RC = Context.getRawComment(this))
-    return RC.getValue();
+  if (Optional<std::pair<RawComment, bool>> RC = Context.getRawComment(this)) {
+    auto P = RC.getValue();
+    if (!SerializedOK || P.second)
+      return P.first;
+  }
 
   // Check the declaration itself.
   if (auto *Attr = getAttrs().getAttribute<RawDocCommentAttr>()) {
     RawComment Result = toRawComment(Context, Attr->getCommentRange());
-    Context.setRawComment(this, Result);
+    Context.setRawComment(this, Result, true);
     return Result;
   }
 
-  // Ask the parent module.
-  if (auto *Unit =
-          dyn_cast<FileUnit>(this->getDeclContext()->getModuleScopeContext())) {
-    if (SerializedOK) {
-      if (const auto *CachedLocs = getSerializedLocs()) {
-        if (!CachedLocs->DocRanges.empty()) {
-          SmallVector<SingleRawComment, 4> SRCs;
-          for (const auto &Range : CachedLocs->DocRanges) {
-            SRCs.push_back({ Range, Context.SourceMgr });
-          }
-          auto RC = RawComment(Context.AllocateCopy(llvm::makeArrayRef(SRCs)));
+  if (!getDeclContext())
+    return RawComment();
+  auto *Unit = dyn_cast<FileUnit>(getDeclContext()->getModuleScopeContext());
+  if (!Unit)
+    return RawComment();
 
-          if (!RC.isEmpty()) {
-            Context.setRawComment(this, RC);
-            return RC;
+  switch (Unit->getKind()) {
+  case FileUnitKind::SerializedAST: {
+    if (SerializedOK) {
+      auto *CachedLocs = getSerializedLocs();
+      if (!CachedLocs->DocRanges.empty()) {
+        SmallVector<SingleRawComment, 4> SRCs;
+        for (const auto &Range : CachedLocs->DocRanges) {
+          if (Range.isValid()) {
+            SRCs.push_back({Range, Context.SourceMgr});
+          } else {
+            // if we've run into an invalid range, don't bother trying to load
+            // any of the other comments
+            SRCs.clear();
+            break;
           }
+        }
+
+        if (!SRCs.empty()) {
+          auto RC = RawComment(Context.AllocateCopy(llvm::makeArrayRef(SRCs)));
+          Context.setRawComment(this, RC, true);
+          return RC;
         }
       }
     }
 
     if (Optional<CommentInfo> C = Unit->getCommentForDecl(this)) {
-      Context.setRawComment(this, C->Raw);
+      Context.setRawComment(this, C->Raw, false);
       return C->Raw;
     }
-  }
 
-  // Give up.
-  return RawComment();
+    return RawComment();
+  }
+  case FileUnitKind::Source:
+  case FileUnitKind::Builtin:
+  case FileUnitKind::Synthesized:
+  case FileUnitKind::ClangModule:
+  case FileUnitKind::DWARFModule:
+    return RawComment();
+  }
+  llvm_unreachable("invalid file kind");
 }
 
 static const Decl* getGroupDecl(const Decl *D) {

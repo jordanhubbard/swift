@@ -11,13 +11,15 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "condbranch-forwarding"
+#include "swift/SIL/BasicBlockBits.h"
+#include "swift/SIL/DebugUtils.h"
+#include "swift/SIL/OwnershipUtils.h"
+#include "swift/SIL/SILArgument.h"
+#include "swift/SIL/SILBuilder.h"
+#include "swift/SIL/SILInstruction.h"
+#include "swift/SIL/SILUndef.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
-#include "swift/SIL/SILInstruction.h"
-#include "swift/SIL/SILArgument.h"
-#include "swift/SIL/DebugUtils.h"
-#include "swift/SIL/SILBuilder.h"
-#include "swift/SIL/SILUndef.h"
 
 using namespace swift;
 
@@ -100,15 +102,12 @@ private:
 
   /// The entry point to the transformation.
   void run() override {
-    LLVM_DEBUG(llvm::dbgs() << "** StackPromotion **\n");
-
     bool Changed = false;
 
     SILFunction *F = getFunction();
 
-    // FIXME: Add ownership support.
-    if (F->hasOwnership())
-      return;
+    LLVM_DEBUG(llvm::dbgs()
+               << "** ConditionForwarding on " << F->getName() << " **\n");
 
     for (SILBasicBlock &BB : *F) {
       if (auto *SEI = dyn_cast<SwitchEnumInst>(BB.getTerminator())) {
@@ -142,6 +141,11 @@ static bool hasNoRelevantSideEffects(SILBasicBlock *BB) {
         return false;
       continue;
     }
+    if (isa<BeginBorrowInst>(&I) || isa<EndBorrowInst>(&I)) {
+      continue;
+    }
+    LLVM_DEBUG(llvm::dbgs() << "Bailing out, found inst with side-effects ");
+    LLVM_DEBUG(I.dump());
     return false;
   }
   return true;
@@ -225,10 +229,19 @@ bool ConditionForwarding::tryOptimize(SwitchEnumInst *SEI) {
   if (CommonBranchBlock->getSuccessors().size() != PredBlocks.size())
     return false;
 
+  if (getFunction()->hasOwnership()) {
+    // TODO: Currently disabled because this case may need lifetime extension
+    // Disabling this conservatively for now.
+    assert(Condition->getNumOperands() == 1);
+    BorrowedValue conditionOp(Condition->getOperand(0));
+    if (conditionOp && conditionOp.isLocalScope()) {
+      return false;
+    }
+  }
   // Now do the transformation!
   // First thing to do is to replace all uses of the Enum (= the merging block
   // argument), as this argument gets deleted.
-  llvm::SmallPtrSet<SILBasicBlock *, 4> NeedEnumArg;
+  BasicBlockSet NeedEnumArg(BB->getParent());
   while (!Arg->use_empty()) {
     Operand *ArgUse = *Arg->use_begin();
     SILInstruction *ArgUser = ArgUse->getUser();
@@ -244,10 +257,10 @@ bool ConditionForwarding::tryOptimize(SwitchEnumInst *SEI) {
       // pass the corresponding enum to the block. This argument will be deleted
       // by a subsequent SimplifyCFG.
       SILArgument *NewArg = nullptr;
-      if (NeedEnumArg.insert(UseBlock).second) {
+      if (NeedEnumArg.insert(UseBlock)) {
         // The first Enum use in this UseBlock.
         NewArg = UseBlock->createPhiArgument(Arg->getType(),
-                                             ValueOwnershipKind::Owned);
+                                             Arg->getOwnershipKind());
       } else {
         // We already inserted the Enum argument for this UseBlock.
         assert(UseBlock->getNumArguments() >= 1);
@@ -271,7 +284,7 @@ bool ConditionForwarding::tryOptimize(SwitchEnumInst *SEI) {
     SILBasicBlock *SEDest = SEI->getCaseDestination(EI->getElement());
     SILBuilder B(BI);
     llvm::SmallVector<SILValue, 2> BranchArgs;
-    unsigned HasEnumArg = NeedEnumArg.count(SEDest);
+    unsigned HasEnumArg = NeedEnumArg.contains(SEDest);
     if (SEDest->getNumArguments() == 1 + HasEnumArg) {
       // The successor block has an original argument, which is the Enum's
       // payload.
@@ -280,10 +293,30 @@ bool ConditionForwarding::tryOptimize(SwitchEnumInst *SEI) {
     if (HasEnumArg) {
       // The successor block has a new argument (which we created above) where
       // we have to pass the Enum.
+      assert(!getFunction()->hasOwnership() ||
+             EI->getType().isTrivial(*getFunction()));
       BranchArgs.push_back(EI);
     }
     B.createBranch(BI->getLoc(), SEDest, BranchArgs);
     BI->eraseFromParent();
+    if (EI->use_empty()) {
+      assert(!HasEnumArg);
+      EI->eraseFromParent();
+    } else {
+      // If an @owned EI has uses remaining, ownership fixup is needed.
+      // 1. Create a copy_value of EI's operand and
+      // use it in the branch to avoid a double-consume.
+      // 2. Create a destroy_value of EI, to avoid a leak.
+      if (getFunction()->hasOwnership() && EI->hasOperand() &&
+          EI->getOwnershipKind() == OwnershipKind::Owned) {
+        auto *term = EI->getParent()->getTerminator();
+        assert(!HasEnumArg);
+        auto *copy = SILBuilderWithScope(EI).createCopyValue(EI->getLoc(),
+                                                             EI->getOperand());
+        term->getOperandRef(0).set(copy);
+        SILBuilderWithScope(term).createDestroyValue(EI->getLoc(), EI);
+      }
+    }
   }
 
   // Final step: replace the switch_enum by the condition.

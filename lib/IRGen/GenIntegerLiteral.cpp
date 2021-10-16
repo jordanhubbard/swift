@@ -16,9 +16,10 @@
 
 #include "GenIntegerLiteral.h"
 
+#include "swift/ABI/MetadataValues.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/GlobalVariable.h"
-#include "swift/ABI/MetadataValues.h"
 
 #include "BitPatternBuilder.h"
 #include "Explosion.h"
@@ -36,13 +37,13 @@ namespace {
 
 /// A TypeInfo implementation for Builtin.IntegerLiteral.
 class IntegerLiteralTypeInfo :
-  public ScalarPairTypeInfo<IntegerLiteralTypeInfo, LoadableTypeInfo> {
+  public TrivialScalarPairTypeInfo<IntegerLiteralTypeInfo, LoadableTypeInfo> {
 
 public:
   IntegerLiteralTypeInfo(llvm::StructType *storageType,
                          Size size, Alignment align, SpareBitVector &&spareBits)
-      : ScalarPairTypeInfo(storageType, size, std::move(spareBits), align,
-                           IsPOD, IsFixedSize) {}
+      : TrivialScalarPairTypeInfo(storageType, size, std::move(spareBits), align,
+                                  IsPOD, IsFixedSize) {}
 
   static Size getFirstElementSize(IRGenModule &IGM) {
     return IGM.getPointerSize();
@@ -50,22 +51,11 @@ public:
   static StringRef getFirstElementLabel() {
     return ".data";
   }
-  static bool isFirstElementTrivial() {
-    return true;
-  }
 
   TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                         SILType T) const override {
-    return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
-  }
-
-  void emitRetainFirstElement(IRGenFunction &IGF, llvm::Value *fn,
-                              Optional<Atomicity> atomicity = None) const {}
-  void emitReleaseFirstElement(IRGenFunction &IGF, llvm::Value *fn,
-                               Optional<Atomicity> atomicity = None) const {}
-  void emitAssignFirstElement(IRGenFunction &IGF, llvm::Value *fn,
-                              Address fnAddr) const {
-    IGF.Builder.CreateStore(fn, fnAddr);
+    return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
+                                                      ScalarKind::POD);
   }
 
   static Size getSecondElementOffset(IRGenModule &IGM) {
@@ -76,17 +66,6 @@ public:
   }
   static StringRef getSecondElementLabel() {
     return ".flags";
-  }
-  bool isSecondElementTrivial() const {
-    return true;
-  }
-  void emitRetainSecondElement(IRGenFunction &IGF, llvm::Value *data,
-                               Optional<Atomicity> atomicity = None) const {}
-  void emitReleaseSecondElement(IRGenFunction &IGF, llvm::Value *data,
-                                Optional<Atomicity> atomicity = None) const {}
-  void emitAssignSecondElement(IRGenFunction &IGF, llvm::Value *context,
-                               Address dataAddr) const {
-    IGF.Builder.CreateStore(context, dataAddr);
   }
 
   // The data pointer isn't a heap object, but it is an aligned pointer.
@@ -200,12 +179,12 @@ ConstantIntegerLiteralMap::get(IRGenModule &IGM, APInt &&value) {
   // TODO: make this shared within the image
   auto arrayTy = llvm::ArrayType::get(IGM.SizeTy, numChunks);
   auto initV = llvm::ConstantArray::get(arrayTy, chunks);
-  auto globalArray =
-    new llvm::GlobalVariable(*IGM.getModule(), arrayTy, /*constant*/ true,
-                             llvm::GlobalVariable::PrivateLinkage, initV,
-                             IGM.EnableValueNames
-                               ? Twine("intliteral.") + value.toString(10, true)
-                               : "");
+  auto globalArray = new llvm::GlobalVariable(
+      *IGM.getModule(), arrayTy, /*constant*/ true,
+      llvm::GlobalVariable::PrivateLinkage, initV,
+      IGM.EnableValueNames
+          ? Twine("intliteral.") + llvm::toString(value, 10, true)
+          : "");
   globalArray->setUnnamedAddr(llvm::GlobalVariable::UnnamedAddr::Global);
 
   // Various clients expect this to be a i64*, not an [N x i64]*, so cast down.

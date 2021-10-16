@@ -26,6 +26,24 @@
 using namespace swift;
 using namespace swift::Lowering;
 
+/// Find an opened archetype represented by this type.
+/// It is assumed by this method that the type contains
+/// at most one opened archetype.
+/// Typically, it would be called from a type visitor.
+/// It checks only the type itself, but does not try to
+/// recursively check any children of this type, because
+/// this is the task of the type visitor invoking it.
+/// \returns The found archetype or empty type otherwise.
+CanArchetypeType swift::getOpenedArchetypeOf(CanType Ty) {
+  if (!Ty)
+    return CanArchetypeType();
+  while (auto MetaTy = dyn_cast<AnyMetatypeType>(Ty))
+    Ty = MetaTy.getInstanceType();
+  if (Ty->isOpenedExistential())
+    return cast<ArchetypeType>(Ty);
+  return CanArchetypeType();
+}
+
 SILType SILType::getExceptionType(const ASTContext &C) {
   return SILType::getPrimitiveObjectType(C.getExceptionType());
 }
@@ -84,6 +102,30 @@ bool SILType::isTrivial(const SILFunction &F) const {
   auto contextType = hasTypeParameter() ? F.mapTypeIntoContext(*this) : *this;
   
   return F.getTypeLowering(contextType).isTrivial();
+}
+
+bool SILType::isEmpty(const SILFunction &F) const {
+  if (auto tupleTy = getAs<TupleType>()) {
+    // A tuple is empty if it either has no elements or if all elements are
+    // empty.
+    for (unsigned idx = 0, num = tupleTy->getNumElements(); idx < num; ++idx) {
+      if (!getTupleElementType(idx).isEmpty(F))
+        return false;
+    }
+    return true;
+  }
+  if (StructDecl *structDecl = getStructOrBoundGenericStruct()) {
+    // Also, a struct is empty if it either has no fields or if all fields are
+    // empty.
+    SILModule &module = F.getModule();
+    TypeExpansionContext typeEx = F.getTypeExpansionContext();
+    for (VarDecl *field : structDecl->getStoredProperties()) {
+      if (!getFieldType(field, module, typeEx).isEmpty(F))
+        return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 bool SILType::isReferenceCounted(SILModule &M) const {
@@ -147,7 +189,7 @@ SILType SILType::getFieldType(VarDecl *field, TypeConverter &TC,
     substFieldTy = origFieldTy.getType();
   } else {
     substFieldTy =
-      getASTType()->getTypeOfMember(&TC.M, field, nullptr)->getCanonicalType();
+      getASTType()->getTypeOfMember(&TC.M, field)->getCanonicalType();
   }
 
   auto loweredTy =
@@ -193,6 +235,12 @@ SILType SILType::getEnumElementType(EnumElementDecl *elt, TypeConverter &TC,
 SILType SILType::getEnumElementType(EnumElementDecl *elt, SILModule &M,
                                     TypeExpansionContext context) const {
   return getEnumElementType(elt, M.Types, context);
+}
+
+SILType SILType::getEnumElementType(EnumElementDecl *elt,
+                                    SILFunction *fn) const {
+  return getEnumElementType(elt, fn->getModule(),
+                            fn->getTypeExpansionContext());
 }
 
 bool SILType::isLoadableOrOpaque(const SILFunction &F) const {
@@ -433,17 +481,16 @@ SILResultInfo::getOwnershipKind(SILFunction &F,
       getSILStorageType(M, FTy, TypeExpansionContext::minimal()).isTrivial(F);
   switch (getConvention()) {
   case ResultConvention::Indirect:
-    return SILModuleConventions(M).isSILIndirect(*this)
-               ? ValueOwnershipKind::None
-               : ValueOwnershipKind::Owned;
+    return SILModuleConventions(M).isSILIndirect(*this) ? OwnershipKind::None
+                                                        : OwnershipKind::Owned;
   case ResultConvention::Autoreleased:
   case ResultConvention::Owned:
-    return ValueOwnershipKind::Owned;
+    return OwnershipKind::Owned;
   case ResultConvention::Unowned:
   case ResultConvention::UnownedInnerPointer:
     if (IsTrivial)
-      return ValueOwnershipKind::None;
-    return ValueOwnershipKind::Unowned;
+      return OwnershipKind::None;
+    return OwnershipKind::Unowned;
   }
 
   llvm_unreachable("Unhandled ResultConvention in switch.");
@@ -632,8 +679,8 @@ bool SILType::isDifferentiable(SILModule &M) const {
 
 Type
 TypeBase::replaceSubstitutedSILFunctionTypesWithUnsubstituted(SILModule &M) const {
-  return Type(const_cast<TypeBase*>(this)).transform([&](Type t) -> Type {
-    if (auto f = t->getAs<SILFunctionType>()) {
+  return Type(const_cast<TypeBase *>(this)).transform([&](Type t) -> Type {
+    if (auto *f = t->getAs<SILFunctionType>()) {
       auto sft = f->getUnsubstitutedType(M);
       
       // Also eliminate substituted function types in the arguments, yields,
@@ -693,4 +740,12 @@ bool SILType::isEffectivelyExhaustiveEnumType(SILFunction *f) {
   assert(decl && "Called for a non enum type");
   return decl->isEffectivelyExhaustive(f->getModule().getSwiftModule(),
                                        f->getResilienceExpansion());
+}
+
+SILType SILType::getSILBoxFieldType(const SILFunction *f, unsigned field) {
+  auto *boxTy = getASTType()->getAs<SILBoxType>();
+  if (!boxTy)
+    return SILType();
+  return ::getSILBoxFieldType(f->getTypeExpansionContext(), boxTy,
+                              f->getModule().Types, field);
 }

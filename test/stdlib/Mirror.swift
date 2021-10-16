@@ -24,6 +24,7 @@
 
 // REQUIRES: executable_test
 // REQUIRES: shell
+// REQUIRES: reflection
 
 import StdlibUnittest
 
@@ -514,7 +515,7 @@ mirrors.test("struct/WrapNSArray") {
 // Check that Mirror correctly reflects weak/unowned refs to both
 // Swift and ObjC objects from Swift structs and classes.
 
-protocol WeakUnownedTestsP1: class {
+protocol WeakUnownedTestsP1: AnyObject {
   func f1() -> Int
 }
 

@@ -68,6 +68,7 @@ struct TestOptions {
   std::string moduleCachePath;
   bool rawOutput = false;
   bool structureOutput = false;
+  bool disableImplicitConcurrencyModuleImport = false;
   ArrayRef<const char *> compilerArgs;
 };
 } // end anonymous namespace
@@ -254,6 +255,8 @@ static bool parseOptions(ArrayRef<const char *> args, TestOptions &options,
       options.showTopNonLiteral = uval;
     } else if (opt == "module-cache-path") {
       options.moduleCachePath = value.str();
+    } else if (opt == "disable-implicit-concurrency-module-import") {
+      options.disableImplicitConcurrencyModuleImport = true;
     }
   }
 
@@ -565,6 +568,7 @@ public:
 static void printResponse(sourcekitd_response_t resp, bool raw, bool structure,
                           unsigned indentation) {
   if (raw) {
+    llvm::outs().flush();
     sourcekitd_response_description_dump_filedesc(resp, STDOUT_FILENO);
     return;
   }
@@ -683,6 +687,12 @@ static bool codeCompleteRequest(sourcekitd_uid_t requestUID, const char *name,
     // Add -- options.
     for (const char *arg : options.compilerArgs)
       sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND, arg);
+    if (options.disableImplicitConcurrencyModuleImport) {
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-Xfrontend");
+      sourcekitd_request_array_set_string(args, SOURCEKITD_ARRAY_APPEND,
+          "-disable-implicit-concurrency-module-import");
+    }
   }
   sourcekitd_request_dictionary_set_value(request, KeyCompilerArgs, args);
   sourcekitd_request_release(args);

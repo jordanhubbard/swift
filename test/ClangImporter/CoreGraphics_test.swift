@@ -24,7 +24,8 @@ public func testEnums(_ model: CGColorSpaceModel) -> Int {
   }
 // CHECK:   [[GEP:%.+]] = getelementptr inbounds [8 x i64], [8 x i64]* [[SWITCHTABLE]], i64 0, i64 %{{.*}}
 // CHECK:   [[LOAD:%.+]] = load i64, i64* [[GEP]], align 8
-// CHECK:   ret i64 [[LOAD]]
+// CHECK:   [[PHI:%.*]] = phi i64 [ [[LOAD]], %{{.*}} ], [ -1, %{{.*}} ]
+// CHECK:   ret i64 [[PHI]] 
 }
 
 // CHECK-LABEL: define swiftcc void {{.*}}rotationAround{{.*}} {
@@ -116,8 +117,8 @@ public func testRenames(transform: CGAffineTransform, context: CGContext,
 
   context.clip(to: rect)
   context.clip(to: rect, mask: image)
-// CHECK:   call void @CGContextClipToRect(%struct.CGContext* [[CONTEXT]], %struct.CGRect* nonnull byval align 8 %{{.*}})
-// CHECK:   call void @CGContextClipToMask(%struct.CGContext* [[CONTEXT]], %struct.CGRect* nonnull byval align 8 %{{.*}}, %struct.CGImage* %{{.*}})
+// CHECK:   call void @CGContextClipToRect(%struct.CGContext* [[CONTEXT]], %struct.CGRect* nonnull byval({{.*}}) align 8 %{{.*}})
+// CHECK:   call void @CGContextClipToMask(%struct.CGContext* [[CONTEXT]], %struct.CGRect* nonnull byval({{.*}}) align 8 %{{.*}}, %struct.CGImage* %{{.*}})
 
   var slice = CGRect.zero
   var remainder = CGRect.zero
@@ -125,7 +126,7 @@ public func testRenames(transform: CGAffineTransform, context: CGContext,
           from: edge)
   assert((slice, remainder) == rect.divided(atDistance: CGFloat(2.0),
                                             from: edge))
-// CHECK:   call void @CGRectDivide(%struct.CGRect* nonnull byval align 8 %{{.*}}, %struct.CGRect* nonnull %{{.*}}, %struct.CGRect* nonnull %{{.*}}, double {{2\.0+.*}}, i32 %{{.*}})
+// CHECK:   call void @CGRectDivide(%struct.CGRect* nonnull byval({{.*}}) align 8 %{{.*}}, %struct.CGRect* nonnull %{{.*}}, %struct.CGRect* nonnull %{{.*}}, double {{2\.0+.*}}, i32 %{{.*}})
 //
 // CHECK:   ret void
 }

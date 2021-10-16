@@ -20,6 +20,7 @@
 #include "swift/AST/SILOptions.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Basic/LLVMInitialize.h"
+#include "swift/Basic/InitializeLibSwift.h"
 #include "swift/Frontend/DiagnosticVerifier.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
@@ -103,6 +104,14 @@ static llvm::cl::opt<bool>
 EnableExperimentalConcurrency("enable-experimental-concurrency",
                    llvm::cl::desc("Enable experimental concurrency model."));
 
+static llvm::cl::opt<bool> EnableExperimentalLexicalLifetimes(
+    "enable-experimental-lexical-lifetimes",
+    llvm::cl::desc("Enable experimental lexical lifetimes."));
+
+static llvm::cl::opt<bool>
+EnableExperimentalDistributed("enable-experimental-distributed",
+                   llvm::cl::desc("Enable experimental distributed actors."));
+
 static llvm::cl::opt<bool>
 VerifyExclusivity("enable-verify-exclusivity",
                   llvm::cl::desc("Verify the access markers used to enforce exclusivity."));
@@ -111,12 +120,26 @@ static llvm::cl::opt<bool>
 EnableSpeculativeDevirtualization("enable-spec-devirt",
                   llvm::cl::desc("Enable Speculative Devirtualization pass."));
 
+static llvm::cl::opt<bool> EnableOSSAModules(
+    "enable-ossa-modules",
+    llvm::cl::desc("Do we always serialize SIL in OSSA form? If "
+                   "this is disabled we do not serialize in OSSA "
+                   "form when optimizing."));
+
+static llvm::cl::opt<bool> EnableCopyPropagation(
+    "enable-copy-propagation",
+    llvm::cl::desc("Enable the copy propagation pass."));
+
+static llvm::cl::opt<bool> DisableCopyPropagation(
+    "disable-copy-propagation",
+    llvm::cl::desc("Disable the copy propagation pass."));
+
 namespace {
-enum EnforceExclusivityMode {
+enum class EnforceExclusivityMode {
   Unchecked, // static only
   Checked,   // static and dynamic
   DynamicOnly,
-  None
+  None,
 };
 } // end anonymous namespace
 
@@ -180,11 +203,34 @@ static llvm::cl::opt<int>
 SILInlineThreshold("sil-inline-threshold", llvm::cl::Hidden,
                    llvm::cl::init(-1));
 
+// Legacy option name still in use. The frontend uses -sil-verify-all.
 static llvm::cl::opt<bool>
 EnableSILVerifyAll("enable-sil-verify-all",
                    llvm::cl::Hidden,
                    llvm::cl::init(true),
                    llvm::cl::desc("Run sil verifications after every pass."));
+
+static llvm::cl::opt<bool>
+SILVerifyAll("sil-verify-all",
+             llvm::cl::Hidden,
+             llvm::cl::init(true),
+             llvm::cl::desc("Run sil verifications after every pass."));
+
+static llvm::cl::opt<bool>
+SILVerifyNone("sil-verify-none",
+              llvm::cl::Hidden,
+              llvm::cl::init(false),
+              llvm::cl::desc("Completely disable SIL verification"));
+
+/// Customize the default behavior
+static llvm::cl::opt<bool> EnableASTVerifier(
+    "enable-ast-verifier", llvm::cl::Hidden, llvm::cl::init(false),
+    llvm::cl::desc("Override the default behavior and Enable the ASTVerifier"));
+
+static llvm::cl::opt<bool> DisableASTVerifier(
+    "disable-ast-verifier", llvm::cl::Hidden, llvm::cl::init(false),
+    llvm::cl::desc(
+        "Override the default behavior and force disable the ASTVerifier"));
 
 static llvm::cl::opt<bool>
 RemoveRuntimeAsserts("remove-runtime-asserts",
@@ -198,6 +244,9 @@ EmitVerboseSIL("emit-verbose-sil",
 
 static llvm::cl::opt<bool>
 EmitSIB("emit-sib", llvm::cl::desc("Emit serialized AST + SIL file(s)"));
+
+static llvm::cl::opt<bool>
+Serialize("serialize", llvm::cl::desc("Emit serialized AST + SIL file(s)"));
 
 static llvm::cl::opt<std::string>
 ModuleCachePath("module-cache-path", llvm::cl::desc("Clang module cache path"));
@@ -282,6 +331,11 @@ static llvm::cl::opt<bool>
                        llvm::cl::desc("Ignore [always_inline] attribute."),
                        llvm::cl::init(false));
 
+static llvm::cl::opt<std::string> EnableRequirementMachine(
+    "requirement-machine",
+    llvm::cl::desc("Control usage of experimental generics implementation: "
+                   "'on', 'off', or 'verify'."));
+
 static void runCommandLineSelectedPasses(SILModule *Module,
                                          irgen::IRGenModule *IRGenMod) {
   auto &opts = Module->getOptions();
@@ -291,6 +345,22 @@ static void runCommandLineSelectedPasses(SILModule *Module,
 
   if (Module->getOptions().VerifyAll)
     Module->verify();
+}
+
+namespace {
+using ASTVerifierOverrideKind = LangOptions::ASTVerifierOverrideKind;
+} // end anonymous namespace
+
+static Optional<ASTVerifierOverrideKind> getASTOverrideKind() {
+  assert(!(EnableASTVerifier && DisableASTVerifier) &&
+         "Can only set one of EnableASTVerifier/DisableASTVerifier?!");
+  if (EnableASTVerifier)
+    return ASTVerifierOverrideKind::EnableVerifier;
+
+  if (DisableASTVerifier)
+    return ASTVerifierOverrideKind::DisableVerifier;
+
+  return None;
 }
 
 // This function isn't referenced outside its translation unit, but it
@@ -307,6 +377,8 @@ int main(int argc, char **argv) {
   llvm::EnablePrettyStackTraceOnSigInfoForThisThread();
 
   llvm::cl::ParseCommandLineOptions(argc, argv, "Swift SIL optimizer\n");
+
+  initializeLibSwift();
 
   if (PrintStats)
     llvm::EnableStatistics();
@@ -342,13 +414,16 @@ int main(int argc, char **argv) {
   // cache.
   Invocation.getClangImporterOptions().ModuleCachePath = ModuleCachePath;
   Invocation.setParseStdlib();
-  Invocation.getLangOptions().DisableParserLookup = true;
   Invocation.getLangOptions().DisableAvailabilityChecking = true;
   Invocation.getLangOptions().EnableAccessControl = false;
   Invocation.getLangOptions().EnableObjCAttrRequiresFoundation = false;
-  
+  if (auto overrideKind = getASTOverrideKind()) {
+    Invocation.getLangOptions().ASTVerifierOverride = *overrideKind;
+  }
   Invocation.getLangOptions().EnableExperimentalConcurrency =
     EnableExperimentalConcurrency;
+  Invocation.getLangOptions().EnableExperimentalDistributed =
+    EnableExperimentalDistributed;
 
   Invocation.getLangOptions().EnableObjCInterop =
     EnableObjCInterop ? true :
@@ -372,10 +447,28 @@ int main(int argc, char **argv) {
   Invocation.getDiagnosticOptions().VerifyMode =
       VerifyMode ? DiagnosticOptions::Verify : DiagnosticOptions::NoVerify;
 
+  if (EnableRequirementMachine.size()) {
+    auto value = llvm::StringSwitch<Optional<RequirementMachineMode>>(
+        EnableRequirementMachine)
+      .Case("off", RequirementMachineMode::Disabled)
+      .Case("on", RequirementMachineMode::Enabled)
+      .Case("verify", RequirementMachineMode::Verify)
+      .Default(None);
+
+    if (value)
+      Invocation.getLangOptions().EnableRequirementMachine = *value;
+    else {
+      fprintf(stderr, "Invalid value for -requirement-machine flag: %s\n",
+              EnableRequirementMachine.c_str());
+      exit(-1);
+    }
+  }
+
   // Setup the SIL Options.
   SILOptions &SILOpts = Invocation.getSILOptions();
   SILOpts.InlineThreshold = SILInlineThreshold;
-  SILOpts.VerifyAll = EnableSILVerifyAll;
+  SILOpts.VerifyAll = SILVerifyAll || EnableSILVerifyAll;
+  SILOpts.VerifyNone = SILVerifyNone;
   SILOpts.RemoveRuntimeAsserts = RemoveRuntimeAsserts;
   SILOpts.AssertConfig = AssertConfId;
   if (OptimizationGroup != OptGroup::Diagnostics)
@@ -415,6 +508,11 @@ int main(int argc, char **argv) {
 
   SILOpts.EnableSpeculativeDevirtualization = EnableSpeculativeDevirtualization;
   SILOpts.IgnoreAlwaysInline = IgnoreAlwaysInline;
+  SILOpts.EnableOSSAModules = EnableOSSAModules;
+  SILOpts.EnableCopyPropagation = EnableCopyPropagation;
+  SILOpts.DisableCopyPropagation = DisableCopyPropagation;
+  SILOpts.EnableExperimentalLexicalLifetimes =
+      EnableExperimentalLexicalLifetimes;
 
   serialization::ExtendedValidationInfo extendedInfo;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> FileBufOrErr =
@@ -516,7 +614,7 @@ int main(int argc, char **argv) {
   }
   }
 
-  if (EmitSIB) {
+  if (EmitSIB || Serialize) {
     llvm::SmallString<128> OutputFile;
     if (OutputFilename.size()) {
       OutputFile = OutputFilename;
@@ -532,8 +630,8 @@ int main(int argc, char **argv) {
 
     SerializationOptions serializationOpts;
     serializationOpts.OutputPath = OutputFile.c_str();
-    serializationOpts.SerializeAllSIL = true;
-    serializationOpts.IsSIB = true;
+    serializationOpts.SerializeAllSIL = EmitSIB;
+    serializationOpts.IsSIB = EmitSIB;
 
     serialize(CI.getMainModule(), serializationOpts, SILMod.get());
   } else {
@@ -546,7 +644,7 @@ int main(int argc, char **argv) {
       SILMod->print(llvm::outs(), CI.getMainModule(), SILOpts, !DisableASTDump);
     } else {
       std::error_code EC;
-      llvm::raw_fd_ostream OS(OutputFile, EC, llvm::sys::fs::F_None);
+      llvm::raw_fd_ostream OS(OutputFile, EC, llvm::sys::fs::OF_None);
       if (EC) {
         llvm::errs() << "while opening '" << OutputFile << "': "
                      << EC.message() << '\n';

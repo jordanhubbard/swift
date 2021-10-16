@@ -43,7 +43,7 @@ library should be distributed alongside them.
 ### CMake Standalone (no build-script)
 
 To build the Swift benchmarks using only an Xcode installation: install an
-Xcode version with Swift support, install cmake 2.8.12, and ensure Xcode is
+Xcode version with Swift support, install cmake 3.19.6 or higher, and ensure Xcode is
 selected with xcode-select.
 
 The following build options are available:
@@ -74,6 +74,7 @@ The following build options are available:
 The following build targets are available:
 
 * `swift-benchmark-macosx-x86_64`
+* `swift-benchmark-macosx-arm64`
 * `swift-benchmark-iphoneos-arm64e`
 * `swift-benchmark-iphoneos-arm64`
 * `swift-benchmark-iphoneos-armv7`
@@ -84,7 +85,7 @@ Build steps (with example options):
 
 1. `$ mkdir build; cd build`
 2. `$ cmake [path to swift src]/benchmark -G Ninja -DSWIFT_EXEC=[path to built swiftc]`
-3. `$ ninja swift-benchmark-macosx-x86_64`
+3. `$ ninja swift-benchmark-macosx-$(uname -m)`
 
 Benchmark binaries are placed in `bin`.
 
@@ -98,7 +99,7 @@ relative to the benchmark binary at the time it was executed
 For example, to benchmark against a locally built `swiftc`, including
 any standard library changes in that build, you might configure using:
 
-    cmake <src>/benchmark -G Ninja -DSWIFT_EXEC=<build>/swift-macosx-x86_64/bin/swiftc
+    cmake <src>/benchmark -G Ninja -DSWIFT_EXEC=<build>/swift-macosx-$(uname -m)/bin/swiftc
     ninja swift-benchmark-iphoneos-arm64
 
 To build against the installed Xcode, simply omit SWIFT_EXEC:
@@ -139,7 +140,7 @@ The benchmark suite can be built with swiftpm/llbuild without needing any help
 from build-script by invoking swift build in the benchmark directory:
 
 ```
-swift-source/swift/benchmark$ swift build -configuration release
+swift-source/swift/benchmark$ swift build --configuration release
 swift-source/swift/benchmark$ .build/release/SwiftBench
 #,TEST,SAMPLES,MIN(μs),MAX(μs),MEAN(μs),SD(μs),MEDIAN(μs)
 1,Ackermann,1,169,169,169,0,169
@@ -198,7 +199,30 @@ benchmarks will be compiled with -Onone!**
 * `$ ./Benchmark_O --tags=Dictionary`
 * `$ ./Benchmark_O --skip-tags=unstable,skip,validation`
 
-### Note
+### Deterministic Hashing Requirement
+
+To run benchmarks, you'll need to disable randomized hash seeding by setting the
+`SWIFT_DETERMINISTIC_HASHING` environment variable to `1`. (You only need to do
+this when running the benchmark executables directly -- the driver script does
+this for you automatically.)
+
+* `$ env SWIFT_DETERMINISTIC_HASHING=1 ./Benchmark_O --num-iters=1 --num-samples=1`
+
+This makes for more stable results, by preventing random hash collision changes
+from affecting benchmark measurements. Benchmark measurements start by checking
+that deterministic hashing is enabled and they fail with a runtime trap when it
+isn't.
+
+If for some reason you want to run the benchmarks using standard randomized
+hashing, you can disable this check by passing the
+`--allow-nondeterministic-hashing` option to the executable.
+
+* `$ ./Benchmark_O --num-iters=1 --num-samples=1 --allow-nondeterministic-hashing`
+
+This will affect the reliability of measurements, so this is not recommended.
+
+### Benchmarking by Numbers
+
 As a shortcut, you can also refer to benchmarks by their ordinal numbers.
 These are printed out together with benchmark names and tags using the
 `--list` parameter. For a complete list of all available performance tests run
@@ -289,16 +313,18 @@ If needed you can multiply N by a fixed amount (e.g. `1...100*N`) to achieve thi
 // rdar://problem/00000000
 import TestsUtils
 
-public let YourTestName = BenchmarkInfo(
-  name: "YourTestName",
-  runFunction: run_YourTestName,
-  tags: [.regression])
+public let benchmarks = [
+  BenchmarkInfo(
+    name: "YourTestName",
+    runFunction: run_YourTestName,
+    tags: [.regression])
+]
 
 @inline(never)
-public func run_YourTestName(N: Int) {
+public func run_YourTestName(n: Int) {
     # Declare variables
 
-    for i in 1...N {
+    for i in 1...n {
         # Perform work
 
         # Verify work was done; break otherwise
@@ -319,12 +345,12 @@ swift-source$ ./swift/utils/build-script -R -B
 ````
 you can rebuild just the benchmarks:
 ````
-swift-source$ export SWIFT_BUILD_DIR=`pwd`/build/Ninja-ReleaseAssert/swift-macosx-x86_64
-swift-source$ ninja -C ${SWIFT_BUILD_DIR} swift-benchmark-macosx-x86_64
+swift-source$ export SWIFT_BUILD_DIR=`pwd`/build/Ninja-ReleaseAssert/swift-macosx-$(uname -m)
+swift-source$ ninja -C ${SWIFT_BUILD_DIR} swift-benchmark-macosx-$(uname -m)
 ````
 
 When modifying the testing infrastructure, you should verify that your changes
 pass all the tests:
 ````
-swift-source$ ./llvm/utils/lit/lit.py -sv ${SWIFT_BUILD_DIR}/test-macosx-x86_64/benchmark
+swift-source$ ./llvm/utils/lit/lit.py -sv ${SWIFT_BUILD_DIR}/test-macosx-$(uname -m)/benchmark
 ````

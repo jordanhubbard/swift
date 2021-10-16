@@ -36,8 +36,9 @@ config.swift_frontend_test_options = "@SWIFT_FRONTEND_TEST_OPTIONS@"
 config.darwin_xcrun_toolchain = "@SWIFT_DARWIN_XCRUN_TOOLCHAIN@"
 
 # --- Android Configuration ---
+config.android_linker_name = "lld"
 config.android_ndk_path = "@SWIFT_ANDROID_NDK_PATH@"
-config.android_ndk_gcc_version = "@SWIFT_ANDROID_NDK_GCC_VERSION@"
+config.android_api_level = "@SWIFT_ANDROID_API_LEVEL@"
 
 # --- Windows MSVC Configuration ---
 config.swift_stdlib_msvc_runtime = None
@@ -55,6 +56,7 @@ else:
 config.coverage_mode = "@SWIFT_ANALYZE_CODE_COVERAGE@"
 config.lldb_build_root = "@LLDB_BUILD_DIR@"
 config.libdispatch_build_path = "@SWIFT_PATH_TO_LIBDISPATCH_BUILD@"
+config.libdispatch_static_build_path = "@SWIFT_PATH_TO_LIBDISPATCH_STATIC_BUILD@"
 
 if "@SWIFT_ASAN_BUILD@" == "TRUE":
     config.available_features.add("asan")
@@ -65,6 +67,9 @@ if "@SWIFT_TOOLS_ENABLE_LTO@".lower() in ["full", "thin"]:
    config.available_features.add("lto")
 else:
    config.available_features.add("no_lto")
+
+if '@SWIFT_STDLIB_ENABLE_LTO@'.lower() in ['full', 'thin']:
+    config.available_features.add('stdlib_lto')
 
 if "@LLVM_ENABLE_ASSERTIONS@" == "TRUE":
     config.available_features.add('asserts')
@@ -104,12 +109,6 @@ if "@CMAKE_GENERATOR@" == "Xcode":
       os.path.pathsep.join((xcode_bin_dir, config.environment['PATH']))
 
 config.available_features.add("CMAKE_GENERATOR=@CMAKE_GENERATOR@")
-
-if "@SWIFT_USE_LINKER@" == "lld":
-    config.android_linker_name = "lld"
-else:
-    # even if SWIFT_USE_LINKER isn't set, we cannot use BFD for Android
-    config.android_linker_name = "gold"
 
 # Let the main config do the real work.
 config.test_exec_root = os.path.dirname(os.path.realpath(__file__))

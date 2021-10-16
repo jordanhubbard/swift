@@ -10,11 +10,11 @@
 //
 //===----------------------------------------------------------------------===//
 
-#define DEBUG_TYPE "insert-hop-to-executor"
+#define DEBUG_TYPE "optimize-hop-to-executor"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/ApplySite.h"
-#include "swift/SIL/MemoryLifetime.h"
+#include "swift/SIL/MemoryLocations.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SIL/MemAccessUtils.h"
 
@@ -144,6 +144,7 @@ void OptimizeHopToExecutor::allocateBlockStates() {
 /// Solve the dataflow in forward direction.
 void OptimizeHopToExecutor::solveDataflowForward() {
   bool changed = false;
+  bool firstRound = true;
   do {
     changed = false;
     for (BlockState &state : blockStates) {
@@ -151,19 +152,21 @@ void OptimizeHopToExecutor::solveDataflowForward() {
       for (SILBasicBlock *pred : state.block->getPredecessorBlocks()) {
         newEntry = BlockState::merge(newEntry, block2State[pred]->exit);
       }
-      if (newEntry != state.entry || state.exit == BlockState::NotSet) {
+      if (newEntry != state.entry || firstRound) {
         changed = true;
         state.entry = newEntry;
         if (state.intra == BlockState::NotSet)
           state.exit = state.entry;
       }
     }
+    firstRound = false;
   } while (changed);
 }
 
 /// Solve the dataflow in backward direction.
 void OptimizeHopToExecutor::solveDataflowBackward() {
   bool changed = false;
+  bool firstRound = true;
   do {
     changed = false;
     for (BlockState &state : llvm::reverse(blockStates)) {
@@ -171,13 +174,14 @@ void OptimizeHopToExecutor::solveDataflowBackward() {
       for (SILBasicBlock *succ : state.block->getSuccessorBlocks()) {
         newExit = BlockState::merge(newExit, block2State[succ]->entry);
       }
-      if (newExit != state.exit || state.entry == BlockState::NotSet) {
+      if (newExit != state.exit || firstRound) {
         changed = true;
         state.exit = newExit;
         if (state.intra == BlockState::NotSet)
           state.entry = state.exit;
       }
     }
+    firstRound = false;
   } while (changed);
 }
 
@@ -229,17 +233,22 @@ bool OptimizeHopToExecutor::removeRedundantHopToExecutors(const Actors &actors) 
         actorIdx = BlockState::Unknown;
         continue;
       }
-      if (auto *hop = dyn_cast<HopToExecutorInst>(inst)) {
-        int newActorIdx = actors.lookup(hop->getOperand());
-        if (newActorIdx == actorIdx) {
-          // There is a dominating hop_to_executor with the same operand.
-          hop->eraseFromParent();
-          changed = true;
-          continue;
-        }
+      auto *hop = dyn_cast<HopToExecutorInst>(inst);
+      if (!hop)
+        continue;
+
+      int newActorIdx = actors.lookup(hop->getOperand());
+      if (newActorIdx != actorIdx) {
         actorIdx = newActorIdx;
         continue;
       }
+      if (hop->isMandatory())
+        continue;
+
+      // There is a dominating hop_to_executor with the same operand.
+      LLVM_DEBUG(llvm::dbgs() << "Redundant executor " << *hop);
+      hop->eraseFromParent();
+      changed = true;
     }
     assert(actorIdx == state.exit);
   }
@@ -255,7 +264,7 @@ bool OptimizeHopToExecutor::removeDeadHopToExecutors() {
   // might require a dedicated executor, don't remove a preceeding
   // hop_to_executor instruction.
   for (BlockState &state : blockStates) {
-    state.exit = (state.block->getTerminator()->isFunctionExiting() ?
+    state.exit = (state.block->getSuccessors().empty() ?
                     BlockState::NoExecutorNeeded : BlockState::NotSet);
     state.intra = BlockState::NotSet;
     for (SILInstruction &inst : llvm::reverse(*state.block)) {
@@ -275,8 +284,10 @@ bool OptimizeHopToExecutor::removeDeadHopToExecutors() {
     for (auto iter = state.block->rbegin(); iter != state.block->rend();) {
       SILInstruction *inst = &*iter++;
       auto *hop = dyn_cast<HopToExecutorInst>(inst);
-      if (hop && needActor == BlockState::NoExecutorNeeded) {
+      if (hop && !hop->isMandatory()
+          && needActor == BlockState::NoExecutorNeeded) {
         // Remove the dead hop_to_executor.
+        LLVM_DEBUG(llvm::dbgs() << "Dead executor " << *hop);
         hop->eraseFromParent();
         changed = true;
         continue;

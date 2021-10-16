@@ -11,8 +11,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/SILFunctionBuilder.h"
+#include "swift/AST/AttrKind.h"
 #include "swift/AST/Availability.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/SemanticAttrs.h"
+
 using namespace swift;
 
 SILFunction *SILFunctionBuilder::getOrCreateFunction(
@@ -45,6 +48,13 @@ void SILFunctionBuilder::addFunctionAttributes(
   for (auto *A : Attrs.getAttributes<SemanticsAttr>())
     F->addSemanticsAttr(cast<SemanticsAttr>(A)->Value);
 
+  // If we are asked to emit assembly vision remarks for this function, mark the
+  // function as force emitting all optremarks including assembly vision
+  // remarks. This allows us to emit the assembly vision remarks without needing
+  // to change any of the underlying optremark mechanisms.
+  if (auto *A = Attrs.getAttribute(DAK_EmitAssemblyVisionRemarks))
+    F->addSemanticsAttr(semantics::FORCE_EMIT_OPT_REMARK_PREFIX);
+
   // Propagate @_specialize.
   for (auto *A : Attrs.getAttributes<SpecializeAttr>()) {
     auto *SA = cast<SpecializeAttr>(A);
@@ -70,17 +80,20 @@ void SILFunctionBuilder::addFunctionAttributes(
     if (hasSPI) {
       spiGroupIdent = spiGroups[0];
     }
+    auto availability =
+      AvailabilityInference::annotatedAvailableRangeForAttr(SA,
+         M.getSwiftModule()->getASTContext());
     if (targetFunctionDecl) {
       SILDeclRef declRef(targetFunctionDecl, constant.kind, false);
       targetFunction = getOrCreateDeclaration(targetFunctionDecl, declRef);
       F->addSpecializeAttr(SILSpecializeAttr::create(
           M, SA->getSpecializedSignature(), SA->isExported(), kind,
           targetFunction, spiGroupIdent,
-          attributedFuncDecl->getModuleContext()));
+          attributedFuncDecl->getModuleContext(), availability));
     } else {
       F->addSpecializeAttr(SILSpecializeAttr::create(
           M, SA->getSpecializedSignature(), SA->isExported(), kind, nullptr,
-          spiGroupIdent, attributedFuncDecl->getModuleContext()));
+          spiGroupIdent, attributedFuncDecl->getModuleContext(), availability));
     }
   }
 
@@ -164,11 +177,20 @@ SILFunction *SILFunctionBuilder::getOrCreateFunction(
   SILLinkage linkage = constant.getLinkage(forDefinition);
 
   if (auto fn = mod.lookUpFunction(nameTmp)) {
-    assert(fn->getLoweredFunctionType() == constantType);
-    assert(fn->getLinkage() == linkage ||
+    // During SILGen (where the module's SIL stage is Raw), there might be
+    // mismatches between the type or linkage. This can happen, when two
+    // functions are mistakenly mapped to the same name (e.g. with @_cdecl).
+    // We want to issue a regular error in this case and not crash with an
+    // assert.
+    assert(mod.getStage() == SILStage::Raw ||
+           fn->getLoweredFunctionType() == constantType);
+    auto linkageForDef = constant.getLinkage(ForDefinition_t::ForDefinition);
+    auto fnLinkage = fn->getLinkage();
+    assert(mod.getStage() == SILStage::Raw || fn->getLinkage() == linkage ||
            (forDefinition == ForDefinition_t::NotForDefinition &&
-            fn->getLinkage() ==
-                constant.getLinkage(ForDefinition_t::ForDefinition)));
+            (fnLinkage == linkageForDef ||
+             (linkageForDef == SILLinkage::PublicNonABI &&
+              fnLinkage == SILLinkage::SharedExternal))));
     if (forDefinition) {
       // In all the cases where getConstantLinkage returns something
       // different for ForDefinition, it returns an available-externally

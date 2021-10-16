@@ -88,17 +88,17 @@ static llvm::cl::opt<std::string>
 static llvm::cl::opt<bool>
     PerformWMO("wmo", llvm::cl::desc("Enable whole-module optimizations"));
 
-static llvm::cl::opt<IRGenOutputKind>
-    OutputKind("output-kind", llvm::cl::desc("Type of output to produce"),
-               llvm::cl::values(clEnumValN(IRGenOutputKind::LLVMAssembly,
-                                           "llvm-as", "Emit llvm assembly"),
-                                clEnumValN(IRGenOutputKind::LLVMBitcode,
-                                           "llvm-bc", "Emit llvm bitcode"),
-                                clEnumValN(IRGenOutputKind::NativeAssembly,
-                                           "as", "Emit native assembly"),
-                                clEnumValN(IRGenOutputKind::ObjectFile,
-                                           "object", "Emit an object file")),
-               llvm::cl::init(IRGenOutputKind::ObjectFile));
+static llvm::cl::opt<IRGenOutputKind> OutputKind(
+    "output-kind", llvm::cl::desc("Type of output to produce"),
+    llvm::cl::values(clEnumValN(IRGenOutputKind::LLVMAssemblyAfterOptimization,
+                                "llvm-as", "Emit llvm assembly"),
+                     clEnumValN(IRGenOutputKind::LLVMBitcode, "llvm-bc",
+                                "Emit llvm bitcode"),
+                     clEnumValN(IRGenOutputKind::NativeAssembly, "as",
+                                "Emit native assembly"),
+                     clEnumValN(IRGenOutputKind::ObjectFile, "object",
+                                "Emit an object file")),
+    llvm::cl::init(IRGenOutputKind::ObjectFile));
 
 static llvm::cl::opt<bool>
     DisableLegacyTypeInfo("disable-legacy-type-info",
@@ -179,7 +179,7 @@ int main(int argc, char **argv) {
     return 1;
 
   std::error_code EC;
-  llvm::raw_fd_ostream outStream(OutputFilename, EC, llvm::sys::fs::F_None);
+  llvm::raw_fd_ostream outStream(OutputFilename, EC, llvm::sys::fs::OF_None);
   if (outStream.has_error() || EC) {
     CI.getDiags().diagnose(SourceLoc(), diag::error_opening_output,
                            OutputFilename, EC.message());

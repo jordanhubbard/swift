@@ -15,6 +15,7 @@
 
 #include "IRGenModule.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/AutoDiff.h"
 #include "swift/AST/ProtocolAssociations.h"
 #include "swift/IRGen/ValueWitness.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -51,6 +52,20 @@ public:
     return finalize();
   }
 
+  std::string mangleDerivativeDispatchThunk(
+      const AbstractFunctionDecl *func,
+      AutoDiffDerivativeFunctionIdentifier *derivativeId) {
+    beginManglingWithAutoDiffOriginalFunction(func);
+    auto kind = Demangle::getAutoDiffFunctionKind(derivativeId->getKind());
+    AutoDiffConfig config(
+        derivativeId->getParameterIndices(),
+        IndexSubset::get(func->getASTContext(), 1, {0}),
+        derivativeId->getDerivativeGenericSignature());
+    appendAutoDiffFunctionParts("TJ", kind, config);
+    appendOperator("Tj");
+    return finalize();
+  }
+
   std::string mangleConstructorDispatchThunk(const ConstructorDecl *ctor,
                                              bool isAllocating) {
     beginMangling();
@@ -62,6 +77,20 @@ public:
   std::string mangleMethodDescriptor(const FuncDecl *func) {
     beginMangling();
     appendEntity(func);
+    appendOperator("Tq");
+    return finalize();
+  }
+
+  std::string mangleDerivativeMethodDescriptor(
+      const AbstractFunctionDecl *func,
+      AutoDiffDerivativeFunctionIdentifier *derivativeId) {
+    beginManglingWithAutoDiffOriginalFunction(func);
+    auto kind = Demangle::getAutoDiffFunctionKind(derivativeId->getKind());
+    AutoDiffConfig config(
+        derivativeId->getParameterIndices(),
+        IndexSubset::get(func->getASTContext(), 1, {0}),
+        derivativeId->getDerivativeGenericSignature());
+    appendAutoDiffFunctionParts("TJ", kind, config);
     appendOperator("Tq");
     return finalize();
   }
@@ -161,6 +190,10 @@ public:
 
   std::string mangleNominalTypeDescriptor(const NominalTypeDecl *Decl) {
     return mangleNominalTypeSymbol(Decl, "Mn");
+  }
+
+  std::string mangleNominalTypeDescriptorRecord(const NominalTypeDecl *Decl) {
+    return mangleNominalTypeSymbol(Decl, "Hn");
   }
   
   std::string mangleOpaqueTypeDescriptorAccessor(const OpaqueTypeDecl *decl) {
@@ -264,6 +297,13 @@ public:
     return finalize();
   }
 
+  std::string mangleProtocolDescriptorRecord(const ProtocolDecl *Decl) {
+    beginMangling();
+    appendProtocolName(Decl);
+    appendOperator("Hr");
+    return finalize();
+  }
+
   std::string mangleProtocolRequirementsBaseDescriptor(
                                                     const ProtocolDecl *Decl) {
     beginMangling();
@@ -282,6 +322,7 @@ public:
     bool isAssocTypeAtDepth = false;
     (void)appendAssocType(
         assocType->getDeclaredInterfaceType()->castTo<DependentMemberType>(),
+        nullptr,
         isAssocTypeAtDepth);
     appendOperator("Tl");
     return finalize();
@@ -294,7 +335,7 @@ public:
     beginMangling();
     appendAnyGenericType(proto);
     if (isa<GenericTypeParamType>(subject)) {
-      appendType(subject);
+      appendType(subject, nullptr);
     } else {
       bool isFirstAssociatedTypeIdentifier = true;
       appendAssociatedTypePath(subject, isFirstAssociatedTypeIdentifier);
@@ -328,6 +369,8 @@ public:
   }
 
   std::string mangleProtocolConformanceDescriptor(
+                                    const RootProtocolConformance *conformance);
+  std::string mangleProtocolConformanceDescriptorRecord(
                                     const RootProtocolConformance *conformance);
   std::string mangleProtocolConformanceInstantiationCache(
                                     const RootProtocolConformance *conformance);
@@ -397,6 +440,7 @@ public:
                                       const ProtocolDecl *Proto) {
     beginMangling();
     appendProtocolConformance(Conformance);
+
     bool isFirstAssociatedTypeIdentifier = true;
     appendAssociatedTypePath(AssociatedType, isFirstAssociatedTypeIdentifier);
     appendAnyGenericType(Proto);
@@ -417,7 +461,7 @@ public:
   void appendAssociatedTypePath(CanType associatedType, bool &isFirst) {
     if (auto memberType = dyn_cast<DependentMemberType>(associatedType)) {
       appendAssociatedTypePath(memberType.getBase(), isFirst);
-      appendAssociatedTypeName(memberType);
+      appendAssociatedTypeName(memberType, nullptr);
       appendListSeparator(isFirst);
     } else {
       assert(isa<GenericTypeParamType>(associatedType));
@@ -454,7 +498,7 @@ public:
   std::string mangleOutlinedCopyFunction(CanType ty,
                                          CanGenericSignature sig) {
     beginMangling();
-    appendType(ty);
+    appendType(ty, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOy");
@@ -463,7 +507,7 @@ public:
   std::string mangleOutlinedConsumeFunction(CanType ty,
                                             CanGenericSignature sig) {
     beginMangling();
-    appendType(ty);
+    appendType(ty, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOe");
@@ -473,7 +517,7 @@ public:
   std::string mangleOutlinedRetainFunction(CanType t,
                                            CanGenericSignature sig) {
     beginMangling();
-    appendType(t);
+    appendType(t, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOr");
@@ -482,7 +526,7 @@ public:
   std::string mangleOutlinedReleaseFunction(CanType t,
                                             CanGenericSignature sig) {
     beginMangling();
-    appendType(t);
+    appendType(t, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOs");
@@ -492,7 +536,7 @@ public:
   std::string mangleOutlinedInitializeWithTakeFunction(CanType t,
                                                        CanGenericSignature sig) {
     beginMangling();
-    appendType(t);
+    appendType(t, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOb");
@@ -501,7 +545,7 @@ public:
   std::string mangleOutlinedInitializeWithCopyFunction(CanType t,
                                                        CanGenericSignature sig) {
     beginMangling();
-    appendType(t);
+    appendType(t, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOc");
@@ -510,7 +554,7 @@ public:
   std::string mangleOutlinedAssignWithTakeFunction(CanType t,
                                                    CanGenericSignature sig) {
     beginMangling();
-    appendType(t);
+    appendType(t, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOd");
@@ -519,7 +563,7 @@ public:
   std::string mangleOutlinedAssignWithCopyFunction(CanType t,
                                                    CanGenericSignature sig) {
     beginMangling();
-    appendType(t);
+    appendType(t, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOf");
@@ -528,7 +572,7 @@ public:
   std::string mangleOutlinedDestroyFunction(CanType t,
                                             CanGenericSignature sig) {
     beginMangling();
-    appendType(t);
+    appendType(t, sig);
     if (sig)
       appendGenericSignature(sig);
     appendOperator("WOh");
@@ -542,11 +586,8 @@ public:
   }
 
   SymbolicMangling mangleTypeForReflection(IRGenModule &IGM,
-                                           Type Ty);
-  
-  SymbolicMangling mangleProtocolConformanceForReflection(IRGenModule &IGM,
-                                            Type Ty,
-                                            ProtocolConformanceRef conformance);
+                                           CanGenericSignature genericSig,
+                                           CanType Ty);
 
   std::string mangleTypeForLLVMTypeName(CanType Ty);
 
@@ -581,7 +622,7 @@ protected:
 
   std::string mangleTypeSymbol(Type type, const char *Op) {
     beginMangling();
-    appendType(type);
+    appendType(type, nullptr);
     appendOperator(Op);
     return finalize();
   }
@@ -599,12 +640,17 @@ protected:
                                       const char *Op) {
     beginMangling();
     if (type)
-      appendType(type);
+      appendType(type, nullptr);
     appendProtocolConformance(Conformance);
     appendOperator(Op);
     return finalize();
   }
 };
+
+/// Determines if the minimum deployment target's runtime demangler will not
+/// understand the mangled name for the given type.
+/// \returns true iff the target's runtime does not understand the mangled name.
+bool mangledNameIsUnknownToDeployTarget(IRGenModule &IGM, CanType type);
 
 } // end namespace irgen
 } // end namespace swift

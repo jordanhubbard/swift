@@ -17,12 +17,9 @@
 using namespace SourceKit;
 
 GlobalConfig::Settings
-GlobalConfig::update(Optional<bool> OptimizeForIDE,
-                     Optional<unsigned> CompletionMaxASTContextReuseCount,
+GlobalConfig::update(Optional<unsigned> CompletionMaxASTContextReuseCount,
                      Optional<unsigned> CompletionCheckDependencyInterval) {
   llvm::sys::ScopedLock L(Mtx);
-  if (OptimizeForIDE.hasValue())
-    State.OptimizeForIDE = *OptimizeForIDE;
   if (CompletionMaxASTContextReuseCount.hasValue())
     State.CompletionOpts.MaxASTContextReuseCount =
         *CompletionMaxASTContextReuseCount;
@@ -32,10 +29,6 @@ GlobalConfig::update(Optional<bool> OptimizeForIDE,
   return State;
 };
 
-bool GlobalConfig::shouldOptimizeForIDE() const {
-  llvm::sys::ScopedLock L(Mtx);
-  return State.OptimizeForIDE;
-}
 GlobalConfig::Settings::CompletionOptions
 GlobalConfig::getCompletionOpts() const {
   llvm::sys::ScopedLock L(Mtx);
@@ -51,7 +44,7 @@ SourceKit::Context::Context(
       DiagnosticDocumentationPath(DiagnosticDocumentationPath),
       NotificationCtr(
           new NotificationCenter(shouldDispatchNotificationsOnMain)),
-      Config(new GlobalConfig()) {
+      Config(new GlobalConfig()), SlowRequestSim(new SlowRequestSimulator()) {
   // Should be called last after everything is initialized.
   SwiftLang = LangSupportFactoryFn(*this);
 }

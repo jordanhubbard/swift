@@ -43,13 +43,23 @@ static llvm::cl::opt<bool>
     SILViewCFG("sil-view-cfg", llvm::cl::init(false),
                llvm::cl::desc("Enable the sil cfg viewer pass"));
 
-static llvm::cl::opt<bool> SILViewGuaranteedCFG(
-    "sil-view-guaranteed-cfg", llvm::cl::init(false),
+static llvm::cl::opt<bool> SILViewCanonicalCFG(
+    "sil-view-canonical-cfg", llvm::cl::init(false),
     llvm::cl::desc("Enable the sil cfg viewer pass after diagnostics"));
+
+static llvm::cl::opt<bool> SILPrintCanonicalModule(
+    "sil-print-canonical-module", llvm::cl::init(false),
+    llvm::cl::desc("Print the textual SIL module after diagnostics"));
 
 static llvm::cl::opt<bool> SILViewSILGenCFG(
     "sil-view-silgen-cfg", llvm::cl::init(false),
     llvm::cl::desc("Enable the sil cfg viewer pass before diagnostics"));
+
+
+llvm::cl::opt<bool> SILDisableLateOMEByDefault(
+    "sil-disable-late-ome-by-default", llvm::cl::init(false),
+    llvm::cl::desc(
+        "Disable late OME for non-transparent functions by default"));
 
 //===----------------------------------------------------------------------===//
 //                          Diagnostic Pass Pipeline
@@ -58,6 +68,12 @@ static llvm::cl::opt<bool> SILViewSILGenCFG(
 static void addCFGPrinterPipeline(SILPassPipelinePlan &P, StringRef Name) {
   P.startPipeline(Name);
   P.addCFGPrinter();
+}
+
+static void addModulePrinterPipeline(SILPassPipelinePlan &plan,
+                                     StringRef name) {
+  plan.startPipeline(name);
+  plan.addModulePrinter();
 }
 
 static void addMandatoryDebugSerialization(SILPassPipelinePlan &P) {
@@ -122,7 +138,7 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
     P.addSILSkippingChecker();
 #endif
 
-  if (Options.shouldOptimize()) {
+  if (Options.shouldOptimize() && !Options.EnableExperimentalLexicalLifetimes) {
     P.addDestroyHoisting();
   }
   P.addMandatoryInlining();
@@ -155,6 +171,11 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.addYieldOnceCheck();
   P.addEmitDFDiagnostics();
 
+  // Only issue weak lifetime warnings for users who select object lifetime
+  // optimization. The risk of spurious warnings outweighs the benefits.
+  if (P.getOptions().EnableCopyPropagation) {
+    P.addDiagnoseLifetimeIssues();
+  }
   // Canonical swift requires all non cond_br critical edges to be split.
   P.addSplitNonCondBrCriticalEdges();
 }
@@ -178,9 +199,20 @@ SILPassPipelinePlan::getDiagnosticPassPipeline(const SILOptions &Options) {
   // Otherwise run the rest of diagnostics.
   addMandatoryDiagnosticOptPipeline(P);
 
-  if (SILViewGuaranteedCFG) {
-    addCFGPrinterPipeline(P, "SIL View Guaranteed CFG");
+  if (SILViewCanonicalCFG) {
+    addCFGPrinterPipeline(P, "SIL View Canonical CFG");
   }
+  if (SILPrintCanonicalModule) {
+    addModulePrinterPipeline(P, "SIL Print Canonical Module");
+  }
+  return P;
+}
+
+SILPassPipelinePlan SILPassPipelinePlan::getLowerHopToActorPassPipeline(
+    const SILOptions &Options) {
+  SILPassPipelinePlan P(Options);
+  P.startPipeline("Lower Hop to Actor");
+  P.addLowerHopToActor();
   return P;
 }
 
@@ -242,6 +274,9 @@ void addHighLevelLoopOptPasses(SILPassPipelinePlan &P) {
   P.addSimplifyCFG();
   // Optimize access markers for better LICM: might merge accesses
   // It will also set the no_nested_conflict for dynamic accesses
+  // AccessEnforcementReleaseSinking results in non-canonical OSSA.
+  // It is only used to expose opportunities in AccessEnforcementOpts
+  // before CanonicalOSSA re-hoists destroys.
   P.addAccessEnforcementReleaseSinking();
   P.addAccessEnforcementOpts();
   P.addHighLevelLICM();
@@ -250,6 +285,9 @@ void addHighLevelLoopOptPasses(SILPassPipelinePlan &P) {
   // LICM might have added new merging potential by hoisting
   // we don't want to restart the pipeline - ignore the
   // potential of merging out of two loops
+  // AccessEnforcementReleaseSinking results in non-canonical OSSA.
+  // It is only used to expose opportunities in AccessEnforcementOpts
+  // before CanonicalOSSA re-hoists destroys.
   P.addAccessEnforcementReleaseSinking();
   P.addAccessEnforcementOpts();
   // Start of loop unrolling passes.
@@ -302,11 +340,6 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   // Promote stack allocations to values.
   P.addMem2Reg();
 
-  // We earlier eliminated ownership if we are not compiling the stdlib. Now
-  // handle the stdlib functions, re-simplifying, eliminating ARC as we do.
-  P.addSemanticARCOpts();
-  P.addNonTransparentFunctionOwnershipModelEliminator();
-
   // Run the existential specializer Pass.
   P.addExistentialSpecializer();
 
@@ -333,6 +366,12 @@ void addFunctionPasses(SILPassPipelinePlan &P,
     P.addCOWArrayOpts();
     P.addDCE();
     P.addSwiftArrayPropertyOpt();
+    
+    // This string optimization can catch additional opportunities, which are
+    // exposed once optimized String interpolations (from the high-level string
+    // optimization) are cleaned up. But before the mid-level inliner inlines
+    // semantic calls.
+    P.addStringOptimization();
   }
 
   // Run the devirtualizer, specializer, and inliner. If any of these
@@ -343,6 +382,16 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   // Run devirtualizer after the specializer, because many
   // class_method/witness_method instructions may use concrete types now.
   P.addDevirtualizer();
+  P.addARCSequenceOpts();
+
+  if (P.getOptions().EnableOSSAModules) {
+    // We earlier eliminated ownership if we are not compiling the stdlib. Now
+    // handle the stdlib functions, re-simplifying, eliminating ARC as we do.
+    if (!P.getOptions().DisableCopyPropagation) {
+      P.addCopyPropagation();
+    }
+    P.addSemanticARCOpts();
+  }
 
   switch (OpLevel) {
   case OptimizationLevelKind::HighLevel:
@@ -358,6 +407,14 @@ void addFunctionPasses(SILPassPipelinePlan &P,
     // Inlines everything
     P.addLateInliner();
     break;
+  }
+
+  // Clean up Semantic ARC before we perform additional post-inliner opts.
+  if (P.getOptions().EnableOSSAModules) {
+    if (!P.getOptions().DisableCopyPropagation) {
+      P.addCopyPropagation();
+    }
+    P.addSemanticARCOpts();
   }
 
   // Promote stack allocations to values and eliminate redundant
@@ -384,6 +441,8 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   } else {
     P.addRedundantLoadElimination();
   }
+  // Optimize copies created during RLE.
+  P.addSemanticARCOpts();
 
   P.addCOWOpts();
   P.addPerformanceConstantPropagation();
@@ -416,6 +475,14 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   P.addRetainSinking();
   P.addReleaseHoisting();
   P.addARCSequenceOpts();
+
+  // Run a final round of ARC opts when ownership is enabled.
+  if (P.getOptions().EnableOSSAModules) {
+    if (!P.getOptions().DisableCopyPropagation) {
+      P.addCopyPropagation();
+    }
+    P.addSemanticARCOpts();
+  }
 }
 
 static void addPerfDebugSerializationPipeline(SILPassPipelinePlan &P) {
@@ -427,13 +494,13 @@ static void addPerfDebugSerializationPipeline(SILPassPipelinePlan &P) {
 static void addPrepareOptimizationsPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("PrepareOptimizationPasses");
 
-  // Verify AccessedStorage once in OSSA before optimizing.
+  // Verify AccessStorage once in OSSA before optimizing.
 #ifndef NDEBUG
   P.addAccessPathVerification();
 #endif
 
   P.addForEachLoopUnroll();
-  P.addMandatoryCombine();
+  P.addOptimizedMandatoryCombine();
   P.addAccessMarkerElimination();
 }
 
@@ -442,11 +509,14 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
 
   // Get rid of apparently dead functions as soon as possible so that
   // we do not spend time optimizing them.
-  P.addDeadFunctionElimination();
+  P.addDeadFunctionAndGlobalElimination();
 
   // Cleanup after SILGen: remove trivial copies to temporaries.
   P.addTempRValueOpt();
   // Cleanup after SILGen: remove unneeded borrows/copies.
+  if (P.getOptions().EnableCopyPropagation) {
+    P.addCopyPropagation();
+  }
   P.addSemanticARCOpts();
 
   // Devirtualizes differentiability witnesses into functions that reference them.
@@ -454,17 +524,12 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   // not blocked by any other passes' optimizations, so do it early.
   P.addDifferentiabilityWitnessDevirtualizer();
 
-  // Strip ownership from non-transparent functions when we are not compiling
-  // the stdlib module. When compiling the stdlib, we eliminate ownership on
-  // these functions later with a nromal call to
-  // P.addNonTransparentFunctionOwnershipModelEliminator().
-  //
-  // This is done so we can push ownership through the pass pipeline first for
-  // the stdlib and then everything else.
-  if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
-    return;
+  if (!P.getOptions().EnableOSSAModules && SILDisableLateOMEByDefault) {
+    if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
+      return;
 
-  P.addNonStdlibNonTransparentFunctionOwnershipModelEliminator();
+    P.addNonTransparentFunctionOwnershipModelEliminator();
+  }
 
   // Start by linking in referenced functions from other modules.
   P.addPerformanceSILLinker();
@@ -477,6 +542,13 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   // Needed to serialize static initializers of globals for cross-module
   // optimization.
   P.addGlobalOpt();
+
+  if (!P.getOptions().EnableOSSAModules && !SILDisableLateOMEByDefault) {
+    if (P.getOptions().StopOptimizationBeforeLoweringOwnership)
+      return;
+
+    P.addNonTransparentFunctionOwnershipModelEliminator();
+  }
 
   // Add the outliner pass (Osize).
   P.addOutliner();
@@ -503,7 +575,6 @@ static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
   // FIXME: update EagerSpecializer to be a function pass!
   P.addEagerSpecializer();
 
-  // stdlib ownership model elimination is done within addFunctionPasses
   addFunctionPasses(P, OptimizationLevelKind::HighLevel);
 
   addHighLevelLoopOptPasses(P);
@@ -515,7 +586,7 @@ static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
 // one round of module passes.
 static void addHighLevelModulePipeline(SILPassPipelinePlan &P) {
   P.startPipeline("HighLevel,Module+StackPromote");
-  P.addDeadFunctionElimination();
+  P.addDeadFunctionAndGlobalElimination();
   P.addPerformanceSILLinker();
   P.addDeadObjectElimination();
   P.addGlobalPropertyOpt();
@@ -562,7 +633,7 @@ static void addMidLevelFunctionPipeline(SILPassPipelinePlan &P) {
 
 static void addClosureSpecializePassPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("ClosureSpecialize");
-  P.addDeadFunctionElimination();
+  P.addDeadFunctionAndGlobalElimination();
   P.addDeadStoreElimination();
   P.addDeadObjectElimination();
 
@@ -629,7 +700,7 @@ static void addLateLoopOptPassPipeline(SILPassPipelinePlan &P) {
   // Delete dead code and drop the bodies of shared functions.
   // Also, remove externally available witness tables. They are not needed
   // anymore after the last devirtualizer run.
-  P.addLateDeadFunctionElimination();
+  P.addLateDeadFunctionAndGlobalElimination();
 
   // Perform the final lowering transformations.
   P.addCodeSinking();
@@ -679,7 +750,7 @@ static void addLastChanceOptPassPipeline(SILPassPipelinePlan &P) {
   // A loop might have only one dynamic access now, i.e. hoistable
   P.addLICM();
 
-  // Verify AccessedStorage once again after optimizing and lowering OSSA.
+  // Verify AccessStorage once again after optimizing and lowering OSSA.
 #ifndef NDEBUG
   P.addAccessPathVerification();
 #endif
@@ -687,10 +758,11 @@ static void addLastChanceOptPassPipeline(SILPassPipelinePlan &P) {
   // Only has an effect if the -assume-single-thread option is specified.
   P.addAssumeSingleThreaded();
 
-  // Only has an effect if opt-remark is enabled.
-  P.addOptRemarkGenerator();
+  // Emits remarks on all functions with @_assemblyVision attribute.
+  P.addAssemblyVisionRemarkGenerator();
 
-  P.addPruneVTables();
+  // FIXME: rdar://72935649 (Miscompile on combining PruneVTables with WMO)
+  // P.addPruneVTables();
 }
 
 static void addSILDebugInfoGeneratorPipeline(SILPassPipelinePlan &P) {
@@ -704,6 +776,7 @@ SILPassPipelinePlan
 SILPassPipelinePlan::getLoweringPassPipeline(const SILOptions &Options) {
   SILPassPipelinePlan P(Options);
   P.startPipeline("Address Lowering");
+  P.addLowerHopToActor(); // FIXME: earlier for more opportunities?
   P.addOwnershipModelEliminator();
   P.addIRGenPrepare();
   P.addAddressLowering();
@@ -719,9 +792,8 @@ SILPassPipelinePlan::getIRGenPreparePassPipeline(const SILOptions &Options) {
   // Hoist generic alloc_stack instructions to the entry block to enable better
   // llvm-ir generation for dynamic alloca instructions.
   P.addAllocStackHoisting();
-  if (Options.EnableLargeLoadableTypes) {
-    P.addLoadableByAddress();
-  }
+  P.addLoadableByAddress();
+
   return P;
 }
 
@@ -753,11 +825,18 @@ SILPassPipelinePlan::getPerformancePassPipeline(const SILOptions &Options) {
   //
   // FIXME: When *not* emitting a .swiftmodule, skip the high-level function
   // pipeline to save compile time.
-  //
-  // NOTE: Ownership is now stripped within this function for the stdlib.
   addHighLevelFunctionPipeline(P);
 
   addHighLevelModulePipeline(P);
+
+  // Run one last copy propagation/semantic arc opts run before serialization/us
+  // lowering ownership.
+  if (P.getOptions().EnableOSSAModules) {
+    if (!P.getOptions().DisableCopyPropagation) {
+      P.addCopyPropagation();
+    }
+    P.addSemanticARCOpts();
+  }
 
   addSerializePipeline(P);
   if (Options.StopOptimizationAfterSerialization)
@@ -779,7 +858,7 @@ SILPassPipelinePlan::getPerformancePassPipeline(const SILOptions &Options) {
 
   addLastChanceOptPassPipeline(P);
 
-  // Has only an effect if the -gsil option is specified.
+  // Has only an effect if the -sil-based-debuginfo option is specified.
   addSILDebugInfoGeneratorPipeline(P);
 
   // Call the CFG viewer.
@@ -805,7 +884,13 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   P.startPipeline("non-Diagnostic Enabling Mandatory Optimizations");
   P.addForEachLoopUnroll();
   P.addMandatoryCombine();
-  P.addGuaranteedARCOpts();
+  if (P.getOptions().EnableCopyPropagation) {
+    // MandatoryCopyPropagation should only be run at -Onone, not -O.
+    P.addMandatoryCopyPropagation();
+  }
+  // TODO: MandatoryARCOpts should be subsumed by CopyPropagation. There should
+  // be no need to run another analysis of copies at -Onone.
+  P.addMandatoryARCOpts();
 
   // First serialize the SIL if we are asked to.
   P.startPipeline("Serialization");
@@ -824,7 +909,7 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   // Create pre-specializations.
   P.addOnonePrespecializations();
 
-  // Has only an effect if the -gsil option is specified.
+  // Has only an effect if the -sil-based-debuginfo option is specified.
   P.addSILDebugInfoGenerator();
 
   return P;

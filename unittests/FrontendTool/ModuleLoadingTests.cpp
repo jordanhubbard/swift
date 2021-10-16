@@ -12,10 +12,12 @@
 
 #include "gtest/gtest.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/ModuleInterfaceLoader.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/Serialization/Validation.h"
+#include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/VirtualFileSystem.h"
 
@@ -99,13 +101,15 @@ protected:
     langOpts.Target = llvm::Triple(llvm::sys::getDefaultTargetTriple());
     SearchPathOptions searchPathOpts;
     ClangImporterOptions clangImpOpts;
-    auto ctx =
-        ASTContext::get(langOpts, typeckOpts, searchPathOpts, clangImpOpts,
-                        sourceMgr, diags);
+    symbolgraphgen::SymbolGraphOptions symbolGraphOpts;
+    SILOptions silOpts;
+    auto ctx = ASTContext::get(langOpts, typeckOpts, silOpts, searchPathOpts,
+                               clangImpOpts, symbolGraphOpts, sourceMgr, diags);
 
     ctx->addModuleInterfaceChecker(
       std::make_unique<ModuleInterfaceCheckerImpl>(*ctx, cacheDir,
-        prebuiltCacheDir, ModuleInterfaceLoaderOptions()));
+        prebuiltCacheDir, ModuleInterfaceLoaderOptions(),
+        swift::RequireOSSAModules_t(silOpts)));
 
     auto loader = ModuleInterfaceLoader::create(
         *ctx, *static_cast<ModuleInterfaceCheckerImpl*>(
@@ -123,7 +127,8 @@ protected:
       loader->findModuleFilesInDirectory({moduleName, SourceLoc()},
         SerializedModuleBaseName(tempDir, SerializedModuleBaseName("Library")),
         /*ModuleInterfacePath*/nullptr,
-        &moduleBuffer, &moduleDocBuffer, &moduleSourceInfoBuffer, /*IsFramework*/false);
+        &moduleBuffer, &moduleDocBuffer, &moduleSourceInfoBuffer,
+        /*skipBuildingInterface*/ false, /*IsFramework*/false);
     ASSERT_FALSE(error);
     ASSERT_FALSE(diags.hadAnyError());
 
@@ -143,7 +148,8 @@ protected:
     ASSERT_TRUE(bufOrErr);
 
     auto bufData = (*bufOrErr)->getBuffer();
-    auto validationInfo = serialization::validateSerializedAST(bufData);
+    auto validationInfo = serialization::validateSerializedAST(
+        bufData, silOpts.EnableOSSAModules);
     ASSERT_EQ(serialization::Status::Valid, validationInfo.status);
     ASSERT_EQ(bufData, moduleBuffer->getBuffer());
   }

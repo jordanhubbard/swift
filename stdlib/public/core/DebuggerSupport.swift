@@ -12,6 +12,8 @@
 
 import SwiftShims
 
+#if SWIFT_ENABLE_REFLECTION
+
 @frozen // namespace
 public enum _DebuggerSupport {
   private enum CollectionStatus {
@@ -110,7 +112,7 @@ public enum _DebuggerSupport {
 
   private static func ivarCount(mirror: Mirror) -> Int {
     let ivars = mirror.superclassMirror.map(ivarCount) ?? 0
-    return ivars + mirror._children.count
+    return ivars + mirror.children.count
   }
 
   private static func shouldExpand(
@@ -119,7 +121,7 @@ public enum _DebuggerSupport {
     isRoot: Bool
   ) -> Bool {
     if isRoot || collectionStatus.isCollection { return true }
-    if !mirror._children.isEmpty { return true }
+    if !mirror.children.isEmpty { return true }
     if mirror.displayStyle == .`class` { return true }
     if let sc = mirror.superclassMirror { return ivarCount(mirror: sc) > 0 }
     return true
@@ -161,7 +163,7 @@ public enum _DebuggerSupport {
     }
     let willExpand = isNonClass || isCustomReflectable
 
-    let count = mirror._children.count
+    let count = mirror.children.count
     let bullet = isRoot && (count == 0 || !willExpand) ? ""
       : count == 0    ? "- "
       : maxDepth <= 0 ? "▹ " : "▿ "
@@ -209,7 +211,7 @@ public enum _DebuggerSupport {
         target: &target)
     }
   
-    for (optionalName,child) in mirror._children {
+    for (optionalName,child) in mirror.children {
       let childName = optionalName ?? "\(printedElements)"
       if maxItemCounter <= 0 {
         print(String(repeating: " ", count: indent+4), terminator: "", to: &target)
@@ -261,6 +263,8 @@ public enum _DebuggerSupport {
 public func _stringForPrintObject(_ value: Any) -> String {
   return _DebuggerSupport.stringForPrintObject(value)
 }
+
+#endif // SWIFT_ENABLE_REFLECTION
 
 public func _debuggerTestingCheckExpect(_: String, _: String) { }
 

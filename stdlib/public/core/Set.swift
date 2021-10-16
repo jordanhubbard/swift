@@ -1123,7 +1123,15 @@ extension Set {
   ///   otherwise, `false`.
   @inlinable
   public func isDisjoint(with other: Set<Element>) -> Bool {
-    return _isDisjoint(with: other)
+    guard !isEmpty && !other.isEmpty else { return true }
+    let (smaller, larger) =
+      count < other.count ? (self, other) : (other, self)
+    for member in smaller {
+      if larger.contains(member) {
+        return false
+      }
+    }
+    return true
   }
     
   @inlinable
@@ -1223,8 +1231,10 @@ extension Set {
   @inlinable
   public __consuming func intersection(_ other: Set<Element>) -> Set<Element> {
     var newSet = Set<Element>()
-    for member in self {
-      if other.contains(member) {
+    let (smaller, larger) =
+      count < other.count ? (self, other) : (other, self)
+    for member in smaller {
+      if larger.contains(member) {
         newSet.insert(member)
       }
     }
@@ -1570,6 +1580,7 @@ extension Set.Iterator: IteratorProtocol {
   }
 }
 
+#if SWIFT_ENABLE_REFLECTION
 extension Set.Iterator: CustomReflectable {
   /// A mirror that reflects the iterator.
   public var customMirror: Mirror {
@@ -1586,6 +1597,7 @@ extension Set: CustomReflectable {
     return Mirror(self, unlabeledChildren: self, displayStyle: style)
   }
 }
+#endif
 
 extension Set {
   /// Removes and returns the first element of the set.
@@ -1629,3 +1641,10 @@ extension Set {
 
 public typealias SetIndex<Element: Hashable> = Set<Element>.Index
 public typealias SetIterator<Element: Hashable> = Set<Element>.Iterator
+
+extension Set: Sendable, UnsafeSendable
+  where Element: Sendable { }
+extension Set.Index: Sendable, UnsafeSendable
+  where Element: Sendable { }
+extension Set.Iterator: Sendable, UnsafeSendable
+  where Element: Sendable { }

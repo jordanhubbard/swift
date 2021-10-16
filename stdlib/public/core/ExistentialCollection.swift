@@ -108,6 +108,9 @@ extension AnyIterator: Sequence { }
 @usableFromInline
 @frozen
 internal struct _ClosureBasedIterator<Element>: IteratorProtocol {
+  @usableFromInline
+  internal let _body: () -> Element?
+
   @inlinable
   internal init(_ body: @escaping () -> Element?) {
     self._body = body
@@ -115,9 +118,6 @@ internal struct _ClosureBasedIterator<Element>: IteratorProtocol {
 
   @inlinable
   internal func next() -> Element? { return _body() }
-
-  @usableFromInline
-  internal let _body: () -> Element?
 }
 
 @_fixed_layout
@@ -1641,7 +1641,7 @@ extension AnyRandomAccessCollection {
 //===----------------------------------------------------------------------===//
 
 @usableFromInline
-internal protocol _AnyIndexBox: class {
+internal protocol _AnyIndexBox: AnyObject {
   var _typeID: ObjectIdentifier { get }
 
   func _unbox<T: Comparable>() -> T?

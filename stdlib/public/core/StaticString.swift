@@ -69,7 +69,7 @@
 ///         utf8[4]     //-> Fatal error!
 ///     }
 @frozen
-public struct StaticString {
+public struct StaticString: Sendable {
 
   /// Either a pointer to the start of UTF-8 data, represented as an integer,
   /// or an integer representation of a single Unicode scalar.
@@ -90,6 +90,39 @@ public struct StaticString {
   ///   sequence, or stores an ASCII scalar value.
   @usableFromInline
   internal var _flags: Builtin.Int8
+
+  /// Creates an empty static string.
+  @_transparent
+  public init() {
+    self = ""
+  }
+
+  @usableFromInline @_transparent
+  internal init(
+    _start: Builtin.RawPointer,
+    utf8CodeUnitCount: Builtin.Word,
+    isASCII: Builtin.Int1
+  ) {
+    // We don't go through UnsafePointer here to make things simpler for alias
+    // analysis. A higher-level algorithm may be trying to make sure an
+    // unrelated buffer is not accessed or freed.
+    self._startPtrOrData = Builtin.ptrtoint_Word(_start)
+    self._utf8CodeUnitCount = utf8CodeUnitCount
+    self._flags = Bool(isASCII)
+      ? (0x2 as UInt8)._value
+      : (0x0 as UInt8)._value
+  }
+
+  @usableFromInline @_transparent
+  internal init(
+    unicodeScalar: Builtin.Int32
+  ) {
+    self._startPtrOrData = UInt(UInt32(unicodeScalar))._builtinWordValue
+    self._utf8CodeUnitCount = 0._builtinWordValue
+    self._flags = Unicode.Scalar(_builtinUnicodeScalarLiteral: unicodeScalar).isASCII
+      ? (0x3 as UInt8)._value
+      : (0x1 as UInt8)._value
+  }
 
   /// A pointer to a null-terminated sequence of UTF-8 code units.
   ///
@@ -174,39 +207,6 @@ public struct StaticString {
     } else {
       return unicodeScalar.withUTF8CodeUnits { body($0) }
     }
-  }
-
-  /// Creates an empty static string.
-  @_transparent
-  public init() {
-    self = ""
-  }
-
-  @usableFromInline @_transparent
-  internal init(
-    _start: Builtin.RawPointer,
-    utf8CodeUnitCount: Builtin.Word,
-    isASCII: Builtin.Int1
-  ) {
-    // We don't go through UnsafePointer here to make things simpler for alias
-    // analysis. A higher-level algorithm may be trying to make sure an
-    // unrelated buffer is not accessed or freed.
-    self._startPtrOrData = Builtin.ptrtoint_Word(_start)
-    self._utf8CodeUnitCount = utf8CodeUnitCount
-    self._flags = Bool(isASCII)
-      ? (0x2 as UInt8)._value
-      : (0x0 as UInt8)._value
-  }
-
-  @usableFromInline @_transparent
-  internal init(
-    unicodeScalar: Builtin.Int32
-  ) {
-    self._startPtrOrData = UInt(UInt32(unicodeScalar))._builtinWordValue
-    self._utf8CodeUnitCount = 0._builtinWordValue
-    self._flags = Unicode.Scalar(_builtinUnicodeScalarLiteral: unicodeScalar).isASCII
-      ? (0x3 as UInt8)._value
-      : (0x1 as UInt8)._value
   }
 }
 
@@ -308,9 +308,11 @@ extension StaticString: CustomDebugStringConvertible {
   }
 }
 
+#if SWIFT_ENABLE_REFLECTION
 extension StaticString: CustomReflectable {
 
   public var customMirror: Mirror {
     return Mirror(reflecting: description)
   }
 }
+#endif

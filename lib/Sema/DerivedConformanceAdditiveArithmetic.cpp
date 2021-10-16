@@ -77,7 +77,8 @@ bool DerivedConformance::canDeriveAdditiveArithmetic(NominalTypeDecl *nominal,
     if (v->getInterfaceType()->hasError())
       return false;
     auto varType = DC->mapTypeIntoContext(v->getValueInterfaceType());
-    return (bool)TypeChecker::conformsToProtocol(varType, proto, DC);
+    return (bool)TypeChecker::conformsToProtocol(varType, proto,
+                                                 DC->getParentModule());
   });
 }
 
@@ -97,7 +98,7 @@ deriveBodyMathOperator(AbstractFunctionDecl *funcDecl, MathOperator op) {
   auto *nominalTypeExpr = TypeExpr::createImplicitForDecl(
       DeclNameLoc(), nominal, funcDecl,
       funcDecl->mapTypeIntoContext(nominal->getInterfaceType()));
-  auto *initExpr = new (C) ConstructorRefCallExpr(initDRE, nominalTypeExpr);
+  auto *initExpr = ConstructorRefCallExpr::create(C, initDRE, nominalTypeExpr);
 
   // Get operator protocol requirement.
   auto *proto = C.getProtocol(KnownProtocolKind::AdditiveArithmetic);
@@ -142,25 +143,19 @@ deriveBodyMathOperator(AbstractFunctionDecl *funcDecl, MathOperator op) {
                                          DeclNameLoc(), /*Implicit*/ true);
     auto *rhsArg = new (C) MemberRefExpr(rhsDRE, SourceLoc(), member,
                                          DeclNameLoc(), /*Implicit*/ true);
-    auto *memberOpArgs =
-        TupleExpr::create(C, SourceLoc(), {lhsArg, rhsArg}, {}, {}, SourceLoc(),
-                          /*HasTrailingClosure*/ false,
-                          /*Implicit*/ true);
-    auto *memberOpCallExpr =
-        new (C) BinaryExpr(memberOpExpr, memberOpArgs, /*Implicit*/ true);
-    return memberOpCallExpr;
+    return BinaryExpr::create(C, lhsArg, memberOpExpr, rhsArg,
+                              /*implicit*/ true);
   };
 
   // Create array of member operator call expressions.
-  llvm::SmallVector<Expr *, 2> memberOpExprs;
-  llvm::SmallVector<Identifier, 2> memberNames;
+  llvm::SmallVector<Argument, 2> memberOpArgs;
   for (auto member : nominal->getStoredProperties()) {
-    memberOpExprs.push_back(createMemberOpExpr(member));
-    memberNames.push_back(member->getName());
+    memberOpArgs.emplace_back(SourceLoc(), member->getName(),
+                              createMemberOpExpr(member));
   }
   // Call memberwise initializer with member operator call expressions.
-  auto *callExpr =
-      CallExpr::createImplicit(C, initExpr, memberOpExprs, memberNames);
+  auto *argList = ArgumentList::createImplicit(C, memberOpArgs);
+  auto *callExpr = CallExpr::createImplicit(C, initExpr, argList);
   ASTNode returnStmt = new (C) ReturnStmt(SourceLoc(), callExpr, true);
   return std::pair<BraceStmt *, bool>(
       BraceStmt::create(C, SourceLoc(), returnStmt, SourceLoc(), true), false);
@@ -181,6 +176,7 @@ static ValueDecl *deriveMathOperator(DerivedConformance &derived,
                           C.getIdentifier(name), parentDC);
     param->setSpecifier(ParamDecl::Specifier::Default);
     param->setInterfaceType(type);
+    param->setImplicit();
     return param;
   };
 
@@ -206,6 +202,12 @@ static ValueDecl *deriveMathOperator(DerivedConformance &derived,
   operatorDecl->copyFormalAccessFrom(nominal, /*sourceIsParentContext*/ true);
 
   derived.addMembersToConformanceContext({operatorDecl});
+
+  // For the effective memberwise initializer before we force the body,
+  // so that it becomes part of the emitted ABI members even if we don't
+  // emit the body.
+  (void) nominal->getEffectiveMemberwiseInitializer();
+
   return operatorDecl;
 }
 
@@ -226,7 +228,7 @@ deriveBodyPropertyGetter(AbstractFunctionDecl *funcDecl, ProtocolDecl *proto,
   auto *nominalTypeExpr = TypeExpr::createImplicitForDecl(
       DeclNameLoc(), nominal, funcDecl,
       funcDecl->mapTypeIntoContext(nominal->getInterfaceType()));
-  auto *initExpr = new (C) ConstructorRefCallExpr(initDRE, nominalTypeExpr);
+  auto *initExpr = ConstructorRefCallExpr::create(C, initDRE, nominalTypeExpr);
 
   auto createMemberPropertyExpr = [&](VarDecl *member) -> Expr * {
     auto memberType =
@@ -264,15 +266,14 @@ deriveBodyPropertyGetter(AbstractFunctionDecl *funcDecl, ProtocolDecl *proto,
   };
 
   // Create array of `member.<property>` expressions.
-  llvm::SmallVector<Expr *, 2> memberPropExprs;
-  llvm::SmallVector<Identifier, 2> memberNames;
+  llvm::SmallVector<Argument, 2> args;
   for (auto member : nominal->getStoredProperties()) {
-    memberPropExprs.push_back(createMemberPropertyExpr(member));
-    memberNames.push_back(member->getName());
+    args.emplace_back(SourceLoc(), member->getName(),
+                      createMemberPropertyExpr(member));
   }
   // Call memberwise initializer with member property expressions.
-  auto *callExpr =
-      CallExpr::createImplicit(C, initExpr, memberPropExprs, memberNames);
+  auto *callExpr = CallExpr::createImplicit(
+      C, initExpr, ArgumentList::createImplicit(C, args));
   ASTNode returnStmt = new (C) ReturnStmt(SourceLoc(), callExpr, true);
   auto *braceStmt =
       BraceStmt::create(C, SourceLoc(), returnStmt, SourceLoc(), true);
@@ -310,6 +311,12 @@ static ValueDecl *deriveAdditiveArithmetic_zero(DerivedConformance &derived) {
   getterDecl->setBodySynthesizer(deriveBodyAdditiveArithmetic_zero, nullptr);
 
   derived.addMembersToConformanceContext({propDecl, pbDecl});
+
+  // For the effective memberwise initializer before we force the body,
+  // so that it becomes part of the emitted ABI members even if we don't
+  // emit the body.
+  (void) nominal->getEffectiveMemberwiseInitializer();
+
   return propDecl;
 }
 

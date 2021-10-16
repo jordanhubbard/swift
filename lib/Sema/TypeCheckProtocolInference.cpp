@@ -19,6 +19,7 @@
 
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericSignature.h"
+#include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeMatcher.h"
@@ -206,26 +207,18 @@ AssociatedTypeInference::inferTypeWitnessesViaValueWitnesses(
     if (extendedNominal == nullptr)
       return true;
 
-    // FIXME: The extension may not have a generic signature set up yet as
-    // resolving signatures may trigger associated type inference.  This cycle
-    // is now detectable and we should look into untangling it
-    // - see rdar://55263708
-    if (!extension->hasComputedGenericSignature())
-      return true;
-
-    // Retrieve the generic signature of the extension.
-    const auto extensionSig = extension->getGenericSignature();
+    auto *proto = dyn_cast<ProtocolDecl>(extendedNominal);
 
     // If the extension is bound to the nominal the conformance is
     // declared on, it is viable for inference when its conditional
     // requirements are satisfied by those of the conformance context.
-    if (!isa<ProtocolDecl>(extendedNominal)) {
-      // Extensions of non-generic nominals are always viable for inference.
-      if (!extensionSig)
-        return true;
-
-      return extensionSig->requirementsNotSatisfiedBy(
-          conformanceCtx->getGenericSignatureOfContext()).empty();
+    if (!proto) {
+      // Retrieve the generic signature of the extension.
+      const auto extensionSig = extension->getGenericSignature();
+      return extensionSig
+          .requirementsNotSatisfiedBy(
+              conformanceCtx->getGenericSignatureOfContext())
+          .empty();
     }
 
     // The condition here is a bit more fickle than
@@ -235,29 +228,28 @@ AssociatedTypeInference::inferTypeWitnessesViaValueWitnesses(
     // in the first place. Only check conformances on the `Self` type,
     // because those have to be explicitly declared on the type somewhere
     // so won't be affected by whatever answer inference comes up with.
-    auto selfTy = extension->getSelfInterfaceType();
-    for (const Requirement &reqt : extensionSig->getRequirements()) {
-      switch (reqt.getKind()) {
-      case RequirementKind::Conformance:
-      case RequirementKind::Superclass:
-        // FIXME: This is the wrong check
-        if (selfTy->isEqual(reqt.getFirstType()) &&
-            !TypeChecker::isSubtypeOf(conformance->getType(),
-                                      reqt.getSecondType(), dc))
-          return false;
-        break;
+    auto *module = dc->getParentModule();
+    auto checkConformance = [&](ProtocolDecl *proto) {
+      auto otherConf = module->lookupConformance(conformance->getType(),
+                                                 proto);
+      return (otherConf && otherConf.getConditionalRequirements().empty());
+    };
 
-      case RequirementKind::Layout:
-      case RequirementKind::SameType:
-        break;
+    // First check the extended protocol itself.
+    if (!checkConformance(proto))
+      return false;
+
+    // Now check any additional bounds on 'Self' from the where clause.
+    auto bounds = getSelfBoundsFromWhereClause(extension);
+    for (auto *decl : bounds.decls) {
+      if (auto *proto = dyn_cast<ProtocolDecl>(decl)) {
+        if (!checkConformance(proto))
+          return false;
       }
     }
 
     return true;
   };
-
-  auto typeInContext =
-    conformance->getDeclContext()->mapTypeIntoContext(conformance->getType());
 
   for (auto witness :
        checker.lookupValueWitnesses(req, /*ignoringNames=*/nullptr)) {
@@ -314,6 +306,10 @@ AssociatedTypeInference::inferTypeWitnessesViaValueWitnesses(
           if (!associatedTypesAreSameEquivalenceClass(dmt->getAssocType(),
                                                       result.first))
             return false;
+
+          auto typeInContext =
+            conformance->getDeclContext()->mapTypeIntoContext(conformance->getType());
+
           if (!dmt->getBase()->isEqual(typeInContext))
             return false;
 
@@ -327,7 +323,7 @@ AssociatedTypeInference::inferTypeWitnessesViaValueWitnesses(
             auto selfAssocTy = DependentMemberType::get(selfTy,
                                                         dmt->getAssocType());
             for (auto &reqt : witnessContext->getGenericSignatureOfContext()
-                                            ->getRequirements()) {
+                                            .getRequirements()) {
               switch (reqt.getKind()) {
               case RequirementKind::Conformance:
               case RequirementKind::Superclass:
@@ -810,8 +806,6 @@ AssociatedTypeDecl *AssociatedTypeInference::findDefaultedAssociatedType(
 Type AssociatedTypeInference::computeFixedTypeWitness(
                                             AssociatedTypeDecl *assocType) {
   Type resultType;
-  auto *const structuralTy = DependentMemberType::get(
-      proto->getSelfInterfaceType(), assocType->getName());
 
   // Look at all of the inherited protocols to determine whether they
   // require a fixed type for this associated type.
@@ -820,16 +814,27 @@ Type AssociatedTypeInference::computeFixedTypeWitness(
         !conformedProto->inheritsFrom(assocType->getProtocol()))
       continue;
 
-    const auto ty =
-        conformedProto->getGenericSignature()->getCanonicalTypeInContext(
-            structuralTy);
+    auto sig = conformedProto->getGenericSignature();
+
+    // FIXME: The RequirementMachine will assert on re-entrant construction.
+    // We should find a more principled way of breaking this cycle.
+    if (ctx.isRecursivelyConstructingRequirementMachine(sig.getCanonicalSignature()) ||
+        conformedProto->isComputingRequirementSignature())
+      continue;
+
+    auto selfTy = conformedProto->getSelfInterfaceType();
+    if (!sig->requiresProtocol(selfTy, assocType->getProtocol()))
+      continue;
+
+    auto structuralTy = DependentMemberType::get(selfTy, assocType->getName());
+    const auto ty = sig.getCanonicalTypeInContext(structuralTy);
 
     // A dependent member type with an identical base and name indicates that
     // the protocol does not same-type constrain it in any way; move on to
     // the next protocol.
     if (auto *const memberTy = ty->getAs<DependentMemberType>()) {
-      if (memberTy->getBase()->isEqual(structuralTy->getBase()) &&
-          memberTy->getName() == structuralTy->getName())
+      if (memberTy->getBase()->isEqual(selfTy) &&
+          memberTy->getName() == assocType->getName())
         continue;
     }
 
@@ -908,7 +913,7 @@ AssociatedTypeInference::computeAbstractTypeWitness(
 
   // If there is a generic parameter of the named type, use that.
   if (auto genericSig = dc->getGenericSignatureOfContext()) {
-    for (auto gp : genericSig->getInnermostGenericParams()) {
+    for (auto gp : genericSig.getInnermostGenericParams()) {
       if (gp->getName() == assocType->getName())
         return AbstractTypeWitness::forGenericParam(assocType, gp);
     }
@@ -1130,8 +1135,8 @@ bool AssociatedTypeInference::checkConstrainedExtension(ExtensionDecl *ext) {
   SubstOptions options = getSubstOptionsWithCurrentTypeWitnesses();
   switch (TypeChecker::checkGenericArguments(
                        dc, SourceLoc(), SourceLoc(), adoptee,
-                       ext->getGenericSignature()->getGenericParams(),
-                       ext->getGenericSignature()->getRequirements(),
+                       ext->getGenericSignature().getGenericParams(),
+                       ext->getGenericSignature().getRequirements(),
                        QueryTypeSubstitutionMap{subs},
                        options)) {
   case RequirementCheckResult::Success:
@@ -1505,13 +1510,12 @@ static Comparison compareDeclsForInference(DeclContext *DC, ValueDecl *decl1,
       insertProtocol(parent);
   };
 
-  for (auto &reqt : sig1->getRequirements()) {
+  for (auto &reqt : sig1.getRequirements()) {
     if (!reqt.getFirstType()->isEqual(selfParam))
       continue;
     switch (reqt.getKind()) {
     case RequirementKind::Conformance: {
-      auto *proto = reqt.getSecondType()->castTo<ProtocolType>()->getDecl();
-      insertProtocol(proto);
+      insertProtocol(reqt.getProtocolDecl());
       break;
     }
     case RequirementKind::Superclass:
@@ -1538,13 +1542,12 @@ static Comparison compareDeclsForInference(DeclContext *DC, ValueDecl *decl1,
       removeProtocol(parent);
   };
 
-  for (auto &reqt : sig2->getRequirements()) {
+  for (auto &reqt : sig2.getRequirements()) {
     if (!reqt.getFirstType()->isEqual(selfParam))
       continue;
     switch (reqt.getKind()) {
     case RequirementKind::Conformance: {
-      auto *proto = reqt.getSecondType()->castTo<ProtocolType>()->getDecl();
-      removeProtocol(proto);
+      removeProtocol(reqt.getProtocolDecl());
       break;
     }
     case RequirementKind::Superclass:
@@ -1881,9 +1884,11 @@ bool AssociatedTypeInference::diagnoseAmbiguousSolutions(
           }
 
           // Otherwise, we have a default.
-          diags.diagnose(assocType, diag::associated_type_deduction_default,
-                         type)
-            .highlight(assocType->getDefaultDefinitionTypeRepr()->getSourceRange());
+          auto defaultDiag =
+            diags.diagnose(assocType, diag::associated_type_deduction_default,
+                           type);
+          if (auto defaultTypeRepr = assocType->getDefaultDefinitionTypeRepr())
+            defaultDiag.highlight(defaultTypeRepr->getSourceRange());
         };
 
         diagnoseWitness(firstMatch, firstType);

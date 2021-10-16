@@ -123,7 +123,6 @@ bool ObjectOutliner::isValidUseOfObject(SILInstruction *I,
     return true;
 
   switch (I->getKind()) {
-  case SILInstructionKind::DebugValueAddrInst:
   case SILInstructionKind::DebugValueInst:
   case SILInstructionKind::LoadInst:
   case SILInstructionKind::DeallocRefInst:
@@ -579,7 +578,7 @@ void ObjectOutliner::replaceFindStringCall(ApplyInst *FindStringCall) {
                                      { FindStringCall->getArgument(0),
                                        FindStringCall->getArgument(1),
                                        CacheAddr },
-                                     FindStringCall->isNonThrowing());
+                                     FindStringCall->getApplyOptions());
 
   FindStringCall->replaceAllUsesWith(NewCall);
   FindStringCall->eraseFromParent();

@@ -20,6 +20,7 @@
 #include "swift/Basic/EditorPlaceholder.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/LLVM.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/FoldingSet.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/TrailingObjects.h"
@@ -110,6 +111,10 @@ public:
     return isOperatorSlow();
   }
 
+  bool isArithmeticOperator() const {
+    return is("+") || is("-") || is("*") || is("/") || is("%");
+  }
+
   // Returns whether this is a standard comparison operator,
   // such as '==', '>=' or '!=='.
   bool isStandardComparisonOperator() const {
@@ -159,6 +164,10 @@ public:
 
   bool isEditorPlaceholder() const {
     return !empty() && isEditorPlaceholder(str());
+  }
+
+  bool hasDollarPrefix() const {
+    return str().startswith("$") && !(getLength() == 1);
   }
   
   const void *getAsOpaquePointer() const {
@@ -318,6 +327,10 @@ public:
 
   bool isEditorPlaceholder() const {
     return !isSpecial() && getIdentifier().isEditorPlaceholder();
+  }
+
+  bool hasDollarPrefix() const {
+    return getIdentifier().hasDollarPrefix();
   }
 
   /// A representation of the name to be displayed to users. May be ambiguous
@@ -815,6 +828,13 @@ public:
 
   /// Construct an invalid ObjCSelector.
   ObjCSelector() : Storage() {}
+
+  /// Split \p string into selector pieces on colons to create an ObjCSelector.
+  ///
+  /// This should not be used to parse selectors written directly in Swift
+  /// source source code (e.g. the argument of an @objc attribute). Use the
+  /// parser for that.
+  static llvm::Optional<ObjCSelector> parse(ASTContext &ctx, StringRef string);
 
   /// Convert to true if the decl name is valid.
   explicit operator bool() const { return (bool)Storage; }

@@ -93,7 +93,7 @@ extension String {
 ///   substrings may, therefore, prolong the lifetime of string data that is
 ///   no longer otherwise accessible, which can appear to be memory leakage.
 @frozen
-public struct Substring {
+public struct Substring: Sendable {
   @usableFromInline
   internal var _slice: Slice<String>
 
@@ -105,7 +105,7 @@ public struct Substring {
 
     self._slice = Slice(
       base: slice.base,
-      bounds: Range(uncheckedBounds: (start, end)))
+      bounds: Range(_uncheckedBounds: (start, end)))
     _invariantCheck()
   }
 
@@ -132,7 +132,7 @@ extension Substring {
   @inlinable @inline(__always)
   internal var _offsetRange: Range<Int> {
     return Range(
-      uncheckedBounds: (startIndex._encodedOffset, endIndex._encodedOffset))
+      _uncheckedBounds: (startIndex._encodedOffset, endIndex._encodedOffset))
   }
 
   #if !INTERNAL_CHECKS_ENABLED
@@ -307,9 +307,11 @@ extension Substring: StringProtocol {
   }
 }
 
+#if SWIFT_ENABLE_REFLECTION
 extension Substring: CustomReflectable {
  public var customMirror: Mirror { return String(self).customMirror }
 }
+#endif
 
 extension Substring: CustomStringConvertible {
   @inlinable @inline(__always)
@@ -322,15 +324,24 @@ extension Substring: CustomDebugStringConvertible {
 
 extension Substring: LosslessStringConvertible {
   public init(_ content: String) {
-    self = content[...]
+    let range = Range(_uncheckedBounds: (content.startIndex, content.endIndex))
+    self.init(Slice(base: content, bounds: range))
   }
 }
 
 extension Substring {
   @frozen
-  public struct UTF8View {
+  public struct UTF8View: Sendable {
     @usableFromInline
     internal var _slice: Slice<String.UTF8View>
+
+    /// Creates an instance that slices `base` at `_bounds`.
+    @inlinable
+    internal init(_ base: String.UTF8View, _bounds: Range<Index>) {
+      _slice = Slice(
+        base: String(base._guts).utf8,
+        bounds: _bounds)
+    }
   }
 }
 
@@ -339,14 +350,6 @@ extension Substring.UTF8View: BidirectionalCollection {
   public typealias Indices = String.UTF8View.Indices
   public typealias Element = String.UTF8View.Element
   public typealias SubSequence = Substring.UTF8View
-
-  /// Creates an instance that slices `base` at `_bounds`.
-  @inlinable
-  internal init(_ base: String.UTF8View, _bounds: Range<Index>) {
-    _slice = Slice(
-      base: String(base._guts).utf8,
-      bounds: _bounds)
-  }
 
   //
   // Plumb slice operations through
@@ -465,9 +468,17 @@ extension String {
 }
 extension Substring {
   @frozen
-  public struct UTF16View {
+  public struct UTF16View: Sendable {
     @usableFromInline
     internal var _slice: Slice<String.UTF16View>
+
+    /// Creates an instance that slices `base` at `_bounds`.
+    @inlinable
+    internal init(_ base: String.UTF16View, _bounds: Range<Index>) {
+      _slice = Slice(
+        base: String(base._guts).utf16,
+        bounds: _bounds)
+    }
   }
 }
 
@@ -476,14 +487,6 @@ extension Substring.UTF16View: BidirectionalCollection {
   public typealias Indices = String.UTF16View.Indices
   public typealias Element = String.UTF16View.Element
   public typealias SubSequence = Substring.UTF16View
-
-  /// Creates an instance that slices `base` at `_bounds`.
-  @inlinable
-  internal init(_ base: String.UTF16View, _bounds: Range<Index>) {
-    _slice = Slice(
-      base: String(base._guts).utf16,
-      bounds: _bounds)
-  }
 
   //
   // Plumb slice operations through
@@ -591,9 +594,17 @@ extension String {
 }
 extension Substring {
   @frozen
-  public struct UnicodeScalarView {
+  public struct UnicodeScalarView: Sendable {
     @usableFromInline
     internal var _slice: Slice<String.UnicodeScalarView>
+
+    /// Creates an instance that slices `base` at `_bounds`.
+    @inlinable
+    internal init(_ base: String.UnicodeScalarView, _bounds: Range<Index>) {
+      _slice = Slice(
+        base: String(base._guts).unicodeScalars,
+        bounds: _bounds)
+    }
   }
 }
 
@@ -602,14 +613,6 @@ extension Substring.UnicodeScalarView: BidirectionalCollection {
   public typealias Indices = String.UnicodeScalarView.Indices
   public typealias Element = String.UnicodeScalarView.Element
   public typealias SubSequence = Substring.UnicodeScalarView
-
-  /// Creates an instance that slices `base` at `_bounds`.
-  @inlinable
-  internal init(_ base: String.UnicodeScalarView, _bounds: Range<Index>) {
-    _slice = Slice(
-      base: String(base._guts).unicodeScalars,
-      bounds: _bounds)
-  }
 
   //
   // Plumb slice operations through
@@ -727,14 +730,14 @@ extension Substring: RangeReplaceableCollection {
   public init<S: Sequence>(_ elements: S)
   where S.Element == Character {
     if let str = elements as? String {
-      self = str[...]
+      self.init(str)
       return
     }
     if let subStr = elements as? Substring {
       self = subStr
       return
     }
-    self = String(elements)[...]
+    self.init(String(elements))
   }
 
   @inlinable // specialize

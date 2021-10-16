@@ -37,6 +37,12 @@ func testWithoutActuallyEscaping(closure: (Int) -> Void) {
   }
 }
 
+class SR12957 {
+  static let main = SR12957()
+}
+
+func bar(x: SR12957 = .main) {}
+
 // RUN: %target-swift-ide-test -range -pos=7:8 -end-pos=7:19 -source-filename %s | %FileCheck %s -check-prefix=CHECK-BOOL
 // CHECK-BOOL: <Type>Bool</Type>
 
@@ -55,12 +61,13 @@ func testWithoutActuallyEscaping(closure: (Int) -> Void) {
 // RUN: %target-swift-ide-test -range -pos=35:1 -end-pos=38:1 -source-filename %s | %FileCheck %s -check-prefix=CHECK-MTEE-EXPR-1
 // RUN: %target-swift-ide-test -range -pos=35:27 -end-pos=35:34 -source-filename %s | %FileCheck %s -check-prefix=CHECK-MTEE-EXPR-2
 // RUN: %target-swift-ide-test -range -pos=35:36 -end-pos=37:4 -source-filename %s | %FileCheck %s -check-prefix=CHECK-MTEE-EXPR-3
+// RUN: %target-swift-ide-test -range -pos=44:23 -end-pos=44:28 -source-filename %s | %FileCheck %s -check-prefix=CHECK-DEFAULT-ARGUMENT
 
 // CHECK-PART-EXPR: <Kind>PartOfExpression</Kind>
 // CHECK-PART-EXPR-NEXT: <Content>getSelf()</Content>
 // CHECK-PART-EXPR-NEXT: <Context>swift_ide_test.(file).foo1(_:)</Context>
 // CHECK-PART-EXPR-NEXT: <Parent>Call</Parent>
-// CHECK-PART-EXPR-NEXT: <ASTNodes>2</ASTNodes>
+// CHECK-PART-EXPR-NEXT: <ASTNodes>1</ASTNodes>
 // CHECK-PART-EXPR-NEXT: <end>
 
 // CHECK-PART-EXPR1: <Kind>PartOfExpression</Kind>
@@ -107,3 +114,11 @@ func testWithoutActuallyEscaping(closure: (Int) -> Void) {
 // CHECK-MTEE-EXPR-3-NEXT: <Referenced>escapable</Referenced><Type>(Int) -> Void</Type>
 // CHECK-MTEE-EXPR-3-NEXT: <ASTNodes>1</ASTNodes>
 // CHECK-MTEE-EXPR-3-NEXT: <end>
+
+// CHECK-DEFAULT-ARGUMENT: <Kind>SingleExpression</Kind>
+// CHECK-DEFAULT-ARGUMENT-NEXT: <Content>.main</Content>
+// CHECK-DEFAULT-ARGUMENT-NEXT: <Type>SR12957</Type><Exit>false</Exit>
+// CHECK-DEFAULT-ARGUMENT-NEXT: <Context>swift_ide_test.(file).bar(x:)</Context>
+// CHECK-DEFAULT-ARGUMENT-NEXT: <ASTNodes>1</ASTNodes>
+// CHECK-DEFAULT-ARGUMENT-NEXT: <end>
+

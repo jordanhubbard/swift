@@ -72,18 +72,18 @@ public struct IndexingIterator<Elements: Collection> {
   @usableFromInline
   internal var _position: Elements.Index
 
+  /// Creates an iterator over the given collection.
   @inlinable
   @inline(__always)
-  /// Creates an iterator over the given collection.
   public /// @testable
   init(_elements: Elements) {
     self._elements = _elements
     self._position = _elements.startIndex
   }
 
+  /// Creates an iterator over the given collection.
   @inlinable
   @inline(__always)
-  /// Creates an iterator over the given collection.
   public /// @testable
   init(_elements: Elements, _position: Elements.Index) {
     self._elements = _elements
@@ -129,6 +129,9 @@ extension IndexingIterator: IteratorProtocol, Sequence {
     return element
   }
 }
+
+extension IndexingIterator: Sendable
+  where Elements: Sendable, Elements.Index: Sendable { }
 
 /// A sequence whose elements can be traversed multiple times,
 /// nondestructively, and accessed by an indexed subscript.
@@ -384,12 +387,11 @@ public protocol Collection: Sequence {
   /// Returns an iterator over the elements of the collection.
   override __consuming func makeIterator() -> Iterator
 
-  /// A sequence that represents a contiguous subrange of the collection's
-  /// elements.
+  /// A collection representing a contiguous subrange of this collection's
+  /// elements. The subsequence shares indices with the original collection.
   ///
-  /// This associated type appears as a requirement in the `Sequence`
-  /// protocol, but it is restated here with stricter constraints. In a
-  /// collection, the subsequence should also conform to `Collection`.
+  /// The default subsequence type for collections that don't define their own
+  /// is `Slice`.
   associatedtype SubSequence: Collection = Slice<Self>
   where SubSequence.Index == Index,
         Element == SubSequence.Element,
@@ -1039,6 +1041,18 @@ extension Collection where SubSequence == Slice<Self> {
     _failEarlyRangeCheck(bounds, bounds: startIndex..<endIndex)
     return Slice(base: self, bounds: bounds)
   }
+}
+
+extension Collection {
+  // This unavailable default implementation of `subscript(bounds: Range<_>)`
+  // prevents incomplete Collection implementations from satisfying the
+  // protocol through the use of the generic convenience implementation
+  // `subscript<R: RangeExpression>(r: R)`. If that were the case, at
+  // runtime the generic implementation would call itself
+  // in an infinite recursion because of the absence of a better option.
+  @available(*, unavailable)
+  @_alwaysEmitIntoClient
+  public subscript(bounds: Range<Index>) -> SubSequence { fatalError() }
 }
 
 extension Collection where SubSequence == Self {

@@ -102,8 +102,23 @@ ATTRIBUTE_NODES = [
          element='Syntax', element_name='SpecializeAttribute',
          element_choices=[
              'LabeledSpecializeEntry',
+             'AvailabilityEntry',
              'TargetFunctionEntry',
              'GenericWhereClause',
+         ]),
+
+    Node('AvailabilityEntry', kind='Syntax',
+         description='''
+         The availability argument for the _specialize attribute
+         ''',
+         children=[
+             Child('Label', kind='IdentifierToken',
+                   description='The label of the argument'),
+             Child('Colon', kind='ColonToken',
+                   description='The colon separating the label and the value'),
+             Child('AvailabilityList', kind='AvailabilitySpecList',
+                   collection_element_name='Availability'),
+             Child('Semicolon', kind='SemicolonToken'),
          ]),
 
     # Representation of e.g. 'exported: true,'
@@ -228,13 +243,21 @@ ATTRIBUTE_NODES = [
 
     # The argument of '@differentiable(...)'.
     # differentiable-attr-arguments ->
-    #     differentiability-params-clause? ','? generic-where-clause?
+    #     differentiability-kind? '.'? differentiability-params-clause? ','?
+    #     generic-where-clause?
     Node('DifferentiableAttributeArguments', kind='Syntax',
          description='''
          The arguments for the `@differentiable` attribute: an optional
-         differentiability parameter clause and an optional 'where' clause.
+         differentiability kind, an optional differentiability parameter clause,
+         and an optional 'where' clause.
          ''',
          children=[
+             Child('DiffKind', kind='IdentifierToken',
+                   text_choices=['forward', 'reverse', 'linear'],
+                   is_optional=True),
+             Child('DiffKindComma', kind='CommaToken', description='''
+                   The comma following the differentiability kind, if it exists.
+                   ''', is_optional=True),
              Child('DiffParams', kind='DifferentiabilityParamsClause',
                    is_optional=True),
              Child('DiffParamsComma', kind='CommaToken', description='''
@@ -277,7 +300,7 @@ ATTRIBUTE_NODES = [
     Node('DifferentiabilityParamList', kind='SyntaxCollection',
          element='DifferentiabilityParam'),
 
-    # differentiability-param -> ('self' | identifer | integer-literal) ','?
+    # differentiability-param -> ('self' | identifier | integer-literal) ','?
     Node('DifferentiabilityParam', kind='Syntax',
          description='''
          A differentiability parameter: either the "self" identifier, a function

@@ -17,10 +17,12 @@
 #ifndef SWIFT_AST_ASTCONTEXT_H
 #define SWIFT_AST_ASTCONTEXT_H
 
+#include "swift/AST/ASTAllocated.h"
 #include "swift/AST/Evaluator.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/Import.h"
+#include "swift/AST/SILOptions.h"
 #include "swift/AST/SearchPathOptions.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeAlignments.h"
@@ -28,6 +30,7 @@
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/Located.h"
 #include "swift/Basic/Malloc.h"
+#include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "clang/AST/DeclTemplate.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -37,6 +40,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/DataTypes.h"
@@ -73,6 +77,7 @@ namespace swift {
   class DerivativeAttr;
   class DifferentiableAttr;
   class ExtensionDecl;
+  struct ExternalSourceLocs;
   class ForeignRepresentationInfo;
   class FuncDecl;
   class GenericContext;
@@ -103,6 +108,8 @@ namespace swift {
   class InheritedProtocolConformance;
   class SelfProtocolConformance;
   class SpecializedProtocolConformance;
+  enum class BuiltinConformanceKind;
+  class BuiltinProtocolConformance;
   enum class ProtocolConformanceState;
   class Pattern;
   enum PointerTypeKind : unsigned;
@@ -132,25 +139,13 @@ namespace namelookup {
   class ImportCache;
 }
 
+namespace rewriting {
+  class RequirementMachine;
+}
+
 namespace syntax {
   class SyntaxArena;
 }
-
-/// The arena in which a particular ASTContext allocation will go.
-enum class AllocationArena {
-  /// The permanent arena, which is tied to the lifetime of
-  /// the ASTContext.
-  ///
-  /// All global declarations and types need to be allocated into this arena.
-  /// At present, everything that is not a type involving a type variable is
-  /// allocated in this arena.
-  Permanent,
-  /// The constraint solver's temporary arena, which is tied to the
-  /// lifetime of a particular instance of the constraint solver.
-  ///
-  /// Any type involving a type variable is allocated in this arena.
-  ConstraintSolver
-};
 
 /// Lists the set of "known" Foundation entities that are used in the
 /// compiler.
@@ -227,10 +222,10 @@ class ASTContext final {
   void operator=(const ASTContext&) = delete;
 
   ASTContext(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
-             SearchPathOptions &SearchPathOpts,
+             SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
              ClangImporterOptions &ClangImporterOpts,
-             SourceManager &SourceMgr,
-             DiagnosticEngine &Diags);
+             symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
+             SourceManager &SourceMgr, DiagnosticEngine &Diags);
 
 public:
   // Members that should only be used by ASTContext.cpp.
@@ -242,8 +237,9 @@ public:
   void operator delete(void *Data) throw();
 
   static ASTContext *get(LangOptions &langOpts, TypeCheckerOptions &typeckOpts,
-                         SearchPathOptions &SearchPathOpts,
+                         SILOptions &silOpts, SearchPathOptions &SearchPathOpts,
                          ClangImporterOptions &ClangImporterOpts,
+                         symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts,
                          SourceManager &SourceMgr, DiagnosticEngine &Diags);
   ~ASTContext();
 
@@ -259,11 +255,17 @@ public:
   /// The type checker options.
   const TypeCheckerOptions &TypeCheckerOpts;
 
+  /// Options for SIL.
+  const SILOptions &SILOpts;
+
   /// The search path options used by this AST context.
   SearchPathOptions &SearchPathOpts;
 
   /// The clang importer options used by this AST context.
   ClangImporterOptions &ClangImporterOpts;
+
+  /// The symbol graph generation options used by this AST context.
+  symbolgraphgen::SymbolGraphOptions &SymbolGraphOpts;
 
   /// The source manager object.
   SourceManager &SourceMgr;
@@ -346,8 +348,11 @@ private:
     DelayedPatternContexts;
 
   /// Cache of module names that fail the 'canImport' test in this context.
-  llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
+  mutable llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
   
+  /// Mapping between aliases and real (physical) names of imported or referenced modules.
+  mutable llvm::DenseMap<Identifier, Identifier> ModuleAliasMap;
+
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
   getAllocator(AllocationArena arena = AllocationArena::Permanent) const;
@@ -472,6 +477,16 @@ public:
   /// specified string.
   Identifier getIdentifier(StringRef Str) const;
 
+  /// Convert a given alias map to a map of Identifiers between module aliases and their actual names.
+  /// For example, if '-module-alias Foo=X -module-alias Bar=Y' input is passed in, the aliases Foo and Bar are
+  /// the names of the imported or referenced modules in source files in the main module, and X and Y
+  /// are the real (physical) module names on disk.
+  void setModuleAliases(const llvm::StringMap<StringRef> &aliasMap);
+
+  /// Retrieve the actual module name if a module alias is used via '-module-alias Foo=X', where Foo is
+  /// a module alias and X is the real (physical) name. Returns \p key if no aliasing is used.
+  Identifier getRealModuleName(Identifier key) const;
+
   /// Decide how to interpret two precedence groups.
   Associativity associateInfixOperators(PrecedenceGroupDecl *left,
                                         PrecedenceGroupDecl *right) const;
@@ -482,7 +497,10 @@ public:
   
 #define KNOWN_STDLIB_TYPE_DECL(NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of Swift.NAME. */ \
-  DECL_CLASS *get##NAME##Decl() const;
+  DECL_CLASS *get##NAME##Decl() const; \
+\
+  /** Retrieve the type of Swift.NAME. */ \
+  Type get##NAME##Type() const;
 #include "swift/AST/KnownStdlibTypes.def"
 
   /// Retrieve the declaration of Swift.Optional<T>.Some.
@@ -491,14 +509,17 @@ public:
   /// Retrieve the declaration of Swift.Optional<T>.None.
   EnumElementDecl *getOptionalNoneDecl() const;
 
+  /// Retrieve the declaration of Swift.Void.
+  TypeAliasDecl *getVoidDecl() const;
+
+  /// Retrieve the type of Swift.Void.
+  Type getVoidType() const;
+
   /// Retrieve the declaration of the "pointee" property of a pointer type.
   VarDecl *getPointerPointeePropertyDecl(PointerTypeKind ptrKind) const;
 
   /// Retrieve the type Swift.AnyObject.
   CanType getAnyObjectType() const;
-
-  /// Retrieve the type Swift.Never.
-  CanType getNeverType() const;
 
 #define KNOWN_SDK_TYPE_DECL(MODULE, NAME, DECL_CLASS, NUM_GENERIC_PARAMS) \
   /** Retrieve the declaration of MODULE.NAME. */ \
@@ -513,6 +534,11 @@ public:
   FuncDecl *get##Name() const;
 #include "swift/AST/KnownDecls.def"
 
+  // Declare accessors for the known declarations.
+#define KNOWN_SDK_FUNC_DECL(Module, Name, Id) \
+  FuncDecl *get##Name() const;
+#include "swift/AST/KnownSDKDecls.def"
+
   /// Get the '+' function on two RangeReplaceableCollection.
   FuncDecl *getPlusFunctionOnRangeReplaceableCollection() const;
 
@@ -521,6 +547,9 @@ public:
 
   /// Get Sequence.makeIterator().
   FuncDecl *getSequenceMakeIterator() const;
+
+  /// Get AsyncSequence.makeAsyncIterator().
+  FuncDecl *getAsyncSequenceMakeAsyncIterator() const;
 
   /// Check whether the standard library provides all the correct
   /// intrinsic support for Optional<T>.
@@ -580,7 +609,12 @@ public:
 
   // Retrieve the declaration of Swift._stdlib_isOSVersionAtLeast.
   FuncDecl *getIsOSVersionAtLeastDecl() const;
-  
+
+  /// Look for the declaration with the given name within the
+  /// passed in module.
+  void lookupInModule(ModuleDecl *M, StringRef name,
+                      SmallVectorImpl<ValueDecl *> &results) const;
+
   /// Look for the declaration with the given name within the
   /// Swift module.
   void lookupInSwiftModule(StringRef name,
@@ -629,8 +663,15 @@ public:
     ArrayRef<SILParameterInfo> params, Optional<SILResultInfo> result,
     SILFunctionType::Representation trueRep);
 
-  /// Instantiates "Impl.Converter" if needed, then calls
-  /// ClangTypeConverter::getClangTemplateArguments.
+  /// Instantiates "Impl.Converter" if needed, then translate Swift generic
+  /// substitutions to equivalent C++ types using \p templateParams and \p
+  /// genericArgs. The converted Clang types are placed into \p templateArgs.
+  ///
+  /// \p templateArgs must be empty. \p templateParams and \p genericArgs must
+  /// be equal in size.
+  ///
+  /// \returns nullptr if successful. If an error occors, returns a list of
+  /// types that couldn't be converted.
   std::unique_ptr<TemplateInstantiationError> getClangTemplateArguments(
       const clang::TemplateParameterList *templateParams,
       ArrayRef<Type> genericArgs,
@@ -639,6 +680,14 @@ public:
   /// Get the Swift declaration that a Clang declaration was exported from,
   /// if applicable.
   const Decl *getSwiftDeclForExportedClangDecl(const clang::Decl *decl);
+
+  /// General conversion method from Swift types -> Clang types.
+  ///
+  /// HACK: This method is only intended to be called from a specific place in
+  /// IRGen. For converting function types, strongly prefer using one of the
+  /// other methods instead, instead of manually iterating over parameters
+  /// and results.
+  const clang::Type *getClangTypeForIRGen(Type ty);
 
   /// Determine whether the given Swift type is representable in a
   /// given foreign language.
@@ -705,6 +754,20 @@ public:
   /// Get the runtime availability of support for concurrency.
   AvailabilityContext getConcurrencyAvailability();
 
+  /// Get the back-deployed availability for concurrency.
+  AvailabilityContext getBackDeployedConcurrencyAvailability();
+
+  /// Get the runtime availability of support for differentiation.
+  AvailabilityContext getDifferentiationAvailability();
+
+  /// Get the runtime availability of getters and setters of multi payload enum
+  /// tag single payloads.
+  AvailabilityContext getMultiPayloadEnumTagSinglePayload();
+
+  /// Get the runtime availability of the Objective-C enabled
+  /// swift_isUniquelyReferenced functions.
+  AvailabilityContext getObjCIsUniquelyReferencedAvailability();
+
   /// Get the runtime availability of features introduced in the Swift 5.2
   /// compiler for the target platform.
   AvailabilityContext getSwift52Availability();
@@ -716,6 +779,19 @@ public:
   /// Get the runtime availability of features introduced in the Swift 5.4
   /// compiler for the target platform.
   AvailabilityContext getSwift54Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.5
+  /// compiler for the target platform.
+  AvailabilityContext getSwift55Availability();
+
+  /// Get the runtime availability of features introduced in the Swift 5.6
+  /// compiler for the target platform.
+  AvailabilityContext getSwift56Availability();
+
+  // Note: Update this function if you add a new getSwiftXYAvailability above.
+  /// Get the runtime availability for a particular version of Swift (5.0+).
+  AvailabilityContext
+  getSwift5PlusAvailability(llvm::VersionTuple swiftVersion);
 
   /// Get the runtime availability of features that have been introduced in the
   /// Swift compiler for future versions of the target platform.
@@ -737,13 +813,10 @@ public:
   const CanType TheUnresolvedType;        /// This is the UnresolvedType singleton.
   const CanType TheEmptyTupleType;        /// This is '()', aka Void
   const CanType TheAnyType;               /// This is 'Any', the empty protocol composition
-  const CanType TheNativeObjectType;      /// Builtin.NativeObject
-  const CanType TheBridgeObjectType;      /// Builtin.BridgeObject
-  const CanType TheRawPointerType;        /// Builtin.RawPointer
-  const CanType TheUnsafeValueBufferType; /// Builtin.UnsafeValueBuffer
-  const CanType TheSILTokenType;          /// Builtin.SILToken
-  const CanType TheIntegerLiteralType;    /// Builtin.IntegerLiteralType
-  
+#define SINGLETON_TYPE(SHORT_ID, ID) \
+  const CanType The##SHORT_ID##Type;
+#include "swift/AST/TypeNodes.def"
+
   const CanType TheIEEE32Type;            /// 32-bit IEEE floating point
   const CanType TheIEEE64Type;            /// 64-bit IEEE floating point
   
@@ -787,13 +860,21 @@ public:
       StringRef moduleName,
       bool isUnderlyingClangModule,
       ModuleDependenciesCache &cache,
-      InterfaceSubContextDelegate &delegate);
+      InterfaceSubContextDelegate &delegate,
+      bool cacheOnly = false);
 
   /// Retrieve the module dependencies for the Swift module with the given name.
   Optional<ModuleDependencies> getSwiftModuleDependencies(
       StringRef moduleName,
       ModuleDependenciesCache &cache,
       InterfaceSubContextDelegate &delegate);
+
+  /// Compute the extra implicit framework search paths on Apple platforms:
+  /// $SDKROOT/System/Library/Frameworks/ and $SDKROOT/Library/Frameworks/.
+  std::vector<std::string> getDarwinImplicitFrameworkSearchPaths() const;
+
+  /// Return a set of all possible filesystem locations where modules can be found.
+  llvm::StringSet<> getAllModuleSearchPathsSet() const;
 
   /// Load extensions to the given nominal type from the external
   /// module loaders.
@@ -856,6 +937,16 @@ public:
   /// If there is no Clang module loader, returns a null pointer.
   /// The loader is owned by the AST context.
   ClangModuleLoader *getDWARFModuleLoader() const;
+
+  /// Check whether the module with a given name can be imported without
+  /// importing it.
+  ///
+  /// Note that even if this check succeeds, errors may still occur if the
+  /// module is loaded in full.
+  bool canImportModuleImpl(ImportPath::Element ModulePath,
+                           llvm::VersionTuple version,
+                           bool underlyingVersion,
+                           bool updateFailingList) const;
 public:
   namelookup::ImportCache &getImportCache() const;
 
@@ -884,7 +975,12 @@ public:
   ///
   /// Note that even if this check succeeds, errors may still occur if the
   /// module is loaded in full.
-  bool canImportModule(ImportPath::Element ModulePath);
+  bool canImportModule(ImportPath::Element ModulePath,
+                       llvm::VersionTuple version = llvm::VersionTuple(),
+                       bool underlyingVersion = false);
+  bool canImportModule(ImportPath::Element ModulePath,
+                       llvm::VersionTuple version = llvm::VersionTuple(),
+                       bool underlyingVersion = false) const;
 
   /// \returns a module with a given name that was already loaded.  If the
   /// module was not loaded, returns nullptr.
@@ -900,6 +996,13 @@ public:
   ///
   /// \returns The requested module, or NULL if the module cannot be found.
   ModuleDecl *getModule(ImportPath::Module ModulePath);
+
+  /// Attempts to load the matching overlay module for the given clang
+  /// module into this ASTContext.
+  ///
+  /// \returns The Swift overlay module corresponding to the given Clang module,
+  /// or NULL if the overlay module cannot be found.
+  ModuleDecl *getOverlayModule(const FileUnit *ClangModule);
 
   ModuleDecl *getModuleByName(StringRef ModuleName);
 
@@ -942,11 +1045,19 @@ public:
                  ProtocolDecl *protocol,
                  SourceLoc loc,
                  DeclContext *dc,
-                 ProtocolConformanceState state);
+                 ProtocolConformanceState state,
+                 bool isUnchecked);
 
   /// Produce a self-conformance for the given protocol.
   SelfProtocolConformance *
   getSelfConformance(ProtocolDecl *protocol);
+
+  /// Produce the builtin conformance for some structural type to some protocol.
+  BuiltinProtocolConformance *
+  getBuiltinConformance(Type type, ProtocolDecl *protocol,
+                        GenericSignature genericSig,
+                        ArrayRef<Requirement> conditionalRequirements,
+                        BuiltinConformanceKind kind);
 
   /// A callback used to produce a diagnostic for an ill-formed protocol
   /// conformance that was type-checked before we're actually walking the
@@ -960,7 +1071,13 @@ public:
 
   /// Check whether current context has any errors associated with
   /// ill-formed protocol conformances which haven't been produced yet.
-  bool hasDelayedConformanceErrors() const;
+  ///
+  /// @param conformance if non-null, will check only for errors specific to the
+  /// provided conformance. Otherwise, checks for _any_ errors.
+  ///
+  /// @returns true iff there are any delayed diagnostic errors
+  bool hasDelayedConformanceErrors(
+                  NormalProtocolConformance const* conformance = nullptr) const;
 
   /// Add a delayed diagnostic produced while type-checking a
   /// particular protocol conformance.
@@ -970,7 +1087,7 @@ public:
   /// Retrieve the delayed-conformance diagnostic callbacks for the
   /// given normal protocol conformance.
   std::vector<DelayedConformanceDiag>
-  takeDelayedConformanceDiags(NormalProtocolConformance *conformance);
+  takeDelayedConformanceDiags(NormalProtocolConformance const* conformance);
 
   /// Add delayed missing witnesses for the given normal protocol conformance.
   void addDelayedMissingWitnesses(
@@ -1074,6 +1191,21 @@ public:
   GenericSignatureBuilder *getOrCreateGenericSignatureBuilder(
                                                      CanGenericSignature sig);
 
+  /// Retrieve or create a term rewriting system for answering queries on
+  /// type parameters written against the given generic signature.
+  rewriting::RequirementMachine *getOrCreateRequirementMachine(
+      CanGenericSignature sig);
+
+  /// This is a hack to break cycles. Don't introduce new callers of this
+  /// method.
+  bool isRecursivelyConstructingRequirementMachine(
+      CanGenericSignature sig);
+
+  /// Retrieve or create a term rewriting system for answering queries on
+  /// type parameters written against the given protocol requirement signature.
+  rewriting::RequirementMachine *getOrCreateRequirementMachine(
+      const ProtocolDecl *proto);
+
   /// Retrieve a generic signature with a single unconstrained type parameter,
   /// like `<T>`.
   CanGenericSignature getSingleGenericParameterSignature() const;
@@ -1128,10 +1260,18 @@ public:
   /// standard library's String implementation.
   bool isASCIIString(StringRef s) const;
 
+  /// Retrieve the name of to be used for the entry point, either main or an
+  /// alternative specified via the -entry-point-function-name frontend flag.
+  std::string getEntryPointFunctionName() const;
+
 private:
   friend Decl;
-  Optional<RawComment> getRawComment(const Decl *D);
-  void setRawComment(const Decl *D, RawComment RC);
+
+  Optional<ExternalSourceLocs *> getExternalSourceLocs(const Decl *D);
+  void setExternalSourceLocs(const Decl *D, ExternalSourceLocs *Locs);
+
+  Optional<std::pair<RawComment, bool>> getRawComment(const Decl *D);
+  void setRawComment(const Decl *D, RawComment RC, bool FromSerialized);
 
   Optional<StringRef> getBriefComment(const Decl *D);
   void setBriefComment(const Decl *D, StringRef Comment);

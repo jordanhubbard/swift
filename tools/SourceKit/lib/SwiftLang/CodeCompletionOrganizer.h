@@ -36,19 +36,20 @@ struct Options {
   bool addInnerResults = false;
   bool addInnerOperators = true;
   bool addInitsToTopLevel = false;
-  bool callPatternHeuristics = true;
+  bool callPatternHeuristics = false;
   bool hideUnderscores = true;
   bool reallyHideAllUnderscores = false;
   bool hideLowPriority = true;
   bool hideByNameStyle = true;
   bool fuzzyMatching = true;
   bool annotatedDescription = false;
+  bool includeObjectLiterals = true;
   unsigned minFuzzyLength = 2;
   unsigned showTopNonLiteralResults = 3;
 
   // Options for combining priorities.
-  unsigned semanticContextWeight = 15;
-  unsigned fuzzyMatchWeight = 10;
+  unsigned semanticContextWeight = 7;
+  unsigned fuzzyMatchWeight = 13;
   unsigned popularityBonus = 2;
 };
 
@@ -65,8 +66,7 @@ extendCompletions(ArrayRef<SwiftResult *> swiftResults, CompletionSink &sink,
                   SwiftCompletionInfo &info,
                   const NameToPopularityMap *nameToPopularity,
                   const Options &options, Completion *prefix = nullptr,
-                  Optional<SemanticContextKind> overrideContext = None,
-                  Optional<SemanticContextKind> overrideOperatorContext = None);
+                  bool clearFlair = false);
 
 bool addCustomCompletions(CompletionSink &sink,
                           std::vector<Completion *> &completions,

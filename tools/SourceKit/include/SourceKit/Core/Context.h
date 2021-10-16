@@ -14,9 +14,12 @@
 #define LLVM_SOURCEKIT_CORE_CONTEXT_H
 
 #include "SourceKit/Core/LLVM.h"
-#include "llvm/ADT/StringRef.h"
+#include "SourceKit/Support/CancellationToken.h"
+#include "SourceKit/Support/Concurrency.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Mutex.h"
+#include <map>
 #include <memory>
 #include <string>
 
@@ -31,12 +34,6 @@ namespace SourceKit {
 class GlobalConfig {
 public:
   struct Settings {
-    /// When true, the default compiler options and other configuration flags
-    /// will be chosen to optimize for usage from an IDE.
-    ///
-    /// At the time of writing this just means ignoring .swiftsourceinfo files.
-    bool OptimizeForIDE = false;
-
     struct CompletionOptions {
 
       /// Max count of reusing ASTContext for cached code completion.
@@ -52,11 +49,48 @@ private:
   mutable llvm::sys::Mutex Mtx;
 
 public:
-  Settings update(Optional<bool> OptimizeForIDE,
-                  Optional<unsigned> CompletionMaxASTContextReuseCount,
+  Settings update(Optional<unsigned> CompletionMaxASTContextReuseCount,
                   Optional<unsigned> CompletionCheckDependencyInterval);
-  bool shouldOptimizeForIDE() const;
   Settings::CompletionOptions getCompletionOpts() const;
+};
+
+class SlowRequestSimulator {
+  std::map<SourceKitCancellationToken, std::shared_ptr<Semaphore>>
+      InProgressRequests;
+
+  /// Mutex guarding \c InProgressRequests.
+  llvm::sys::Mutex InProgressRequestsMutex;
+
+public:
+  /// Simulate that a request takes \p DurationMs to execute. While waiting that
+  /// duration, the request can be cancelled using the \p CancellationToken.
+  /// Returns \c true if the request waited the required duration and \c false
+  /// if it was cancelled.
+  bool simulateLongRequest(int64_t DurationMs,
+                           SourceKitCancellationToken CancellationToken) {
+    auto Sema = std::make_shared<Semaphore>(0);
+    {
+      llvm::sys::ScopedLock L(InProgressRequestsMutex);
+      InProgressRequests[CancellationToken] = Sema;
+    }
+    bool DidTimeOut = Sema->wait(DurationMs);
+    {
+      llvm::sys::ScopedLock L(InProgressRequestsMutex);
+      InProgressRequests[CancellationToken] = nullptr;
+    }
+    // If we timed out, we waited the required duration. If we didn't time out,
+    // the semaphore was cancelled.
+    return DidTimeOut;
+  }
+
+  /// Cancel a simulated long request. If the required wait duration already
+  /// elapsed, this is a no-op.
+  void cancel(SourceKitCancellationToken CancellationToken) {
+    llvm::sys::ScopedLock L(InProgressRequestsMutex);
+    if (auto InProgressSema = InProgressRequests[CancellationToken]) {
+      InProgressSema->signal();
+    }
+  }
 };
 
 class Context {
@@ -65,6 +99,7 @@ class Context {
   std::unique_ptr<LangSupport> SwiftLang;
   std::shared_ptr<NotificationCenter> NotificationCtr;
   std::shared_ptr<GlobalConfig> Config;
+  std::shared_ptr<SlowRequestSimulator> SlowRequestSim;
 
 public:
   Context(StringRef RuntimeLibPath, StringRef DiagnosticDocumentationPath,
@@ -83,6 +118,10 @@ public:
   std::shared_ptr<NotificationCenter> getNotificationCenter() { return NotificationCtr; }
 
   std::shared_ptr<GlobalConfig> getGlobalConfiguration() { return Config; }
+
+  std::shared_ptr<SlowRequestSimulator> getSlowRequestSimulator() {
+    return SlowRequestSim;
+  }
 };
 
 } // namespace SourceKit

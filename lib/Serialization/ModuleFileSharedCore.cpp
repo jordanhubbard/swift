@@ -14,18 +14,16 @@
 #include "ModuleFileCoreTableInfo.h"
 #include "BCReadingExtras.h"
 #include "DeserializationErrors.h"
+#include "swift/Basic/LangOptions.h"
 #include "swift/Strings.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/OnDiskHashTable.h"
+#include "llvm/Support/PrettyStackTrace.h"
 
 using namespace swift;
 using namespace swift::serialization;
 using namespace llvm::support;
 using llvm::Expected;
-
-StringRef swift::getNameOfModule(const ModuleFileSharedCore *MF) {
-  return MF->getName();
-}
 
 static bool checkModuleSignature(llvm::BitstreamCursor &cursor,
                                  ArrayRef<unsigned char> signature) {
@@ -131,6 +129,9 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
       options_block::IsSIBLayout::readRecord(scratch, IsSIB);
       extendedInfo.setIsSIB(IsSIB);
       break;
+    case options_block::IS_STATIC_LIBRARY:
+      extendedInfo.setIsStaticLibrary(true);
+      break;
     case options_block::IS_TESTABLE:
       extendedInfo.setIsTestable(true);
       break;
@@ -145,6 +146,15 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
       options_block::ResilienceStrategyLayout::readRecord(scratch, Strategy);
       extendedInfo.setResilienceStrategy(ResilienceStrategy(Strategy));
       break;
+    case options_block::IS_ALLOW_MODULE_WITH_COMPILER_ERRORS_ENABLED:
+      extendedInfo.setAllowModuleWithCompilerErrorsEnabled(true);
+      break;
+    case options_block::MODULE_ABI_NAME:
+      extendedInfo.setModuleABIName(blobData);
+      break;
+    case options_block::IS_CONCURRENCY_CHECKED:
+      extendedInfo.setIsConcurrencyChecked(true);
+      break;
     default:
       // Unknown options record, possibly for use by a future version of the
       // module format.
@@ -155,11 +165,10 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
   return true;
 }
 
-static ValidationInfo
-validateControlBlock(llvm::BitstreamCursor &cursor,
-                     SmallVectorImpl<uint64_t> &scratch,
-                     std::pair<uint16_t, uint16_t> expectedVersion,
-                     ExtendedValidationInfo *extendedInfo) {
+static ValidationInfo validateControlBlock(
+    llvm::BitstreamCursor &cursor, SmallVectorImpl<uint64_t> &scratch,
+    std::pair<uint16_t, uint16_t> expectedVersion, bool requiresOSSAModules,
+    ExtendedValidationInfo *extendedInfo) {
   // The control block is malformed until we've at least read a major version
   // number.
   ValidationInfo result;
@@ -245,7 +254,24 @@ validateControlBlock(llvm::BitstreamCursor &cursor,
       // These fields were added later; be resilient against their absence.
       switch (scratch.size()) {
       default:
-        // Add new cases here, in descending order.
+      // Add new cases here, in descending order.
+      case 8:
+      case 7:
+      case 6:
+      case 5: {
+        auto subMinor = 0;
+        auto build = 0;
+        // case 7 and 8 were added after case 5 and 6, so we need to have this
+        // special handling to make sure we can still load the module without
+        // case 7 and case 8 successfully.
+        if (scratch.size() >= 8) {
+          subMinor = scratch[6];
+          build = scratch[7];
+        }
+        result.userModuleVersion = llvm::VersionTuple(scratch[4], scratch[5],
+                                                      subMinor, build);
+        LLVM_FALLTHROUGH;
+      }
       case 4:
         if (scratch[3] != 0) {
           result.compatibilityVersion =
@@ -272,6 +298,45 @@ validateControlBlock(llvm::BitstreamCursor &cursor,
     case control_block::TARGET:
       result.targetTriple = blobData;
       break;
+    case control_block::SDK_NAME: {
+      result.sdkName = blobData;
+      break;
+    }
+    case control_block::REVISION: {
+      // Tagged compilers should load only resilient modules if they were
+      // produced by the exact same version.
+
+      // Disable this restriction for compiler testing by setting this
+      // env var to any value.
+      static const char* ignoreRevision =
+        ::getenv("SWIFT_DEBUG_IGNORE_SWIFTMODULE_REVISION");
+      if (ignoreRevision)
+        break;
+
+      // Override this env var for testing, forcing the behavior of a tagged
+      // compiler and using the env var value to override this compiler's
+      // revision.
+      static const char* forcedDebugRevision =
+        ::getenv("SWIFT_DEBUG_FORCE_SWIFTMODULE_REVISION");
+
+      bool isCompilerTagged = forcedDebugRevision ||
+        !version::Version::getCurrentCompilerVersion().empty();
+
+      StringRef moduleRevision = blobData;
+      if (isCompilerTagged && !moduleRevision.empty()) {
+        StringRef compilerRevision = forcedDebugRevision ?
+          forcedDebugRevision : version::getSwiftRevision();
+        if (moduleRevision != compilerRevision)
+          result.status = Status::RevisionIncompatible;
+      }
+      break;
+    }
+    case control_block::IS_OSSA: {
+      auto isModuleInOSSA = scratch[0];
+      if (requiresOSSAModules && !isModuleInOSSA)
+        result.status = Status::NotInOSSA;
+      break;
+    }
     default:
       // Unknown metadata record, possibly for use by a future version of the
       // module format.
@@ -358,7 +423,7 @@ bool serialization::isSerializedAST(StringRef data) {
 }
 
 ValidationInfo serialization::validateSerializedAST(
-    StringRef data,
+    StringRef data, bool requiresOSSAModules,
     ExtendedValidationInfo *extendedInfo,
     SmallVectorImpl<SerializationOptions::FileDependency> *dependencies) {
   ValidationInfo result;
@@ -397,10 +462,10 @@ ValidationInfo serialization::validateSerializedAST(
         result.status = Status::Malformed;
         return result;
       }
-      result = validateControlBlock(cursor, scratch,
-                                    {SWIFTMODULE_VERSION_MAJOR,
-                                     SWIFTMODULE_VERSION_MINOR},
-                                    extendedInfo);
+      result = validateControlBlock(
+          cursor, scratch,
+          {SWIFTMODULE_VERSION_MAJOR, SWIFTMODULE_VERSION_MINOR},
+          requiresOSSAModules, extendedInfo);
       if (result.status == Status::Malformed)
         return result;
     } else if (dependencies &&
@@ -446,11 +511,29 @@ std::string ModuleFileSharedCore::Dependency::getPrettyPrintedPath() const {
   return output;
 }
 
-void ModuleFileSharedCore::fatal(llvm::Error error) {
-  logAllUnhandledErrors(std::move(error), llvm::errs(),
-                        "\n*** DESERIALIZATION FAILURE (please include this "
-                        "section in any bug report) ***\n");
+void ModuleFileSharedCore::fatal(llvm::Error error) const {
+  llvm::SmallString<0> errorStr;
+  llvm::raw_svector_ostream out(errorStr);
+
+  out << "*** DESERIALIZATION FAILURE ***\n";
+  outputDiagnosticInfo(out);
+  out << "\n";
+  if (error) {
+    handleAllErrors(std::move(error), [&](const llvm::ErrorInfoBase &ei) {
+      ei.log(out);
+      out << "\n";
+    });
+  }
+
+  llvm::PrettyStackTraceString trace(errorStr.c_str());
   abort();
+}
+
+void ModuleFileSharedCore::outputDiagnosticInfo(llvm::raw_ostream &os) const {
+  os << "module '" << Name << "' with full misc version '" << MiscVersion
+      << "'";
+  if (Bits.IsAllowModuleWithCompilerErrorsEnabled)
+    os << " (built with -experimental-allow-module-with-compiler-errors)";
 }
 
 ModuleFileSharedCore::~ModuleFileSharedCore() { }
@@ -526,6 +609,18 @@ ModuleFileSharedCore::readDeclMembersTable(ArrayRef<uint64_t> fields,
   using OwnedTable = std::unique_ptr<SerializedDeclMembersTable>;
   return OwnedTable(SerializedDeclMembersTable::Create(base + tableOffset,
       base + sizeof(uint32_t), base));
+}
+
+std::unique_ptr<ModuleFileSharedCore::SerializedDeclFingerprintsTable>
+ModuleFileSharedCore::readDeclFingerprintsTable(ArrayRef<uint64_t> fields,
+                                                StringRef blobData) const {
+  uint32_t tableOffset;
+  index_block::DeclFingerprintsLayout::readRecord(fields, tableOffset);
+  auto base = reinterpret_cast<const uint8_t *>(blobData.data());
+
+  using OwnedTable = std::unique_ptr<SerializedDeclFingerprintsTable>;
+  return OwnedTable(SerializedDeclFingerprintsTable::Create(
+      base + tableOffset, base + sizeof(uint32_t), base));
 }
 
 std::unique_ptr<ModuleFileSharedCore::SerializedObjCMethodTable>
@@ -670,6 +765,9 @@ bool ModuleFileSharedCore::readIndexBlock(llvm::BitstreamCursor &cursor) {
       case index_block::ORDERED_TOP_LEVEL_DECLS:
         allocateBuffer(OrderedTopLevelDecls, scratch);
         break;
+      case index_block::EXPORTED_PRESPECIALIZATION_DECLS:
+        allocateBuffer(ExportedPrespecializationDecls, scratch);
+        break;
       case index_block::LOCAL_TYPE_DECLS:
         LocalTypeDecls = readLocalDeclTable(scratch, blobData);
         break;
@@ -681,6 +779,9 @@ bool ModuleFileSharedCore::readIndexBlock(llvm::BitstreamCursor &cursor) {
         break;
       case index_block::DECL_MEMBER_NAMES:
         DeclMemberNames = readDeclMemberNamesTable(scratch, blobData);
+        break;
+      case index_block::DECL_FINGERPRINTS:
+        DeclFingerprints = readDeclFingerprintsTable(scratch, blobData);
         break;
       case index_block::LOCAL_DECL_CONTEXT_OFFSETS:
         assert(blobData.empty());
@@ -870,10 +971,10 @@ bool ModuleFileSharedCore::readModuleDocIfPresent() {
         return false;
       }
 
-      info = validateControlBlock(docCursor, scratch,
-                                  {SWIFTDOC_VERSION_MAJOR,
-                                   SWIFTDOC_VERSION_MINOR},
-                                  /*extendedInfo*/nullptr);
+      info = validateControlBlock(
+          docCursor, scratch, {SWIFTDOC_VERSION_MAJOR, SWIFTDOC_VERSION_MINOR},
+          RequiresOSSAModules,
+          /*extendedInfo*/ nullptr);
       if (info.status != Status::Valid)
         return false;
       // Check that the swiftdoc is actually for this module.
@@ -953,6 +1054,9 @@ bool ModuleFileSharedCore::readDeclLocsBlock(llvm::BitstreamCursor &cursor) {
         return false;
       }
       switch (*kind) {
+      case decl_locs_block::SOURCE_FILE_LIST:
+        SourceFileListData = blobData;
+        break;
       case decl_locs_block::BASIC_DECL_LOCS:
         BasicDeclLocsData = blobData;
         break;
@@ -1010,10 +1114,11 @@ bool ModuleFileSharedCore::readModuleSourceInfoIfPresent() {
         consumeError(std::move(Err));
         return false;
       }
-      info = validateControlBlock(infoCursor, scratch,
-                                  {SWIFTSOURCEINFO_VERSION_MAJOR,
-                                   SWIFTSOURCEINFO_VERSION_MINOR},
-                                  /*extendedInfo*/nullptr);
+      info = validateControlBlock(
+          infoCursor, scratch,
+          {SWIFTSOURCEINFO_VERSION_MAJOR, SWIFTSOURCEINFO_VERSION_MINOR},
+          RequiresOSSAModules,
+          /*extendedInfo*/ nullptr);
       if (info.status != Status::Valid)
         return false;
       // Check that the swiftsourceinfo is actually for this module.
@@ -1087,10 +1192,12 @@ ModuleFileSharedCore::ModuleFileSharedCore(
     std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
     std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
     std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
-    bool isFramework, serialization::ValidationInfo &info)
+    bool isFramework, bool requiresOSSAModules,
+    serialization::ValidationInfo &info)
     : ModuleInputBuffer(std::move(moduleInputBuffer)),
       ModuleDocInputBuffer(std::move(moduleDocInputBuffer)),
-      ModuleSourceInfoInputBuffer(std::move(moduleSourceInfoInputBuffer)) {
+      ModuleSourceInfoInputBuffer(std::move(moduleSourceInfoInputBuffer)),
+      RequiresOSSAModules(requiresOSSAModules) {
   assert(!hasError());
   Bits.IsFramework = isFramework;
 
@@ -1134,23 +1241,30 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       }
 
       ExtendedValidationInfo extInfo;
-      info = validateControlBlock(cursor, scratch,
-                                  {SWIFTMODULE_VERSION_MAJOR,
-                                   SWIFTMODULE_VERSION_MINOR},
-                                  &extInfo);
+      info = validateControlBlock(
+          cursor, scratch,
+          {SWIFTMODULE_VERSION_MAJOR, SWIFTMODULE_VERSION_MINOR},
+          RequiresOSSAModules, &extInfo);
       if (info.status != Status::Valid) {
         error(info.status);
         return;
       }
       Name = info.name;
       TargetTriple = info.targetTriple;
+      SDKName = info.sdkName;
       CompatibilityVersion = info.compatibilityVersion;
+      UserModuleVersion = info.userModuleVersion;
       Bits.ArePrivateImportsEnabled = extInfo.arePrivateImportsEnabled();
       Bits.IsSIB = extInfo.isSIB();
+      Bits.IsStaticLibrary = extInfo.isStaticLibrary();
       Bits.IsTestable = extInfo.isTestable();
       Bits.ResilienceStrategy = unsigned(extInfo.getResilienceStrategy());
       Bits.IsImplicitDynamicEnabled = extInfo.isImplicitDynamicEnabled();
+      Bits.IsAllowModuleWithCompilerErrorsEnabled =
+          extInfo.isAllowModuleWithCompilerErrorsEnabled();
+      Bits.IsConcurrencyChecked = extInfo.isConcurrencyChecked();
       MiscVersion = info.miscVersion;
+      ModuleABIName = extInfo.getModuleABIName();
 
       hasValidControlBlock = true;
       break;
@@ -1459,4 +1573,8 @@ ModuleFileSharedCore::ModuleFileSharedCore(
     info.status = error(Status::MalformedDocumentation);
     return;
   }
+}
+
+bool ModuleFileSharedCore::hasSourceInfo() const {
+  return !!DeclUSRsTable;
 }

@@ -29,13 +29,13 @@
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/MemAccessUtils.h"
-#include "swift/SIL/MemoryLifetime.h"
+#include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PostOrder.h"
 #include "swift/SIL/PrettyStackTrace.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILModule.h"
-#include "swift/SIL/SILOpenedArchetypesTracker.h"
 #include "swift/SIL/SILVTable.h"
 #include "swift/SIL/SILVTableVisitor.h"
 #include "swift/SIL/SILVisitor.h"
@@ -59,6 +59,9 @@ static llvm::cl::opt<bool> AbortOnFailure(
                               llvm::cl::init(true));
 
 static llvm::cl::opt<bool> ContinueOnFailure("verify-continue-on-failure",
+                                             llvm::cl::init(false));
+
+static llvm::cl::opt<bool> DumpModuleOnFailure("verify-dump-module-on-failure",
                                              llvm::cl::init(false));
 
 static llvm::cl::opt<bool> VerifyDIHoles(
@@ -101,6 +104,15 @@ static bool isArchetypeValidInFunction(ArchetypeType *A, const SILFunction *F) {
 
 namespace {
 
+/// When resilience is bypassed, direct access is legal, but the decls are still
+/// resilient.
+template <typename DeclType>
+bool checkResilience(DeclType *D, ModuleDecl *M,
+                     ResilienceExpansion expansion) {
+  return !D->getModuleContext()->getBypassResilience() &&
+         D->isResilient(M, expansion);
+}
+
 /// Metaprogramming-friendly base class.
 template <class Impl>
 class SILVerifierBase : public SILInstructionVisitor<Impl> {
@@ -126,7 +138,7 @@ namespace {
 
 /// Verify invariants on a key path component.
 void verifyKeyPathComponent(SILModule &M,
-                            ResilienceExpansion expansion,
+                            TypeExpansionContext typeExpansionContext,
                             llvm::function_ref<void(bool, StringRef)> require,
                             CanType &baseTy,
                             CanType leafTy,
@@ -136,9 +148,7 @@ void verifyKeyPathComponent(SILModule &M,
                             SubstitutionMap patternSubs,
                             bool forPropertyDescriptor,
                             bool hasIndices) {
-  auto &C = M.getASTContext();
-  auto typeExpansionContext =
-      TypeExpansionContext::noOpaqueTypeArchetypesSubstitution(expansion);
+  auto expansion = typeExpansionContext.getResilienceExpansion();
   auto opaque = AbstractionPattern::getOpaque();
   auto loweredBaseTy =
       M.Types.getLoweredType(opaque, baseTy, typeExpansionContext);
@@ -146,7 +156,9 @@ void verifyKeyPathComponent(SILModule &M,
     ->getCanonicalType();
   auto loweredComponentTy =
       M.Types.getLoweredType(opaque, componentTy, typeExpansionContext);
-
+  auto getTypeInExpansionContext = [&](CanType ty) -> CanType {
+    return M.Types.getLoweredType(opaque, ty, typeExpansionContext).getASTType();
+  };
   auto checkIndexEqualsAndHash = [&]{
     if (!component.getSubscriptIndices().empty()) {
       // Equals should be
@@ -166,8 +178,7 @@ void verifyKeyPathComponent(SILModule &M,
           require(param.getConvention()
                     == ParameterConvention::Direct_Unowned,
                   "indices pointer should be trivial");
-          require(param.getInterfaceType()->getAnyNominal()
-                    == C.getUnsafeRawPointerDecl(),
+          require(param.getInterfaceType()->isUnsafeRawPointer(),
                   "indices pointer should be an UnsafeRawPointer");
         }
         
@@ -177,9 +188,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(substEqualsType->getResults()[0].getConvention()
                   == ResultConvention::Unowned,
                 "result should be unowned");
-        require(substEqualsType->getResults()[0].getInterfaceType()
-                               ->getAnyNominal()
-                  == C.getBoolDecl(),
+        require(substEqualsType->getResults()[0].getInterfaceType()->isBool(),
                 "result should be Bool");
       }
       {
@@ -198,8 +207,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(param.getConvention()
                   == ParameterConvention::Direct_Unowned,
                 "indices pointer should be trivial");
-        require(param.getInterfaceType()->getAnyNominal()
-                  == C.getUnsafeRawPointerDecl(),
+        require(param.getInterfaceType()->isUnsafeRawPointer(),
                 "indices pointer should be an UnsafeRawPointer");
         
         require(substHashType->getResults().size() == 1,
@@ -208,9 +216,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(substHashType->getResults()[0].getConvention()
                   == ResultConvention::Unowned,
                 "result should be unowned");
-        require(substHashType->getResults()[0].getInterfaceType()
-                             ->getAnyNominal()
-                  == C.getIntDecl(),
+        require(substHashType->getResults()[0].getInterfaceType()->isInt(),
                 "result should be Int");
       }
     } else {
@@ -232,11 +238,12 @@ void verifyKeyPathComponent(SILModule &M,
     auto fieldTy = baseTy->getTypeOfMember(M.getSwiftModule(), property)
                          ->getReferenceStorageReferent()
                          ->getCanonicalType();
-    require(fieldTy == componentTy,
+    require(getTypeInExpansionContext(fieldTy) ==
+                getTypeInExpansionContext(componentTy),
             "property decl should be a member of the base with the same type "
             "as the component");
     require(property->hasStorage(), "property must be stored");
-    require(!property->isResilient(M.getSwiftModule(), expansion),
+    require(!checkResilience(property, M.getSwiftModule(), expansion),
             "cannot access storage of resilient property");
     auto propertyTy =
         loweredBaseTy.getFieldType(property, M, typeExpansionContext);
@@ -285,10 +292,11 @@ void verifyKeyPathComponent(SILModule &M,
       auto baseParam = substGetterType->getParameters()[0];
       require(baseParam.getConvention() == normalArgConvention,
               "getter base parameter should have normal arg convention");
-      require(baseParam.getArgumentType(M, substGetterType, typeExpansionContext)
-                == loweredBaseTy.getASTType(),
+      require(getTypeInExpansionContext(baseParam.getArgumentType(
+                  M, substGetterType, typeExpansionContext)) ==
+                  loweredBaseTy.getASTType(),
               "getter base parameter should match base of component");
-      
+
       if (hasIndices) {
         auto indicesParam = substGetterType->getParameters()[1];
         require(indicesParam.getConvention()
@@ -297,7 +305,7 @@ void verifyKeyPathComponent(SILModule &M,
         require(
             indicesParam
                     .getArgumentType(M, substGetterType, typeExpansionContext)
-                    ->getAnyNominal() == C.getUnsafeRawPointerDecl(),
+                    ->isUnsafeRawPointer(),
             "indices pointer should be an UnsafeRawPointer");
       }
 
@@ -306,11 +314,11 @@ void verifyKeyPathComponent(SILModule &M,
       auto result = substGetterType->getResults()[0];
       require(result.getConvention() == ResultConvention::Indirect,
               "getter result should be @out");
-      require(
-          result.getReturnValueType(M, substGetterType, typeExpansionContext) ==
-              loweredComponentTy.getASTType(),
-          "getter result should match the maximal abstraction of the "
-          "formal component type");
+      require(getTypeInExpansionContext(result.getReturnValueType(
+                  M, substGetterType, typeExpansionContext)) ==
+                  getTypeInExpansionContext(loweredComponentTy.getASTType()),
+              "getter result should match the maximal abstraction of the "
+              "formal component type");
     }
     
     if (kind == KeyPathPatternComponent::Kind::SettableProperty) {
@@ -355,13 +363,13 @@ void verifyKeyPathComponent(SILModule &M,
         require(
             indicesParam
                     .getArgumentType(M, substSetterType, typeExpansionContext)
-                    ->getAnyNominal() == C.getUnsafeRawPointerDecl(),
+                    ->isUnsafeRawPointer(),
             "indices pointer should be an UnsafeRawPointer");
       }
 
-      require(newValueParam.getArgumentType(M, substSetterType,
-                                            typeExpansionContext) ==
-                  loweredComponentTy.getASTType(),
+      require(getTypeInExpansionContext(newValueParam.getArgumentType(
+                  M, substSetterType, typeExpansionContext)) ==
+                  getTypeInExpansionContext(loweredComponentTy.getASTType()),
               "setter value should match the maximal abstraction of the "
               "formal component type");
 
@@ -458,7 +466,6 @@ struct ImmutableAddressUseVerifier {
     case SILArgumentConvention::Direct_Unowned:
     case SILArgumentConvention::Direct_Guaranteed:
     case SILArgumentConvention::Direct_Owned:
-    case SILArgumentConvention::Direct_Deallocating:
       assert(conv.isIndirectConvention() && "Expect an indirect convention");
       return true; // return something "conservative".
     }
@@ -490,7 +497,7 @@ struct ImmutableAddressUseVerifier {
     return false;
   }
 
-  bool isCastToNonConsuming(UncheckedAddrCastInst *i) {
+  bool isAddrCastToNonConsuming(SingleValueInstruction *i) {
     // Check if any of our uses are consuming. If none of them are consuming, we
     // are good to go.
     return llvm::none_of(i->getUses(), [&](Operand *use) -> bool {
@@ -539,7 +546,6 @@ struct ImmutableAddressUseVerifier {
       }
       case SILInstructionKind::MarkDependenceInst:
       case SILInstructionKind::LoadBorrowInst:
-      case SILInstructionKind::DebugValueAddrInst:
       case SILInstructionKind::ExistentialMetatypeInst:
       case SILInstructionKind::ValueMetatypeInst:
       case SILInstructionKind::FixLifetimeInst:
@@ -547,6 +553,13 @@ struct ImmutableAddressUseVerifier {
       case SILInstructionKind::SwitchEnumAddrInst:
       case SILInstructionKind::SelectEnumAddrInst:
         break;
+      case SILInstructionKind::DebugValueInst:
+        if (cast<DebugValueInst>(inst)->hasAddrVal())
+          break;
+        else {
+          llvm::errs() << "Unhandled, unexpected instruction: " << *inst;
+          llvm_unreachable("invoking standard assertion failure");
+        }
       case SILInstructionKind::AddressToPointerInst:
         // We assume that the user is attempting to do something unsafe since we
         // are converting to a raw pointer. So just ignore this use.
@@ -585,8 +598,9 @@ struct ImmutableAddressUseVerifier {
           break;
       case SILInstructionKind::DestroyAddrInst:
         return true;
+      case SILInstructionKind::UpcastInst:
       case SILInstructionKind::UncheckedAddrCastInst: {
-        if (isCastToNonConsuming(cast<UncheckedAddrCastInst>(inst))) {
+        if (isAddrCastToNonConsuming(cast<SingleValueInstruction>(inst))) {
           break;
         }
         return true;
@@ -661,8 +675,7 @@ class SILVerifier : public SILVerifierBase<SILVerifier> {
   const SILFunction &F;
   SILFunctionConventions fnConv;
   Lowering::TypeConverter &TC;
-  SILOpenedArchetypesTracker OpenedArchetypes;
-  SmallVector<StringRef, 16> DebugVars;
+  SmallVector<std::pair<StringRef, SILType>, 16> DebugVars;
   const SILInstruction *CurInstruction = nullptr;
   const SILArgument *CurArgument = nullptr;
   std::unique_ptr<DominanceInfo> Dominance;
@@ -673,6 +686,31 @@ class SILVerifier : public SILVerifierBase<SILVerifier> {
   DeadEndBlocks DEBlocks;
   LoadBorrowImmutabilityAnalysis loadBorrowImmutabilityAnalysis;
   bool SingleFunction = true;
+
+  /// A cache of the isOperandInValueUse check. When we process an operand, we
+  /// fix this for each of its uses.
+  llvm::DenseSet<std::pair<SILValue, const Operand *>> isOperandInValueUsesCache;
+
+  /// Check that this operand appears in the use-chain of the value it uses.
+  bool isOperandInValueUses(const Operand *operand) {
+    SILValue value = operand->get();
+
+    // First check the cache.
+    if (isOperandInValueUsesCache.contains({value, operand}))
+      return true;
+
+    // Otherwise, compute the value and initialize the cache for each of the
+    // operand's value uses.
+    bool foundUse = false;
+    for (auto *use : value->getUses()) {
+      if (use == operand) {
+        foundUse = true;
+      }
+      isOperandInValueUsesCache.insert({value, use});
+    }
+
+    return foundUse;
+  }
 
   SILVerifier(const SILVerifier&) = delete;
   void operator=(const SILVerifier&) = delete;
@@ -712,8 +750,11 @@ public:
 
     llvm::dbgs() << "In function:\n";
     F.print(llvm::dbgs());
-    llvm::dbgs() << "In module:\n";
-    F.getModule().print(llvm::dbgs());
+    if (DumpModuleOnFailure) {
+      // Don't do this by default because modules can be _very_ large.
+      llvm::dbgs() << "In module:\n";
+      F.getModule().print(llvm::dbgs());
+    }
 
     // We abort by default because we want to always crash in
     // the debugger.
@@ -806,6 +847,15 @@ public:
             valueDescription + " cannot apply to a function type");
   }
 
+  /// Require the operand to be `$Optional<Builtin.Executor>`.
+  void requireOptionalExecutorType(SILValue value, const Twine &what) {
+    auto type = value->getType();
+    require(type.isObject(), what + " must be an object type");
+    auto objectType = type.getASTType().getOptionalObjectType();
+    require(objectType && objectType == M->getASTContext().TheExecutorType,
+            what + " must be Optional<Builtin.Executor>");
+  }
+
   /// Assert that two types are equal.
   void requireSameType(Type type1, Type type2, const Twine &complaint) {
     _require(type1->isEqual(type2), complaint,
@@ -882,7 +932,7 @@ public:
   SILVerifier(const SILFunction &F, bool SingleFunction = true)
       : M(F.getModule().getSwiftModule()), F(F),
         fnConv(F.getConventionsInContext()), TC(F.getModule().Types),
-        OpenedArchetypes(&F), Dominance(nullptr),
+        Dominance(nullptr),
         InstNumbers(numInstsInFunction(F)), DEBlocks(&F),
         loadBorrowImmutabilityAnalysis(DEBlocks, &F),
         SingleFunction(SingleFunction) {
@@ -913,6 +963,8 @@ public:
   // blocks it would result in quadratic behavior.
   bool properlyDominates(SILInstruction *a, SILInstruction *b) {
     auto aBlock = a->getParent(), bBlock = b->getParent();
+    require(aBlock->getParent() == bBlock->getParent(),
+            "instructions are not in the same function");
 
     // If the blocks are different, it's as easy as whether A's block
     // dominates B's block.
@@ -944,14 +996,17 @@ public:
     // Verify that the `isPhiArgument` property is sound:
     // - Phi arguments come from branches.
     // - Non-phi arguments have a single predecessor.
-    if (arg->isPhiArgument()) {
-      for (SILBasicBlock *predBB : arg->getParent()->getPredecessorBlocks()) {
-        auto *TI = predBB->getTerminator();
-        // FIXME: when critical edges are removed, only allow BranchInst.
-        require(isa <BranchInst>(TI) || isa<CondBranchInst>(TI),
+    assert(arg->isPhiArgument() && "precondition");
+    for (SILBasicBlock *predBB : arg->getParent()->getPredecessorBlocks()) {
+      auto *TI = predBB->getTerminator();
+      if (F.hasOwnership()) {
+        require(isa<BranchInst>(TI), "All phi inputs must be branch operands.");
+      } else {
+        // FIXME: when critical edges are removed and cond_br arguments are
+        // disallowed, only allow BranchInst.
+        require(isa<BranchInst>(TI) || isa<CondBranchInst>(TI),
                 "All phi argument inputs must be from branches.");
       }
-    } else {
     }
     if (arg->isPhiArgument() && prohibitAddressPhis()) {
       // As a property of well-formed SIL, we disallow address-type
@@ -997,13 +1052,13 @@ public:
 
   void visitSILInstruction(SILInstruction *I) {
     CurInstruction = I;
-    OpenedArchetypes.registerOpenedArchetypes(I);
     checkSILInstruction(I);
 
-    // Check the SILLLocation attached to the instruction.
-    checkInstructionsSILLocation(I);
+    // Check the SILLLocation attached to the instruction,
+    // as well as debug-variable-carrying instructions.
+    checkInstructionsDebugInfo(I);
 
-    // Check ownership.
+    // Check ownership and types.
     SILFunction *F = I->getFunction();
     assert(F && "Expected value base with parent function");
 
@@ -1022,8 +1077,11 @@ public:
     assert(F && "Expected value base with parent function");
     // If we do not have qualified ownership, then do not verify value base
     // ownership.
-    if (!F->hasOwnership())
+    if (!F->hasOwnership()) {
+      require(SILValue(V).getOwnershipKind() == OwnershipKind::None,
+              "Once ownership is gone, all values should have none ownership");
       return;
+    }
     SILValue(V).verifyOwnership(&DEBlocks);
   }
 
@@ -1070,6 +1128,8 @@ public:
     // Verify some basis structural stuff about an instruction's operands.
     for (auto &operand : I->getAllOperands()) {
       require(operand.get(), "instruction has null operand");
+      require(!isa<PlaceholderValue>(operand.get()),
+              "instruction has placeholder operand");
 
       if (auto *valueI = operand.get()->getDefiningInstruction()) {
         require(valueI->getParent(),
@@ -1098,9 +1158,9 @@ public:
 
       require(operand.getUser() == I,
               "instruction's operand's owner isn't the instruction");
-      require(isInValueUses(&operand), "operand value isn't used by operand");
+      require(isOperandInValueUses(&operand), "operand value isn't used by operand");
 
-      if (I->isTypeDependentOperand(operand)) {
+      if (operand.isTypeDependent()) {
         require(isa<SILInstruction>(I),
                "opened archetype operand should refer to a SILInstruction");
       }
@@ -1108,73 +1168,207 @@ public:
       // Make sure that if operand is generic that its primary archetypes match
       // the function context.
       checkLegalType(I->getFunction(), operand.get(), I);
-    }
 
-    // TODO: There should be a use of an opened archetype inside the instruction for
-    // each opened archetype operand of the instruction.
-  }
+      // If we are not in OSSA, our operand constraint should be invalid for a
+      // type dependent operand (that is Optional::None) and if we have a non
+      // type dependent operand then we should have a constraint of
+      // OwnershipKind::Any, UseLifetimeConstraint::NonLifetimeEnding.
+      if (!I->getFunction()->hasOwnership()) {
+        auto constraint = operand.getOwnershipConstraint();
+        require(constraint.getPreferredKind() == OwnershipKind::Any &&
+                    constraint.getLifetimeConstraint() ==
+                        UseLifetimeConstraint::NonLifetimeEnding,
+                "In non-ossa all non-type dependent operands must have a "
+                "constraint of Any, NonLifetimeEnding");
+      } else {
+        // Perform some structural checks on the operand if we have ownership.
 
-  void checkInstructionsSILLocation(SILInstruction *I) {
-    // Check the debug scope.
-    auto *DS = I->getDebugScope();
-    if (DS && !maybeScopeless(*I))
-      require(DS, "instruction has a location, but no scope");
-
-    require(!DS || DS->getParentFunction() == I->getFunction(),
-            "debug scope of instruction belongs to a different function");
-
-    // Check the location kind.
-    SILLocation L = I->getLoc();
-    SILLocation::LocationKind LocKind = L.getKind();
-    SILInstructionKind InstKind = I->getKind();
-
-    // Check that there is at most one debug variable defined
-    // for each argument slot. This catches SIL transformations
-    // that accidentally remove inline information (stored in the SILDebugScope)
-    // from debug-variable-carrying instructions.
-    if (!DS->InlinedCallSite) {
-      Optional<SILDebugVariable> VarInfo;
-      if (auto *DI = dyn_cast<AllocStackInst>(I))
-        VarInfo = DI->getVarInfo();
-      else if (auto *DI = dyn_cast<AllocBoxInst>(I))
-        VarInfo = DI->getVarInfo();
-      else if (auto *DI = dyn_cast<DebugValueInst>(I))
-        VarInfo = DI->getVarInfo();
-      else if (auto *DI = dyn_cast<DebugValueAddrInst>(I))
-        VarInfo = DI->getVarInfo();
-
-      if (VarInfo)
-        if (unsigned ArgNo = VarInfo->ArgNo) {
-          // It is a function argument.
-          if (ArgNo < DebugVars.size() && !DebugVars[ArgNo].empty() && !VarInfo->Name.empty()) {
-            require(
-                DebugVars[ArgNo] == VarInfo->Name,
-                "Scope contains conflicting debug variables for one function "
-                "argument");
-          } else {
-            // Reserve enough space.
-            while (DebugVars.size() <= ArgNo) {
-              DebugVars.push_back(StringRef());
-            }
-          }
-          DebugVars[ArgNo] = VarInfo->Name;
+        // Make sure that our operand constraint isn't Unowned. There do not
+        // exist in SIL today any instructions that require an Unowned
+        // value. This is because we want to always allow for guaranteed and
+        // owned values to be passed as values to operands that take unowned.
+        auto constraint = operand.getOwnershipConstraint();
+        require(constraint.getPreferredKind() != OwnershipKind::Unowned,
+                "Operand constraint should never have an unowned preferred "
+                "kind since guaranteed and owned values can always be passed "
+                "in unowned positions");
       }
     }
 
-    // Regular locations are allowed on all instructions.
-    if (LocKind == SILLocation::RegularKind)
+    if (I->getFunction()->hasOwnership() && OwnershipForwardingMixin::isa(I)) {
+      checkOwnershipForwardingInst(I);
+    }
+  }
+
+  // Verify the result of any forwarding terminator, including switch_enum.
+  void checkForwardedTermResult(OwnershipForwardingTermInst *term,
+                                SILBasicBlock *destBB) {
+    require(destBB->getNumArguments() == 1,
+            "OwnershipForwardingTermInst needs a single result");
+    auto *arg = destBB->getArgument(0);
+    auto argKind = arg->getOwnershipKind();
+    // A terminator may cast a nontrivial to a trivial type. e.g. a trivial
+    // payload in a nontrivial enum. If the result is trivial, it no longer
+    // requires ownership.
+    if (arg->getType().isTrivial(F) && argKind == OwnershipKind::None)
       return;
 
-    if (LocKind == SILLocation::ReturnKind ||
-        LocKind == SILLocation::ImplicitReturnKind)
-      require(InstKind == SILInstructionKind::BranchInst ||
-              InstKind == SILInstructionKind::ReturnInst ||
-              InstKind == SILInstructionKind::UnreachableInst,
-        "return locations are only allowed on branch and return instructions");
+    require(argKind == term->getForwardingOwnershipKind(),
+            "OwnershipForwardingTermInst nontrivial result "
+            "must have the same ownership");
+  }
 
-    if (LocKind == SILLocation::ArtificialUnreachableKind)
-      require(InstKind == SILInstructionKind::UnreachableInst,
-        "artificial locations are only allowed on Unreachable instructions");
+  /// A terminator result is forwarded from the terminator's operand. Forwarding
+  /// a nontrivial value to another nontrivial value can never gain or lose
+  /// ownership information. If the terminator's operand has ownership and the
+  /// result is nontrivial, then the result must have identical ownership.
+  ///
+  /// The terminator result can only "lose" ownership if the operand is
+  /// nontrivial but the result is trivial. It is still valid for the trivial
+  /// result to retain the operand's ownership, but unnecessary and produces
+  /// less efficient SIL.
+  void checkOwnershipForwardingTermInst(OwnershipForwardingTermInst *term) {
+    // Verifying switch_enum ownership requires evaluating the payload
+    // types. These are fully verified by checkSwitchEnumInst.
+    if (isa<SwitchEnumInst>(term))
+      return;
+
+    for (auto &succ : term->getSuccessors()) {
+      checkForwardedTermResult(term, succ.getBB());
+    }
+  }
+
+  /// We are given an instruction \p fInst that forwards ownership from \p
+  /// operand to one of \p fInst's results, make sure that if we have a
+  /// forwarding instruction that can only accept owned or guaranteed ownership
+  /// that we are following that invariant.
+  void checkOwnershipForwardingInst(SILInstruction *i) {
+    if (auto *o = dyn_cast<OwnedFirstArgForwardingSingleValueInst>(i)) {
+      ValueOwnershipKind kind = OwnershipKind::Owned;
+      require(kind.isCompatibleWith(o->getForwardingOwnershipKind()),
+              "OwnedFirstArgForwardingSingleValueInst's ownership kind must be "
+              "compatible with owned");
+    }
+
+    if (auto *o = dyn_cast<GuaranteedFirstArgForwardingSingleValueInst>(i)) {
+      ValueOwnershipKind kind = OwnershipKind::Guaranteed;
+      require(kind.isCompatibleWith(o->getForwardingOwnershipKind()),
+              "GuaranteedFirstArgForwardingSingleValueInst's ownership kind "
+              "must be compatible with guaranteed");
+    }
+
+    if (auto *term = dyn_cast<OwnershipForwardingTermInst>(i)) {
+      checkOwnershipForwardingTermInst(term);
+    }
+  }
+
+  void checkDebugVariable(SILInstruction *inst) {
+    Optional<SILDebugVariable> varInfo;
+    if (auto *di = dyn_cast<AllocStackInst>(inst))
+      varInfo = di->getVarInfo();
+    else if (auto *di = dyn_cast<AllocBoxInst>(inst))
+      varInfo = di->getVarInfo();
+    else if (auto *di = dyn_cast<DebugValueInst>(inst))
+      varInfo = di->getVarInfo();
+
+    if (!varInfo)
+      return;
+
+    // Retrive debug variable type
+    SILType DebugVarTy;
+    if (varInfo->Type)
+      DebugVarTy = *varInfo->Type;
+    else {
+      // Fetch from related SSA value
+      switch (inst->getKind()) {
+      case SILInstructionKind::AllocStackInst:
+      case SILInstructionKind::AllocBoxInst:
+        DebugVarTy = inst->getResult(0)->getType();
+        break;
+      case SILInstructionKind::DebugValueInst:
+        DebugVarTy = inst->getOperand(0)->getType();
+        if (DebugVarTy.isAddress()) {
+          auto Expr = varInfo->DIExpr.operands();
+          if (!Expr.empty() &&
+              Expr.begin()->getOperator() == SILDIExprOperator::Dereference)
+            DebugVarTy = DebugVarTy.getObjectType();
+        }
+        break;
+      default:
+        llvm_unreachable("impossible instruction kind");
+      }
+    }
+
+    auto *debugScope = inst->getDebugScope();
+    if (varInfo->ArgNo)
+      require(!varInfo->Name.empty(), "function argument without a name");
+
+    // Check that there is at most one debug variable defined for each argument
+    // slot if our debug scope is not an inlined call site.
+    //
+    // This catches SIL transformations that accidentally remove inline
+    // information (stored in the SILDebugScope) from debug-variable-carrying
+    // instructions.
+    if (debugScope && !debugScope->InlinedCallSite)
+      if (unsigned argNum = varInfo->ArgNo) {
+        // It is a function argument.
+        if (argNum < DebugVars.size() && !DebugVars[argNum].first.empty()) {
+          require(DebugVars[argNum].first == varInfo->Name,
+                  "Scope contains conflicting debug variables for one function "
+                  "argument");
+          // Check for type
+          require(DebugVars[argNum].second == DebugVarTy,
+                  "conflicting debug variable type!");
+        } else {
+          // Reserve enough space.
+          while (DebugVars.size() <= argNum) {
+            DebugVars.push_back({StringRef(), SILType()});
+          }
+        }
+        DebugVars[argNum] = {varInfo->Name, DebugVarTy};
+      }
+
+    // Check the (auxiliary) debug variable scope
+    if (const SILDebugScope *VarDS = varInfo->Scope)
+      require(VarDS->getInlinedFunction() == debugScope->getInlinedFunction(),
+              "Scope of the debug variable should have the same parent function"
+              " as that of instruction.");
+
+    // Check debug info expression
+    if (const auto &DIExpr = varInfo->DIExpr) {
+      for (auto It = DIExpr.element_begin(), ItEnd = DIExpr.element_end();
+           It != ItEnd;) {
+        require(It->getKind() == SILDIExprElement::OperatorKind,
+                "dangling di-expression operand");
+        auto Op = It->getAsOperator();
+        const auto *DIExprInfo = SILDIExprInfo::get(Op);
+        require(DIExprInfo, "unrecognized di-expression operator");
+        ++It;
+        // Check operand kinds
+        for (auto OpK : DIExprInfo->OperandKinds)
+          require(It != ItEnd && (It++)->getKind() == OpK,
+                  "di-expression operand kind mismatch");
+
+        if (Op == SILDIExprOperator::Fragment)
+          require(It == ItEnd, "op_fragment directive needs to be at the end "
+                               "of a di-expression");
+      }
+    }
+  }
+
+  void checkInstructionsDebugInfo(SILInstruction *inst) {
+    // First verify structural debug info information.
+    inst->verifyDebugInfo();
+
+    // Check the debug scope.
+    auto *debugScope = inst->getDebugScope();
+    if (debugScope && !maybeScopeless(*inst))
+      require(debugScope, "instruction has a location, but no scope");
+    require(!debugScope ||
+                debugScope->getParentFunction() == inst->getFunction(),
+            "debug scope of instruction belongs to a different function");
+
+    checkDebugVariable(inst);
   }
 
   /// Check that the types of this value producer are all legal in the function
@@ -1192,8 +1386,8 @@ public:
   }
 
   static bool isLegalSILTokenProducer(SILValue value) {
-    if (auto beginApply = dyn_cast<BeginApplyResult>(value))
-      return beginApply->isTokenResult();
+    if (auto *baResult = isaResultOf<BeginApplyInst>(value))
+      return baResult->isBeginApplyToken();
 
     // Add more token cases here as they arise.
 
@@ -1241,22 +1435,13 @@ public:
               "Operand is of an ArchetypeType that does not exist in the "
               "Caller's generic param list.");
       if (auto OpenedA = getOpenedArchetypeOf(A)) {
-        auto Def = OpenedArchetypes.getOpenedArchetypeDef(OpenedA);
-        require (Def, "Opened archetype should be registered in SILFunction");
-        require(I == nullptr || Def == I ||
-                properlyDominates(cast<SILInstruction>(Def), I),
+        auto *openingInst = F->getModule().getOpenedArchetypeInst(OpenedA, F);
+        require(I == nullptr || openingInst == I ||
+                properlyDominates(openingInst, I),
                 "Use of an opened archetype should be dominated by a "
                 "definition of this opened archetype");
       }
     });
-  }
-
-  /// Check that this operand appears in the use-chain of the value it uses.
-  static bool isInValueUses(const Operand *operand) {
-    for (auto use : operand->get()->getUses())
-      if (use == operand)
-        return true;
-    return false;
   }
 
   /// \return True if all of the users of the AllocStack instruction \p ASI are
@@ -1350,8 +1535,8 @@ public:
       });
     }
 
-    if (subs.getGenericSignature()->getCanonicalSignature() !=
-          fnTy->getInvocationGenericSignature()->getCanonicalSignature()) {
+    if (subs.getGenericSignature().getCanonicalSignature() !=
+          fnTy->getInvocationGenericSignature().getCanonicalSignature()) {
       llvm::dbgs() << "substitution map's generic signature: ";
       subs.getGenericSignature()->print(llvm::dbgs());
       llvm::dbgs() << "\n";
@@ -1384,10 +1569,10 @@ public:
         FoundOpenedArchetypes.insert(A);
         // Also check that they are properly tracked inside the current
         // function.
-        auto Def = OpenedArchetypes.getOpenedArchetypeDef(A);
-        require(Def, "Opened archetype should be registered in SILFunction");
-        require(Def == AI ||
-                properlyDominates(cast<SILInstruction>(Def), AI),
+        auto *openingInst = F.getModule().getOpenedArchetypeInst(A,
+                              AI->getFunction());
+        require(openingInst == AI ||
+                properlyDominates(openingInst, AI),
                 "Use of an opened archetype should be dominated by a "
                 "definition of this opened archetype");
       }
@@ -1419,7 +1604,7 @@ public:
       } else {
         require(isa<SingleValueInstruction>(V),
                 "opened archetype operand should refer to a SIL instruction");
-        auto Archetype = getOpenedArchetypeOf(cast<SingleValueInstruction>(V));
+        auto Archetype = cast<SingleValueInstruction>(V)->getOpenedArchetype();
         require(Archetype,
                 "opened archetype operand should define an opened archetype");
         require(FoundOpenedArchetypes.count(Archetype),
@@ -1475,18 +1660,16 @@ public:
               "apply instruction cannot call function with error result");
     }
 
+    if (AI->isNonAsync()) {
+      require(calleeConv.funcTy->isAsync(),
+              "noasync flag used for sync callee");
+    } else {
+      require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
+              "cannot call an async function from a non async function");
+    }
+
     require(!calleeConv.funcTy->isCoroutine(),
             "cannot call coroutine with normal apply");
-    require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
-            "cannot call an async function from a non async function");
-
-    // Check that if the apply is of a noreturn callee, make sure that an
-    // unreachable is the next instruction.
-    if (AI->getModule().getStage() == SILStage::Raw ||
-        !AI->isCalleeNoReturn())
-      return;
-    require(isa<UnreachableInst>(std::next(SILBasicBlock::iterator(AI))),
-            "No return apply without an unreachable as a next instruction.");
   }
 
   void checkTryApplyInst(TryApplyInst *AI) {
@@ -1497,8 +1680,13 @@ public:
     require(!calleeConv.funcTy->isCoroutine(),
             "cannot call coroutine with normal apply");
 
-    require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
-            "cannot call an async function from a non async function");
+    if (AI->isNonAsync()) {
+      require(calleeConv.funcTy->isAsync(),
+              "noasync flag used for sync callee");
+    } else {
+      require(!calleeConv.funcTy->isAsync() || AI->getFunction()->isAsync(),
+              "cannot call an async function from a non async function");
+    }
 
     auto normalBB = AI->getNormalBB();
     require(normalBB->args_size() == 1,
@@ -1549,14 +1737,12 @@ public:
   }
 
   void checkAbortApplyInst(AbortApplyInst *AI) {
-    require(isa<BeginApplyResult>(AI->getOperand()) &&
-            cast<BeginApplyResult>(AI->getOperand())->isTokenResult(),
+    require(getAsResultOf<BeginApplyInst>(AI->getOperand())->isBeginApplyToken(),
             "operand of abort_apply must be a begin_apply");
   }
 
   void checkEndApplyInst(EndApplyInst *AI) {
-    require(isa<BeginApplyResult>(AI->getOperand()) &&
-            cast<BeginApplyResult>(AI->getOperand())->isTokenResult(),
+    require(getAsResultOf<BeginApplyInst>(AI->getOperand())->isBeginApplyToken(),
             "operand of end_apply must be a begin_apply");
   }
 
@@ -1619,13 +1805,24 @@ public:
     SILFunctionConventions substConv(substTy, F.getModule());
     unsigned appliedArgStartIdx =
         substConv.getNumSILArguments() - PAI->getNumArguments();
-    for (unsigned i = 0, size = PAI->getArguments().size(); i < size; ++i) {
+    bool isSendableAndStageIsCanonical =
+        PAI->getFunctionType()->isSendable() &&
+        F.getModule().getStage() >= SILStage::Canonical;
+    for (auto p : llvm::enumerate(PAI->getArguments())) {
       requireSameType(
-          PAI->getArguments()[i]->getType(),
-          substConv.getSILArgumentType(appliedArgStartIdx + i,
+          p.value()->getType(),
+          substConv.getSILArgumentType(appliedArgStartIdx + p.index(),
                                        F.getTypeExpansionContext()),
           "applied argument types do not match suffix of function type's "
           "inputs");
+
+      // TODO: Expand this to also be true for address only types.
+      if (isSendableAndStageIsCanonical)
+        require(
+            !p.value()->getType().getASTType()->is<SILBoxType>() ||
+                p.value()->getType().getSILBoxFieldType(&F).isAddressOnly(F),
+            "Concurrent partial apply in canonical SIL with a loadable box "
+            "type argument?!");
     }
 
     // The arguments to the result function type must match the prefix of the
@@ -1737,11 +1934,54 @@ public:
       return;
     }
 
+    auto builtinKind = BI->getBuiltinKind();
+    auto arguments = BI->getArguments();
+
     // Check that 'getCurrentAsyncTask' only occurs within an async function.
-    if (BI->getBuiltinKind() &&
-        *BI->getBuiltinKind() == BuiltinValueKind::GetCurrentAsyncTask) {
+    if (builtinKind == BuiltinValueKind::GetCurrentAsyncTask) {
       require(F.isAsync(),
           "getCurrentAsyncTask builtin can only be used in an async function");
+      return;
+    }
+
+    if (builtinKind == BuiltinValueKind::InitializeDefaultActor ||
+        builtinKind == BuiltinValueKind::DestroyDefaultActor) {
+      require(arguments.size() == 1,
+              "default-actor builtin can only operate on a single object");
+      auto argType = arguments[0]->getType().getASTType();
+      auto argClass = argType.getClassOrBoundGenericClass();
+      require((argClass && argClass->isRootDefaultActor(M,
+                                        F.getResilienceExpansion())) ||
+              isa<BuiltinNativeObjectType>(argType),
+              "default-actor builtin can only operate on default actors");
+      return;
+    }
+
+    // Check that 'getCurrentAsyncTask' only occurs within an async function.
+    if (builtinKind == BuiltinValueKind::GetCurrentExecutor) {
+      require(F.isAsync(),
+              "getCurrentExecutor can only be used in an async function");
+      require(arguments.empty(), "getCurrentExecutor takes no arguments");
+      requireOptionalExecutorType(BI, "result of getCurrentExecutor");
+      return;
+    }
+
+    if (builtinKind == BuiltinValueKind::BuildOrdinarySerialExecutorRef ||
+        builtinKind == BuiltinValueKind::BuildDefaultActorExecutorRef) {
+      require(arguments.size() == 1,
+              "builtin expects one argument");
+      require(arguments[0]->getType().isObject(),
+              "operand of builtin should have object type");
+      requireObjectType(BuiltinExecutorType, BI,
+                        "result of build*ExecutorRef");
+      return;
+    }
+
+    if (builtinKind == BuiltinValueKind::BuildMainActorExecutorRef) {
+      require(arguments.size() == 0,
+              "buildMainActorExecutorRef expects no arguments");
+      requireObjectType(BuiltinExecutorType, BI,
+                        "result of build*ExecutorRef");
       return;
     }
   }
@@ -1814,7 +2054,7 @@ public:
   void checkAllocGlobalInst(AllocGlobalInst *AGI) {
     SILGlobalVariable *RefG = AGI->getReferencedGlobal();
     if (auto *VD = RefG->getDecl()) {
-      require(!VD->isResilient(F.getModule().getSwiftModule(),
+      require(!checkResilience(VD, F.getModule().getSwiftModule(),
                                F.getResilienceExpansion()),
               "cannot access storage of resilient global");
     }
@@ -1833,7 +2073,7 @@ public:
         RefG->getLoweredTypeInContext(F.getTypeExpansionContext()),
         "global_addr/value must be the type of the variable it references");
     if (auto *VD = RefG->getDecl()) {
-      require(!VD->isResilient(F.getModule().getSwiftModule(),
+      require(!checkResilience(VD, F.getModule().getSwiftModule(),
                                F.getResilienceExpansion()),
               "cannot access storage of resilient global");
     }
@@ -1927,10 +2167,29 @@ public:
         "Inst with qualified ownership in a function that is not qualified");
   }
 
+  void checkEndLifetimeInst(EndLifetimeInst *I) {
+    require(!I->getOperand()->getType().isTrivial(*I->getFunction()),
+            "Source value should be non-trivial");
+    require(!fnConv.useLoweredAddresses() || F.hasOwnership(),
+            "end_lifetime is only valid in functions with qualified "
+            "ownership");
+  }
+
   void checkUncheckedValueCastInst(UncheckedValueCastInst *) {
     require(
         F.hasOwnership(),
         "Inst with qualified ownership in a function that is not qualified");
+  }
+
+  void checkUncheckedOwnershipConversionInst(
+    UncheckedOwnershipConversionInst *uoci) {
+    require(
+        F.hasOwnership(),
+        "Inst with qualified ownership in a function that is not qualified");
+    require(!uoci->getType().isAddress(),
+            "cannot convert ownership of an address");
+    require(uoci->getType() == uoci->getOperand()->getType(),
+            "converting ownership does not affect the type");
   }
 
   template <class AI>
@@ -1973,7 +2232,7 @@ public:
     //
     // First check that identifyFormalAccess returns without asserting. For
     // Unsafe enforcement, that is sufficient. For any other enforcement
-    // level also require that it returns a valid AccessedStorage object.
+    // level also require that it returns a valid AccessStorage object.
     // Unsafe enforcement is used for some unrecognizable access patterns,
     // like debugger variables. The compiler never cares about the source of
     // those accesses.
@@ -1984,7 +2243,7 @@ public:
     // I will probably enable a much broader SILVerification of address-type
     // block arguments first to ensure we never hit this check again.
     /*
-    AccessedStorage storage = identifyFormalAccess(BAI);
+    AccessStorage storage = identifyFormalAccess(BAI);
     if (BAI->getEnforcement() != SILAccessEnforcement::Unsafe)
       require(storage, "Unknown formal access pattern");
     */
@@ -2024,7 +2283,7 @@ public:
     }
 
     // First check that identifyFormalAccess never asserts.
-    AccessedStorage storage = identifyFormalAccess(BUAI);
+    AccessStorage storage = identifyFormalAccess(BUAI);
     // Only allow Unsafe and Builtin access to have invalid storage.
     if (BUAI->getEnforcement() != SILAccessEnforcement::Unsafe
         && !BUAI->isFromBuiltin()) {
@@ -2077,12 +2336,29 @@ public:
           "Inst with qualified ownership in a function that is not qualified");
       SILValue Src = SI->getSrc();
       require(Src->getType().isTrivial(*SI->getFunction()) ||
-                  Src.getOwnershipKind() == ValueOwnershipKind::None,
+                  Src.getOwnershipKind() == OwnershipKind::None,
               "A store with trivial ownership must store a type with trivial "
               "ownership");
       break;
     }
     }
+  }
+
+  void checkStoreBorrowInst(StoreBorrowInst *SI) {
+    require(SI->getSrc()->getType().isObject(),
+            "Can't store from an address source");
+    require(!fnConv.useLoweredAddresses()
+                || SI->getSrc()->getType().isLoadable(*SI->getFunction()),
+            "Can't store a non loadable type");
+    require(SI->getDest()->getType().isAddress(),
+            "Must store to an address dest");
+    requireSameType(SI->getDest()->getType().getObjectType(),
+                    SI->getSrc()->getType(),
+                    "Store operand type and dest type mismatch");
+
+    // Note: This is the current implementation and the design is not final.
+    require(isa<AllocStackInst>(SI->getDest()),
+            "store_borrow destination can only be an alloc_stack");
   }
 
   void checkAssignInst(AssignInst *AI) {
@@ -2408,21 +2684,6 @@ public:
             "closure parameter must not be a @noescape closure");
   }
 
-  void checkAllocValueBufferInst(AllocValueBufferInst *I) {
-    require(I->getOperand()->getType().isAddress(),
-            "Operand value should be an address");
-    require(I->getOperand()->getType().is<BuiltinUnsafeValueBufferType>(),
-            "Operand value should be a Builtin.UnsafeValueBuffer");
-    verifyOpenedArchetype(I, I->getValueType().getASTType());
-  }
-
-  void checkProjectValueBufferInst(ProjectValueBufferInst *I) {
-    require(I->getOperand()->getType().isAddress(),
-            "Operand value should be an address");
-    require(I->getOperand()->getType().is<BuiltinUnsafeValueBufferType>(),
-            "Operand value should be a Builtin.UnsafeValueBuffer");
-  }
-
   void checkProjectBoxInst(ProjectBoxInst *I) {
     require(I->getOperand()->getType().isObject(),
             "project_box operand should be a value");
@@ -2472,21 +2733,14 @@ public:
     }
   }
   
-  void checkDeallocValueBufferInst(DeallocValueBufferInst *I) {
-    require(I->getOperand()->getType().isAddress(),
-            "Operand value should be an address");
-    require(I->getOperand()->getType().is<BuiltinUnsafeValueBufferType>(),
-            "Operand value should be a Builtin.UnsafeValueBuffer");
-  }
-  
   void checkStructInst(StructInst *SI) {
     auto *structDecl = SI->getType().getStructOrBoundGenericStruct();
     require(structDecl, "StructInst must return a struct");
     require(!structDecl->hasUnreferenceableStorage(),
             "Cannot build a struct with unreferenceable storage from elements "
             "using StructInst");
-    require(!structDecl->isResilient(F.getModule().getSwiftModule(),
-                                     F.getResilienceExpansion()),
+    require(!checkResilience(structDecl, F.getModule().getSwiftModule(),
+                             F.getResilienceExpansion()),
             "cannot access storage of resilient struct");
     require(SI->getType().isObject(),
             "StructInst must produce an object");
@@ -2687,8 +2941,8 @@ public:
     require(cd, "Operand of dealloc_ref must be of class type");
 
     if (!DI->canAllocOnStack()) {
-      require(!cd->isResilient(F.getModule().getSwiftModule(),
-                              F.getResilienceExpansion()),
+      require(!checkResilience(cd, F.getModule().getSwiftModule(),
+                               F.getResilienceExpansion()),
               "cannot directly deallocate resilient class");
     }
   }
@@ -2785,6 +3039,10 @@ public:
 
     require(EI->getFieldIndex() < operandTy->getNumElements(),
             "invalid field index for tuple_extract instruction");
+
+    require(EI->getForwardingOwnershipKind() == OwnershipKind::None ||
+                EI->getForwardingOwnershipKind() == OwnershipKind::Guaranteed,
+            "invalid forwarding ownership kind on tuple_extract instruction");
     if (EI->getModule().getStage() != SILStage::Lowered) {
       requireSameType(EI->getType().getASTType(),
                       operandTy.getElementType(EI->getFieldIndex()),
@@ -2800,7 +3058,7 @@ public:
             "result of struct_extract cannot be address");
     StructDecl *sd = operandTy.getStructOrBoundGenericStruct();
     require(sd, "must struct_extract from struct");
-    require(!sd->isResilient(F.getModule().getSwiftModule(),
+    require(!checkResilience(sd, F.getModule().getSwiftModule(),
                              F.getResilienceExpansion()),
             "cannot access storage of resilient struct");
     require(!EI->getField()->isStatic(),
@@ -2810,6 +3068,10 @@ public:
 
     require(EI->getField()->getDeclContext() == sd,
             "struct_extract field is not a member of the struct");
+
+    require(EI->getForwardingOwnershipKind() == OwnershipKind::None ||
+                EI->getForwardingOwnershipKind() == OwnershipKind::Guaranteed,
+            "invalid forwarding ownership kind on tuple_extract instruction");
 
     if (EI->getModule().getStage() != SILStage::Lowered) {
       SILType loweredFieldTy = operandTy.getFieldType(
@@ -2845,7 +3107,7 @@ public:
             "must derive struct_element_addr from address");
     StructDecl *sd = operandTy.getStructOrBoundGenericStruct();
     require(sd, "struct_element_addr operand must be struct address");
-    require(!sd->isResilient(F.getModule().getSwiftModule(),
+    require(!checkResilience(sd, F.getModule().getSwiftModule(),
                              F.getResilienceExpansion()),
             "cannot access storage of resilient struct");
     require(EI->getType().isAddress(),
@@ -2878,7 +3140,7 @@ public:
     SILType operandTy = EI->getOperand()->getType();
     ClassDecl *cd = operandTy.getClassOrBoundGenericClass();
     require(cd, "ref_element_addr operand must be a class instance");
-    require(!cd->isResilient(F.getModule().getSwiftModule(),
+    require(!checkResilience(cd, F.getModule().getSwiftModule(),
                              F.getResilienceExpansion()),
             "cannot access storage of resilient class");
 
@@ -2902,7 +3164,7 @@ public:
     SILType operandTy = RTAI->getOperand()->getType();
     ClassDecl *cd = operandTy.getClassOrBoundGenericClass();
     require(cd, "ref_tail_addr operand must be a class instance");
-    require(!cd->isResilient(F.getModule().getSwiftModule(),
+    require(!checkResilience(cd, F.getModule().getSwiftModule(),
                              F.getResilienceExpansion()),
             "cannot access storage of resilient class");
     require(cd, "ref_tail_addr operand must be a class instance");
@@ -2912,7 +3174,7 @@ public:
     SILType operandTy = DSI->getOperand()->getType();
     StructDecl *sd = operandTy.getStructOrBoundGenericStruct();
     require(sd, "must struct_extract from struct");
-    require(!sd->isResilient(F.getModule().getSwiftModule(),
+    require(!checkResilience(sd, F.getModule().getSwiftModule(),
                              F.getResilienceExpansion()),
             "cannot access storage of resilient struct");
     if (F.hasOwnership()) {
@@ -2920,13 +3182,13 @@ public:
       // compatible with our destructure_struct's ownership kind /and/ that if
       // our destructure ownership kind is non-trivial then all non-trivial
       // results must have the same ownership kind as our operand.
-      auto parentKind = DSI->getOwnershipKind();
-      for (const DestructureStructResult &result : DSI->getAllResultsBuffer()) {
+      auto parentKind = DSI->getForwardingOwnershipKind();
+      for (const auto &result : DSI->getAllResultsBuffer()) {
         require(parentKind.isCompatibleWith(result.getOwnershipKind()),
                 "destructure result with ownership that is incompatible with "
                 "parent forwarding ownership kind");
-        require(parentKind != ValueOwnershipKind::None ||
-                    result.getOwnershipKind() == ValueOwnershipKind::None,
+        require(parentKind != OwnershipKind::None ||
+                    result.getOwnershipKind() == OwnershipKind::None,
                 "destructure with none ownership kind operand and non-none "
                 "ownership kind result?!");
       }
@@ -2939,13 +3201,13 @@ public:
       // compatible with our destructure_struct's ownership kind /and/ that if
       // our destructure ownership kind is non-trivial then all non-trivial
       // results must have the same ownership kind as our operand.
-      auto parentKind = dti->getOwnershipKind();
+      auto parentKind = dti->getForwardingOwnershipKind();
       for (const auto &result : dti->getAllResultsBuffer()) {
         require(parentKind.isCompatibleWith(result.getOwnershipKind()),
                 "destructure result with ownership that is incompatible with "
                 "parent forwarding ownership kind");
-        require(parentKind != ValueOwnershipKind::None ||
-                    result.getOwnershipKind() == ValueOwnershipKind::None,
+        require(parentKind != OwnershipKind::None ||
+                    result.getOwnershipKind() == OwnershipKind::None,
                 "destructure with none ownership kind operand and non-none "
                 "ownership kind result?!");
       }
@@ -2953,6 +3215,7 @@ public:
   }
 
   SILType getMethodSelfType(CanSILFunctionType ft) {
+    SILFunctionConventions fnConv(ft, F.getModule());
     return fnConv.getSILType(ft->getParameters().back(),
                              F.getTypeExpansionContext());
   }
@@ -2975,12 +3238,12 @@ public:
 
     auto genericSig = methodType->getInvocationGenericSignature();
 
-    auto selfGenericParam = genericSig->getGenericParams()[0];
+    auto selfGenericParam = genericSig.getGenericParams()[0];
     require(selfGenericParam->getDepth() == 0
             && selfGenericParam->getIndex() == 0,
             "method should be polymorphic on Self parameter at depth 0 index 0");
     Optional<Requirement> selfRequirement;
-    for (auto req : genericSig->getRequirements()) {
+    for (auto req : genericSig.getRequirements()) {
       if (req.getKind() != RequirementKind::SameType) {
         selfRequirement = req;
         break;
@@ -2995,7 +3258,7 @@ public:
             "requirement Self parameter must conform to called protocol");
 
     auto lookupType = AMI->getLookupType();
-    if (getOpenedArchetypeOf(lookupType)) {
+    if (getOpenedArchetypeOf(lookupType) || lookupType->hasDynamicSelfType()) {
       require(AMI->getTypeDependentOperands().size() == 1,
               "Must have a type dependent operand for the opened archetype");
       verifyOpenedArchetype(AMI, lookupType);
@@ -3003,7 +3266,7 @@ public:
       require(AMI->getTypeDependentOperands().empty(),
               "Should not have an operand for the opened existential");
     }
-    if (!isa<ArchetypeType>(lookupType)) {
+    if (!isa<ArchetypeType>(lookupType) && !isa<DynamicSelfType>(lookupType)) {
       require(AMI->getConformance().isConcrete(),
               "concrete type lookup requires concrete conformance");
       auto conformance = AMI->getConformance().getConcrete();
@@ -3253,7 +3516,8 @@ public:
     auto archetype = getOpenedArchetypeOf(OEI->getType().getASTType());
     require(archetype,
         "open_existential_addr result must be an opened existential archetype");
-    require(OpenedArchetypes.getOpenedArchetypeDef(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_addr should be registered in "
             "SILFunction");
 
@@ -3286,7 +3550,8 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_ref result must be an opened existential archetype");
-    require(OpenedArchetypes.getOpenedArchetypeDef(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_ref should be registered in "
             "SILFunction");
   }
@@ -3308,7 +3573,8 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_box result must be an opened existential archetype");
-    require(OpenedArchetypes.getOpenedArchetypeDef(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_box should be registered in "
             "SILFunction");
   }
@@ -3330,7 +3596,8 @@ public:
     auto archetype = getOpenedArchetypeOf(resultInstanceTy);
     require(archetype,
         "open_existential_box_value result not an opened existential archetype");
-    require(OpenedArchetypes.getOpenedArchetypeDef(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential_box_value should be "
             "registered in SILFunction");
   }
@@ -3376,7 +3643,7 @@ public:
     require(archetype, "open_existential_metatype result must be an opened "
                        "existential metatype");
     require(
-        OpenedArchetypes.getOpenedArchetypeDef(archetype) == I,
+        I->getModule().getOpenedArchetypeInst(archetype, I->getFunction()) == I,
         "Archetype opened by open_existential_metatype should be registered in "
         "SILFunction");
   }
@@ -3395,7 +3662,8 @@ public:
     auto archetype = getOpenedArchetypeOf(OEI->getType().getASTType());
     require(archetype, "open_existential_value result must be an opened "
                        "existential archetype");
-    require(OpenedArchetypes.getOpenedArchetypeDef(archetype) == OEI,
+    require(OEI->getModule().getOpenedArchetypeInst(archetype,
+                 OEI->getFunction()) == OEI,
             "Archetype opened by open_existential should be registered in "
             "SILFunction");
   }
@@ -3683,8 +3951,8 @@ public:
       SILValue Def;
       if (t->isOpenedExistential()) {
         auto archetypeTy = cast<ArchetypeType>(t);
-        Def = OpenedArchetypes.getOpenedArchetypeDef(archetypeTy);
-        require(Def, "Opened archetype should be registered in SILFunction");
+        Def = I->getModule().getOpenedArchetypeInst(archetypeTy, I->getFunction());
+        require(Def, "Opened archetype should be registered in SILModule");
       } else if (t->hasDynamicSelfType()) {
         require(I->getFunction()->hasSelfParam() ||
                 I->getFunction()->hasDynamicSelfMetadata(),
@@ -3857,7 +4125,7 @@ public:
       require(instClass,
               "upcast must convert a class metatype to a class metatype");
       
-      if (instClass->usesObjCGenericsModel()) {
+      if (instClass->isTypeErasedGenericClass()) {
         require(instClass->getDeclaredTypeInContext()
                   ->isBindableToSuperclassOf(opInstTy),
                 "upcast must cast to a superclass or an existential metatype");
@@ -3890,7 +4158,7 @@ public:
     auto ToClass = ToTy.getClassOrBoundGenericClass();
     require(ToClass,
             "upcast must convert a class instance to a class type");
-      if (ToClass->usesObjCGenericsModel()) {
+      if (ToClass->isTypeErasedGenericClass()) {
         require(ToClass->getDeclaredTypeInContext()
                   ->isBindableToSuperclassOf(FromTy.getASTType()),
                 "upcast must cast to a superclass or an existential metatype");
@@ -4294,104 +4562,96 @@ public:
     checkSelectValueCases(SVI);
   }
 
-  void checkSwitchEnumInst(SwitchEnumInst *SOI) {
-    require(SOI->getOperand()->getType().isObject(),
+  void checkSwitchEnumInst(SwitchEnumInst *switchEnum) {
+    require(switchEnum->getOperand()->getType().isObject(),
             "switch_enum operand must be an object");
 
-    SILType uTy = SOI->getOperand()->getType();
+    SILType uTy = switchEnum->getOperand()->getType();
     EnumDecl *uDecl = uTy.getEnumOrBoundGenericEnum();
     require(uDecl, "switch_enum operand is not an enum");
 
     // Find the set of enum elements for the type so we can verify
     // exhaustiveness.
     llvm::DenseSet<EnumElementDecl*> unswitchedElts;
-    uDecl->getAllElements(unswitchedElts);
 
-    // Verify the set of enum cases we dispatch on.
-    for (unsigned i = 0, e = SOI->getNumCases(); i < e; ++i) {
-      EnumElementDecl *elt;
-      SILBasicBlock *dest;
-      std::tie(elt, dest) = SOI->getCase(i);
-
+    auto checkSwitchCase = [&](EnumElementDecl *elt, SILBasicBlock *dest) {
       require(elt->getDeclContext() == uDecl,
               "switch_enum dispatches on enum element that is not part of "
               "its type");
-      require(unswitchedElts.count(elt),
+      require(unswitchedElts.insert(elt).second,
               "switch_enum dispatches on same enum element more than once");
-      unswitchedElts.erase(elt);
 
-      // The destination BB can take the argument payload, if any, as a BB
-      // arguments, or it can ignore it and take no arguments.
-      if (elt->hasAssociatedValues()) {
-        if (isSILOwnershipEnabled() && F.hasOwnership()) {
-          require(dest->getArguments().size() == 1,
-                  "switch_enum destination for case w/ args must take 1 "
-                  "argument");
-          if (!dest->getArgument(0)->getType().isTrivial(*SOI->getFunction())) {
-            require(
-                dest->getArgument(0)->getOwnershipKind().isCompatibleWith(
-                    SOI->getOwnershipKind()),
-                "Switch enum non-trivial destination arg must have ownership "
-                "kind that is compatible with the switch_enum's operand");
-          }
-        } else {
-          require(dest->getArguments().empty() ||
-                      dest->getArguments().size() == 1,
-                  "switch_enum destination for case w/ args must take 0 or 1 "
-                  "arguments");
-        }
-
-        if (dest->getArguments().size() == 1) {
-          SILType eltArgTy = uTy.getEnumElementType(elt, F.getModule(),
-                                                    F.getTypeExpansionContext());
-          SILType bbArgTy = dest->getArguments()[0]->getType();
-          if (F.getModule().getStage() != SILStage::Lowered) {
-            // During the lowered stage, a function type might have different
-            // signature
-            require(eltArgTy == bbArgTy,
-                    "switch_enum destination bbarg must match case arg type");
-          }
-          require(!dest->getArguments()[0]->getType().isAddress(),
-                  "switch_enum destination bbarg type must not be an address");
-        }
-
-      } else {
+      if (!elt->hasAssociatedValues()) {
         require(dest->getArguments().empty(),
                 "switch_enum destination for no-argument case must take no "
                 "arguments");
+        return;
       }
+      // Check for a valid switch result type.
+      if (dest->getArguments().size() == 1) {
+        SILType eltArgTy = uTy.getEnumElementType(elt, F.getModule(),
+                                                  F.getTypeExpansionContext());
+        SILType bbArgTy = dest->getArguments()[0]->getType();
+        if (F.getModule().getStage() != SILStage::Lowered) {
+          // During the lowered stage, a function type might have different
+          // signature
+          require(eltArgTy == bbArgTy,
+                  "switch_enum destination bbarg must match case arg type");
+        }
+        require(!dest->getArguments()[0]->getType().isAddress(),
+                "switch_enum destination bbarg type must not be an address");
+      }
+      if (!isSILOwnershipEnabled() || !F.hasOwnership()) {
+        // In non-OSSA, the destBB can optionally ignore the payload.
+        require(dest->getArguments().empty()
+                    || dest->getArguments().size() == 1,
+                "switch_enum destination for case w/ args must take 0 or 1 "
+                "arguments");
+        return;
+      }
+      checkForwardedTermResult(switchEnum, dest);
+    };
+    // Verify the set of enum cases we dispatch on.
+    for (unsigned i = 0, e = switchEnum->getNumCases(); i < e; ++i) {
+      EnumElementDecl *elt;
+      SILBasicBlock *dest;
+      std::tie(elt, dest) = switchEnum->getCase(i);
+      checkSwitchCase(elt, dest);
     }
-
     // If the switch is non-exhaustive, we require a default.
-    bool isExhaustive =
-        uDecl->isEffectivelyExhaustive(F.getModule().getSwiftModule(),
-                                       F.getResilienceExpansion());
-    require((isExhaustive && unswitchedElts.empty()) || SOI->hasDefault(),
-            "nonexhaustive switch_enum must have a default destination");
-    if (SOI->hasDefault()) {
-      // When SIL ownership is enabled, we require all default branches to take
-      // an @owned original version of the enum.
-      //
-      // When SIL ownership is disabled, we no longer support this.
-      if (isSILOwnershipEnabled() && F.hasOwnership()) {
-        require(SOI->getDefaultBB()->getNumArguments() == 1,
-                "Switch enum default block should have one argument");
-        requireSameType(
-            SOI->getDefaultBB()->getArgument(0)->getType(),
-            SOI->getOperand()->getType(),
-            "Switch enum default block should have one argument that is "
-            "the same as the input type");
-        auto defaultKind =
-            SOI->getDefaultBB()->getArgument(0)->getOwnershipKind();
-        require(
-            defaultKind.isCompatibleWith(SOI->getOperand().getOwnershipKind()),
-            "Switch enum default block arg must have same ownership kind "
-            "as operand");
-      } else if (!F.hasOwnership()) {
-        require(SOI->getDefaultBB()->args_empty(),
-                "switch_enum default destination must take no arguments");
-      }
+    if (!switchEnum->hasDefault()) {
+      bool isExhaustive = uDecl->isEffectivelyExhaustive(
+          F.getModule().getSwiftModule(), F.getResilienceExpansion());
+      require(isExhaustive
+                  && (unswitchedElts.size() == uDecl->getNumElements()),
+              "nonexhaustive switch_enum must have a default destination");
+      return;
     }
+    auto *defaultBB = switchEnum->getDefaultBB();
+    if (!isSILOwnershipEnabled() || !F.hasOwnership()) {
+      require(switchEnum->getDefaultBB()->args_empty(),
+              "switch_enum default destination must take no arguments");
+      return;
+    }
+    // When the switch has a unique default case, the OSSA result has the same
+    // requirements as a matched result.
+    if (NullablePtr<EnumElementDecl> uniqueCase =
+            switchEnum->getUniqueCaseForDefault()) {
+      checkSwitchCase(uniqueCase.get(), defaultBB);
+      return;
+    }
+    // With no unique case, the switch_enum operand is simply forwarded.
+    require(defaultBB->getNumArguments() == 1,
+            "Switch enum default block should have one argument");
+    requireSameType(
+        defaultBB->getArgument(0)->getType(),
+        switchEnum->getOperand()->getType(),
+        "Switch enum default block should have one argument that is "
+        "the same as the input type");
+    require(defaultBB->getArgument(0)->getOwnershipKind()
+                == switchEnum->getForwardingOwnershipKind(),
+            "switch_enum non-trivial destination arg must have the same "
+            "ownership as switch_enum's operand");
   }
 
   void checkSwitchEnumAddrInst(SwitchEnumAddrInst *SOI) {
@@ -4621,7 +4881,22 @@ public:
           "result must match all parameters of invoke function but the first");
     }
   }
-  
+
+  void checkHopToExecutorInst(HopToExecutorInst *HI) {
+    auto executor = HI->getTargetExecutor();
+    if (HI->getModule().getStage() == SILStage::Lowered) {
+      requireOptionalExecutorType(executor,
+                                  "hop_to_executor operand in lowered SIL");
+    }
+  }
+
+  void checkExtractExecutorInst(ExtractExecutorInst *EEI) {
+    if (EEI->getModule().getStage() == SILStage::Lowered) {
+      require(false,
+              "extract_executor instruction should have been lowered away");
+    }
+  }
+
   void checkObjCProtocolInst(ObjCProtocolInst *OPI) {
     require(OPI->getProtocol()->isObjC(),
             "objc_protocol must be applied to an @objc protocol");
@@ -4670,22 +4945,26 @@ public:
     
     auto kpBGT = kpTy.getAs<BoundGenericType>();
     require(kpBGT, "keypath result must be a generic type");
-    auto &C = F.getASTContext();
-    require(kpBGT->getDecl() == C.getKeyPathDecl()
-            || kpBGT->getDecl() == C.getWritableKeyPathDecl()
-            || kpBGT->getDecl() == C.getReferenceWritableKeyPathDecl(),
+    require(kpBGT->isKeyPath() ||
+            kpBGT->isWritableKeyPath() ||
+            kpBGT->isReferenceWritableKeyPath(),
             "keypath result must be a key path type");
     
     auto baseTy = CanType(kpBGT->getGenericArgs()[0]);
     auto pattern = KPI->getPattern();
     SubstitutionMap patternSubs = KPI->getSubstitutions();
     requireSameType(
-        baseTy, pattern->getRootType().subst(patternSubs)->getCanonicalType(),
+        F.getLoweredType(baseTy).getASTType(),
+        F.getLoweredType(
+            pattern->getRootType().subst(patternSubs)->getCanonicalType()).getASTType(),
         "keypath root type should match root type of keypath pattern");
 
     auto leafTy = CanType(kpBGT->getGenericArgs()[1]);
     requireSameType(
-        leafTy, pattern->getValueType().subst(patternSubs)->getCanonicalType(),
+        F.getLoweredType(leafTy).getASTType(),
+        F.getLoweredType(
+             pattern->getValueType().subst(patternSubs)->getCanonicalType())
+            .getASTType(),
         "keypath value type should match value type of keypath pattern");
 
     {
@@ -4706,7 +4985,7 @@ public:
           break;
         }
       
-        verifyKeyPathComponent(F.getModule(), F.getResilienceExpansion(),
+        verifyKeyPathComponent(F.getModule(), F.getTypeExpansionContext(),
           [&](bool reqt, StringRef message) { _require(reqt, message); },
           baseTy,
           leafTy,
@@ -4719,7 +4998,8 @@ public:
       }
     }
     requireSameType(
-        CanType(baseTy), CanType(leafTy),
+        F.getLoweredType(CanType(baseTy)).getASTType(),
+        F.getLoweredType(CanType(leafTy)).getASTType(),
         "final component should match leaf value type of key path type");
   }
 
@@ -4822,15 +5102,19 @@ public:
       DifferentiableFunctionExtractInst *dfei) {
     auto fnTy = dfei->getOperand()->getType().getAs<SILFunctionType>();
     require(fnTy, "The function operand must have a function type");
-    require(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal,
-            "The function operand must be a '@differentiable' function");
+    // TODO: Ban 'Normal' and 'Forward'.
+    require(
+        fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Reverse ||
+        fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Normal ||
+        fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Forward,
+        "The function operand must be a '@differentiable(reverse)' function");
   }
 
   void checkLinearFunctionExtractInst(LinearFunctionExtractInst *lfei) {
     auto fnTy = lfei->getOperand()->getType().getAs<SILFunctionType>();
     require(fnTy, "The function operand must have a function type");
     require(fnTy->getDifferentiabilityKind() == DifferentiabilityKind::Linear,
-            "The function operand must be a '@differentiable(linear)' "
+            "The function operand must be a '@differentiable(_linear)' "
             "function");
   }
 
@@ -4858,12 +5142,7 @@ public:
   
   void checkGetAsyncContinuationInstBase(GetAsyncContinuationInstBase *GACI) {
     auto resultTy = GACI->getType();
-    auto &C = resultTy.getASTContext();
-    auto resultBGT = resultTy.getAs<BoundGenericType>();
-    require(resultBGT, "Instruction type must be a continuation type");
-    auto resultDecl = resultBGT->getDecl();
-    require(resultDecl == C.getUnsafeContinuationDecl()
-             || resultDecl == C.getUnsafeThrowingContinuationDecl(),
+    require(resultTy.is<BuiltinRawUnsafeContinuationType>(),
             "Instruction type must be a continuation type");
   }
   
@@ -4901,7 +5180,7 @@ public:
               "error successor argument must have Error type");
       
       if (AACI->getFunction()->hasOwnership()) {
-        require(arg->getOwnershipKind() == ValueOwnershipKind::Owned,
+        require(arg->getOwnershipKind() == OwnershipKind::Owned,
                 "error successor argument must be owned");
       }
     }
@@ -4916,7 +5195,7 @@ public:
       requireSameType(arg->getType(), cont->getLoweredResumeType(),
                       "resume successor must take an argument of the continuation resume type");
       if (AACI->getFunction()->hasOwnership()) {
-        require(arg->getOwnershipKind() == ValueOwnershipKind::Owned,
+        require(arg->getOwnershipKind() == OwnershipKind::Owned,
                 "resume successor argument must be owned");
       }
     }
@@ -5009,6 +5288,13 @@ public:
             "convention");
   }
 
+  void checkMoveValueInst(MoveValueInst *mvi) {
+    require(mvi->getOperand()->getType().isObject(),
+            "Operand value should be an object");
+    require(mvi->getType() == mvi->getOperand()->getType(),
+            "Result and operand must have the same type, today.");
+  }
+
   void verifyEpilogBlocks(SILFunction *F) {
     bool FoundReturnBlock = false;
     bool FoundThrowBlock = false;
@@ -5033,7 +5319,7 @@ public:
   }
 
   bool isUnreachableAlongAllPathsStartingAt(
-      SILBasicBlock *StartBlock, SmallPtrSetImpl<SILBasicBlock *> &Visited) {
+      SILBasicBlock *StartBlock, BasicBlockSet &Visited) {
     if (isa<UnreachableInst>(StartBlock->getTerminator()))
       return true;
     else if (isa<ReturnInst>(StartBlock->getTerminator()))
@@ -5043,7 +5329,7 @@ public:
 
     // Recursively check all successors.
     for (auto *SuccBB : StartBlock->getSuccessorBlocks())
-      if (!Visited.insert(SuccBB).second)
+      if (!Visited.insert(SuccBB))
         if (!isUnreachableAlongAllPathsStartingAt(SuccBB, Visited))
           return false;
 
@@ -5227,7 +5513,7 @@ public:
             // this successor bb.  (FIXME: Why? Infinite loops should still
             // preserve consistency...)
             auto isUnreachable = [&] {
-              SmallPtrSet<SILBasicBlock *, 16> visited;
+              BasicBlockSet visited(F);
               return isUnreachableAlongAllPathsStartingAt(succBB, visited);
             };
             
@@ -5276,22 +5562,6 @@ public:
     }
   }
 
-  void verifyOpenedArchetypes(SILFunction *F) {
-    require(OpenedArchetypes.getFunction() == F,
-           "Wrong SILFunction provided to verifyOpenedArchetypes");
-    // Check that definitions of all opened archetypes from
-    // OpenedArchetypesDefs are existing instructions
-    // belonging to the function F.
-    for (auto KV: OpenedArchetypes.getOpenedArchetypeDefs()) {
-      require(getOpenedArchetypeOf(CanType(KV.first)),
-              "Only opened archetypes should be registered in SILFunction");
-      auto Def = cast<SILInstruction>(KV.second);
-      require(Def->getFunction() == F, 
-              "Definition of every registered opened archetype should be an"
-              " existing instruction in a current SILFunction");
-    }
-  }
-
   /// This pass verifies that there are no hole in debug scopes at -Onone.
   void verifyDebugScopeHoles(SILBasicBlock *BB) {
     if (!VerifyDIHoles)
@@ -5312,12 +5582,7 @@ public:
     for (SILInstruction &SI : *BB) {
       if (SI.isMetaInstruction())
         continue;
-      LastSeenScope = SI.getDebugScope();
-      AlreadySeenScopes.insert(LastSeenScope);
-      break;
-    }
-    for (SILInstruction &SI : *BB) {
-      if (SI.isMetaInstruction())
+      if (SI.getLoc().getKind() == SILLocation::CleanupKind)
         continue;
 
       // If we haven't seen this debug scope yet, update the
@@ -5394,7 +5659,7 @@ public:
     // This ensures that any open_existential instructions, which
     // open archetypes, are seen before the uses of these archetypes.
     llvm::ReversePostOrderTraversal<SILFunction *> RPOT(F);
-    llvm::DenseSet<SILBasicBlock *> VisitedBBs;
+    BasicBlockSet VisitedBBs(F);
     for (auto Iter = RPOT.begin(), E = RPOT.end(); Iter != E; ++Iter) {
       auto *BB = *Iter;
       VisitedBBs.insert(BB);
@@ -5404,7 +5669,7 @@ public:
     // Visit all basic blocks that were not visited during the RPOT traversal,
     // e.g. unreachable basic blocks.
     for (auto &BB : *F) {
-      if (VisitedBBs.count(&BB))
+      if (VisitedBBs.contains(&BB))
         continue;
       visitSILBasicBlock(&BB);
     }
@@ -5415,6 +5680,16 @@ public:
 
     CanSILFunctionType FTy = F->getLoweredFunctionType();
     verifySILFunctionType(FTy);
+
+    // Don't verify functions that were skipped. We are likely to see them in
+    // FunctionBodySkipping::NonInlinableWithoutTypes mode.
+    auto Ctx = F->getDeclContext();
+    if (Ctx) {
+      if (auto AFD = dyn_cast<AbstractFunctionDecl>(Ctx)) {
+        if (AFD->isBodySkipped())
+          return;
+      }
+    }
 
     if (F->isExternalDeclaration()) {
       if (F->hasForeignBody())
@@ -5441,21 +5716,16 @@ public:
     }
 
     // Otherwise, verify the body of the function.
-    verifyEntryBlock(&*F->getBlocks().begin());
+    verifyEntryBlock(F->getEntryBlock());
     verifyEpilogBlocks(F);
     verifyFlowSensitiveRules(F);
     verifyBranches(F);
 
     visitSILBasicBlocks(F);
 
-    // Verify archetypes after all basic blocks are visited,
-    // because we build the map of archetypes as we visit the
-    // instructions.
-    verifyOpenedArchetypes(F);
-
     if (F->hasOwnership() && F->shouldVerifyOwnership() &&
         !F->getModule().getASTContext().hadError()) {
-      verifyMemoryLifetime(F);
+      F->verifyMemoryLifetime();
     }
   }
 
@@ -5473,11 +5743,21 @@ public:
 //===----------------------------------------------------------------------===//
 
 static bool verificationEnabled(const SILModule &M) {
-#ifdef NDEBUG
-  if (!M.getOptions().VerifyAll)
+  // If we are asked to never verify, return false early.
+  if (M.getOptions().VerifyNone)
     return false;
+
+  // Otherwise, if verify all is set, we always verify.
+  if (M.getOptions().VerifyAll)
+    return true;
+
+#ifndef NDEBUG
+  // Otherwise if we do have asserts enabled, always verify...
+  return true;
+#else
+  // And if we don't never verify.
+  return false;
 #endif
-  return !M.getOptions().VerifyNone;
 }
 
 /// verify - Run the SIL verifier to make sure that the SILFunction follows
@@ -5534,8 +5814,11 @@ void SILProperty::verify(const SILModule &M) const {
     };
 
   if (auto &component = getComponent()) {
+    auto typeExpansionContext =
+        TypeExpansionContext::noOpaqueTypeArchetypesSubstitution(
+            ResilienceExpansion::Maximal);
     verifyKeyPathComponent(const_cast<SILModule&>(M),
-                           ResilienceExpansion::Maximal,
+                           typeExpansionContext,
                            require,
                            baseTy,
                            leafTy,
@@ -5669,6 +5952,7 @@ void SILVTable::verify(const SILModule &M) const {
         assert(!superEntry->isNonOverridden()
                && "vtable entry overrides an entry that claims to have no overrides");
         // TODO: Check the root vtable entry for the method too.
+
         break;
       }
     }
@@ -5712,6 +5996,8 @@ void SILDefaultWitnessTable::verify(const SILModule &M) const {
       continue;
 
     SILFunction *F = E.getMethodWitness().Witness;
+    if (!F)
+      continue;
 
 #if 0
     // FIXME: For now, all default witnesses are private.

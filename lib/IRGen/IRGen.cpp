@@ -134,9 +134,11 @@ static void addAddressSanitizerPasses(const PassManagerBuilder &Builder,
   auto recover =
       bool(BuilderWrapper.IRGOpts.SanitizersWithRecoveryInstrumentation &
            SanitizerKind::Address);
+  auto useODRIndicator = BuilderWrapper.IRGOpts.SanitizeAddressUseODRIndicator;
   PM.add(createAddressSanitizerFunctionPass(/*CompileKernel=*/false, recover));
-  PM.add(createModuleAddressSanitizerLegacyPassPass(/*CompileKernel=*/false,
-                                                    recover));
+  PM.add(createModuleAddressSanitizerLegacyPassPass(
+      /*CompileKernel=*/false, recover, /*UseGlobalsGC=*/true,
+      useODRIndicator));
 }
 
 static void addThreadSanitizerPass(const PassManagerBuilder &Builder,
@@ -173,6 +175,23 @@ swift::getIRTargetOptions(const IRGenOptions &Opts, ASTContext &Ctx) {
   if (Clang->getTargetInfo().getTriple().isOSBinFormatWasm())
     TargetOpts.ThreadModel = llvm::ThreadModel::Single;
 
+  if (Opts.EnableGlobalISel) {
+    TargetOpts.EnableGlobalISel = true;
+    TargetOpts.GlobalISelAbort = GlobalISelAbortMode::DisableWithDiag;
+  }
+
+  switch (Opts.SwiftAsyncFramePointer) {
+  case SwiftAsyncFramePointerKind::Never:
+    TargetOpts.SwiftAsyncFramePointer = SwiftAsyncFramePointerMode::Never;
+    break;
+  case SwiftAsyncFramePointerKind::Auto:
+    TargetOpts.SwiftAsyncFramePointer = SwiftAsyncFramePointerMode::DeploymentBased;
+    break;
+  case SwiftAsyncFramePointerKind::Always:
+    TargetOpts.SwiftAsyncFramePointer = SwiftAsyncFramePointerMode::Always;
+    break;
+  }
+
   clang::TargetOptions &ClangOpts = Clang->getTargetInfo().getTargetOpts();
   return std::make_tuple(TargetOpts, ClangOpts.CPU, ClangOpts.Features, ClangOpts.Triple);
 }
@@ -185,6 +204,11 @@ void setModuleFlags(IRGenModule &IGM) {
   // error during LTO if the user tries to combine files across ABIs.
   Module->addModuleFlag(llvm::Module::Error, "Swift Version",
                         IRGenModule::swiftVersion);
+
+  if (IGM.getOptions().VirtualFunctionElimination ||
+      IGM.getOptions().WitnessMethodElimination) {
+    Module->addModuleFlag(llvm::Module::Error, "Virtual Function Elim", 1);
+  }
 }
 
 void swift::performLLVMOptimizations(const IRGenOptions &Opts,
@@ -524,7 +548,7 @@ bool swift::performLLVM(const IRGenOptions &Opts,
   if (!OutputFilename.empty()) {
     // Try to open the output file.  Clobbering an existing file is fine.
     // Open in binary mode if we're doing binary output.
-    llvm::sys::fs::OpenFlags OSFlags = llvm::sys::fs::F_None;
+    llvm::sys::fs::OpenFlags OSFlags = llvm::sys::fs::OF_None;
     std::error_code EC;
     RawOS.emplace(OutputFilename, EC, OSFlags);
 
@@ -534,6 +558,10 @@ bool swift::performLLVM(const IRGenOptions &Opts,
                    OutputFilename, EC.message());
       RawOS->clear_error();
       return true;
+    }
+    if (Opts.OutputKind == IRGenOutputKind::LLVMAssemblyBeforeOptimization) {
+      Module->print(RawOS.getValue(), nullptr);
+      return false;
     }
   } else {
     assert(Opts.OutputKind == IRGenOutputKind::Module && "no output specified");
@@ -567,9 +595,11 @@ bool swift::compileAndWriteLLVM(llvm::Module *module,
 
   // Set up the final emission passes.
   switch (opts.OutputKind) {
+  case IRGenOutputKind::LLVMAssemblyBeforeOptimization:
+    llvm_unreachable("Should be handled earlier.");
   case IRGenOutputKind::Module:
     break;
-  case IRGenOutputKind::LLVMAssembly:
+  case IRGenOutputKind::LLVMAssemblyAfterOptimization:
     EmitPasses.add(createPrintModulePass(out));
     break;
   case IRGenOutputKind::LLVMBitcode: {
@@ -636,6 +666,11 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
   // might end up on a global constant initializer.
   auto nonABICodeKey = PointerAuthSchema::ARM8_3Key::ASIB;
 
+  // A key suitable for data pointers that are only used in private
+  // situations.  Do not use this key for any sort of signature that
+  // might end up on a global constant initializer.
+  auto nonABIDataKey = PointerAuthSchema::ARM8_3Key::ASDB;
+
   // If you change anything here, be sure to update <ptrauth.h>.
   opts.SwiftFunctionPointers =
     PointerAuthSchema(codeKey, /*address*/ false, Discrimination::Type);
@@ -689,9 +724,43 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
       PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
       SpecialPointerAuthDiscriminators::ResilientClassStubInitCallback);
 
+  opts.AsyncSwiftFunctionPointers =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Type);
+
+  opts.AsyncSwiftClassMethods =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Decl);
+
+  opts.AsyncProtocolWitnesses =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Decl);
+
+  opts.AsyncSwiftClassMethodPointers =
+      PointerAuthSchema(dataKey, /*address*/ false, Discrimination::Decl);
+
+  opts.AsyncSwiftDynamicReplacements =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Decl);
+
+  opts.AsyncPartialApplyCapture =
+      PointerAuthSchema(nonABIDataKey, /*address*/ true, Discrimination::Decl);
+
   opts.AsyncContextParent =
-      PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
                         SpecialPointerAuthDiscriminators::AsyncContextParent);
+
+  opts.AsyncContextResume =
+      PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
+                        SpecialPointerAuthDiscriminators::AsyncContextResume);
+
+  opts.TaskResumeFunction =
+      PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Constant,
+                        SpecialPointerAuthDiscriminators::TaskResumeFunction);
+
+  opts.TaskResumeContext =
+      PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
+                        SpecialPointerAuthDiscriminators::TaskResumeContext);
+
+  opts.AsyncContextExtendedFrameEntry = PointerAuthSchema(
+      dataKey, /*address*/ true, Discrimination::Constant,
+      SpecialPointerAuthDiscriminators::SwiftAsyncContextExtendedFrameEntry);
 }
 
 std::unique_ptr<llvm::TargetMachine>
@@ -777,7 +846,7 @@ static void embedBitcode(llvm::Module *M, const IRGenOptions &Opts)
 
   // Save llvm.compiler.used and remove it.
   SmallVector<llvm::Constant*, 2> UsedArray;
-  SmallSet<llvm::GlobalValue*, 4> UsedGlobals;
+  SmallVector<llvm::GlobalValue*, 4> UsedGlobals;
   auto *UsedElementType =
     llvm::Type::getInt8Ty(M->getContext())->getPointerTo(0);
   llvm::GlobalVariable *Used =
@@ -1036,12 +1105,13 @@ GeneratedModule IRGenRequest::evaluate(Evaluator &evaluator,
     } else {
       // Emit protocol conformances into a section we can recognize at runtime.
       // In JIT mode these are manually registered above.
-      IGM.emitSwiftProtocols();
-      IGM.emitProtocolConformances();
-      IGM.emitTypeMetadataRecords();
+      IGM.emitSwiftProtocols(/*asContiguousArray*/ false);
+      IGM.emitProtocolConformances(/*asContiguousArray*/ false);
+      IGM.emitTypeMetadataRecords(/*asContiguousArray*/ false);
       IGM.emitBuiltinReflectionMetadata();
       IGM.emitReflectionMetadataVersion();
       irgen.emitEagerClassInitialization();
+      irgen.emitObjCActorsNeedingSuperclassSwizzle();
       irgen.emitDynamicReplacements();
     }
 
@@ -1282,6 +1352,7 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
   irgen.emitReflectionMetadataVersion();
 
   irgen.emitEagerClassInitialization();
+  irgen.emitObjCActorsNeedingSuperclassSwizzle();
 
   // Emit reflection metadata for builtin and imported types.
   irgen.emitBuiltinReflectionMetadata();
@@ -1453,6 +1524,7 @@ swift::createSwiftModuleObjectFile(SILModule &SILMod, StringRef Buffer,
                                           Data, "__Swift_AST");
   std::string Section;
   switch (IGM.TargetInfo.OutputObjectFormat) {
+  case llvm::Triple::GOFF:
   case llvm::Triple::UnknownObjectFormat:
     llvm_unreachable("unknown object format");
   case llvm::Triple::XCOFF:
@@ -1485,7 +1557,7 @@ bool swift::performLLVM(const IRGenOptions &Opts, ASTContext &Ctx,
 
   auto *Clang = static_cast<ClangImporter *>(Ctx.getClangModuleLoader());
   // Use clang's datalayout.
-  Module->setDataLayout(Clang->getTargetInfo().getDataLayout());
+  Module->setDataLayout(Clang->getTargetInfo().getDataLayoutString());
 
   embedBitcode(Module, Opts);
   if (::performLLVM(Opts, Ctx.Diags, nullptr, nullptr, Module,

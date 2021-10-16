@@ -32,6 +32,15 @@ public struct Repeated<Element> {
 
   /// The value of every element in this collection.
   public let repeatedValue: Element
+
+  /// Creates an instance that contains `count` elements having the
+  /// value `repeatedValue`.
+  @inlinable // trivial-implementation
+  internal init(_repeating repeatedValue: Element, count: Int) {
+    _precondition(count >= 0, "Repetition count should be non-negative")
+    self.count = count
+    self.repeatedValue = repeatedValue
+  }
 }
 
 extension Repeated: RandomAccessCollection {
@@ -43,15 +52,6 @@ extension Repeated: RandomAccessCollection {
   /// end" position that's not valid for use as a subscript.
   public typealias Index = Int
 
-  /// Creates an instance that contains `count` elements having the
-  /// value `repeatedValue`.
-  @inlinable // trivial-implementation
-  internal init(_repeating repeatedValue: Element, count: Int) {
-    _precondition(count >= 0, "Repetition count should be non-negative")
-    self.count = count
-    self.repeatedValue = repeatedValue
-  }
-  
   /// The position of the first element in a nonempty collection.
   ///
   /// In a `Repeated` collection, `startIndex` is always equal to zero. If the
@@ -107,3 +107,5 @@ extension Repeated: RandomAccessCollection {
 public func repeatElement<T>(_ element: T, count n: Int) -> Repeated<T> {
   return Repeated(_repeating: element, count: n)
 }
+
+extension Repeated: Sendable where Element: Sendable { }

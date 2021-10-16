@@ -89,7 +89,7 @@ extension String {
   ///     print(String(s1.utf8.prefix(15))!)
   ///     // Prints "They call me 'B"
   @frozen
-  public struct UTF8View {
+  public struct UTF8View: Sendable {
     @usableFromInline
     internal var _guts: _StringGuts
 
@@ -251,13 +251,16 @@ extension String {
   ///     }
   ///     // Prints "6"
   public var utf8CString: ContiguousArray<CChar> {
-    if _fastPath(_guts.isFastUTF8) {
-      var result = _guts.withFastCChar { ContiguousArray($0) }
-      result.append(0)
-      return result
-    }
+    @_effects(readonly) @_semantics("string.getUTF8CString")
+    get {
+      if _fastPath(_guts.isFastUTF8) {
+        var result = _guts.withFastCChar { ContiguousArray($0) }
+        result.append(0)
+        return result
+      }
 
-    return _slowUTF8CString()
+      return _slowUTF8CString()
+    }
   }
 
   @usableFromInline @inline(never) // slow-path
@@ -343,6 +346,7 @@ extension String.UTF8View.Index {
   }
 }
 
+#if SWIFT_ENABLE_REFLECTION
 // Reflection
 extension String.UTF8View: CustomReflectable {
   /// Returns a mirror that reflects the UTF-8 view of a string.
@@ -350,6 +354,7 @@ extension String.UTF8View: CustomReflectable {
     return Mirror(self, unlabeledChildren: self)
   }
 }
+#endif
 
 //===--- Slicing Support --------------------------------------------------===//
 /// In Swift 3.2, in the absence of type context,

@@ -482,6 +482,9 @@ swift::_swift_buildDemanglingForMetadata(const Metadata *type,
         parent->addChild(input, Dem);
         input = parent;
       };
+      if (flags.isNoDerivative()) {
+        wrapInput(Node::Kind::NoDerivative);
+      }
       switch (flags.getValueOwnership()) {
       case ValueOwnership::Default:
         /* nothing */
@@ -495,6 +498,9 @@ swift::_swift_buildDemanglingForMetadata(const Metadata *type,
       case ValueOwnership::Owned:
         wrapInput(Node::Kind::Owned);
         break;
+      }
+      if (flags.isIsolated()) {
+        wrapInput(Node::Kind::Isolated);
       }
 
       inputs.push_back({input, flags.isVariadic()});
@@ -561,10 +567,47 @@ swift::_swift_buildDemanglingForMetadata(const Metadata *type,
     result->addChild(resultTy, Dem);
     
     auto funcNode = Dem.createNode(kind);
+    if (func->hasGlobalActor()) {
+      auto globalActorTypeNode =
+          _swift_buildDemanglingForMetadata(func->getGlobalActor(), Dem);
+      NodePointer globalActorNode =
+          Dem.createNode(Node::Kind::GlobalActorFunctionType);
+      globalActorNode->addChild(globalActorTypeNode, Dem);
+      funcNode->addChild(globalActorNode, Dem);
+    }
+    switch (func->getDifferentiabilityKind().Value) {
+    case FunctionMetadataDifferentiabilityKind::NonDifferentiable:
+      break;
+    case FunctionMetadataDifferentiabilityKind::Forward:
+      funcNode->addChild(Dem.createNode(
+          Node::Kind::DifferentiableFunctionType,
+          (Node::IndexType)MangledDifferentiabilityKind::Forward), Dem);
+      break;
+    case FunctionMetadataDifferentiabilityKind::Reverse:
+      funcNode->addChild(Dem.createNode(
+          Node::Kind::DifferentiableFunctionType,
+          (Node::IndexType)MangledDifferentiabilityKind::Reverse), Dem);
+      break;
+    case FunctionMetadataDifferentiabilityKind::Normal:
+      funcNode->addChild(Dem.createNode(
+          Node::Kind::DifferentiableFunctionType,
+          (Node::IndexType)MangledDifferentiabilityKind::Normal), Dem);
+      break;
+    case FunctionMetadataDifferentiabilityKind::Linear:
+      funcNode->addChild(Dem.createNode(
+          Node::Kind::DifferentiableFunctionType,
+          (Node::IndexType)MangledDifferentiabilityKind::Linear), Dem);
+      break;
+    }
     if (func->isThrowing())
       funcNode->addChild(Dem.createNode(Node::Kind::ThrowsAnnotation), Dem);
+    if (func->isSendable()) {
+      funcNode->addChild(
+          Dem.createNode(Node::Kind::ConcurrentFunctionType), Dem);
+    }
     if (func->isAsync())
       funcNode->addChild(Dem.createNode(Node::Kind::AsyncAnnotation), Dem);
+
     funcNode->addChild(parameters, Dem);
     funcNode->addChild(result, Dem);
     return funcNode;
@@ -641,6 +684,23 @@ swift::_swift_buildDemanglingForMetadata(const Metadata *type,
 // NB: This function is not used directly in the Swift codebase, but is
 // exported for Xcode support and is used by the sanitizers. Please coordinate
 // before changing.
+//
+/// Demangles a Swift symbol name.
+///
+/// \param mangledName is the symbol name that needs to be demangled.
+/// \param mangledNameLength is the length of the string that should be
+/// demangled.
+/// \param outputBuffer is the user provided buffer where the demangled name
+/// will be placed. If nullptr, a new buffer will be malloced. In that case,
+/// the user of this API is responsible for freeing the returned buffer.
+/// \param outputBufferSize is the size of the output buffer. If the demangled
+/// name does not fit into the outputBuffer, the output will be truncated and
+/// the size will be updated, indicating how large the buffer should be.
+/// \param flags can be used to select the demangling style. TODO: We should
+//// define what these will be.
+/// \returns the demangled name. Returns nullptr if the input String is not a
+/// Swift mangled name.
+SWIFT_RUNTIME_EXPORT
 char *swift_demangle(const char *mangledName,
                      size_t mangledNameLength,
                      char *outputBuffer,

@@ -76,6 +76,63 @@ static bool isValidVersion(const version::Version &Version,
   llvm_unreachable("unsupported unary operator");
 }
 
+static llvm::VersionTuple getCanImportVersion(ArgumentList *args,
+                                              DiagnosticEngine *D,
+                                              bool &underlyingVersion) {
+  llvm::VersionTuple result;
+  if (args->size() != 2) {
+    if (D) {
+      D->diagnose(args->getLoc(), diag::canimport_two_parameters);
+    }
+    return result;
+  }
+  auto label = args->getLabel(1);
+  auto subE = args->getExpr(1);
+  if (label.str() == "_version") {
+    underlyingVersion = false;
+  } else if (label.str() == "_underlyingVersion") {
+    underlyingVersion = true;
+  } else {
+    if (D) {
+      D->diagnose(subE->getLoc(), diag::canimport_label);
+    }
+    return result;
+  }
+  StringRef verText;
+  if (auto *nle = dyn_cast<NumberLiteralExpr>(subE)) {
+    verText = nle->getDigitsText();
+  } else if (auto *sle= dyn_cast<StringLiteralExpr>(subE)) {
+    verText = sle->getValue();
+  }
+  if (verText.empty())
+    return result;
+  if (result.tryParse(verText)) {
+    if (D) {
+      D->diagnose(subE->getLoc(), diag::canimport_version, verText);
+    }
+  }
+  return result;
+}
+
+static Expr *getSingleSubExp(ArgumentList *args, StringRef kindName,
+                             DiagnosticEngine *D) {
+  if (args->empty())
+    return nullptr;
+
+  if (auto *unary = args->getUnlabeledUnaryExpr())
+    return unary;
+
+  if (kindName == "canImport") {
+    bool underlyingVersion;
+    if (D) {
+      // Diagnose canImport syntax
+      (void)getCanImportVersion(args, D, underlyingVersion);
+    }
+    return args->getExpr(0);
+  }
+  return nullptr;
+}
+
 /// The condition validator.
 class ValidateIfConfigCondition :
   public ExprVisitor<ValidateIfConfigCondition, Expr*> {
@@ -102,7 +159,7 @@ class ValidateIfConfigCondition :
     return nullptr;
   }
 
-  // Support '||' and '&&' operator. The procedence of '&&' is higher than '||'.
+  // Support '||' and '&&' operator. The precedence of '&&' is higher than '||'.
   // Invalid operator and the next operand are diagnosed and removed from AST.
   Expr *foldSequence(Expr *LHS, ArrayRef<Expr*> &S, bool isRecurse = false) {
     assert(!S.empty() && ((S.size() & 1) == 0));
@@ -148,11 +205,7 @@ class ValidateIfConfigCondition :
 
       // Apply the operator with left-associativity by folding the first two
       // operands.
-      TupleExpr *Arg = TupleExpr::create(Ctx, SourceLoc(), { LHS, RHS },
-                                         { }, { }, SourceLoc(),
-                                         /*HasTrailingClosure=*/false,
-                                         /*Implicit=*/true);
-      LHS = new (Ctx) BinaryExpr(Op, Arg, /*implicit*/false);
+      LHS = BinaryExpr::create(Ctx, LHS, Op, RHS, /*implicit*/ false);
 
       // If we don't have the next operator, we're done.
       if (IsEnd)
@@ -208,13 +261,15 @@ public:
       return nullptr;
     }
 
-    auto *ArgP = dyn_cast<ParenExpr>(E->getArg());
-    if (!ArgP) {
-      D.diagnose(E->getLoc(), diag::platform_condition_expected_one_argument);
+    Expr *Arg = getSingleSubExp(E->getArgs(), *KindName, &D);
+    if (!Arg) {
+      if (E->getArgs()->empty()) {
+        D.diagnose(E->getLoc(), diag::platform_condition_expected_argument);
+      } else {
+        D.diagnose(E->getLoc(), diag::platform_condition_expected_one_argument);
+      }
       return nullptr;
     }
-    Expr *Arg = ArgP->getSubExpr();
-
     // '_compiler_version' '(' string-literal ')'
     if (*KindName == "_compiler_version") {
       auto SLE = dyn_cast<StringLiteralExpr>(Arg);
@@ -250,9 +305,9 @@ public:
             "a unary comparison '>=' or '<'; for example, '>=2.2' or '<2.2'");
         return nullptr;
       }
-      auto versionString = extractExprSource(Ctx.SourceMgr, PUE->getArg());
+      auto versionString = extractExprSource(Ctx.SourceMgr, PUE->getOperand());
       auto Val = version::Version::parseVersionString(
-          versionString, PUE->getArg()->getStartLoc(), &D);
+          versionString, PUE->getOperand()->getStartLoc(), &D);
       if (!Val.hasValue())
         return nullptr;
       return E;
@@ -341,7 +396,7 @@ public:
                  diag::unsupported_conditional_compilation_unary_expression);
       return nullptr;
     }
-    E->setArg(validate(E->getArg()));
+    E->setOperand(validate(E->getOperand()));
     return E;
   }
 
@@ -407,13 +462,24 @@ public:
 
   bool visitUnresolvedDeclRefExpr(UnresolvedDeclRefExpr *E) {
     auto Name = getDeclRefStr(E);
-    return Ctx.LangOpts.isCustomConditionalCompilationFlagSet(Name);
+
+    // Check whether this is any one of the known compiler features.
+    const auto &langOpts = Ctx.LangOpts;
+    bool isKnownFeature = llvm::StringSwitch<bool>(Name)
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option) \
+        .Case("$" #FeatureName, Option)
+#include "swift/Basic/Features.def"
+        .Default(false);
+
+    if (isKnownFeature)
+      return true;
+    
+    return langOpts.isCustomConditionalCompilationFlagSet(Name);
   }
 
   bool visitCallExpr(CallExpr *E) {
     auto KindName = getDeclRefStr(E->getFn());
-    auto *Arg = cast<ParenExpr>(E->getArg())->getSubExpr();
-
+    auto *Arg = getSingleSubExp(E->getArgs(), KindName, nullptr);
     if (KindName == "_compiler_version") {
       auto Str = cast<StringLiteralExpr>(Arg)->getValue();
       auto Val = version::Version::parseCompilerVersionString(
@@ -423,7 +489,7 @@ public:
     } else if ((KindName == "swift") || (KindName == "compiler")) {
       auto PUE = cast<PrefixUnaryExpr>(Arg);
       auto PrefixName = getDeclRefStr(PUE->getFn());
-      auto Str = extractExprSource(Ctx.SourceMgr, PUE->getArg());
+      auto Str = extractExprSource(Ctx.SourceMgr, PUE->getOperand());
       auto Val = version::Version::parseVersionString(
           Str, SourceLoc(), nullptr).getValue();
       if (KindName == "swift") {
@@ -438,7 +504,13 @@ public:
       }
     } else if (KindName == "canImport") {
       auto Str = extractExprSource(Ctx.SourceMgr, Arg);
-      return Ctx.canImportModule({ Ctx.getIdentifier(Str) , E->getLoc()  });
+      bool underlyingModule = false;
+      llvm::VersionTuple version;
+      if (!E->getArgs()->isUnlabeledUnary()) {
+        version = getCanImportVersion(E->getArgs(), nullptr, underlyingModule);
+      }
+      return Ctx.canImportModule({ Ctx.getIdentifier(Str) , E->getLoc() },
+                                 version, underlyingModule);
     }
 
     auto Val = getDeclRefStr(Arg);
@@ -447,7 +519,7 @@ public:
   }
 
   bool visitPrefixUnaryExpr(PrefixUnaryExpr *E) {
-    return !visit(E->getArg());
+    return !visit(E->getOperand());
   }
 
   bool visitParenExpr(ParenExpr *E) {
@@ -456,9 +528,8 @@ public:
 
   bool visitBinaryExpr(BinaryExpr *E) {
     auto OpName = getDeclRefStr(E->getFn());
-    auto Args = E->getArg()->getElements();
-    if (OpName == "||") return visit(Args[0]) || visit(Args[1]);
-    if (OpName == "&&") return visit(Args[0]) && visit(Args[1]);
+    if (OpName == "||") return visit(E->getLHS()) || visit(E->getRHS());
+    if (OpName == "&&") return visit(E->getLHS()) && visit(E->getRHS());
     llvm_unreachable("unsupported binary operator");
   }
 
@@ -486,9 +557,8 @@ public:
 
   bool visitBinaryExpr(BinaryExpr *E) {
     auto OpName = getDeclRefStr(E->getFn());
-    auto Args = E->getArg()->getElements();
-    if (OpName == "||") return visit(Args[0]) && visit(Args[1]);
-    if (OpName == "&&") return visit(Args[0]) || visit(Args[1]);
+    if (OpName == "||") return visit(E->getLHS()) && visit(E->getRHS());
+    if (OpName == "&&") return visit(E->getLHS()) || visit(E->getRHS());
     llvm_unreachable("unsupported binary operator");
   }
 
@@ -498,7 +568,9 @@ public:
         KindName == "compiler";
   }
 
-  bool visitPrefixUnaryExpr(PrefixUnaryExpr *E) { return visit(E->getArg()); }
+  bool visitPrefixUnaryExpr(PrefixUnaryExpr *E) {
+    return visit(E->getOperand());
+  }
   bool visitParenExpr(ParenExpr *E) { return visit(E->getSubExpr()); }
   bool visitExpr(Expr *E) { return false; }
 };
@@ -521,22 +593,19 @@ static bool isPlatformConditionDisjunction(Expr *E, PlatformConditionKind Kind,
                                            ArrayRef<StringRef> Vals) {
   if (auto *Or = dyn_cast<BinaryExpr>(E)) {
     if (getDeclRefStr(Or->getFn()) == "||") {
-      auto Args = Or->getArg()->getElements();
-      return (isPlatformConditionDisjunction(Args[0], Kind, Vals) &&
-              isPlatformConditionDisjunction(Args[1], Kind, Vals));
+      return (isPlatformConditionDisjunction(Or->getLHS(), Kind, Vals) &&
+              isPlatformConditionDisjunction(Or->getRHS(), Kind, Vals));
     }
   } else if (auto *P = dyn_cast<ParenExpr>(E)) {
     return isPlatformConditionDisjunction(P->getSubExpr(), Kind, Vals);
   } else if (auto *C = dyn_cast<CallExpr>(E)) {
     if (getPlatformConditionKind(getDeclRefStr(C->getFn())) != Kind)
       return false;
-    if (auto *ArgP = dyn_cast<ParenExpr>(C->getArg())) {
-      if (auto *Arg = ArgP->getSubExpr()) {
-        auto ArgStr = getDeclRefStr(Arg);
-        for (auto V : Vals) {
-          if (ArgStr == V)
-            return true;
-        }
+    if (auto *Arg = C->getArgs()->getUnlabeledUnaryExpr()) {
+      auto ArgStr = getDeclRefStr(Arg);
+      for (auto V : Vals) {
+        if (ArgStr == V)
+          return true;
       }
     }
   }
@@ -561,7 +630,7 @@ static Expr *findAnyLikelySimulatorEnvironmentTest(Expr *Condition) {
     return nullptr;
 
   if (auto *N = dyn_cast<PrefixUnaryExpr>(Condition)) {
-    return findAnyLikelySimulatorEnvironmentTest(N->getArg());
+    return findAnyLikelySimulatorEnvironmentTest(N->getOperand());
   } else if (auto *P = dyn_cast<ParenExpr>(Condition)) {
     return findAnyLikelySimulatorEnvironmentTest(P->getSubExpr());
   }
@@ -584,11 +653,10 @@ static Expr *findAnyLikelySimulatorEnvironmentTest(Expr *Condition) {
 
   if (auto *And = dyn_cast<BinaryExpr>(Condition)) {
     if (getDeclRefStr(And->getFn()) == "&&") {
-      auto Args = And->getArg()->getElements();
-      if ((isSimulatorPlatformOSTest(Args[0]) &&
-           isSimulatorPlatformArchTest(Args[1])) ||
-          (isSimulatorPlatformOSTest(Args[1]) &&
-           isSimulatorPlatformArchTest(Args[0]))) {
+      if ((isSimulatorPlatformOSTest(And->getLHS()) &&
+           isSimulatorPlatformArchTest(And->getRHS())) ||
+          (isSimulatorPlatformOSTest(And->getRHS()) &&
+           isSimulatorPlatformArchTest(And->getLHS()))) {
         return And;
       }
     }
@@ -616,7 +684,7 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
       SourceMgr.getCodeCompletionBufferID() == L->getBufferID() &&
       SourceMgr.isBeforeInBuffer(Tok.getLoc(),
                                  SourceMgr.getCodeCompletionLoc())) {
-    llvm::SaveAndRestore<Optional<llvm::MD5>> H(CurrentTokenHash, None);
+    llvm::SaveAndRestore<Optional<StableHasher>> H(CurrentTokenHash, None);
     BacktrackingScope backtrack(*this);
     do {
       auto startLoc = Tok.getLoc();
@@ -635,7 +703,7 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
       // Don't evaluate if it's in '-parse' mode, etc.
       shouldEvaluatePoundIfDecls() &&
       // If it's in inactive #if ... #endif block, there's no point to do it.
-      !getScopeInfo().isInactiveConfigBlock() &&
+      !InInactiveClauseEnvironment &&
       // If this directive contains code completion location, 'isActive' is
       // determined solely by which block has the completion token.
       !codeCompletionClauseLoc.isValid();
@@ -661,6 +729,8 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
     // clause unless we're doing a parse-only pass.
     if (isElse) {
       isActive = !foundActive && shouldEvaluate;
+      if (SyntaxContext->isEnabled())
+        SyntaxContext->addRawSyntax(ParsedRawSyntaxNode());
     } else {
       llvm::SaveAndRestore<bool> S(InPoundIfEnvironment, true);
       ParserResult<Expr> Result = parseExprSequence(diag::expected_expr,
@@ -706,7 +776,7 @@ ParserResult<IfConfigDecl> Parser::parseIfConfig(
     llvm::SaveAndRestore<bool> S(InInactiveClauseEnvironment,
                                  InInactiveClauseEnvironment || !isActive);
     // Disable updating the interface hash inside inactive blocks.
-    Optional<llvm::SaveAndRestore<Optional<llvm::MD5>>> T;
+    Optional<llvm::SaveAndRestore<Optional<StableHasher>>> T;
     if (!isActive)
       T.emplace(CurrentTokenHash, None);
 

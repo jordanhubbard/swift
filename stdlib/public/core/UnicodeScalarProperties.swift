@@ -19,7 +19,7 @@ extension Unicode.Scalar {
 
   /// A value that provides access to properties of a Unicode scalar that are
   /// defined by the Unicode standard.
-  public struct Properties {
+  public struct Properties: Sendable {
     @usableFromInline
     internal var _scalar: Unicode.Scalar
 
@@ -821,7 +821,7 @@ extension Unicode {
   /// The general category of a scalar is its "first-order, most usual
   /// categorization". It does not attempt to cover multiple uses of some
   /// scalars, such as the use of letters to represent Roman numerals.
-  public enum GeneralCategory {
+  public enum GeneralCategory: Sendable {
 
     /// An uppercase letter.
     ///
@@ -1156,7 +1156,7 @@ extension Unicode.Scalar.Properties {
   /// The name of a scalar is immutable and never changed in future versions of
   /// the Unicode Standard. The `nameAlias` property is provided to issue
   /// corrections if a name was issued erroneously. For example, the `name` of
-  /// U+FE18 is "PRESENTATION FORM FOR VERTICAL RIGHT WHITE LENTICULAR BRAKCET"
+  /// U+FE18 is "PRESENTATION FORM FOR VERTICAL RIGHT WHITE LENTICULAR BRACKET"
   /// (note that "BRACKET" is misspelled). The `nameAlias` property then
   /// contains the corrected name.
   ///
@@ -1208,7 +1208,7 @@ extension Unicode {
   ///     let overlayClassIsOverlay = overlayClass == .overlay
   ///     // overlayClassIsOverlay == true
   public struct CanonicalCombiningClass:
-    Comparable, Hashable, RawRepresentable
+    Comparable, Hashable, RawRepresentable, Sendable
   {
     /// Base glyphs that occupy their own space and do not combine with others.
     public static let notReordered = CanonicalCombiningClass(rawValue: 0)
@@ -1315,8 +1315,8 @@ extension Unicode.Scalar.Properties {
   /// This property corresponds to the "Canonical_Combining_Class" property in
   /// the [Unicode Standard](http://www.unicode.org/versions/latest/).
   public var canonicalCombiningClass: Unicode.CanonicalCombiningClass {
-    let rawValue = UInt8(__swift_stdlib_u_getIntPropertyValue(
-      icuValue, __swift_stdlib_UCHAR_CANONICAL_COMBINING_CLASS))
+    let normData = _swift_stdlib_getNormData(_scalar.value)
+    let rawValue = UInt8(normData >> 3)
     return Unicode.CanonicalCombiningClass(rawValue: rawValue)
   }
 }
@@ -1332,7 +1332,7 @@ extension Unicode {
   /// Some letterlike scalars used in numeric systems, such as Greek or Latin
   /// letters, do not have a non-nil numeric type, in order to prevent programs
   /// from incorrectly interpreting them as numbers in non-numeric contexts.
-  public enum NumericType {
+  public enum NumericType: Sendable {
 
     /// A digit that is commonly understood to form base-10 numbers.
     ///
@@ -1356,7 +1356,7 @@ extension Unicode {
     /// type or a non-digit numeric value.
     ///
     /// This numeric type includes fractions such as "⅕" (U+2155 VULGAR
-    /// FRACITON ONE FIFTH), numerical CJK ideographs like "兆" (U+5146 CJK
+    /// FRACTION ONE FIFTH), numerical CJK ideographs like "兆" (U+5146 CJK
     /// UNIFIED IDEOGRAPH-5146), and other scalars that are not decimal digits
     /// used positionally in the writing of base-10 numbers.
     ///

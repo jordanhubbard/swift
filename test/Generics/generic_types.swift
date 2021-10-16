@@ -199,7 +199,7 @@ struct XParam<T> { // expected-note{{'XParam' declared here}}
   }
 }
 
-var xp : XParam<Int>.T = Int() // expected-error{{'T' is not a member type of 'XParam<Int>'}}
+var xp : XParam<Int>.T = Int() // expected-error{{'T' is not a member type of generic struct 'generic_types.XParam<Swift.Int>'}}
 
 // Diagnose failure to meet a superclass requirement.
 class X1 { }
@@ -228,20 +228,20 @@ var y: X5<X4, Int> // expected-error{{'X5' requires the types 'X4.AssocP' (aka '
 // Recursive generic signature validation.
 class Top {}
 class Bottom<T : Bottom<Top>> {}
-// expected-error@-1 {{generic class 'Bottom' references itself}}
-// expected-note@-2 {{type declared here}}
-// expected-error@-3 {{circular reference}}
+// expected-error@-1 {{'Bottom' requires that 'Top' inherit from 'Bottom<Top>'}}
+// expected-note@-2 {{requirement specified as 'T' : 'Bottom<Top>' [with T = Top]}}
+// expected-error@-3 {{generic class 'Bottom' has self-referential generic requirements}}
 // expected-note@-4 {{while resolving type 'Bottom<Top>'}}
 // expected-note@-5 {{through reference here}}
 
 // Invalid inheritance clause
 
 struct UnsolvableInheritance1<T : T.A> {}
-// expected-error@-1 {{'A' is not a member type of 'T'}}
+// expected-error@-1 {{'A' is not a member type of type 'T'}}
 
 struct UnsolvableInheritance2<T : U.A, U : T.A> {}
-// expected-error@-1 {{'A' is not a member type of 'U'}}
-// expected-error@-2 {{'A' is not a member type of 'T'}}
+// expected-error@-1 {{'A' is not a member type of type 'U'}}
+// expected-error@-2 {{'A' is not a member type of type 'T'}}
 
 enum X7<T> where X7.X : G { case X } // expected-error{{enum case 'X' is not a member type of 'X7<T>'}}
 // expected-error@-1{{cannot find type 'G' in scope}}

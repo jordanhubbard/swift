@@ -136,7 +136,7 @@ func generic<T: P>(_ t: T) {
   let _: (T) -> (Int) -> () = id(T.bar)
   let _: (Int) -> () = id(T.bar(t))
 
-  _ = t.mut // expected-error{{partial application of 'mutating' method is not allowed}}
+  _ = t.mut // expected-error{{cannot reference 'mutating' method as function value}}
   _ = t.tum // expected-error{{static member 'tum' cannot be used on instance of type 'T'}}
 }
 
@@ -167,7 +167,7 @@ func existential(_ p: P) {
   var p = p
   // Fully applied mutating method
   p.mut(1)
-  _ = p.mut // expected-error{{partial application of 'mutating' method is not allowed}}
+  _ = p.mut // expected-error{{cannot reference 'mutating' method as function value}}
 
   // Instance member of existential)
   let _: (Int) -> () = id(p.bar)
@@ -212,7 +212,7 @@ func staticExistential(_ p: P.Type, pp: P.Protocol) {
   // Instance member of existential metatype -- not allowed
   _ = p.bar // expected-error{{instance member 'bar' cannot be used on type 'P'}}
   _ = p.mut // expected-error{{instance member 'mut' cannot be used on type 'P'}}
-  // expected-error@-1 {{partial application of 'mutating' method is not allowed}}
+  // expected-error@-1 {{cannot reference 'mutating' method as function value}}
 
   // Static member of metatype -- not allowed
   _ = pp.tum // expected-error{{static member 'tum' cannot be used on protocol metatype 'P.Protocol'}}
@@ -431,4 +431,91 @@ func rdar70814576() {
   }
 
   test(S()) // expected-error {{argument type 'S' does not conform to expected type 'Fooable'}}
+}
+
+extension Optional : Trivial {
+  typealias T = Wrapped
+}
+
+extension UnsafePointer : Trivial {
+  typealias T = Int
+}
+
+extension AnyHashable : Trivial {
+  typealias T = Int
+}
+
+extension UnsafeRawPointer : Trivial {
+  typealias T = Int
+}
+
+extension UnsafeMutableRawPointer : Trivial {
+  typealias T = Int
+}
+
+func test_inference_through_implicit_conversion() {
+  struct C : Hashable {}
+
+  func test<T: Trivial>(_: T) -> T {}
+
+  var arr: [C] = []
+  let ptr: UnsafeMutablePointer<C> = UnsafeMutablePointer(bitPattern: 0)!
+  let rawPtr: UnsafeMutableRawPointer = UnsafeMutableRawPointer(bitPattern: 0)!
+
+  let _: C? = test(C()) // Ok -> argument is implicitly promoted into an optional
+  let _: UnsafePointer<C> = test([C()]) // Ok - argument is implicitly converted to a pointer
+  let _: UnsafeRawPointer = test([C()]) // Ok - argument is implicitly converted to a raw pointer
+  let _: UnsafeMutableRawPointer = test(&arr) // Ok - inout Array<T> -> UnsafeMutableRawPointer
+  let _: UnsafePointer<C> = test(ptr) // Ok - UnsafeMutablePointer<T> -> UnsafePointer<T>
+  let _: UnsafeRawPointer = test(ptr) // Ok - UnsafeMutablePointer<T> -> UnsafeRawPointer
+  let _: UnsafeRawPointer = test(rawPtr) // Ok - UnsafeMutableRawPointer -> UnsafeRawPointer
+  let _: UnsafeMutableRawPointer = test(ptr) // Ok - UnsafeMutablePointer<T> -> UnsafeMutableRawPointer
+  let _: AnyHashable = test(C()) // Ok - argument is implicitly converted to `AnyHashable` because it's Hashable
+}
+
+// Make sure that conformances transitively checked through implicit conversions work with conditional requirements
+protocol TestCond {}
+
+extension Optional : TestCond where Wrapped == Int? {}
+
+func simple<T : TestCond>(_ x: T) -> T { x }
+
+func overloaded<T: TestCond>(_ x: T) -> T { x }
+func overloaded<T: TestCond>(_ x: String) -> T { fatalError() }
+
+func overloaded_result() -> Int { 42 }
+func overloaded_result() -> String { "" }
+
+func test_arg_conformance_with_conditional_reqs(i: Int) {
+  let _: Int?? = simple(i)
+  let _: Int?? = overloaded(i)
+  let _: Int?? = simple(overloaded_result())
+  let _: Int?? = overloaded(overloaded_result())
+}
+
+// rdar://77570994 - regression in type unification for literal collections
+
+protocol Elt {
+}
+
+extension Int : Elt {}
+extension Int64 : Elt {}
+extension Dictionary : Elt where Key == String, Value: Elt {}
+
+struct Object {}
+
+extension Object : ExpressibleByDictionaryLiteral {
+  init(dictionaryLiteral elements: (String, Elt)...) {
+  }
+}
+
+enum E {
+case test(cond: Bool, v: Int64)
+
+  var test_prop: Object {
+    switch self {
+    case let .test(cond, v):
+      return ["obj": ["a": v, "b": cond ? 0 : 42]] // Ok
+    }
+  }
 }

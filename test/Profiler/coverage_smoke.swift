@@ -13,7 +13,6 @@
 // RUN: %llvm-profdata show %t/default.profdata -function=main | %FileCheck %s --check-prefix=CHECK-MAIN
 // RUN: %llvm-cov show %t/main -instr-profile=%t/default.profdata | %FileCheck %s --check-prefix=CHECK-COV
 // RUN: %llvm-cov report %t/main -instr-profile=%t/default.profdata -show-functions %s | %FileCheck %s --check-prefix=CHECK-REPORT
-// RUN: rm -rf %t
 
 // REQUIRES: profile_runtime
 // REQUIRES: executable_test

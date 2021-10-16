@@ -30,10 +30,10 @@ internal func _abstract(
 // The two must coexist, so it was renamed. The old name must not be
 // used in the new runtime. _TtCs11_AnyKeyPath is the mangled name for
 // Swift._AnyKeyPath.
-@_objcRuntimeName(_TtCs11_AnyKeyPath)
 
 /// A type-erased key path, from any root type to any resulting value
 /// type.
+@_objcRuntimeName(_TtCs11_AnyKeyPath)
 public class AnyKeyPath: Hashable, _AppendKeyPath {
   /// The root type for this key path.
   @inlinable
@@ -610,6 +610,10 @@ internal struct ComputedArgumentWitnessesPtr {
 
 internal enum KeyPathComponent: Hashable {
   internal struct ArgumentRef {
+    internal var data: UnsafeRawBufferPointer
+    internal var witnesses: ComputedArgumentWitnessesPtr
+    internal var witnessSizeAdjustment: Int
+
     internal init(
       data: UnsafeRawBufferPointer,
       witnesses: ComputedArgumentWitnessesPtr,
@@ -619,10 +623,6 @@ internal enum KeyPathComponent: Hashable {
       self.witnesses = witnesses
       self.witnessSizeAdjustment = witnessSizeAdjustment
     }
-
-    internal var data: UnsafeRawBufferPointer
-    internal var witnesses: ComputedArgumentWitnessesPtr
-    internal var witnessSizeAdjustment: Int
   }
 
   /// The keypath projects within the storage of the outer value, like a
@@ -748,7 +748,7 @@ internal enum KeyPathComponent: Hashable {
 internal final class ClassHolder<ProjectionType> {
 
   /// The type of the scratch record passed to the runtime to record
-  /// accesses to guarantee exlcusive access.
+  /// accesses to guarantee exclusive access.
   internal typealias AccessRecord = Builtin.UnsafeValueBuffer
 
   internal var previous: AnyObject?
@@ -879,20 +879,97 @@ internal enum KeyPathComputedIDResolution {
 }
 
 internal struct RawKeyPathComponent {
+  internal var header: Header
+  internal var body: UnsafeRawBufferPointer
+
   internal init(header: Header, body: UnsafeRawBufferPointer) {
     self.header = header
     self.body = body
   }
 
-  internal var header: Header
-  internal var body: UnsafeRawBufferPointer
-  
   @_transparent
   static var metadataAccessorPtrAuthKey: UInt64 {
     return UInt64(_SwiftKeyPath_ptrauth_MetadataAccessor)
   }
 
   internal struct Header {
+    internal var _value: UInt32
+
+    init(discriminator: UInt32, payload: UInt32) {
+      _value = 0
+      self.discriminator = discriminator
+      self.payload = payload
+    }
+
+    internal var discriminator: UInt32 {
+      get {
+        return (_value & Header.discriminatorMask) >> Header.discriminatorShift
+      }
+      set {
+        let shifted = newValue << Header.discriminatorShift
+        _internalInvariant(shifted & Header.discriminatorMask == shifted,
+                     "discriminator doesn't fit")
+        _value = _value & ~Header.discriminatorMask | shifted
+      }
+    }
+    internal var payload: UInt32 {
+      get {
+        return _value & Header.payloadMask
+      }
+      set {
+        _internalInvariant(newValue & Header.payloadMask == newValue,
+                     "payload too big")
+        _value = _value & ~Header.payloadMask | newValue
+      }
+    }
+    internal var storedOffsetPayload: UInt32 {
+      get {
+        _internalInvariant(kind == .struct || kind == .class,
+                     "not a stored component")
+        return _value & Header.storedOffsetPayloadMask
+      }
+      set {
+        _internalInvariant(kind == .struct || kind == .class,
+                     "not a stored component")
+        _internalInvariant(newValue & Header.storedOffsetPayloadMask == newValue,
+                     "payload too big")
+        _value = _value & ~Header.storedOffsetPayloadMask | newValue
+      }
+    }
+    internal var endOfReferencePrefix: Bool {
+      get {
+        return _value & Header.endOfReferencePrefixFlag != 0
+      }
+      set {
+        if newValue {
+          _value |= Header.endOfReferencePrefixFlag
+        } else {
+          _value &= ~Header.endOfReferencePrefixFlag
+        }
+      }
+    }
+
+    internal var kind: KeyPathComponentKind {
+      switch (discriminator, payload) {
+      case (Header.externalTag, _):
+        return .external
+      case (Header.structTag, _):
+        return .struct
+      case (Header.classTag, _):
+        return .class
+      case (Header.computedTag, _):
+        return .computed
+      case (Header.optionalTag, Header.optionalChainPayload):
+        return .optionalChain
+      case (Header.optionalTag, Header.optionalWrapPayload):
+        return .optionalWrap
+      case (Header.optionalTag, Header.optionalForcePayload):
+        return .optionalForce
+      default:
+        _internalInvariantFailure("invalid header")
+      }
+    }
+
     internal static var payloadMask: UInt32 {
       return _SwiftKeyPathComponentHeader_PayloadMask
     }
@@ -1049,77 +1126,6 @@ internal struct RawKeyPathComponent {
         _internalInvariantFailure("invalid key path resolution")
       }
     }
-    
-    internal var _value: UInt32
-    
-    internal var discriminator: UInt32 {
-      get {
-        return (_value & Header.discriminatorMask) >> Header.discriminatorShift
-      }
-      set {
-        let shifted = newValue << Header.discriminatorShift
-        _internalInvariant(shifted & Header.discriminatorMask == shifted,
-                     "discriminator doesn't fit")
-        _value = _value & ~Header.discriminatorMask | shifted
-      }
-    }
-    internal var payload: UInt32 {
-      get {
-        return _value & Header.payloadMask
-      }
-      set {
-        _internalInvariant(newValue & Header.payloadMask == newValue,
-                     "payload too big")
-        _value = _value & ~Header.payloadMask | newValue
-      }
-    }
-    internal var storedOffsetPayload: UInt32 {
-      get {
-        _internalInvariant(kind == .struct || kind == .class,
-                     "not a stored component")
-        return _value & Header.storedOffsetPayloadMask
-      }
-      set {
-        _internalInvariant(kind == .struct || kind == .class,
-                     "not a stored component")
-        _internalInvariant(newValue & Header.storedOffsetPayloadMask == newValue,
-                     "payload too big")
-        _value = _value & ~Header.storedOffsetPayloadMask | newValue
-      }
-    }
-    internal var endOfReferencePrefix: Bool {
-      get {
-        return _value & Header.endOfReferencePrefixFlag != 0
-      }
-      set {
-        if newValue {
-          _value |= Header.endOfReferencePrefixFlag
-        } else {
-          _value &= ~Header.endOfReferencePrefixFlag
-        }
-      }
-    }
-
-    internal var kind: KeyPathComponentKind {
-      switch (discriminator, payload) {
-      case (Header.externalTag, _):
-        return .external
-      case (Header.structTag, _):
-        return .struct
-      case (Header.classTag, _):
-        return .class
-      case (Header.computedTag, _):
-        return .computed
-      case (Header.optionalTag, Header.optionalChainPayload):
-        return .optionalChain
-      case (Header.optionalTag, Header.optionalWrapPayload):
-        return .optionalWrap
-      case (Header.optionalTag, Header.optionalForcePayload):
-        return .optionalForce
-      default:
-        _internalInvariantFailure("invalid header")
-      }
-    }
 
     // The component header is 4 bytes, but may be followed by an aligned
     // pointer field for some kinds of component, forcing padding.
@@ -1183,12 +1189,6 @@ internal struct RawKeyPathComponent {
         // Otherwise, there's no body.
         return 0
       }
-    }
-
-    init(discriminator: UInt32, payload: UInt32) {
-      _value = 0
-      self.discriminator = discriminator
-      self.payload = payload
     }
 
     init(optionalForce: ()) {
@@ -1735,13 +1735,71 @@ internal struct KeyPathBuffer {
   internal var trivial: Bool
   internal var hasReferencePrefix: Bool
 
+  internal init(base: UnsafeRawPointer) {
+    let header = base.load(as: Header.self)
+    data = UnsafeRawBufferPointer(
+      start: base + MemoryLayout<Int>.size,
+      count: header.size)
+    trivial = header.trivial
+    hasReferencePrefix = header.hasReferencePrefix
+  }
+
+  internal init(partialData: UnsafeRawBufferPointer,
+                trivial: Bool = false,
+                hasReferencePrefix: Bool = false) {
+    self.data = partialData
+    self.trivial = trivial
+    self.hasReferencePrefix = hasReferencePrefix
+  }
+
   internal var mutableData: UnsafeMutableRawBufferPointer {
     return UnsafeMutableRawBufferPointer(mutating: data)
   }
 
+  internal struct Builder {
+    internal var buffer: UnsafeMutableRawBufferPointer
+    internal init(_ buffer: UnsafeMutableRawBufferPointer) {
+      self.buffer = buffer
+    }
+    internal mutating func pushRaw(size: Int, alignment: Int)
+        -> UnsafeMutableRawBufferPointer {
+      var baseAddress = buffer.baseAddress.unsafelyUnwrapped
+      var misalign = Int(bitPattern: baseAddress) % alignment
+      if misalign != 0 {
+        misalign = alignment - misalign
+        baseAddress = baseAddress.advanced(by: misalign)
+      }
+      let result = UnsafeMutableRawBufferPointer(
+        start: baseAddress,
+        count: size)
+      buffer = UnsafeMutableRawBufferPointer(
+        start: baseAddress + size,
+        count: buffer.count - size - misalign)
+      return result
+    }
+    internal mutating func push<T>(_ value: T) {
+      let buf = pushRaw(size: MemoryLayout<T>.size,
+                        alignment: MemoryLayout<T>.alignment)
+      buf.storeBytes(of: value, as: T.self)
+    }
+    internal mutating func pushHeader(_ header: Header) {
+      push(header)
+      // Start the components at pointer alignment
+      _ = pushRaw(size: RawKeyPathComponent.Header.pointerAlignmentSkew,
+             alignment: 4)
+    }
+  }
+
   internal struct Header {
     internal var _value: UInt32
-    
+
+    internal init(size: Int, trivial: Bool, hasReferencePrefix: Bool) {
+      _internalInvariant(size <= Int(Header.sizeMask), "key path too big")
+      _value = UInt32(size)
+        | (trivial ? Header.trivialFlag : 0)
+        | (hasReferencePrefix ? Header.hasReferencePrefixFlag : 0)
+    }
+
     internal static var sizeMask: UInt32 {
       return _SwiftKeyPathBufferHeader_SizeMask
     }
@@ -1753,13 +1811,6 @@ internal struct KeyPathBuffer {
     }
     internal static var hasReferencePrefixFlag: UInt32 {
       return _SwiftKeyPathBufferHeader_HasReferencePrefixFlag
-    }
-
-    internal init(size: Int, trivial: Bool, hasReferencePrefix: Bool) {
-      _internalInvariant(size <= Int(Header.sizeMask), "key path too big")
-      _value = UInt32(size)
-        | (trivial ? Header.trivialFlag : 0)
-        | (hasReferencePrefix ? Header.hasReferencePrefixFlag : 0)
     }
 
     internal var size: Int { return Int(_value & Header.sizeMask) }
@@ -1789,23 +1840,6 @@ internal struct KeyPathBuffer {
     }
   }
 
-  internal init(base: UnsafeRawPointer) {
-    let header = base.load(as: Header.self)
-    data = UnsafeRawBufferPointer(
-      start: base + MemoryLayout<Int>.size,
-      count: header.size)
-    trivial = header.trivial
-    hasReferencePrefix = header.hasReferencePrefix
-  }
-
-  internal init(partialData: UnsafeRawBufferPointer,
-                trivial: Bool = false,
-                hasReferencePrefix: Bool = false) {
-    self.data = partialData
-    self.trivial = trivial
-    self.hasReferencePrefix = hasReferencePrefix
-  }
-  
   internal func destroy() {
     // Short-circuit if nothing in the object requires destruction.
     if trivial { return }
@@ -1898,6 +1932,11 @@ func _modifyAtWritableKeyPath_impl<Root, Value>(
   root: inout Root,
   keyPath: WritableKeyPath<Root, Value>
 ) -> (UnsafeMutablePointer<Value>, AnyObject?) {
+  if type(of: keyPath).kind == .reference {
+    return _modifyAtReferenceWritableKeyPath_impl(root: root,
+      keyPath: _unsafeUncheckedDowncast(keyPath,
+        to: ReferenceWritableKeyPath<Root, Value>.self))
+  }
   return keyPath._projectMutableAddress(from: &root)
 }
 
@@ -1920,6 +1959,12 @@ func _setAtWritableKeyPath<Root, Value>(
   keyPath: WritableKeyPath<Root, Value>,
   value: __owned Value
 ) {
+  if type(of: keyPath).kind == .reference {
+    return _setAtReferenceWritableKeyPath(root: root,
+      keyPath: _unsafeUncheckedDowncast(keyPath,
+        to: ReferenceWritableKeyPath<Root, Value>.self),
+      value: value)
+  }
   // TODO: we should be able to do this more efficiently than projecting.
   let (addr, owner) = keyPath._projectMutableAddress(from: &root)
   addr.pointee = value
@@ -2280,40 +2325,16 @@ internal func _appendingKeyPaths<
                              count: resultSize)
         }
         
-        func pushRaw(size: Int, alignment: Int)
-            -> UnsafeMutableRawBufferPointer {
-          var baseAddress = destBuffer.baseAddress.unsafelyUnwrapped
-          var misalign = Int(bitPattern: baseAddress) % alignment
-          if misalign != 0 {
-            misalign = alignment - misalign
-            baseAddress = baseAddress.advanced(by: misalign)
-          }
-          let result = UnsafeMutableRawBufferPointer(
-            start: baseAddress,
-            count: size)
-          destBuffer = UnsafeMutableRawBufferPointer(
-            start: baseAddress + size,
-            count: destBuffer.count - size - misalign)
-          return result
-        }
-        func push<T>(_ value: T) {
-          let buf = pushRaw(size: MemoryLayout<T>.size,
-                            alignment: MemoryLayout<T>.alignment)
-          buf.storeBytes(of: value, as: T.self)
-        }
+        var destBuilder = KeyPathBuffer.Builder(destBuffer)
         
         // Save space for the header.
         let leafIsReferenceWritable = type(of: leaf).kind == .reference
-        let header = KeyPathBuffer.Header(
+        destBuilder.pushHeader(KeyPathBuffer.Header(
           size: resultSize - MemoryLayout<Int>.size,
           trivial: rootBuffer.trivial && leafBuffer.trivial,
           hasReferencePrefix: rootBuffer.hasReferencePrefix
                               || leafIsReferenceWritable
-        )
-        push(header)
-        // Start the components at pointer alignment
-        _ = pushRaw(size: RawKeyPathComponent.Header.pointerAlignmentSkew,
-                alignment: 4)
+        ))
         
         let leafHasReferencePrefix = leafBuffer.hasReferencePrefix
         
@@ -2334,13 +2355,13 @@ internal func _appendingKeyPaths<
           }
           
           component.clone(
-            into: &destBuffer,
+            into: &destBuilder.buffer,
             endOfReferencePrefix: endOfReferencePrefix)
+          // Insert our endpoint type between the root and leaf components.
           if let type = type {
-            push(type)
+            destBuilder.push(type)
           } else {
-            // Insert our endpoint type between the root and leaf components.
-            push(Value.self as Any.Type)
+            destBuilder.push(Value.self as Any.Type)
             break
           }
         }
@@ -2350,17 +2371,17 @@ internal func _appendingKeyPaths<
           let (component, type) = leafBuffer.next()
 
           component.clone(
-            into: &destBuffer,
+            into: &destBuilder.buffer,
             endOfReferencePrefix: component.header.endOfReferencePrefix)
 
           if let type = type {
-            push(type)
+            destBuilder.push(type)
           } else {
             break
           }
         }
         
-        _internalInvariant(destBuffer.isEmpty,
+        _internalInvariant(destBuilder.buffer.isEmpty,
                      "did not fill entire result buffer")
       }
 
@@ -3351,7 +3372,7 @@ internal struct InstantiateKeyPathBuffer: KeyPathPatternVisitor {
 
     case .pointer:
       // Resolve the sign-extended relative reference.
-      var absoluteID: UnsafeRawPointer? = idValueBase + Int(idValue)
+      var absoluteID: UnsafeRawPointer? = _resolveRelativeAddress(idValueBase, idValue)
 
       // If the pointer ID is unresolved, then it needs work to get to
       // the final value.
@@ -3456,7 +3477,7 @@ internal struct InstantiateKeyPathBuffer: KeyPathPatternVisitor {
       for i in externalArgs.indices {
         let base = externalArgs.baseAddress.unsafelyUnwrapped + i
         let offset = base.pointee
-        let metadataRef = UnsafeRawPointer(base) + Int(offset)
+        let metadataRef = _resolveRelativeAddress(UnsafeRawPointer(base), offset)
         let result = _resolveKeyPathGenericArgReference(
                        metadataRef,
                        genericEnvironment: genericEnvironment,
@@ -3661,3 +3682,4 @@ internal func _instantiateKeyPathBuffer(
       as: RawKeyPathComponent.Header.self)
   }
 }
+

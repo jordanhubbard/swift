@@ -33,7 +33,7 @@
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/StringExtras.h"
 #include "Private.h"
-#include "CompatibilityOverride.h"
+#include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "ImageInspection.h"
 #include <functional>
 #include <vector>
@@ -211,20 +211,29 @@ namespace {
 
   struct NominalTypeDescriptorCacheEntry {
   private:
-    std::string Name;
+    const char *Name;
+    size_t NameLength;
     const ContextDescriptor *Description;
 
   public:
     NominalTypeDescriptorCacheEntry(const llvm::StringRef name,
                                     const ContextDescriptor *description)
-      : Name(name.str()), Description(description) {}
-
-    const ContextDescriptor *getDescription() {
-      return Description;
+        : Description(description) {
+      char *nameCopy = reinterpret_cast<char *>(malloc(name.size()));
+      memcpy(nameCopy, name.data(), name.size());
+      Name = nameCopy;
+      NameLength = name.size();
     }
 
-    int compareWithKey(llvm::StringRef aName) const {
-      return aName.compare(Name);
+    const ContextDescriptor *getDescription() const { return Description; }
+
+    bool matchesKey(llvm::StringRef aName) {
+      return aName == llvm::StringRef{Name, NameLength};
+    }
+
+    friend llvm::hash_code
+    hash_value(const NominalTypeDescriptorCacheEntry &value) {
+      return hash_value(llvm::StringRef{value.Name, value.NameLength});
     }
 
     template <class... T>
@@ -235,7 +244,7 @@ namespace {
 } // end anonymous namespace
 
 struct TypeMetadataPrivateState {
-  ConcurrentMap<NominalTypeDescriptorCacheEntry> NominalCache;
+  ConcurrentReadableHashMap<NominalTypeDescriptorCacheEntry> NominalCache;
   ConcurrentReadableArray<TypeMetadataSection> SectionsToScan;
   
   TypeMetadataPrivateState() {
@@ -316,7 +325,10 @@ _findExtendedTypeContextDescriptor(const ContextDescriptor *maybeExtension,
     node = node->getChild(0);
   }
   if (Demangle::isSpecialized(node)) {
-    node = Demangle::getUnspecialized(node, demangler);
+    auto unspec = Demangle::getUnspecialized(node, demangler);
+    if (!unspec.isSuccess())
+      return nullptr;
+    node = unspec.result();
   }
 
   return _findContextDescriptor(node, demangler);
@@ -664,6 +676,10 @@ _searchTypeMetadataRecords(TypeMetadataPrivateState &T,
 #define STANDARD_TYPE(KIND, MANGLING, TYPENAME) \
   extern "C" const ContextDescriptor DESCRIPTOR_MANGLING(MANGLING, DESCRIPTOR_MANGLING_SUFFIX(KIND));
 
+// FIXME: When the _Concurrency library gets merged into the Standard Library,
+// we will be able to reference those symbols directly as well.
+#define STANDARD_TYPE_CONCURRENCY(KIND, MANGLING, TYPENAME)
+
 #if !SWIFT_OBJC_INTEROP
 # define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
 #endif
@@ -683,6 +699,7 @@ _findContextDescriptor(Demangle::NodePointer node,
       (const ContextDescriptor *)symbolicNode->getIndex());
   }
 
+#if SWIFT_STDLIB_SHORT_MANGLING_LOOKUPS
   // Fast-path lookup for standard library type references with short manglings.
   if (symbolicNode->getNumChildren() >= 2
       && symbolicNode->getChild(0)->getKind() == Node::Kind::Module
@@ -694,12 +711,16 @@ _findContextDescriptor(Demangle::NodePointer node,
     if (name.equals(#TYPENAME)) { \
       return &DESCRIPTOR_MANGLING(MANGLING, DESCRIPTOR_MANGLING_SUFFIX(KIND)); \
     }
+  // FIXME: When the _Concurrency library gets merged into the Standard Library,
+  // we will be able to reference those symbols directly as well.
+#define STANDARD_TYPE_CONCURRENCY(KIND, MANGLING, TYPENAME)
 #if !SWIFT_OBJC_INTEROP
 # define OBJC_INTEROP_STANDARD_TYPE(KIND, MANGLING, TYPENAME)
 #endif
 
 #include "swift/Demangling/StandardTypesMangling.def"
   }
+#endif
   
   const ContextDescriptor *foundContext = nullptr;
   auto &T = TypeMetadataRecords.get();
@@ -708,13 +729,22 @@ _findContextDescriptor(Demangle::NodePointer node,
   if (symbolicNode->getKind() == Node::Kind::DependentGenericParamType)
     return nullptr;
 
-  StringRef mangledName =
+  auto mangling =
     Demangle::mangleNode(node, ExpandResolvedSymbolicReferences(Dem), Dem);
+
+  if (!mangling.isSuccess())
+    return nullptr;
+
+  StringRef mangledName = mangling.result();
+
 
   // Look for an existing entry.
   // Find the bucket for the metadata entry.
-  if (auto Value = T.NominalCache.find(mangledName))
-    return Value->getDescription();
+  {
+    auto snapshot = T.NominalCache.snapshot();
+    if (auto Value = snapshot.find(mangledName))
+      return Value->getDescription();
+  }
 
   // Check type metadata records		   
   // Scan any newly loaded images for context descriptors, then try the context
@@ -726,7 +756,13 @@ _findContextDescriptor(Demangle::NodePointer node,
     foundContext = _searchConformancesByMangledTypeName(node);
   
   if (foundContext)
-    T.NominalCache.getOrInsert(mangledName, foundContext);
+    T.NominalCache.getOrInsert(mangledName, [&](NominalTypeDescriptorCacheEntry
+                                                    *entry,
+                                                bool created) {
+      if (created)
+        new (entry) NominalTypeDescriptorCacheEntry{mangledName, foundContext};
+      return true;
+    });
 
   return foundContext;
 }
@@ -746,18 +782,29 @@ namespace {
 
   struct ProtocolDescriptorCacheEntry {
   private:
-    std::string Name;
+    const char *Name;
+    size_t NameLength;
     const ProtocolDescriptor *Description;
 
   public:
     ProtocolDescriptorCacheEntry(const llvm::StringRef name,
                                  const ProtocolDescriptor *description)
-        : Name(name.str()), Description(description) {}
+        : Description(description) {
+      char *nameCopy = reinterpret_cast<char *>(malloc(name.size()));
+      memcpy(nameCopy, name.data(), name.size());
+      Name = nameCopy;
+      NameLength = name.size();
+    }
 
-    const ProtocolDescriptor *getDescription() { return Description; }
+    const ProtocolDescriptor *getDescription() const { return Description; }
 
-    int compareWithKey(llvm::StringRef aName) const {
-      return aName.compare(Name);
+    bool matchesKey(llvm::StringRef aName) {
+      return aName == llvm::StringRef{Name, NameLength};
+    }
+
+    friend llvm::hash_code
+    hash_value(const ProtocolDescriptorCacheEntry &value) {
+      return hash_value(llvm::StringRef{value.Name, value.NameLength});
     }
 
     template <class... T>
@@ -767,7 +814,7 @@ namespace {
   };
 
   struct ProtocolMetadataPrivateState {
-    ConcurrentMap<ProtocolDescriptorCacheEntry> ProtocolCache;
+    ConcurrentReadableHashMap<ProtocolDescriptorCacheEntry> ProtocolCache;
     ConcurrentReadableArray<ProtocolSection> SectionsToScan;
 
     ProtocolMetadataPrivateState() {
@@ -844,19 +891,33 @@ _findProtocolDescriptor(NodePointer node,
     return cast<ProtocolDescriptor>(
       (const ContextDescriptor *)symbolicNode->getIndex());
 
-  mangledName =
-    Demangle::mangleNode(node, ExpandResolvedSymbolicReferences(Dem), Dem).str();
+  auto mangling =
+    Demangle::mangleNode(node, ExpandResolvedSymbolicReferences(Dem), Dem);
+
+  if (!mangling.isSuccess())
+    return nullptr;
+
+  mangledName = mangling.result().str();
 
   // Look for an existing entry.
   // Find the bucket for the metadata entry.
-  if (auto Value = T.ProtocolCache.find(mangledName))
-    return Value->getDescription();
+  {
+    auto snapshot = T.ProtocolCache.snapshot();
+    if (auto Value = snapshot.find(mangledName))
+      return Value->getDescription();
+  }
 
   // Check type metadata records
   foundProtocol = _searchProtocolRecords(T, node);
 
   if (foundProtocol) {
-    T.ProtocolCache.getOrInsert(mangledName, foundProtocol);
+    T.ProtocolCache.getOrInsert(mangledName, [&](ProtocolDescriptorCacheEntry
+                                                     *entry,
+                                                 bool created) {
+      if (created)
+        new (entry) ProtocolDescriptorCacheEntry{mangledName, foundProtocol};
+      return true;
+    });
   }
 
   return foundProtocol;
@@ -975,7 +1036,7 @@ _gatherGenericParameters(const ContextDescriptor *context,
 
       str += "_gatherGenericParameters: context: ";
 
-#if !defined(SWIFT_RUNTIME_MACHO_NO_DYLD)
+#if SWIFT_STDLIB_HAS_DLADDR
       SymbolInfo contextInfo;
       if (lookupSymbol(context, &contextInfo)) {
         str += contextInfo.symbolName.get();
@@ -1246,6 +1307,10 @@ public:
   using BuiltTypeDecl = const ContextDescriptor *;
   using BuiltProtocolDecl = ProtocolDescriptorRef;
 
+  BuiltType decodeMangledType(NodePointer node) {
+    return Demangle::decodeMangledType(*this, node).getType();
+  }
+
   Demangle::NodeFactory &getNodeFactory() { return demangler; }
 
   TypeLookupErrorOr<BuiltType>
@@ -1299,9 +1364,12 @@ public:
 #if SWIFT_OBJC_INTEROP
     // Look for a Swift-defined @objc protocol with the Swift 3 mangling that
     // is used for Objective-C entities.
-    const char *objcMangledName = mangleNodeAsObjcCString(node, demangler);
-    if (auto protocol = objc_getProtocol(objcMangledName))
-      return ProtocolDescriptorRef::forObjC(protocol);
+    auto mangling = mangleNodeAsObjcCString(node, demangler);
+    if (mangling.isSuccess()) {
+      const char *objcMangledName = mangling.result();
+      if (auto protocol = objc_getProtocol(objcMangledName))
+        return ProtocolDescriptorRef::forObjC(protocol);
+    }
 #endif
 
     return ProtocolDescriptorRef();
@@ -1397,6 +1465,12 @@ public:
   TypeLookupErrorOr<BuiltType> createExistentialMetatypeType(
       BuiltType instance,
       llvm::Optional<Demangle::ImplMetatypeRepresentation> repr = None) const {
+    if (instance->getKind() != MetadataKind::Existential
+        && instance->getKind() != MetadataKind::ExistentialMetatype) {
+      return TYPE_LOOKUP_ERROR_FMT("Tried to build an existential metatype from "
+                                   "a type that was neither an existential nor "
+                                   "an existential metatype");
+    }
     return swift_getExistentialMetatypeMetadata(instance);
   }
 
@@ -1425,7 +1499,7 @@ public:
     return BuiltType();
   }
 
-  TypeLookupErrorOr<BuiltType>
+  BuiltType
   createGenericTypeParameterType(unsigned depth, unsigned index) const {
     // Use the callback, when provided.
     if (substGenericParameter)
@@ -1435,8 +1509,14 @@ public:
   }
 
   TypeLookupErrorOr<BuiltType>
-  createFunctionType(llvm::ArrayRef<Demangle::FunctionParam<BuiltType>> params,
-                     BuiltType result, FunctionTypeFlags flags) const {
+  createFunctionType(
+      llvm::ArrayRef<Demangle::FunctionParam<BuiltType>> params,
+      BuiltType result, FunctionTypeFlags flags,
+      FunctionMetadataDifferentiabilityKind diffKind,
+      BuiltType globalActorType) const {
+    assert(
+        (flags.isDifferentiable() && diffKind.isDifferentiable()) ||
+        (!flags.isDifferentiable() && !diffKind.isDifferentiable()));
     llvm::SmallVector<BuiltType, 8> paramTypes;
     llvm::SmallVector<uint32_t, 8> paramFlags;
 
@@ -1450,11 +1530,22 @@ public:
         paramFlags.push_back(param.getFlags().getIntValue());
     }
 
-    return swift_getFunctionTypeMetadata(flags, paramTypes.data(),
-                                         flags.hasParameterFlags()
-                                           ? paramFlags.data()
-                                           : nullptr,
-                                         result);
+    if (globalActorType)
+      flags = flags.withGlobalActor(true);
+
+    return flags.hasGlobalActor()
+        ? swift_getFunctionTypeMetadataGlobalActor(flags, diffKind, paramTypes.data(),
+            flags.hasParameterFlags() ? paramFlags.data() : nullptr, result,
+            globalActorType)
+        : flags.isDifferentiable()
+          ? swift_getFunctionTypeMetadataDifferentiable(
+                flags, diffKind, paramTypes.data(),
+                flags.hasParameterFlags() ? paramFlags.data() : nullptr,
+                result)
+          : swift_getFunctionTypeMetadata(
+                flags, paramTypes.data(),
+                flags.hasParameterFlags() ? paramFlags.data() : nullptr,
+                result);
   }
 
   TypeLookupErrorOr<BuiltType> createImplFunctionType(
@@ -1522,6 +1613,67 @@ public:
   TypeLookupErrorOr<BuiltType> createSILBoxType(BuiltType base) const {
     // FIXME: Implement.
     return BuiltType();
+  }
+
+  using BuiltSILBoxField = llvm::PointerIntPair<BuiltType, 1>;
+  using BuiltSubstitution = std::pair<BuiltType, BuiltType>;
+  struct BuiltLayoutConstraint {
+    bool operator==(BuiltLayoutConstraint rhs) const { return true; }
+    operator bool() const { return true; }
+  };
+  using BuiltLayoutConstraint = BuiltLayoutConstraint;
+  BuiltLayoutConstraint getLayoutConstraint(LayoutConstraintKind kind) {
+    return {};
+  }
+  BuiltLayoutConstraint
+  getLayoutConstraintWithSizeAlign(LayoutConstraintKind kind, unsigned size,
+                                   unsigned alignment) {
+    return {};
+  }
+
+#if LLVM_PTR_SIZE == 4
+  /// Unfortunately the alignment of TypeRef is too large to squeeze in 3 extra
+  /// bits on (some?) 32-bit systems.
+  class BigBuiltTypeIntPair {
+    BuiltType Ptr;
+    RequirementKind Int;
+  public:
+    BigBuiltTypeIntPair(BuiltType ptr, RequirementKind i) : Ptr(ptr), Int(i) {}
+    RequirementKind getInt() const { return Int; }
+    BuiltType getPointer() const { return Ptr; }
+    uint64_t getOpaqueValue() const {
+      return (uint64_t)Ptr | ((uint64_t)Int << 32);
+    }
+  };
+#endif
+
+  struct Requirement : public RequirementBase<BuiltType,
+#if LLVM_PTR_SIZE == 4
+         BigBuiltTypeIntPair,
+#else
+         llvm::PointerIntPair<BuiltType, 3, RequirementKind>,
+
+#endif
+         BuiltLayoutConstraint> {
+    Requirement(RequirementKind kind, BuiltType first, BuiltType second)
+        : RequirementBase(kind, first, second) {}
+    Requirement(RequirementKind kind, BuiltType first,
+                BuiltLayoutConstraint second)
+        : RequirementBase(kind, first, second) {}
+  };
+  using BuiltRequirement = Requirement;
+
+  TypeLookupErrorOr<BuiltType> createSILBoxTypeWithLayout(
+      llvm::ArrayRef<BuiltSILBoxField> Fields,
+      llvm::ArrayRef<BuiltSubstitution> Substitutions,
+      llvm::ArrayRef<BuiltRequirement> Requirements) const {
+    // FIXME: Implement.
+    return BuiltType();
+  }
+
+  bool isExistential(BuiltType) {
+    // FIXME: Implement.
+    return true;
   }
 
   TypeReferenceOwnership getReferenceOwnership() const {
@@ -1832,23 +1984,9 @@ getObjCClassByMangledName(const char * _Nonnull typeName,
 
 __attribute__((constructor))
 static void installGetClassHook() {
-  // FIXME: delete this #if and dlsym once we don't
-  // need to build with older libobjc headers
-#if !OBJC_GETCLASSHOOK_DEFINED
-  using objc_hook_getClass =  BOOL(*)(const char * _Nonnull name,
-                                      Class _Nullable * _Nonnull outClass);
-  auto objc_setHook_getClass =
-    (void(*)(objc_hook_getClass _Nonnull,
-             objc_hook_getClass _Nullable * _Nonnull))
-    dlsym(RTLD_DEFAULT, "objc_setHook_getClass");
-#endif
-
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wunguarded-availability"
-  if (objc_setHook_getClass) {
-    objc_setHook_getClass(getObjCClassByMangledName, &OldGetClassHook);
+  if (SWIFT_RUNTIME_WEAK_CHECK(objc_setHook_getClass)) {
+    SWIFT_RUNTIME_WEAK_USE(objc_setHook_getClass(getObjCClassByMangledName, &OldGetClassHook));
   }
-#pragma clang diagnostic pop
 }
 
 #endif
@@ -2197,30 +2335,33 @@ void DynamicReplacementDescriptor::enableReplacement() const {
     auto *previous = chainRoot->next;
     chainRoot->next = previous->next;
     //chainRoot->implementationFunction = previous->implementationFunction;
-    swift_ptrauth_copy(
-      reinterpret_cast<void **>(&chainRoot->implementationFunction),
-      reinterpret_cast<void *const *>(&previous->implementationFunction),
-      replacedFunctionKey->getExtraDiscriminator());
+    swift_ptrauth_copy_code_or_data(
+        reinterpret_cast<void **>(&chainRoot->implementationFunction),
+        reinterpret_cast<void *const *>(&previous->implementationFunction),
+        replacedFunctionKey->getExtraDiscriminator(),
+        !replacedFunctionKey->isAsync());
   }
 
   // First populate the current replacement's chain entry.
   auto *currentEntry =
       const_cast<DynamicReplacementChainEntry *>(chainEntry.get());
   // currentEntry->implementationFunction = chainRoot->implementationFunction;
-  swift_ptrauth_copy(
+  swift_ptrauth_copy_code_or_data(
       reinterpret_cast<void **>(&currentEntry->implementationFunction),
       reinterpret_cast<void *const *>(&chainRoot->implementationFunction),
-      replacedFunctionKey->getExtraDiscriminator());
+      replacedFunctionKey->getExtraDiscriminator(),
+      !replacedFunctionKey->isAsync());
 
   currentEntry->next = chainRoot->next;
 
   // Link the replacement entry.
   chainRoot->next = chainEntry.get();
   // chainRoot->implementationFunction = replacementFunction.get();
-  swift_ptrauth_init(
+  swift_ptrauth_init_code_or_data(
       reinterpret_cast<void **>(&chainRoot->implementationFunction),
       reinterpret_cast<void *>(replacementFunction.get()),
-      replacedFunctionKey->getExtraDiscriminator());
+      replacedFunctionKey->getExtraDiscriminator(),
+      !replacedFunctionKey->isAsync());
 }
 
 void DynamicReplacementDescriptor::disableReplacement() const {
@@ -2241,10 +2382,11 @@ void DynamicReplacementDescriptor::disableReplacement() const {
   auto *previous = const_cast<DynamicReplacementChainEntry *>(prev);
   previous->next = thisEntry->next;
   // previous->implementationFunction = thisEntry->implementationFunction;
-  swift_ptrauth_copy(
+  swift_ptrauth_copy_code_or_data(
       reinterpret_cast<void **>(&previous->implementationFunction),
       reinterpret_cast<void *const *>(&thisEntry->implementationFunction),
-      replacedFunctionKey->getExtraDiscriminator());
+      replacedFunctionKey->getExtraDiscriminator(),
+      !replacedFunctionKey->isAsync());
 }
 
 /// An automatic dymamic replacement entry.
@@ -2401,4 +2543,4 @@ void swift::swift_disableDynamicReplacementScope(
   DynamicReplacementLock.get().withLock([=] { scope->disable(); });
 }
 #define OVERRIDE_METADATALOOKUP COMPATIBILITY_OVERRIDE
-#include "CompatibilityOverride.def"
+#include COMPATIBILITY_OVERRIDE_INCLUDE_PATH

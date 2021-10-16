@@ -1,6 +1,8 @@
 // Must be able to run xcrun-return-self.sh
 // REQUIRES: shell
 // REQUIRES: rdar65281056
+// FIXME: When this is turned on, please move the test from linker-library-with-space.swift
+// to this file and remove that file.
 // RUN: %swiftc_driver -sdk "" -driver-print-jobs -target x86_64-apple-macosx10.9 %s 2>&1 > %t.simple.txt
 // RUN: %FileCheck %s < %t.simple.txt
 // RUN: %FileCheck -check-prefix SIMPLE %s < %t.simple.txt
@@ -28,7 +30,7 @@
 // RUN: %swiftc_driver -sdk "" -driver-print-jobs -target thumbv7-unknown-linux-gnueabihf -Ffoo -Fsystem car -F cdr -framework bar -Lbaz -lboo -Xlinker -undefined %s 2>&1 > %t.linux.txt
 // RUN: %FileCheck -check-prefix LINUX-thumbv7 %s < %t.linux.txt
 
-// RUN: %swiftc_driver_plain -driver-print-jobs -target armv7-none-linux-androideabi -Ffoo -Fsystem car -F cdr -framework bar -Lbaz -lboo -Xlinker -undefined %s 2>&1 > %t.android.txt
+// RUN: %swiftc_driver_plain -driver-print-jobs -target armv7-unknown-linux-androideabi -Ffoo -Fsystem car -F cdr -framework bar -Lbaz -lboo -Xlinker -undefined %s 2>&1 > %t.android.txt
 // RUN: %FileCheck -check-prefix ANDROID-armv7 %s < %t.android.txt
 // RUN: %FileCheck -check-prefix ANDROID-armv7-NEGATIVE %s < %t.android.txt
 

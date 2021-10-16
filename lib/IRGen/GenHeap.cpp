@@ -23,11 +23,12 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Intrinsics.h"
 
-#include "swift/Basic/SourceLoc.h"
+#include "TypeLayout.h"
 #include "swift/ABI/MetadataValues.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/Basic/SourceLoc.h"
 #include "swift/SIL/SILModule.h"
 
 #include "ConstantBuilder.h"
@@ -57,7 +58,7 @@ namespace {
   public: \
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM, \
                                         SILType T) const override { \
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T); \
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T, ScalarKind::Nativeness##Name##Reference); \
     } \
     Nativeness##Name##ReferenceTypeInfo(llvm::Type *valueType, \
                                     llvm::Type *type, \
@@ -145,7 +146,7 @@ namespace {
     enum { IsScalarPOD = false }; \
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,                    \
                                           SILType T) const override {          \
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);             \
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T, ScalarKind::Nativeness##Name##Reference);             \
     } \
     llvm::Type *getScalarType() const { \
       return ValueTypeAndIsOptional.getPointer(); \
@@ -517,7 +518,7 @@ static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
     llvm::ConstantInt::get(IGM.Int32Ty, 2)
   };
   return llvm::ConstantExpr::getInBoundsGetElementPtr(
-      /*Ty=*/nullptr, var, indices);
+      var->getType()->getPointerElementType(), var, indices);
 }
 
 llvm::Constant *
@@ -548,26 +549,25 @@ llvm::Value *IRGenFunction::emitUnmanagedAlloc(const HeapLayout &layout,
 }
 
 namespace {
-  class BuiltinNativeObjectTypeInfo
+class BuiltinNativeObjectTypeInfo
     : public HeapTypeInfo<BuiltinNativeObjectTypeInfo> {
-  public:
-    BuiltinNativeObjectTypeInfo(llvm::PointerType *storage,
-                                 Size size, SpareBitVector spareBits,
-                                 Alignment align)
-    : HeapTypeInfo(storage, size, spareBits, align) {}
+public:
+  BuiltinNativeObjectTypeInfo(llvm::PointerType *storage, Size size,
+                                 SpareBitVector spareBits, Alignment align)
+      : HeapTypeInfo(ReferenceCounting::Native, storage, size, spareBits,
+                     align) {}
 
-    /// Builtin.NativeObject uses Swift native reference-counting.
-    ReferenceCounting getReferenceCounting() const {
-      return ReferenceCounting::Native;
-    }
-  };
+  /// Builtin.NativeObject uses Swift native reference-counting.
+  ReferenceCounting getReferenceCounting() const {
+    return ReferenceCounting::Native;
+  }
+};
 } // end anonymous namespace
 
 const LoadableTypeInfo *TypeConverter::convertBuiltinNativeObject() {
-  return new BuiltinNativeObjectTypeInfo(IGM.RefCountedPtrTy,
-                                      IGM.getPointerSize(),
-                                      IGM.getHeapObjectSpareBits(),
-                                      IGM.getPointerAlignment());
+  return new BuiltinNativeObjectTypeInfo(
+      IGM.RefCountedPtrTy, IGM.getPointerSize(), IGM.getHeapObjectSpareBits(),
+      IGM.getPointerAlignment());
 }
 
 unsigned IRGenModule::getReferenceStorageExtraInhabitantCount(
@@ -1343,21 +1343,34 @@ llvm::Value *IRGenFunction::emitLoadRefcountedPtr(Address addr,
 llvm::Value *IRGenFunction::
 emitIsUniqueCall(llvm::Value *value, SourceLoc loc, bool isNonNull) {
   llvm::Constant *fn;
+  bool nonObjC = !IGM.getAvailabilityContext().isContainedIn(
+      IGM.Context.getObjCIsUniquelyReferencedAvailability());
+
   if (value->getType() == IGM.RefCountedPtrTy) {
     if (isNonNull)
       fn = IGM.getIsUniquelyReferenced_nonNull_nativeFn();
     else
       fn = IGM.getIsUniquelyReferenced_nativeFn();
   } else if (value->getType() == IGM.UnknownRefCountedPtrTy) {
-    if (isNonNull)
-      fn = IGM.getIsUniquelyReferencedNonObjC_nonNullFn();
-    else
-      fn = IGM.getIsUniquelyReferencedNonObjCFn();
+    if (nonObjC) {
+      if (isNonNull)
+        fn = IGM.getIsUniquelyReferencedNonObjC_nonNullFn();
+      else
+        fn = IGM.getIsUniquelyReferencedNonObjCFn();
+    } else {
+      if (isNonNull)
+        fn = IGM.getIsUniquelyReferenced_nonNullFn();
+      else
+        fn = IGM.getIsUniquelyReferencedFn();
+    }
   } else if (value->getType() == IGM.BridgeObjectPtrTy) {
     if (!isNonNull)
       unimplemented(loc, "optional bridge ref");
 
-    fn = IGM.getIsUniquelyReferencedNonObjC_nonNull_bridgeObjectFn();
+    if (nonObjC)
+      fn = IGM.getIsUniquelyReferencedNonObjC_nonNull_bridgeObjectFn();
+    else
+      fn = IGM.getIsUniquelyReferenced_nonNull_bridgeObjectFn();
   } else {
     llvm_unreachable("Unexpected LLVM type for a refcounted pointer.");
   }
@@ -1369,16 +1382,16 @@ emitIsUniqueCall(llvm::Value *value, SourceLoc loc, bool isNonNull) {
 llvm::Value *IRGenFunction::emitIsEscapingClosureCall(
     llvm::Value *value, SourceLoc sourceLoc, unsigned verificationType) {
   auto loc = SILLocation::decode(sourceLoc, IGM.Context.SourceMgr);
-  auto line = llvm::ConstantInt::get(IGM.Int32Ty, loc.Line);
-  auto col = llvm::ConstantInt::get(IGM.Int32Ty, loc.Column);
+  auto line = llvm::ConstantInt::get(IGM.Int32Ty, loc.line);
+  auto col = llvm::ConstantInt::get(IGM.Int32Ty, loc.column);
 
   // Only output the filepath in debug mode. It is going to leak into the
   // executable. This is the same behavior as asserts.
   auto filename = IGM.IRGen.Opts.shouldOptimize()
                       ? IGM.getAddrOfGlobalString("")
-                      : IGM.getAddrOfGlobalString(loc.Filename);
+                      : IGM.getAddrOfGlobalString(loc.filename);
   auto filenameLength =
-      llvm::ConstantInt::get(IGM.Int32Ty, loc.Filename.size());
+      llvm::ConstantInt::get(IGM.Int32Ty, loc.filename.size());
   auto type = llvm::ConstantInt::get(IGM.Int32Ty, verificationType);
   llvm::CallInst *call =
       Builder.CreateCall(IGM.getIsEscapingClosureAtFileLocationFn(),
@@ -1392,9 +1405,9 @@ namespace {
 class BoxTypeInfo : public HeapTypeInfo<BoxTypeInfo> {
 public:
   BoxTypeInfo(IRGenModule &IGM)
-    : HeapTypeInfo(IGM.RefCountedPtrTy, IGM.getPointerSize(),
-                   IGM.getHeapObjectSpareBits(), IGM.getPointerAlignment())
-  {}
+      : HeapTypeInfo(ReferenceCounting::Native, IGM.RefCountedPtrTy,
+                     IGM.getPointerSize(), IGM.getHeapObjectSpareBits(),
+                     IGM.getPointerAlignment()) {}
 
   ReferenceCounting getReferenceCounting() const {
     // Boxes are always native-refcounted.
@@ -1577,11 +1590,11 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // For fixed-sized types, we can emit concrete box metadata.
   auto &fixedTI = cast<FixedTypeInfo>(eltTI);
 
-  // Because we assume in enum's that payloads with a Builtin.NativeObject which
-  // is also the type for indirect enum cases have extra inhabitants of pointers
-  // we can't have a nil pointer as a representation for an empty box type --
-  // nil conflicts with the extra inhabitants. We return a static singleton
-  // empty box object instead.
+  // Because we assume in enum's that payloads with a Builtin.NativeReference
+  // which is also the type for indirect enum cases have extra inhabitants of
+  // pointers we can't have a nil pointer as a representation for an empty box
+  // type -- nil conflicts with the extra inhabitants. We return a static
+  // singleton empty box object instead.
   if (fixedTI.isKnownEmpty(ResilienceExpansion::Maximal)) {
     if (!EmptyBoxTI)
       EmptyBoxTI = new EmptyBoxTypeInfo(IGM);
@@ -1839,7 +1852,9 @@ static llvm::Value *emitLoadOfHeapMetadataRef(IRGenFunction &IGF,
         structTy = dyn_cast<llvm::StructType>(eltTy);
       } while (structTy != nullptr);
 
-      slot = IGF.Builder.CreateInBoundsGEP(object, indexes);
+      slot = IGF.Builder.CreateInBoundsGEP(
+          object->getType()->getScalarType()->getPointerElementType(), object,
+          indexes);
 
       if (!suppressCast) {
         slot = IGF.Builder.CreateBitCast(slot,

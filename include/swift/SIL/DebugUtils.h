@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 //
 // This file contains utilities to work with debug-info related instructions:
-// debug_value and debug_value_addr.
+// debug_value, alloc_stack, and alloc_box.
 //
 // SIL optimizations should deal with debug-info related instructions when
 // looking at the uses of a value.
@@ -217,6 +217,103 @@ inline SILBasicBlock::iterator eraseFromParentWithDebugInsts(
 /// non-trivial users.
 bool hasNonTrivialNonDebugTransitiveUsers(
     PointerUnion<SILInstruction *, SILArgument *> V);
+
+/// A light weight abstraction on top of an instruction that carries within it
+/// information about a debug variable. This allows one to write high level code
+/// over the set of such instructions with greater correctness by using
+/// exhaustive switches, methods, and keeping it light weight by using *, ->
+/// operators to access functionality from the underlying instruction when
+/// needed.
+struct DebugVarCarryingInst {
+  enum class Kind {
+    Invalid = 0,
+    DebugValue,
+    AllocStack,
+    AllocBox,
+  };
+
+  Kind kind;
+  SILInstruction *inst;
+
+  DebugVarCarryingInst() : kind(Kind::Invalid), inst(nullptr) {}
+  DebugVarCarryingInst(DebugValueInst *dvi)
+      : kind(Kind::DebugValue), inst(dvi) {}
+  DebugVarCarryingInst(AllocStackInst *asi)
+      : kind(Kind::AllocStack), inst(asi) {}
+  DebugVarCarryingInst(AllocBoxInst *abi) : kind(Kind::AllocBox), inst(abi) {}
+  DebugVarCarryingInst(SILInstruction *newInst)
+      : kind(Kind::Invalid), inst(nullptr) {
+    switch (newInst->getKind()) {
+    default:
+      return;
+    case SILInstructionKind::DebugValueInst:
+      kind = Kind::DebugValue;
+      break;
+    case SILInstructionKind::AllocStackInst:
+      kind = Kind::AllocStack;
+      break;
+    case SILInstructionKind::AllocBoxInst:
+      kind = Kind::AllocBox;
+      break;
+    }
+    inst = newInst;
+  }
+
+  /// Enable the composition struct to be used as an instruction easily. We use
+  /// a '*' so that in the source it is easily visible to the eye that something
+  /// is happening here.
+  SILInstruction *operator*() const { return inst; }
+
+  /// Enable one to access the methods of the wrapped instruction using
+  /// '->'. This keeps the wrapper light weight.
+  SILInstruction *operator->() const { return inst; }
+
+  /// Add support for this struct in `if` statement.
+  explicit operator bool() const { return bool(kind); }
+
+  VarDecl *getDecl() const {
+    switch (kind) {
+    case Kind::Invalid:
+      llvm_unreachable("Invalid?!");
+    case Kind::DebugValue:
+      return cast<DebugValueInst>(inst)->getDecl();
+    case Kind::AllocStack:
+      return cast<AllocStackInst>(inst)->getDecl();
+    case Kind::AllocBox:
+      return cast<AllocBoxInst>(inst)->getDecl();
+    }
+    llvm_unreachable("covered switch");
+  }
+
+  Optional<SILDebugVariable> getVarInfo() const {
+    switch (kind) {
+    case Kind::Invalid:
+      llvm_unreachable("Invalid?!");
+    case Kind::DebugValue:
+      return cast<DebugValueInst>(inst)->getVarInfo();
+    case Kind::AllocStack:
+      return cast<AllocStackInst>(inst)->getVarInfo();
+    case Kind::AllocBox:
+      return cast<AllocBoxInst>(inst)->getVarInfo();
+    }
+    llvm_unreachable("covered switch");
+  }
+
+  void setDebugVarScope(const SILDebugScope *NewDS) {
+    switch (kind) {
+    case Kind::Invalid:
+      llvm_unreachable("Invalid?!");
+    case Kind::DebugValue:
+      cast<DebugValueInst>(inst)->setDebugVarScope(NewDS);
+      break;
+    case Kind::AllocStack:
+      cast<AllocStackInst>(inst)->setDebugVarScope(NewDS);
+      break;
+    case Kind::AllocBox:
+      llvm_unreachable("Not implemented");
+    }
+  }
+};
 
 } // end namespace swift
 

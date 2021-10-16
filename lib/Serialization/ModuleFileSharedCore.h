@@ -58,6 +58,9 @@ class ModuleFileSharedCore {
   /// The target the module was built for.
   StringRef TargetTriple;
 
+  /// The canonical name of the SDK the module was built with.
+  StringRef SDKName;
+
   /// The name of the module interface this module was compiled from.
   ///
   /// Empty if this module didn't come from an interface file.
@@ -66,6 +69,9 @@ class ModuleFileSharedCore {
   /// The Swift compatibility version in use when this module was built.
   version::Version CompatibilityVersion;
 
+  /// User-defined module version number.
+  llvm::VersionTuple UserModuleVersion;
+
   /// The data blob containing all of the module's identifiers.
   StringRef IdentifierData;
 
@@ -73,8 +79,14 @@ class ModuleFileSharedCore {
   /// include the version string of the compiler that built the module.
   StringRef MiscVersion;
 
+  /// The module ABI name.
+  StringRef ModuleABIName;
+
   /// \c true if this module has incremental dependency information.
   bool HasIncrementalInfo = false;
+
+  /// \c true if this module was compiled with -enable-ossa-modules.
+  bool RequiresOSSAModules;
 
 public:
   /// Represents another module that has been imported as a dependency.
@@ -240,6 +252,10 @@ private:
   using SerializedDeclMembersTable =
       llvm::OnDiskIterableChainedHashTable<DeclMembersTableInfo>;
 
+  class DeclFingerprintsTableInfo;
+  using SerializedDeclFingerprintsTable =
+      llvm::OnDiskIterableChainedHashTable<DeclFingerprintsTableInfo>;
+
   std::unique_ptr<SerializedDeclTable> TopLevelDecls;
   std::unique_ptr<SerializedDeclTable> OperatorDecls;
   std::unique_ptr<SerializedDeclTable> PrecedenceGroupDecls;
@@ -250,6 +266,7 @@ private:
   std::unique_ptr<SerializedOpaqueReturnTypeDeclTable> OpaqueReturnTypeDecls;
   std::unique_ptr<SerializedNestedTypeDeclsTable> NestedTypeDecls;
   std::unique_ptr<SerializedDeclMemberNamesTable> DeclMemberNames;
+  std::unique_ptr<SerializedDeclFingerprintsTable> DeclFingerprints;
 
   class ObjCMethodTableInfo;
   using SerializedObjCMethodTable =
@@ -258,6 +275,7 @@ private:
   std::unique_ptr<SerializedObjCMethodTable> ObjCMethods;
 
   ArrayRef<serialization::DeclID> OrderedTopLevelDecls;
+  ArrayRef<serialization::DeclID> ExportedPrespecializationDecls;
 
   class DeclCommentTableInfo;
   using SerializedDeclCommentTable =
@@ -282,6 +300,9 @@ private:
 
   /// A blob of 0 terminated string segments referenced in \c SourceLocsTextData
   StringRef SourceLocsTextData;
+
+  /// A blob of source file list.
+  StringRef SourceFileListData;
 
   /// An array of fixed size source location data for each USR appearing in
   /// \c DeclUSRsTable.
@@ -311,6 +332,9 @@ private:
     /// Whether this module file is actually a .sib file.
     unsigned IsSIB: 1;
 
+    /// Whether this module is compiled as static library.
+    unsigned IsStaticLibrary: 1;
+
     /// Whether this module file is compiled with '-enable-testing'.
     unsigned IsTestable : 1;
 
@@ -320,8 +344,14 @@ private:
     /// Whether this module is compiled with implicit dynamic.
     unsigned IsImplicitDynamicEnabled: 1;
 
+    /// Whether this module is compiled while allowing errors.
+    unsigned IsAllowModuleWithCompilerErrorsEnabled: 1;
+
+    /// \c true if this module was built with complete checking for concurrency.
+    unsigned IsConcurrencyChecked: 1;
+
     // Explicitly pad out to the next word boundary.
-    unsigned : 0;
+    unsigned : 5;
   } Bits = {};
   static_assert(sizeof(ModuleBits) <= 8, "The bit set should be small");
 
@@ -336,10 +366,12 @@ private:
   }
 
   /// Constructs a new module and validates it.
-  ModuleFileSharedCore(std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
-                 std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
-                 std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
-                 bool isFramework, serialization::ValidationInfo &info);
+  ModuleFileSharedCore(
+      std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
+      std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
+      std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
+      bool isFramework, bool requiresOSSAModules,
+      serialization::ValidationInfo &info);
 
   /// Change the status of the current module.
   Status error(Status issue) {
@@ -350,12 +382,12 @@ private:
 
   /// Emits one last diagnostic, logs the error, and then aborts for the stack
   /// trace.
-  LLVM_ATTRIBUTE_NORETURN static void fatal(llvm::Error error);
-  void fatalIfNotSuccess(llvm::Error error) {
+  [[noreturn]] void fatal(llvm::Error error) const;
+  void fatalIfNotSuccess(llvm::Error error) const {
     if (error)
       fatal(std::move(error));
   }
-  template <typename T> T fatalIfUnexpected(llvm::Expected<T> expected) {
+  template <typename T> T fatalIfUnexpected(llvm::Expected<T> expected) const {
     if (expected)
       return std::move(expected.get());
     fatal(expected.takeError());
@@ -395,6 +427,12 @@ private:
   /// index_block::DeclMembersLayout format.
   std::unique_ptr<SerializedDeclMembersTable>
   readDeclMembersTable(ArrayRef<uint64_t> fields, StringRef blobData) const;
+
+  /// Read an on-disk local declid-string hash table stored in
+  /// index_block::DeclFingerprintsLayout format.
+  std::unique_ptr<SerializedDeclFingerprintsTable>
+  readDeclFingerprintsTable(ArrayRef<uint64_t> fields,
+                            StringRef blobData) const;
 
   /// Read an on-disk derivative function configuration table stored in
   /// index_block::DerivativeFunctionConfigTableLayout format.
@@ -458,6 +496,8 @@ public:
   /// of the buffer, even if there's an error in loading.
   /// \param isFramework If true, this is treated as a framework module for
   /// linking purposes.
+  /// \param requiresOSSAModules If true, this requires dependent modules to be
+  /// compiled with -enable-ossa-modules.
   /// \param[out] theModule The loaded module.
   /// \returns Whether the module was successfully loaded, or what went wrong
   ///          if it was not.
@@ -466,12 +506,13 @@ public:
        std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
        std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
        std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
-       bool isFramework,
+       bool isFramework, bool requiresOSSAModules,
        std::shared_ptr<const ModuleFileSharedCore> &theModule) {
     serialization::ValidationInfo info;
     auto *core = new ModuleFileSharedCore(
         std::move(moduleInputBuffer), std::move(moduleDocInputBuffer),
-        std::move(moduleSourceInfoInputBuffer), isFramework, info);
+        std::move(moduleSourceInfoInputBuffer), isFramework,
+        requiresOSSAModules, info);
     if (!moduleInterfacePath.empty()) {
       ArrayRef<char> path;
       core->allocateBuffer(path, moduleInterfacePath);
@@ -481,6 +522,9 @@ public:
     return info;
   }
 
+  /// Outputs information useful for diagnostics to \p out
+  void outputDiagnosticInfo(llvm::raw_ostream &os) const;
+  
   // Out of line to avoid instantiation OnDiskChainedHashTable here.
   ~ModuleFileSharedCore();
 
@@ -497,6 +541,15 @@ public:
   /// Returns \c true if this module file contains a section with incremental
   /// information.
   bool hasIncrementalInfo() const { return HasIncrementalInfo; }
+
+  /// Returns \c true if a corresponding .swiftsourceinfo has been found.
+  bool hasSourceInfoFile() const { return !!ModuleSourceInfoInputBuffer; }
+
+  /// Returns \c true if a corresponding .swiftsourceinfo has been found *and
+  /// read*.
+  bool hasSourceInfo() const;
+
+  bool isConcurrencyChecked() const { return Bits.IsConcurrencyChecked; }
 };
 
 template <typename T, typename RawData>

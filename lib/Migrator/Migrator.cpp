@@ -21,6 +21,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Edit/EditedSource.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 
 using namespace swift;
@@ -148,6 +149,9 @@ Migrator::performAFixItMigration(version::Version SwiftLanguageVersion) {
   }
 
   auto Instance = std::make_unique<swift::CompilerInstance>();
+  // rdar://78576743 - Reset LLVM global state for command-line arguments set
+  // by prior calls to setup.
+  llvm::cl::ResetAllOptionOccurrences();
   if (Instance->setup(Invocation)) {
     return nullptr;
   }
@@ -381,7 +385,7 @@ bool Migrator::emitRemap() const {
 
   std::error_code Error;
   llvm::raw_fd_ostream FileOS(RemapPath,
-                              Error, llvm::sys::fs::F_Text);
+                              Error, llvm::sys::fs::OF_Text);
   if (FileOS.has_error()) {
     return true;
   }
@@ -402,7 +406,7 @@ bool Migrator::emitMigratedFile() const {
 
   std::error_code Error;
   llvm::raw_fd_ostream FileOS(OutFilename,
-                              Error, llvm::sys::fs::F_Text);
+                              Error, llvm::sys::fs::OF_Text);
   if (FileOS.has_error()) {
     return true;
   }

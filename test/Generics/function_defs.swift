@@ -34,7 +34,7 @@ func min<T : MethodLessComparable>(_ x: T, y: T) -> T {
 //===----------------------------------------------------------------------===//
 
 func existential<T : EqualComparable, U : EqualComparable>(_ t1: T, t2: T, u: U) {
-  var eqComp : EqualComparable = t1 // expected-error{{protocol 'EqualComparable' can only be used as a generic constraint}}
+  var eqComp : EqualComparable = t1 // Ok
   eqComp = u
   if t1.isEqual(eqComp) {} // expected-error{{cannot convert value of type 'EqualComparable' to expected argument type 'T'}}
   if eqComp.isEqual(t2) {} // expected-error{{member 'isEqual' cannot be used on value of protocol type 'EqualComparable'; use a generic constraint instead}}
@@ -49,20 +49,11 @@ func otherExistential<T : EqualComparable>(_ t1: T) {
   otherEqComp = t1 // expected-error{{value of type 'T' does not conform to 'OtherEqualComparable' in assignment}}
   _ = otherEqComp
   
-  var otherEqComp2 : OtherEqualComparable // expected-error{{protocol 'OtherEqualComparable' can only be used as a generic constraint}}
+  var otherEqComp2 : OtherEqualComparable // Ok
   otherEqComp2 = t1 // expected-error{{value of type 'T' does not conform to 'OtherEqualComparable' in assignment}}
   _ = otherEqComp2
 
-  _ = t1 as EqualComparable & OtherEqualComparable // expected-error{{value of type 'T' does not conform to 'EqualComparable & OtherEqualComparable' in coercion}} expected-error{{protocol 'OtherEqualComparable' can only be used as a generic constraint}} expected-error{{protocol 'EqualComparable' can only be used as a generic constraint}}
-}
-
-protocol Runcible {
-  func runce<A>(_ x: A)
-  func spoon(_ x: Self)
-}
-
-func testRuncible(_ x: Runcible) { // expected-error{{protocol 'Runcible' can only be used as a generic constraint}}
-  x.runce(5)
+  _ = t1 as EqualComparable & OtherEqualComparable // expected-error{{value of type 'T' does not conform to 'EqualComparable & OtherEqualComparable' in coercion}}
 }
 
 //===----------------------------------------------------------------------===//
@@ -290,7 +281,7 @@ func sameTypeEq<T>(_: T) where T = T {} // expected-error{{use '==' for same-typ
 
 func badTypeConformance1<T>(_: T) where Int : EqualComparable {} // expected-error{{type 'Int' in conformance requirement does not refer to a generic parameter or associated type}}
 
-func badTypeConformance2<T>(_: T) where T.Blarg : EqualComparable { } // expected-error{{'Blarg' is not a member type of 'T'}}
+func badTypeConformance2<T>(_: T) where T.Blarg : EqualComparable { } // expected-error{{'Blarg' is not a member type of type 'T'}}
 
 func badTypeConformance3<T>(_: T) where (T) -> () : EqualComparable { }
 // expected-error@-1{{type '(T) -> ()' in conformance requirement does not refer to a generic parameter or associated type}}
@@ -308,7 +299,7 @@ func badTypeConformance6<T>(_: T) where [T] : Collection { }
 // expected-error@-1{{type '[T]' in conformance requirement does not refer to a generic parameter or associated type}}
 
 func badTypeConformance7<T, U>(_: T, _: U) where T? : U { }
-// expected-error@-1{{type 'T?' constrained to non-protocol, non-class type 'U'}}
+// expected-error@-1{{type 'T?' in conformance requirement does not refer to a generic parameter or associated type}}
 
 func badSameType<T, U : GeneratesAnElement, V>(_ : T, _ : U)
   where T == U.Element, U.Element == V {} // expected-error{{same-type requirement makes generic parameters 'T' and 'V' equivalent}}

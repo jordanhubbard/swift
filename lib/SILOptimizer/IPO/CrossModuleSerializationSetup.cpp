@@ -45,6 +45,7 @@ class CrossModuleSerializationSetup {
   llvm::SmallVector<SILFunction *, 16> workList;
   llvm::SmallPtrSet<SILFunction *, 16> functionsHandled;
 
+  llvm::DenseMap<SILType, bool> typesChecked;
   llvm::SmallPtrSet<TypeBase *, 16> typesHandled;
 
   SILModule &M;
@@ -62,7 +63,13 @@ class CrossModuleSerializationSetup {
 
   bool canSerialize(SILInstruction *inst, bool lookIntoThunks);
 
+  bool canSerialize(SILGlobalVariable *global);
+
+  bool canSerialize(SILType type);
+
   void setUpForSerialization(SILFunction *F);
+
+  void setUpForSerialization(SILGlobalVariable *global);
 
   void prepareInstructionForSerialization(SILInstruction *inst);
 
@@ -238,9 +245,6 @@ static void makeFunctionUsableFromInline(SILFunction *F) {
 /// referenced function onto the worklist.
 void CrossModuleSerializationSetup::
 prepareInstructionForSerialization(SILInstruction *inst) {
-  // Make all types of the instruction usable from inline.
-  InstructionVisitor::visitInst(inst, *this);
-
   // Put callees onto the worklist if they should be serialized as well.
   if (auto *FRI = dyn_cast<FunctionRefBaseInst>(inst)) {
     SILFunction *callee = FRI->getReferencedFunctionOrNull();
@@ -249,8 +253,11 @@ prepareInstructionForSerialization(SILInstruction *inst) {
     return;
   }
   if (auto *GAI = dyn_cast<GlobalAddrInst>(inst)) {
-    GAI->getReferencedGlobal()->setSerialized(IsSerialized);
-    GAI->getReferencedGlobal()->setLinkage(SILLinkage::Public);
+    SILGlobalVariable *gl = GAI->getReferencedGlobal();
+    if (canSerialize(gl)) {
+      setUpForSerialization(gl);
+    }
+    gl->setLinkage(SILLinkage::Public);
     return;
   }
   if (auto *MI = dyn_cast<MethodInst>(inst)) {
@@ -320,6 +327,12 @@ bool CrossModuleSerializationSetup::canSerialize(SILFunction *F,
 
 bool CrossModuleSerializationSetup::canSerialize(SILInstruction *inst,
                                                  bool lookIntoThunks) {
+
+  for (SILValue result : inst->getResults()) {
+    if (!canSerialize(result->getType()))
+      return false;
+  }
+
   if (auto *FRI = dyn_cast<FunctionRefBaseInst>(inst)) {
     SILFunction *callee = FRI->getReferencedFunctionOrNull();
     return canUseFromInline(callee, lookIntoThunks);
@@ -344,6 +357,38 @@ bool CrossModuleSerializationSetup::canSerialize(SILInstruction *inst,
   return true;
 }
 
+bool CrossModuleSerializationSetup::canSerialize(SILGlobalVariable *global) {
+  for (const SILInstruction &initInst : *global) {
+    if (!canSerialize(const_cast<SILInstruction *>(&initInst),
+                      /*lookIntoThunks*/ true))
+      return false;
+  }
+  return true;
+}
+
+bool CrossModuleSerializationSetup::canSerialize(SILType type) {
+  auto iter = typesChecked.find(type);
+  if (iter != typesChecked.end())
+    return iter->getSecond();
+
+  ModuleDecl *mod = M.getSwiftModule();
+  bool success = !type.getASTType().findIf(
+    [mod](Type rawSubType) {
+      CanType subType = rawSubType->getCanonicalType();
+      if (NominalTypeDecl *subNT = subType->getNominalOrBoundGenericNominal()) {
+      
+        // Exclude types which are defined in an @_implementationOnly imported
+        // module. Such modules are not transitively available.
+        if (!mod->canBeUsedForCrossModuleOptimization(subNT)) {
+          return true;
+        }
+      }
+      return false;
+    });
+  typesChecked[type] = success;
+  return success;
+}
+
 /// Returns true if the function \p func can be used from a serialized function.
 ///
 /// If \p lookIntoThunks is true, serializable shared thunks are also accepted.
@@ -351,6 +396,11 @@ bool CrossModuleSerializationSetup::canUseFromInline(SILFunction *func,
                                                      bool lookIntoThunks) {
   if (!func)
     return false;
+
+  if (DeclContext *funcCtxt = func->getDeclContext()) {
+    if (!M.getSwiftModule()->canBeUsedForCrossModuleOptimization(funcCtxt))
+      return false;
+  }
 
   switch (func->getLinkage()) {
   case SILLinkage::PublicNonABI:
@@ -367,7 +417,6 @@ bool CrossModuleSerializationSetup::canUseFromInline(SILFunction *func,
   case SILLinkage::Private:
   case SILLinkage::PublicExternal:
   case SILLinkage::SharedExternal:
-  case SILLinkage::PrivateExternal:
   case SILLinkage::HiddenExternal:
     break;
   }
@@ -385,6 +434,9 @@ void CrossModuleSerializationSetup::setUpForSerialization(SILFunction *F) {
   // for serialization.
   for (SILBasicBlock &block : *F) {
     for (SILInstruction &inst : block) {
+      // Make all types of the instruction usable from inline.
+      InstructionVisitor::visitInst(&inst, *this);
+
       prepareInstructionForSerialization(&inst);
     }
   }
@@ -401,6 +453,14 @@ void CrossModuleSerializationSetup::setUpForSerialization(SILFunction *F) {
   } else {
     F->setLinkage(SILLinkage::Public);
   }
+}
+
+void CrossModuleSerializationSetup::
+setUpForSerialization(SILGlobalVariable *global) {
+  for (const SILInstruction &initInst : *global) {
+    prepareInstructionForSerialization(const_cast<SILInstruction *>(&initInst));
+  }
+  global->setSerialized(IsSerialized);
 }
 
 /// Select functions in the module which should be serialized.

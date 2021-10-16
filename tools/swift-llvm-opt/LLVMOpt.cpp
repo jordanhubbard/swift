@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
   initializeAtomicExpandPass(Registry);
   initializeRewriteSymbolsLegacyPassPass(Registry);
   initializeWinEHPreparePass(Registry);
-  initializeDwarfEHPreparePass(Registry);
+  initializeDwarfEHPrepareLegacyPassPass(Registry);
   initializeSjLjEHPreparePass(Registry);
 
   // Register Swift Only Passes.
@@ -283,7 +283,7 @@ int main(int argc, char **argv) {
 
   std::error_code EC;
   Out.reset(
-      new llvm::ToolOutputFile(OutputFilename, EC, llvm::sys::fs::F_None));
+      new llvm::ToolOutputFile(OutputFilename, EC, llvm::sys::fs::OF_None));
   if (EC) {
     llvm::errs() << EC.message() << '\n';
     return 1;
@@ -293,7 +293,7 @@ int main(int argc, char **argv) {
   std::string CPUStr, FeaturesStr;
   llvm::TargetMachine *Machine = nullptr;
   const llvm::TargetOptions Options =
-      llvm::codegen::InitTargetOptionsFromCodeGenFlags();
+      llvm::codegen::InitTargetOptionsFromCodeGenFlags(ModuleTriple);
 
   if (ModuleTriple.getArch()) {
     CPUStr = llvm::codegen::getCPUStr();

@@ -276,6 +276,27 @@ internal func _getEnumCaseName<T>(_ value: T) -> UnsafePointer<CChar>?
 @_silgen_name("swift_OpaqueSummary")
 internal func _opaqueSummary(_ metadata: Any.Type) -> UnsafePointer<CChar>?
 
+/// Obtain a fallback raw value for an enum type without metadata; this
+/// should be OK for enums from C/C++ until they have metadata (see
+/// <rdar://22036374>).  Note that if this turns out to be a Swift Enum
+/// with missing metadata, the raw value may be misleading.
+@_semantics("optimize.sil.specialize.generic.never")
+internal func _fallbackEnumRawValue<T>(_ value: T) -> Int64? {
+  switch MemoryLayout.size(ofValue: value) {
+  case 8:
+    return unsafeBitCast(value, to:Int64.self)
+  case 4:
+    return Int64(unsafeBitCast(value, to:Int32.self))
+  case 2:
+    return Int64(unsafeBitCast(value, to:Int16.self))
+  case 1:
+    return Int64(unsafeBitCast(value, to:Int8.self))
+  default:
+    return nil
+  }
+}
+
+#if SWIFT_ENABLE_REFLECTION
 /// Do our best to print a value that cannot be printed directly.
 @_semantics("optimize.sil.specialize.generic.never")
 internal func _adHocPrint_unlocked<T, TargetStream: TextOutputStream>(
@@ -290,7 +311,7 @@ internal func _adHocPrint_unlocked<T, TargetStream: TextOutputStream>(
   if let displayStyle = mirror.displayStyle {
     switch displayStyle {
       case .optional:
-        if let child = mirror._children.first {
+        if let child = mirror.children.first {
           _debugPrint_unlocked(child.1, &target)
         } else {
           _debugPrint_unlocked("nil", &target)
@@ -298,7 +319,7 @@ internal func _adHocPrint_unlocked<T, TargetStream: TextOutputStream>(
       case .tuple:
         target.write("(")
         var first = true
-        for (label, value) in mirror._children {
+        for (label, value) in mirror.children {
           if first {
             first = false
           } else {
@@ -319,7 +340,7 @@ internal func _adHocPrint_unlocked<T, TargetStream: TextOutputStream>(
         printTypeName(mirror.subjectType)
         target.write("(")
         var first = true
-        for (label, value) in mirror._children {
+        for (label, value) in mirror.children {
           if let label = label {
             if first {
               first = false
@@ -342,10 +363,16 @@ internal func _adHocPrint_unlocked<T, TargetStream: TextOutputStream>(
           }
           target.write(caseName)
         } else {
-          // If the case name is garbage, just print the type name.
           printTypeName(mirror.subjectType)
+          // The case name is garbage; this might be a C/C++ enum without
+          // metadata, so see if we can get a raw value
+          if let rawValue = _fallbackEnumRawValue(value) {
+            target.write("(rawValue: ")
+            _debugPrint_unlocked(rawValue, &target);
+            target.write(")")
+          }
         }
-        if let (_, value) = mirror._children.first {
+        if let (_, value) = mirror.children.first {
           if Mirror(reflecting: value).displayStyle == .tuple {
             _debugPrint_unlocked(value, &target)
           } else {
@@ -370,6 +397,7 @@ internal func _adHocPrint_unlocked<T, TargetStream: TextOutputStream>(
     }
   }
 }
+#endif
 
 @usableFromInline
 @_semantics("optimize.sil.specialize.generic.never")
@@ -409,8 +437,12 @@ internal func _print_unlocked<T, TargetStream: TextOutputStream>(
     return
   }
 
+#if SWIFT_ENABLE_REFLECTION
   let mirror = Mirror(reflecting: value)
   _adHocPrint_unlocked(value, mirror, &target, isDebugPrint: false)
+#else
+  target.write("(value cannot be printed without reflection)")
+#endif
 }
 
 //===----------------------------------------------------------------------===//
@@ -437,10 +469,15 @@ public func _debugPrint_unlocked<T, TargetStream: TextOutputStream>(
     return
   }
 
+#if SWIFT_ENABLE_REFLECTION
   let mirror = Mirror(reflecting: value)
   _adHocPrint_unlocked(value, mirror, &target, isDebugPrint: true)
+#else
+  target.write("(value cannot be printed without reflection)")
+#endif
 }
 
+#if SWIFT_ENABLE_REFLECTION
 @_semantics("optimize.sil.specialize.generic.never")
 internal func _dumpPrint_unlocked<T, TargetStream: TextOutputStream>(
     _ value: T, _ mirror: Mirror, _ target: inout TargetStream
@@ -450,19 +487,19 @@ internal func _dumpPrint_unlocked<T, TargetStream: TextOutputStream>(
     // count
     switch displayStyle {
     case .tuple:
-      let count = mirror._children.count
+      let count = mirror.children.count
       target.write(count == 1 ? "(1 element)" : "(\(count) elements)")
       return
     case .collection:
-      let count = mirror._children.count
+      let count = mirror.children.count
       target.write(count == 1 ? "1 element" : "\(count) elements")
       return
     case .dictionary:
-      let count = mirror._children.count
+      let count = mirror.children.count
       target.write(count == 1 ? "1 key/value pair" : "\(count) key/value pairs")
       return
     case .`set`:
-      let count = mirror._children.count
+      let count = mirror.children.count
       target.write(count == 1 ? "1 member" : "\(count) members")
       return
     default:
@@ -507,6 +544,7 @@ internal func _dumpPrint_unlocked<T, TargetStream: TextOutputStream>(
 
   _adHocPrint_unlocked(value, mirror, &target, isDebugPrint: true)
 }
+#endif
 
 //===----------------------------------------------------------------------===//
 // OutputStreams
@@ -582,19 +620,16 @@ extension Unicode.Scalar: TextOutputStreamable {
 /// A hook for playgrounds to print through.
 public var _playgroundPrintHook: ((String) -> Void)? = nil
 
-internal struct _TeeStream<
-  L: TextOutputStream,
-  R: TextOutputStream
->: TextOutputStream {
+internal struct _TeeStream<L: TextOutputStream, R: TextOutputStream>
+  : TextOutputStream
+{
+  internal var left: L
+  internal var right: R
 
   internal init(left: L, right: R) {
     self.left = left
     self.right = right
   }
-
-  internal var left: L
-  internal var right: R
-  
   /// Append the given `string` to this stream.
   internal mutating func write(_ string: String) {
     left.write(string); right.write(string)

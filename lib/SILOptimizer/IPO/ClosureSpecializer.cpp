@@ -57,6 +57,7 @@
 
 #define DEBUG_TYPE "closure-specialization"
 #include "swift/Basic/Range.h"
+#include "swift/Demangling/Demangler.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILFunction.h"
@@ -162,6 +163,14 @@ private:
 namespace {
 struct ClosureInfo;
 
+static SILFunction *getClosureCallee(SILInstruction *inst) {
+  if (auto *PAI = dyn_cast<PartialApplyInst>(inst))
+    return cast<FunctionRefInst>(PAI->getCallee())->getReferencedFunction();
+
+  auto *TTTFI = cast<ThinToThickFunctionInst>(inst);
+  return cast<FunctionRefInst>(TTTFI->getCallee())->getReferencedFunction();
+}
+
 class CallSiteDescriptor {
   ClosureInfo *CInfo;
   FullApplySite AI;
@@ -184,18 +193,11 @@ public:
   CallSiteDescriptor &operator=(CallSiteDescriptor &&) =default;
 
   SILFunction *getApplyCallee() const {
-    return cast<FunctionRefInst>(AI.getCallee())
-        ->getInitiallyReferencedFunction();
+    return cast<FunctionRefInst>(AI.getCallee())->getReferencedFunction();
   }
 
   SILFunction *getClosureCallee() const {
-    if (auto *PAI = dyn_cast<PartialApplyInst>(getClosure()))
-      return cast<FunctionRefInst>(PAI->getCallee())
-          ->getInitiallyReferencedFunction();
-
-    auto *TTTFI = cast<ThinToThickFunctionInst>(getClosure());
-    return cast<FunctionRefInst>(TTTFI->getCallee())
-        ->getInitiallyReferencedFunction();
+    return ::getClosureCallee(getClosure());
   }
 
   bool closureHasRefSemanticContext() const {
@@ -441,7 +443,8 @@ static void rewriteApplyInst(const CallSiteDescriptor &CSDesc,
     auto *TAI = cast<TryApplyInst>(AI);
     NewAI = Builder.createTryApply(AI.getLoc(), FRI,
                                    SubstitutionMap(), NewArgs,
-                                   TAI->getNormalBB(), TAI->getErrorBB());
+                                   TAI->getNormalBB(), TAI->getErrorBB(),
+                                   TAI->getApplyOptions());
     // If we passed in the original closure as @owned, then insert a release
     // right after NewAI. This is to balance the +1 from being an @owned
     // argument to AI.
@@ -461,8 +464,8 @@ static void rewriteApplyInst(const CallSiteDescriptor &CSDesc,
   case FullApplySiteKind::ApplyInst: {
     auto oldApply = cast<ApplyInst>(AI);
     auto newApply = Builder.createApply(oldApply->getLoc(), FRI,
-                                        SubstitutionMap(),
-                                        NewArgs, oldApply->isNonThrowing());
+                                        SubstitutionMap(), NewArgs,
+                                        oldApply->getApplyOptions());
     // If we passed in the original closure as @owned, then insert a release
     // right after NewAI. This is to balance the +1 from being an @owned
     // argument to AI.
@@ -565,8 +568,7 @@ static bool isSupportedClosure(const SILInstruction *Closure) {
     // Bail if any of the arguments are passed by address and
     // are not @inout.
     // This is a temporary limitation.
-    auto ClosureCallee = FRI->getReferencedFunctionOrNull();
-    assert(ClosureCallee);
+    auto ClosureCallee = FRI->getReferencedFunction();
     auto ClosureCalleeConv = ClosureCallee->getConventions();
     unsigned ClosureArgIdx =
         ClosureCalleeConv.getNumSILArguments() - PAI->getNumArguments();
@@ -875,7 +877,7 @@ void ClosureSpecCloner::populateCloned() {
       SILBasicBlock *OpBB = getOpBasicBlock(BB);
 
       TermInst *TI = OpBB->getTerminator();
-      auto Loc = CleanupLocation::get(NewClosure->getLoc());
+      auto Loc = CleanupLocation(NewClosure->getLoc());
 
       // If we have an exit, we place the release right before it so we know
       // that it will be executed at the end of the epilogue.
@@ -927,7 +929,7 @@ void ClosureSpecCloner::populateCloned() {
     }
   }
   if (invalidatedStackNesting) {
-    StackNesting().correctStackNesting(Cloned);
+    StackNesting::fixNesting(Cloned);
   }
 }
 
@@ -992,7 +994,7 @@ void SILClosureSpecializerTransform::run() {
     }
 
     if (invalidatedStackNesting) {
-      StackNesting().correctStackNesting(F);
+      StackNesting::fixNesting(F);
     }
   }
 
@@ -1066,6 +1068,59 @@ static bool canSpecializeFullApplySite(FullApplySiteKind kind) {
     return false;
   }
   llvm_unreachable("covered switch");
+}
+
+static int getSpecializationLevelRecursive(StringRef funcName, Demangler &parent) {
+  using namespace Demangle;
+
+  Demangler demangler;
+  demangler.providePreallocatedMemory(parent);
+
+  // Check for this kind of node tree:
+  //
+  // kind=Global
+  //   kind=FunctionSignatureSpecialization
+  //     kind=SpecializationPassID, index=1
+  //     kind=FunctionSignatureSpecializationParam
+  //       kind=FunctionSignatureSpecializationParamKind, index=5
+  //       kind=FunctionSignatureSpecializationParamPayload, text="..."
+  //
+  Node *root = demangler.demangleSymbol(funcName);
+  if (!root)
+    return 0;
+  if (root->getKind() != Node::Kind::Global)
+    return 0;
+  Node *funcSpec = root->getFirstChild();
+  if (!funcSpec || funcSpec->getNumChildren() < 2)
+    return 0;
+  if (funcSpec->getKind() != Node::Kind::FunctionSignatureSpecialization)
+    return 0;
+  Node *param = funcSpec->getChild(1);
+  if (param->getKind() != Node::Kind::FunctionSignatureSpecializationParam)
+    return 0;
+  if (param->getNumChildren() < 2)
+    return 0;
+  Node *kindNd = param->getChild(0);
+  if (kindNd->getKind() != Node::Kind::FunctionSignatureSpecializationParamKind)
+    return 0;
+  auto kind = FunctionSigSpecializationParamKind(kindNd->getIndex());
+  if (kind != FunctionSigSpecializationParamKind::ConstantPropFunction)
+    return 0;
+    
+  Node *payload = param->getChild(1);
+  if (payload->getKind() != Node::Kind::FunctionSignatureSpecializationParamPayload)
+    return 1;
+  // Check if the specialized function is a specialization itself.
+  return 1 + getSpecializationLevelRecursive(payload->getText(), demangler);
+}
+
+/// If \p function is a function-signature specialization for a constant-
+/// propagated function argument, returns 1.
+/// If \p function is a specialization of such a specialization, returns 2.
+/// And so on.
+static int getSpecializationLevel(SILFunction *f) {
+  Demangle::StackAllocatedDemangler<1024> demangler;
+  return getSpecializationLevelRecursive(f->getName(), demangler);
 }
 
 bool SILClosureSpecializerTransform::gatherCallSites(
@@ -1254,6 +1309,24 @@ bool SILClosureSpecializerTransform::gatherCallSites(
             !findAllNonFailureExitBBs(ApplyCallee, NonFailureExitBBs)) {
           continue;
         }
+
+        // Avoid an infinite specialization loop caused by repeated runs of
+        // ClosureSpecializer and CapturePropagation.
+        // CapturePropagation propagates constant function-literals. Such
+        // function specializations can then be optimized again by the
+        // ClosureSpecializer and so on.
+        // This happens if a closure argument is called _and_ referenced in
+        // another closure, which is passed to a recursive call. E.g.
+        //
+        // func foo(_ c: @escaping () -> ()) {
+        //   c()
+        //   foo({ c() })
+        // }
+        //
+        // A limit of 2 is good enough and will not be exceed in "regular"
+        // optimization scenarios.
+        if (getSpecializationLevel(getClosureCallee(ClosureInst)) > 2)
+          continue;
 
         // Compute the final release points of the closure. We will insert
         // release of the captured arguments here.

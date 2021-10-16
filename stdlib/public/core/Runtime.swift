@@ -163,8 +163,6 @@ func _stdlib_atomicLoadARCRef(
 
 /// A 32 byte buffer.
 internal struct _Buffer32 {
-  internal init() {}
-
   internal var _x0: UInt8 = 0
   internal var _x1: UInt8 = 0
   internal var _x2: UInt8 = 0
@@ -198,6 +196,8 @@ internal struct _Buffer32 {
   internal var _x30: UInt8 = 0
   internal var _x31: UInt8 = 0
 
+  internal init() {}
+
   internal mutating func withBytes<Result>(
     _ body: (UnsafeMutablePointer<UInt8>) throws -> Result
   ) rethrows -> Result {
@@ -209,8 +209,6 @@ internal struct _Buffer32 {
 
 /// A 72 byte buffer.
 internal struct _Buffer72 {
-  internal init() {}
-
   internal var _x0: UInt8 = 0
   internal var _x1: UInt8 = 0
   internal var _x2: UInt8 = 0
@@ -284,6 +282,8 @@ internal struct _Buffer72 {
   internal var _x70: UInt8 = 0
   internal var _x71: UInt8 = 0
 
+  internal init() {}
+
   internal mutating func withBytes<Result>(
     _ body: (UnsafeMutablePointer<UInt8>) throws -> Result
   ) rethrows -> Result {
@@ -293,6 +293,7 @@ internal struct _Buffer72 {
   }
 }
 
+#if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
 // Note that this takes a Float32 argument instead of Float16, because clang
 // doesn't have _Float16 on all platforms yet.
 @_silgen_name("swift_float16ToString")
@@ -303,9 +304,7 @@ internal func _float16ToStringImpl(
   _ debug: Bool
 ) -> Int
 
-@available(iOS 14.0, watchOS 7.0, tvOS 14.0, *)
-@available(macOS, unavailable)
-@available(macCatalyst, unavailable)
+@available(macOS 11.0, iOS 14.0, watchOS 7.0, tvOS 14.0, *)
 internal func _float16ToString(
   _ value: Float16,
   debug: Bool
@@ -317,6 +316,7 @@ internal func _float16ToString(
   }
   return (buffer, length)
 }
+#endif
 
 // Returns a UInt64, but that value is the length of the string, so it's
 // guaranteed to fit into an Int. This is part of the ABI, so we can't

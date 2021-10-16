@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 extension Unicode {
   @frozen
-  public enum UTF8 {
+  public enum UTF8: Sendable {
   case _swift3Buffer(Unicode.UTF8.ForwardParser)
   }
 }
@@ -162,21 +162,25 @@ extension Unicode.UTF8: _UnicodeEncoding {
   }
 
   @frozen
-  public struct ForwardParser {
+  public struct ForwardParser: Sendable {
     public typealias _Buffer = _UIntBuffer<UInt8>
+
+    public var _buffer: _Buffer
+
     @inline(__always)
     @inlinable
     public init() { _buffer = _Buffer() }
-    public var _buffer: _Buffer
   }
 
   @frozen
-  public struct ReverseParser {
+  public struct ReverseParser: Sendable {
     public typealias _Buffer = _UIntBuffer<UInt8>
+
+    public var _buffer: _Buffer
+
     @inline(__always)
     @inlinable
     public init() { _buffer = _Buffer() }
-    public var _buffer: _Buffer
   }
 }
 

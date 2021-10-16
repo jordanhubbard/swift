@@ -131,9 +131,8 @@ static void addReturnValueImpl(SILBasicBlock *RetBB, SILBasicBlock *NewRetBB,
       // Forward the existing return argument to a new BBArg.
       MergedBB = RetBB->split(RetInst->getIterator());
       SILValue OldRetVal = RetInst->getOperand(0);
-      RetInst->setOperand(
-          0, MergedBB->createPhiArgument(OldRetVal->getType(),
-                                         ValueOwnershipKind::Owned));
+      RetInst->setOperand(0, MergedBB->createPhiArgument(OldRetVal->getType(),
+                                                         OwnershipKind::Owned));
       Builder.setInsertionPoint(RetBB);
       Builder.createBranch(Loc, MergedBB, {OldRetVal});
     }
@@ -186,7 +185,7 @@ emitApplyWithRethrow(SILBuilder &Builder, SILLocation Loc, SILValue FuncRef,
     Builder.emitBlock(ErrorBB);
     SILValue Error = ErrorBB->createPhiArgument(
         fnConv.getSILErrorType(F.getTypeExpansionContext()),
-        ValueOwnershipKind::Owned);
+        OwnershipKind::Owned);
     cleanupCallArguments(Builder, Loc, CallArgs,
                          CallArgIndicesThatNeedEndBorrow);
     addThrowValue(ErrorBB, Error);
@@ -198,7 +197,7 @@ emitApplyWithRethrow(SILBuilder &Builder, SILLocation Loc, SILValue FuncRef,
   Builder.emitBlock(NormalBB);
   SILValue finalArgument = Builder.getInsertionBB()->createPhiArgument(
       fnConv.getSILResultType(F.getTypeExpansionContext()),
-      ValueOwnershipKind::Owned);
+      OwnershipKind::Owned);
   cleanupCallArguments(Builder, Loc, CallArgs, CallArgIndicesThatNeedEndBorrow);
   return finalArgument;
 }
@@ -268,8 +267,11 @@ static SILValue emitInvocation(SILBuilder &Builder,
   // or de-facto?
   if (!CanSILFuncTy->hasErrorResult() ||
       CalleeFunc->findThrowBB() == CalleeFunc->end()) {
+    ApplyOptions Options;
+    if (isNonThrowing)
+      Options |= ApplyFlags::DoesNotThrow;
     auto *AI = Builder.createApply(CalleeFunc->getLocation(), FuncRefInst, Subs,
-                                   CallArgs, isNonThrowing);
+                                   CallArgs, Options);
     cleanupCallArguments(Builder, Loc, CallArgs, ArgsNeedEndBorrow);
     return AI;
   }
@@ -733,7 +735,7 @@ SILValue EagerDispatch::emitArgumentConversion(
                                            LoadOwnershipQualifier::Take);
     } else {
       Val = Builder.emitLoadBorrowOperation(Loc, CastArg);
-      if (Val.getOwnershipKind() == ValueOwnershipKind::Guaranteed)
+      if (Val.getOwnershipKind() == OwnershipKind::Guaranteed)
         ArgAtIndexNeedsEndBorrow.push_back(CallArgs.size());
     }
     CallArgs.push_back(Val);
@@ -792,6 +794,7 @@ static SILFunction *eagerSpecialize(SILOptFunctionBuilder &FuncBuilder,
   } else if (SA.isExported()) {
     NewFunc->setLinkage(NewFunc->isDefinition() ? SILLinkage::Public
                                                 : SILLinkage::PublicExternal);
+    NewFunc->setAvailabilityForLinkage(SA.getAvailability());
   }
 
   return NewFunc;
@@ -889,7 +892,11 @@ void EagerSpecializerTransform::run() {
   // removed.
   for (auto *SA : attrsToRemove)
     F.removeSpecializeAttr(SA);
-  F.verify();
+
+  // If any specializations were created, reverify the original body now that it
+  // has checks.
+  if (!newFunctions.empty())
+    F.verify();
 
   for (SILFunction *newF : newFunctions) {
     addFunctionToPassManagerWorklist(newF, nullptr);

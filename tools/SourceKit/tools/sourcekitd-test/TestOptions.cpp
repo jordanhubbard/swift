@@ -143,30 +143,68 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
         .Case("find-rename-ranges", SourceKitRequest::FindRenameRanges)
         .Case("find-local-rename-ranges", SourceKitRequest::FindLocalRenameRanges)
         .Case("translate", SourceKitRequest::NameTranslation)
-        .Case("local-rename", SourceKitRequest::LocalRename)
-        .Case("extract-expr", SourceKitRequest::ExtractExpr)
-        .Case("extract-repeated", SourceKitRequest::ExtractRepeatedExpr)
-        .Case("extract-func", SourceKitRequest::ExtractFunction)
-        .Case("fill-stub", SourceKitRequest::FillProtocolStub)
-        .Case("expand-default", SourceKitRequest::ExpandDefault)
-        .Case("localize-string", SourceKitRequest::LocalizeString)
         .Case("markup-xml", SourceKitRequest::MarkupToXML)
         .Case("stats", SourceKitRequest::Statistics)
         .Case("track-compiles", SourceKitRequest::EnableCompileNotifications)
         .Case("collect-type", SourceKitRequest::CollectExpresstionType)
+        .Case("collect-var-type", SourceKitRequest::CollectVariableType)
         .Case("global-config", SourceKitRequest::GlobalConfiguration)
+        .Case("dependency-updated", SourceKitRequest::DependencyUpdated)
+        .Case("diags", SourceKitRequest::Diagnostics)
+#define SEMANTIC_REFACTORING(KIND, NAME, ID) .Case("refactoring." #ID, SourceKitRequest::KIND)
+#include "swift/IDE/RefactoringKinds.def"
         .Default(SourceKitRequest::None);
 
       if (Request == SourceKitRequest::None) {
         llvm::errs() << "error: invalid request '" << InputArg->getValue()
-            << "'\nexpected one of "
-            << "version/demangle/mangle/index/complete/complete.open/complete.cursor/"
-               "complete.update/complete.cache.ondisk/complete.cache.setpopularapi/"
-               "cursor/related-idents/syntax-map/structure/format/expand-placeholder/"
-               "doc-info/sema/interface-gen/interface-gen-openfind-usr/find-interface/"
-               "open/close/edit/print-annotations/print-diags/extract-comment/module-groups/"
-               "range/syntactic-rename/find-rename-ranges/translate/markup-xml/stats/"
-               "track-compiles/collect-type\n";
+                     << "'\nexpected one of "
+                     << "- version\n"
+                     << "- compiler-version\n"
+                     << "- demangle\n"
+                     << "- mangle\n"
+                     << "- index\n"
+                     << "- complete\n"
+                     << "- complete.open\n"
+                     << "- complete.close\n"
+                     << "- complete.update\n"
+                     << "- complete.cache.ondisk\n"
+                     << "- complete.setpopularapi\n"
+                     << "- typecontextinfo\n"
+                     << "- conformingmethods\n"
+                     << "- cursor\n"
+                     << "- related-idents\n"
+                     << "- syntax-map\n"
+                     << "- syntax-tree\n"
+                     << "- structure\n"
+                     << "- format\n"
+                     << "- expand-placeholder\n"
+                     << "- doc-info\n"
+                     << "- sema\n"
+                     << "- interface-gen\n"
+                     << "- interface-gen-open\n"
+                     << "- find-usr\n"
+                     << "- find-interface\n"
+                     << "- open\n"
+                     << "- close\n"
+                     << "- edit\n"
+                     << "- print-annotations\n"
+                     << "- print-diags\n"
+                     << "- extract-comment\n"
+                     << "- module-groups\n"
+                     << "- range\n"
+                     << "- syntactic-rename\n"
+                     << "- find-rename-ranges\n"
+                     << "- find-local-rename-ranges\n"
+                     << "- translate\n"
+                     << "- markup-xml\n"
+                     << "- stats\n"
+                     << "- track-compiles\n"
+                     << "- collect-type\n"
+                     << "- global-config\n"
+                     << "- dependency-updated\n"
+#define SEMANTIC_REFACTORING(KIND, NAME, ID) << "- refactoring." #ID "\n"
+#include "swift/IDE/RefactoringKinds.def"
+                        "\n";
         return true;
       }
       break;
@@ -235,6 +273,10 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
 
     case OPT_group_name:
       ModuleGroupName = InputArg->getValue();
+      break;
+
+    case OPT_id:
+      RequestId = InputArg->getValue();
       break;
 
     case OPT_interested_usr:
@@ -345,6 +387,10 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       timeRequest = true;
       break;
 
+    case OPT_measure_instructions:
+      measureInstructions = true;
+      break;
+
     case OPT_repeat_request:
       if (StringRef(InputArg->getValue()).getAsInteger(10, repeatRequest)) {
         llvm::errs() << "error: expected integer for 'cancel-on-subsequent-request'\n";
@@ -371,16 +417,29 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       VFSName = InputArg->getValue();
       break;
 
-    case OPT_suppress_config_request:
-      SuppressDefaultConfigRequest = true;
-      break;
-
     case OPT_module_cache_path:
       ModuleCachePath = InputArg->getValue();
       break;
 
+    case OPT_simulate_long_request:
+      unsigned SimulatedDuration;
+      if (StringRef(InputArg->getValue()).getAsInteger(10, SimulatedDuration)) {
+        llvm::errs() << "error: expected integer for 'simulate-long-request'\n";
+        return true;
+      }
+      SimulateLongRequest = SimulatedDuration;
+      break;
+
     case OPT_shell:
       ShellExecution = true;
+      break;
+
+    case OPT_cancel:
+      CancelRequest = InputArg->getValue();
+      break;
+
+    case OPT_disable_implicit_concurrency_module_import:
+      DisableImplicitConcurrencyModuleImport = true;
       break;
 
     case OPT_UNKNOWN:
@@ -409,6 +468,6 @@ void TestOptions::printHelp(bool ShowHidden) const {
 
   TestOptTable Table;
 
-  Table.PrintHelp(llvm::outs(), "sourcekitd-test [options] <inputs>",
+  Table.printHelp(llvm::outs(), "sourcekitd-test [options] <inputs>",
                   "SourceKit Testing Tool", ShowHidden);
 }

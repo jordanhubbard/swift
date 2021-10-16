@@ -8,6 +8,7 @@
 // RUN: %swift-ide-test -code-completion -code-completion-annotate-results -source-filename %s -code-completion-token=CALLARG | %FileCheck %s --check-prefix=CALLARG
 // RUN: %swift-ide-test -code-completion -code-completion-annotate-results -source-filename %s -code-completion-token=GENERIC | %FileCheck %s --check-prefix=GENERIC
 // RUN: %swift-ide-test -code-completion -code-completion-annotate-results -source-filename %s -code-completion-token=WHERE | %FileCheck %s --check-prefix=WHERE
+// RUN: %swift-ide-test -code-completion -code-completion-annotate-results -source-filename %s -code-completion-token=OVERRIDE -code-completion-sourcetext | %FileCheck %s --check-prefix=OVERRIDE
 
 struct MyStruct {
   init(x: Int) {}
@@ -31,8 +32,8 @@ func testGlobal() {
 }
 // GLOBAL_EXPR: Begin completions
 // GLOBAL_EXPR-DAG: Decl[Struct]/CurrModule:            <name>MyStruct</name>; typename=<typeid.user>MyStruct</typeid.user>;
-// GLOBAL_EXPR-DAG: Keyword[class]/None:                <keyword>class</keyword>; typename=;
-// GLOBAL_EXPR-DAG: Keyword[enum]/None:                 <keyword>enum</keyword>; typename=;
+// GLOBAL_EXPR-DAG: Keyword[class]/None/Flair[RareKeyword]: <keyword>class</keyword>; typename=;
+// GLOBAL_EXPR-DAG: Keyword[enum]/None/Flair[RareKeyword]: <keyword>enum</keyword>; typename=;
 // GLOBAL_EXPR-DAG: Keyword[if]/None:                   <keyword>if</keyword>; typename=;
 // GLOBAL_EXPR-DAG: Keyword[guard]/None:                <keyword>guard</keyword>; typename=;
 // GLOBAL_EXPR-DAG: Keyword[try]/None:                  <keyword>try</keyword>; typename=;
@@ -99,12 +100,12 @@ func testImplicitMember() -> MyStruct {
 }
 // EXPR_IMPLICITMEMBER: Begin completions, 7 items
 // EXPR_IMPLICITMEMBER-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Identical]: <name>init</name>(<callarg><callarg.label>x</callarg.label>: <callarg.type><typeid.sys>Int</typeid.sys></callarg.type></callarg>); typename=<typeid.user>MyStruct</typeid.user>;
-// EXPR_IMPLICITMEMBER-DAG: Decl[StaticVar]/ExprSpecific/TypeRelation[Identical]: <name>instance</name>; typename=<typeid.user>MyStruct</typeid.user>;
+// EXPR_IMPLICITMEMBER-DAG: Decl[StaticVar]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Identical]: <name>instance</name>; typename=<typeid.user>MyStruct</typeid.user>;
 // EXPR_IMPLICITMEMBER-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: <name>labelNameParamName</name>(<callarg><callarg.label>_</callarg.label> <callarg.param>self</callarg.param>: <callarg.type><typeid.user>MyStruct</typeid.user></callarg.type></callarg>); typename=(label: (<keyword>inout</keyword> <typeid.sys>Int</typeid.sys>) <keyword>throws</keyword> -&gt; <typeid.user>MyStruct</typeid.user>) -&gt; <typeid.sys>Void</typeid.sys>;
 // EXPR_IMPLICITMEMBER-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: <name>labelName</name>(<callarg><callarg.label>_</callarg.label> <callarg.param>self</callarg.param>: <callarg.type><typeid.user>MyStruct</typeid.user></callarg.type></callarg>); typename=(label: (<attribute>@autoclosure</attribute> () -&gt; <typeid.sys>Int</typeid.sys>) -&gt; <typeid.sys>Int</typeid.sys>) -&gt; <typeid.sys>Void</typeid.sys>;
 // EXPR_IMPLICITMEMBER-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: <name>sameName</name>(<callarg><callarg.label>_</callarg.label> <callarg.param>self</callarg.param>: <callarg.type><typeid.user>MyStruct</typeid.user></callarg.type></callarg>); typename=(label: <keyword>inout</keyword> <typeid.sys>Int</typeid.sys>) -&gt; <typeid.sys>Void</typeid.sys>;
 // EXPR_IMPLICITMEMBER-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: <name>paramName</name>(<callarg><callarg.label>_</callarg.label> <callarg.param>self</callarg.param>: <callarg.type><typeid.user>MyStruct</typeid.user></callarg.type></callarg>); typename=(<typeid.sys>Int</typeid.sys>) -&gt; <typeid.sys>Void</typeid.sys>;
-// EXPR_IMPLICITMEMBER-DAG: Decl[StaticMethod]/ExprSpecific/TypeRelation[Identical]: <name>create</name>(<callarg><callarg.label>x</callarg.label>: <callarg.type><typeid.sys>Int</typeid.sys></callarg.type></callarg>); typename=<typeid.user>MyStruct</typeid.user>;
+// EXPR_IMPLICITMEMBER-DAG: Decl[StaticMethod]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Identical]: <name>create</name>(<callarg><callarg.label>x</callarg.label>: <callarg.type><typeid.sys>Int</typeid.sys></callarg.type></callarg>); typename=<typeid.user>MyStruct</typeid.user>;
 // EXPR_IMPLICITMEMBER: End completions
 
 func testArgument() -> MyStruct {
@@ -112,7 +113,7 @@ func testArgument() -> MyStruct {
   foo(x: 1, #^CALLARG^#
 }
 // CALLARG: Begin completions, 1 items
-// CALLARG-DAG: Pattern/ExprSpecific:               <callarg><callarg.label>y</callarg.label>: <callarg.type><typeid.sys>Int</typeid.sys></callarg.type></callarg>; typename=<typeid.sys>Int</typeid.sys>
+// CALLARG-DAG: Pattern/Local/Flair[ArgLabels]:               <callarg><callarg.label>y</callarg.label>: <callarg.type><typeid.sys>Int</typeid.sys></callarg.type></callarg>; typename=<typeid.sys>Int</typeid.sys>
 // CALLARG: End completions
 
 struct TestArchetypeAnnotations<T> {
@@ -125,14 +126,37 @@ func testArchetypeAnnotations<T>(arg: TestArchetypeAnnotations<T>) {
 }
 // GENERIC: Begin completions, 3 items
 // GENERIC-DAG: Keyword[self]/CurrNominal:          <keyword>self</keyword>; typename=<typeid.user>TestArchetypeAnnotations</typeid.user>&lt;<typeid.user>T</typeid.user>&gt;; name=self
-// GENERIC-DAG: Decl[InstanceMethod]/CurrNominal:   <name>foo1</name>(<callarg><callarg.label>u</callarg.label>: <callarg.type><typeid.user>U</typeid.user></callarg.type></callarg>, <callarg><callarg.label>t</callarg.label>: <callarg.type><typeid.user>T</typeid.user></callarg.type></callarg>); typename=<typeid.sys>Void</typeid.sys>; name=foo1(u: U, t: T)
-// GENERIC-DAG: Decl[InstanceMethod]/CurrNominal:   <name>foo2</name>(<callarg><callarg.label>s</callarg.label>: <callarg.type><typeid.sys>Sequence</typeid.sys></callarg.type></callarg>, <callarg><callarg.label>elt</callarg.label>: <callarg.type><typeid.sys>Sequence</typeid.sys>.<typeid.sys>Element</typeid.sys></callarg.type></callarg>); typename=<typeid.sys>Void</typeid.sys>; name=foo2(s: Sequence, elt: Sequence.Element)
+// GENERIC-DAG: Decl[InstanceMethod]/CurrNominal:   <name>foo1</name>(<callarg><callarg.label>u</callarg.label>: <callarg.type><typeid.user>U</typeid.user></callarg.type></callarg>, <callarg><callarg.label>t</callarg.label>: <callarg.type><typeid.user>T</typeid.user></callarg.type></callarg>); typename=<typeid.sys>Void</typeid.sys>; name=foo1(u:t:)
+// GENERIC-DAG: Decl[InstanceMethod]/CurrNominal:   <name>foo2</name>(<callarg><callarg.label>s</callarg.label>: <callarg.type><typeid.sys>Sequence</typeid.sys></callarg.type></callarg>, <callarg><callarg.label>elt</callarg.label>: <callarg.type><typeid.sys>Sequence</typeid.sys>.<typeid.sys>Element</typeid.sys></callarg.type></callarg>); typename=<typeid.sys>Void</typeid.sys>; name=foo2(s:elt:)
 // GENERIC: End completions
 
 struct TestGenericParamAnnotations<T> {
   func foo1<U>(u: U) where #^WHERE^#
 }
-// WHERE: Begin completions, 2 items
-// WHERE-NEXT: Decl[GenericTypeParam]/Local:       <name>T</name>; typename=<typeid.user>T</typeid.user>; name=T
-// WHERE-NEXT: Decl[GenericTypeParam]/Local:       <name>U</name>; typename=<typeid.user>U</typeid.user>; name=U
+// WHERE: Begin completions, 4 items
+// WHERE-DAG: Decl[GenericTypeParam]/Local:       <name>T</name>; typename=<typeid.user>T</typeid.user>; name=T
+// WHERE-DAG: Decl[GenericTypeParam]/Local:       <name>U</name>; typename=<typeid.user>U</typeid.user>; name=U
+// WHERE-DAG: Decl[Struct]/Local:                 <name>TestGenericParamAnnotations</name>;
+// WHERE-DAG: Keyword[Self]/CurrNominal:          <keyword>Self</keyword>;
 // WHERE: End completions
+
+protocol BaseP {
+  func protoMethod() -> @convention(c) (UInt8) -> Void
+  var value: MyStruct
+}
+class BaseC {
+  func baseMethodAsync(x: Int) async -> Int { }
+  func genericAsyncThrowsConstraint<T, U>(x: T) async throws -> U.Element where U: Collection, U.Element == Int {}
+  subscript(index: Int) -> (Int) -> Int { }
+}
+class DerivedC: BaseC, BaseP {
+  #^OVERRIDE^#
+// OVERRIDE-DAG: Keyword[func]/None:                 <keyword>func</keyword>; typename=; name=func; sourcetext=func
+// OVERRIDE-DAG: Decl[InstanceMethod]/Super:         <name>protoMethod</name>() -&gt; (<typeid.sys>UInt8</typeid.sys>) -&gt; <typeid.sys>Void</typeid.sys>; typename=; name=protoMethod(); sourcetext=func protoMethod() -> (UInt8) -> Void {\n<#code#>\n}
+// OVERRIDE-DAG: Decl[InstanceVar]/Super:            <name>value</name>: <typeid.user>MyStruct</typeid.user>; typename=; name=value; sourcetext=var value: MyStruct
+// OVERRIDE-DAG: Decl[InstanceMethod]/Super:         <name>baseMethodAsync</name>(<param><param.label>x</param.label>: <param.type><typeid.sys>Int</typeid.sys></param.type></param>) <keyword>async</keyword> -&gt; <typeid.sys>Int</typeid.sys>; typename=; name=baseMethodAsync(x:); sourcetext=override func baseMethodAsync(x: Int) async -> Int {\n<#code#>\n}
+// OVERRIDE-DAG: Decl[InstanceMethod]/Super:         <name>genericAsyncThrowsConstraint</name>&lt;T, U&gt;(<param><param.label>x</param.label>: <param.type><typeid.user>T</typeid.user></param.type></param>) <keyword>async</keyword> <keyword>throws</keyword> -&gt; <typeid.user>U</typeid.user>.<typeid.sys>Element</typeid.sys> <keyword>where</keyword> <typeid.user>U</typeid.user> : <typeid.sys>Collection</typeid.sys>, <typeid.user>U</typeid.user>.<typeid.sys>Element</typeid.sys> == <typeid.sys>Int</typeid.sys>; typename=; name=genericAsyncThrowsConstraint(x:); sourcetext=override func genericAsyncThrowsConstraint<T, U>(x: T) async throws -> U.Element where U : Collection, U.Element == Int {\n<#code#>\n}
+
+// OVERRIDE-DAG: Decl[Subscript]/Super:              <name>subscript</name>(<param><param.param>index</param.param>: <param.type><typeid.sys>Int</typeid.sys></param.type></param>) -&gt; (<typeid.sys>Int</typeid.sys>) -&gt; <typeid.sys>Int</typeid.sys>; typename=; name=subscript(:); sourcetext=override subscript(index: Int) -> (Int) -> Int {\n<#code#>\n}
+// OVERRIDE-DAG: Decl[Constructor]/Super:            <name>init</name>(); typename=; name=init(); sourcetext=override init() {\n<#code#>\n}
+}

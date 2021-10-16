@@ -11,10 +11,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "IRGenMangler.h"
+#include "GenClass.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/ProtocolAssociations.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/Basic/Platform.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/ABI/MetadataValues.h"
@@ -35,7 +37,7 @@ const char *getManglingForWitness(swift::Demangle::ValueWitnessKind kind) {
 
 std::string IRGenMangler::mangleValueWitness(Type type, ValueWitness witness) {
   beginMangling();
-  appendType(type);
+  appendType(type, nullptr);
 
   const char *Code = nullptr;
   switch (witness) {
@@ -91,13 +93,14 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
     CanSymbolicReferenceLocally(CanSymbolicReference);
 
   AllowSymbolicReferences = true;
-  CanSymbolicReference = [](SymbolicReferent s) -> bool {
+  CanSymbolicReference = [&](SymbolicReferent s) -> bool {
     if (auto type = s.dyn_cast<const NominalTypeDecl *>()) {
       // The short-substitution types in the standard library have compact
       // manglings already, and the runtime ought to have a lookup table for
       // them. Symbolic referencing would be wasteful.
-      if (type->getModuleContext()->isStdlibModule()
-          && Mangle::getStandardTypeSubst(type->getName().str())) {
+      if (type->getModuleContext()->hasStandardSubstitutions()
+          && Mangle::getStandardTypeSubst(
+               type->getName().str(), AllowConcurrencyStandardSubstitutions)) {
         return false;
       }
       
@@ -113,10 +116,16 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
       // TODO: We could assign a symbolic reference discriminator to refer
       // to objc class refs.
       if (auto clas = dyn_cast<ClassDecl>(type)) {
-        if (clas->hasClangNode()
-            && clas->getForeignClassKind() != ClassDecl::ForeignKind::CFType) {
-          return false;
-        }
+        // Swift-defined classes can be symbolically referenced.
+        if (hasKnownSwiftMetadata(IGM, const_cast<ClassDecl*>(clas)))
+          return true;
+
+        // Foreign class types can be symbolically referenced.
+        if (clas->getForeignClassKind() == ClassDecl::ForeignKind::CFType)
+          return true;
+
+        // Otherwise no.
+        return false;
       }
 
       return true;
@@ -137,9 +146,23 @@ IRGenMangler::withSymbolicReferences(IRGenModule &IGM,
 
 SymbolicMangling
 IRGenMangler::mangleTypeForReflection(IRGenModule &IGM,
-                                      Type Ty) {
+                                      CanGenericSignature Sig,
+                                      CanType Ty) {
+  // If our target predates Swift 5.5, we cannot apply the standard
+  // substitutions for types defined in the Concurrency module.
+  ASTContext &ctx = Ty->getASTContext();
+  llvm::SaveAndRestore<bool> savedConcurrencyStandardSubstitutions(
+      AllowConcurrencyStandardSubstitutions);
+  if (auto runtimeCompatVersion = getSwiftRuntimeCompatibilityVersionForTarget(
+          ctx.LangOpts.Target)) {
+    if (*runtimeCompatVersion < llvm::VersionTuple(5, 5))
+      AllowConcurrencyStandardSubstitutions = false;
+  }
+
+  llvm::SaveAndRestore<bool> savedAllowMarkerProtocols(
+      AllowMarkerProtocols, false);
   return withSymbolicReferences(IGM, [&]{
-    appendType(Ty);
+    appendType(Ty, Sig);
   });
 }
 
@@ -159,6 +182,14 @@ std::string IRGenMangler::mangleProtocolConformanceDescriptor(
   return finalize();
 }
 
+std::string IRGenMangler::mangleProtocolConformanceDescriptorRecord(
+                                 const RootProtocolConformance *conformance) {
+  beginMangling();
+  appendProtocolConformance(conformance);
+  appendOperator("Hc");
+  return finalize();
+}
+
 std::string IRGenMangler::mangleProtocolConformanceInstantiationCache(
                                  const RootProtocolConformance *conformance) {
   beginMangling();
@@ -174,20 +205,6 @@ std::string IRGenMangler::mangleProtocolConformanceInstantiationCache(
   return finalize();
 }
 
-SymbolicMangling
-IRGenMangler::mangleProtocolConformanceForReflection(IRGenModule &IGM,
-                                  Type ty, ProtocolConformanceRef conformance) {
-  return withSymbolicReferences(IGM, [&]{
-    if (conformance.isConcrete()) {
-      appendProtocolConformance(conformance.getConcrete());
-    } else {
-      // Use a special mangling for abstract conformances.
-      appendType(ty);
-      appendProtocolName(conformance.getAbstract());
-    }
-  });
-}
-
 std::string IRGenMangler::mangleTypeForLLVMTypeName(CanType Ty) {
   // To make LLVM IR more readable we always add a 'T' prefix so that type names
   // don't start with a digit and don't need to be quoted.
@@ -196,7 +213,7 @@ std::string IRGenMangler::mangleTypeForLLVMTypeName(CanType Ty) {
     appendProtocolName(P->getDecl(), /*allowStandardSubstitution=*/false);
     appendOperator("P");
   } else {
-    appendType(Ty);
+    appendType(Ty, nullptr);
   }
   return finalize();
 }
@@ -229,7 +246,7 @@ mangleProtocolForLLVMTypeName(ProtocolCompositionType *type) {
           ->getDeclaredType();
       }
 
-      appendType(CanType(superclass));
+      appendType(CanType(superclass), nullptr);
       appendOperator("Xc");
     } else if (layout.getLayoutConstraint()) {
       appendOperator("Xl");
@@ -310,7 +327,7 @@ std::string IRGenMangler::mangleSymbolNameForMangledMetadataAccessorString(
     appendGenericSignature(genericSig);
 
   if (type)
-    appendType(type);
+    appendType(type, genericSig);
   return finalize();
 }
 

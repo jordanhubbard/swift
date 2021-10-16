@@ -18,6 +18,7 @@
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/AccessScope.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/Effects.h"
 #include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignAsyncConvention.h"
@@ -117,7 +118,7 @@ std::pair<bool, Expr *> dispatchVisitPreExprHelper(
   if (V.shouldVerify(node)) {
     // Record any inout_to_pointer or array_to_pointer that we see in
     // the proper position.
-    V.maybeRecordValidPointerConversion(node, node->getArg());
+    V.maybeRecordValidPointerConversion(node->getArgs());
     return {true, node};
   }
   V.cleanup(node);
@@ -133,7 +134,7 @@ std::pair<bool, Expr *> dispatchVisitPreExprHelper(
   if (V.shouldVerify(node)) {
     // Record any inout_to_pointer or array_to_pointer that we see in
     // the proper position.
-    V.maybeRecordValidPointerConversion(node, node->getIndex());
+    V.maybeRecordValidPointerConversion(node->getArgs());
     return {true, node};
   }
   V.cleanup(node);
@@ -149,7 +150,7 @@ std::pair<bool, Expr *> dispatchVisitPreExprHelper(
   if (V.shouldVerify(node)) {
     // Record any inout_to_pointer or array_to_pointer that we see in
     // the proper position.
-    V.maybeRecordValidPointerConversion(node, node->getSingleExpressionBody());
+    V.maybeRecordValidPointerConversionForArg(node->getSingleExpressionBody());
     return {true, node};
   }
   V.cleanup(node);
@@ -229,7 +230,7 @@ class Verifier : public ASTWalker {
   typedef llvm::PointerIntPair<DeclContext *, 1, bool> ClosureDiscriminatorKey;
   llvm::DenseMap<ClosureDiscriminatorKey, SmallBitVector>
       ClosureDiscriminators;
-  DeclContext *CanonicalTopLevelContext = nullptr;
+  DeclContext *CanonicalTopLevelSubcontext = nullptr;
 
   Verifier(PointerUnion<ModuleDecl *, SourceFile *> M, DeclContext *DC)
       : M(M),
@@ -474,7 +475,7 @@ public:
       case AbstractFunctionDecl::BodyKind::None:
       case AbstractFunctionDecl::BodyKind::TypeChecked:
       case AbstractFunctionDecl::BodyKind::Skipped:
-      case AbstractFunctionDecl::BodyKind::MemberwiseInitializer:
+      case AbstractFunctionDecl::BodyKind::SILSynthesize:
       case AbstractFunctionDecl::BodyKind::Deserialized:
         return true;
 
@@ -898,9 +899,9 @@ public:
     DeclContext *getCanonicalDeclContext(DeclContext *DC) {
       // All we really need to do is use a single TopLevelCodeDecl.
       if (auto topLevel = dyn_cast<TopLevelCodeDecl>(DC)) {
-        if (!CanonicalTopLevelContext)
-          CanonicalTopLevelContext = topLevel;
-        return CanonicalTopLevelContext;
+        if (!CanonicalTopLevelSubcontext)
+          CanonicalTopLevelSubcontext = topLevel;
+        return CanonicalTopLevelSubcontext;
       }
 
       // TODO: check for uniqueness of initializer contexts?
@@ -1041,9 +1042,7 @@ public:
       case StmtConditionElement::CK_Boolean: {
         auto *E = elt.getBoolean();
         if (shouldVerifyChecked(E))
-          checkSameType(E->getType(),
-                        Ctx.getBoolDecl()->getDeclaredInterfaceType(),
-                        "condition type");
+          checkSameType(E->getType(), Ctx.getBoolType(), "condition type");
         break;
       }
 
@@ -1137,6 +1136,7 @@ public:
     }
 
     void verifyChecked(TupleExpr *E) {
+      PrettyStackTraceExpr debugStack(Ctx, "verifying TupleExpr", E);
       const TupleType *exprTy = E->getType()->castTo<TupleType>();
       for_each(exprTy->getElements().begin(), exprTy->getElements().end(),
                E->getElements().begin(),
@@ -1149,8 +1149,14 @@ public:
           Out << elt->getType() << "\n";
           abort();
         }
+        if (!field.getParameterFlags().isNone()) {
+          Out << "TupleExpr has non-empty parameter flags?\n";
+          Out << "sub expr: \n";
+          elt->dump(Out);
+          Out << "\n";
+          abort();
+        }
       });
-      // FIXME: Check all the variadic elements.
       verifyCheckedBase(E);
     }
 
@@ -1385,8 +1391,7 @@ public:
       
       // Ensure we don't convert an array to a void pointer this way.
       
-      if (fromElement->getNominalOrBoundGenericNominal() == Ctx.getArrayDecl()
-          && toElement->isEqual(Ctx.TheEmptyTupleType)) {
+      if (fromElement->isArray() && toElement->isVoid()) {
         Out << "InOutToPointer is converting an array to a void pointer; "
                "ArrayToPointer should be used instead:\n";
         E->dump(Out);
@@ -1409,7 +1414,7 @@ public:
       // The source may be optionally inout.
       auto fromArray = E->getSubExpr()->getType()->getInOutObjectType();
       
-      if (fromArray->getNominalOrBoundGenericNominal() != Ctx.getArrayDecl()) {
+      if (!fromArray->isArray()) {
         Out << "ArrayToPointer does not convert from array:\n";
         E->dump(Out);
         Out << "\n";
@@ -1430,8 +1435,7 @@ public:
       PrettyStackTraceExpr debugStack(Ctx,
                                       "verifying StringToPointer", E);
       
-      if (E->getSubExpr()->getType()->getNominalOrBoundGenericNominal()
-            != Ctx.getStringDecl()) {
+      if (!E->getSubExpr()->getType()->isString()) {
         Out << "StringToPointer does not convert from string:\n";
         E->dump(Out);
         Out << "\n";
@@ -1678,87 +1682,71 @@ public:
       verifyCheckedBase(E);
     }
 
-    void maybeRecordValidPointerConversion(Expr *Base, Expr *Arg) {
-      auto handleSubExpr = [&](Expr *origSubExpr) {
-        auto subExpr = origSubExpr;
-        unsigned optionalDepth = 0;
+    void maybeRecordValidPointerConversionForArg(Expr *argExpr) {
+      auto *subExpr = argExpr;
+      unsigned optionalDepth = 0;
 
-        auto checkIsBindOptional = [&](Expr *expr) {
-          for (unsigned depth = optionalDepth; depth; --depth) {
-            if (auto bind = dyn_cast<BindOptionalExpr>(expr)) {
-              expr = bind->getSubExpr();
-            } else {
-              Out << "malformed optional pointer conversion\n";
-              origSubExpr->dump(Out);
-              Out << '\n';
-              abort();
-            }
-          }
-        };
-
-        // FIXME: This doesn't seem like a particularly robust
-        //        approach to tracking whether pointer conversions
-        //        always appear as call arguments.
-        while (true) {
-          // Look through optional evaluations.
-          if (auto *optionalEval = dyn_cast<OptionalEvaluationExpr>(subExpr)) {
-            subExpr = optionalEval->getSubExpr();
-            ++optionalDepth;
-            continue;
-          }
-
-          // Look through injections into Optional<Pointer>.
-          if (auto *injectIntoOpt = dyn_cast<InjectIntoOptionalExpr>(subExpr)) {
-            subExpr = injectIntoOpt->getSubExpr();
-            continue;
-          }
-
-          // FIXME: This is only handling the value conversion, not
-          //        the key conversion. What this verifier check
-          //        should probably do is just track whether we're
-          //        currently visiting arguments of an apply when we
-          //        find these conversions.
-          if (auto *upcast =
-                  dyn_cast<CollectionUpcastConversionExpr>(subExpr)) {
-            subExpr = upcast->getValueConversion().Conversion;
-            continue;
-          }
-
-          break;
+      // FIXME: This doesn't seem like a particularly robust
+      //        approach to tracking whether pointer conversions
+      //        always appear as call arguments.
+      while (true) {
+        // Look through optional evaluations.
+        if (auto *optionalEval = dyn_cast<OptionalEvaluationExpr>(subExpr)) {
+          subExpr = optionalEval->getSubExpr();
+          ++optionalDepth;
+          continue;
         }
 
-        // Record inout-to-pointer conversions.
-        if (auto *inOutToPtr = dyn_cast<InOutToPointerExpr>(subExpr)) {
-          ValidInOutToPointerExprs.insert(inOutToPtr);
-          checkIsBindOptional(inOutToPtr->getSubExpr());
-          return;
+        // Look through injections into Optional<Pointer>.
+        if (auto *injectIntoOpt = dyn_cast<InjectIntoOptionalExpr>(subExpr)) {
+          subExpr = injectIntoOpt->getSubExpr();
+          continue;
         }
 
-        // Record array-to-pointer conversions.
-        if (auto *arrayToPtr = dyn_cast<ArrayToPointerExpr>(subExpr)) {
-          ValidArrayToPointerExprs.insert(arrayToPtr);
-          checkIsBindOptional(arrayToPtr->getSubExpr());
-          return;
+        // FIXME: This is only handling the value conversion, not
+        //        the key conversion. What this verifier check
+        //        should probably do is just track whether we're
+        //        currently visiting arguments of an apply when we
+        //        find these conversions.
+        if (auto *upcast = dyn_cast<CollectionUpcastConversionExpr>(subExpr)) {
+          subExpr = upcast->getValueConversion().Conversion;
+          continue;
+        }
+
+        break;
+      }
+
+      auto checkIsBindOptional = [&](Expr *expr) {
+        for (unsigned depth = optionalDepth; depth; --depth) {
+          if (auto bind = dyn_cast<BindOptionalExpr>(expr)) {
+            expr = bind->getSubExpr();
+          } else {
+            Out << "malformed optional pointer conversion\n";
+            argExpr->dump(Out);
+            Out << '\n';
+            abort();
+          }
         }
       };
 
-      if (auto *ParentExprArg = dyn_cast<ParenExpr>(Arg)) {
-        return handleSubExpr(ParentExprArg->getSubExpr());
-      }
-
-      if (auto *TupleArg = dyn_cast<TupleExpr>(Arg)) {
-        for (auto *SubExpr : TupleArg->getElements()) {
-          handleSubExpr(SubExpr);
-        }
+      // Record inout-to-pointer conversions.
+      if (auto *inOutToPtr = dyn_cast<InOutToPointerExpr>(subExpr)) {
+        ValidInOutToPointerExprs.insert(inOutToPtr);
+        checkIsBindOptional(inOutToPtr->getSubExpr());
         return;
       }
 
-      // Otherwise, just run it through handle sub expr. This case can happen if
-      // we have an autoclosure.
-      if (isa<AutoClosureExpr>(Base)) {
-        handleSubExpr(Arg);
+      // Record array-to-pointer conversions.
+      if (auto *arrayToPtr = dyn_cast<ArrayToPointerExpr>(subExpr)) {
+        ValidArrayToPointerExprs.insert(arrayToPtr);
+        checkIsBindOptional(arrayToPtr->getSubExpr());
         return;
       }
+    }
+
+    void maybeRecordValidPointerConversion(ArgumentList *argList) {
+      for (auto arg : *argList)
+        maybeRecordValidPointerConversionForArg(arg.getExpr());
     }
 
     void verifyChecked(ApplyExpr *E) {
@@ -1781,14 +1769,10 @@ public:
         abort();
       }
 
-      SmallVector<AnyFunctionType::Param, 8> Args;
-      Type InputExprTy = E->getArg()->getType();
-      AnyFunctionType::decomposeInput(InputExprTy, Args);
-      auto Params = FT->getParams();
-      if (!AnyFunctionType::equalParams(Args, Params)) {
-        Out << "Argument type does not match parameter type in ApplyExpr:"
-               "\nArgument type: ";
-        InputExprTy.print(Out);
+      if (!E->getArgs()->matches(FT->getParams())) {
+        Out << "Argument list does not match parameters in ApplyExpr:"
+               "\nArgument list: ";
+        E->getArgs()->dump(Out);
         Out << "\nParameter types: ";
         AnyFunctionType::printParams(FT->getParams(), Out);
         Out << "\n";
@@ -1802,20 +1786,28 @@ public:
         E->dump(Out);
         Out << "\n";
         abort();
-      } else if (E->throws() && !FT->isThrowing()) {
-        Out << "apply expression is marked as throwing, but function operand"
-               "does not have a throwing function type\n";
-        E->dump(Out);
-        Out << "\n";
-        abort();
+      } else if (E->throws() && !FT->isThrowing() && !E->implicitlyThrows()) {
+        PolymorphicEffectKind rethrowingKind = PolymorphicEffectKind::Invalid;
+        if (auto DRE = dyn_cast<DeclRefExpr>(E->getFn())) {
+          if (auto fnDecl = dyn_cast<AbstractFunctionDecl>(DRE->getDecl())) {
+            rethrowingKind = fnDecl->getPolymorphicEffectKind(EffectKind::Throws);
+          }
+        } else if (auto OCDRE = dyn_cast<OtherConstructorDeclRefExpr>(E->getFn())) {
+          if (auto fnDecl = dyn_cast<AbstractFunctionDecl>(OCDRE->getDecl())) {
+            rethrowingKind = fnDecl->getPolymorphicEffectKind(EffectKind::Throws);
+          }
+        }
+
+        if (rethrowingKind != PolymorphicEffectKind::ByConformance &&
+            rethrowingKind != PolymorphicEffectKind::Always) {
+          Out << "apply expression is marked as throwing, but function operand"
+                 "does not have a throwing function type\n";
+          E->dump(Out);
+          Out << "\n";
+          abort();
+        }
       }
 
-      if (E->isSuper() != E->getArg()->isSuperExpr()) {
-        Out << "Function application's isSuper() bit mismatch.\n";
-        E->dump(Out);
-        Out << "\n";
-        abort();
-      }
       verifyCheckedBase(E);
     }
 
@@ -1980,6 +1972,20 @@ public:
         abort();
       }
 
+      verifyCheckedBase(E);
+    }
+
+    void verifyChecked(ParenExpr *E) {
+      PrettyStackTraceExpr debugStack(Ctx, "verifying ParenExpr", E);
+      auto ty = dyn_cast<ParenType>(E->getType().getPointer());
+      if (!ty) {
+        Out << "ParenExpr not of ParenType\n";
+        abort();
+      }
+      if (!ty->getParameterFlags().isNone()) {
+        Out << "ParenExpr has non-empty parameter flags?\n";
+        abort();
+      }
       verifyCheckedBase(E);
     }
 
@@ -2157,8 +2163,13 @@ public:
         abort();
       }
 
-      auto callArgTy = call->getArg()->getType()->getAs<FunctionType>();
-      if (!callArgTy) {
+      auto *unaryArg = call->getArgs()->getUnaryExpr();
+      if (!unaryArg) {
+        Out << "MakeTemporarilyEscapableExpr doesn't have a unary argument\n";
+        abort();
+      }
+
+      if (!unaryArg->getType()->is<FunctionType>()) {
         Out << "MakeTemporarilyEscapableExpr call argument is not a function\n";
         abort();
       }
@@ -2197,22 +2208,20 @@ public:
       auto keyPathTy = E->getKeyPath()->getType();
       auto resultTy = E->getType();
       
-      if (auto nom = keyPathTy->getAs<NominalType>()) {
-        if (nom->getDecl() == Ctx.getAnyKeyPathDecl()) {
-          // AnyKeyPath application is <T> rvalue T -> rvalue Any?
-          if (baseTy->is<LValueType>()) {
-            Out << "AnyKeyPath application base is not an rvalue\n";
-            abort();
-          }
-          auto resultObjTy = resultTy->getOptionalObjectType();
-          if (!resultObjTy || !resultObjTy->isAny()) {
-            Out << "AnyKeyPath application result must be Any?\n";
-            abort();
-          }
-          return;
+      if (keyPathTy->isAnyKeyPath()) {
+        // AnyKeyPath application is <T> rvalue T -> rvalue Any?
+        if (baseTy->is<LValueType>()) {
+          Out << "AnyKeyPath application base is not an rvalue\n";
+          abort();
         }
+        auto resultObjTy = resultTy->getOptionalObjectType();
+        if (!resultObjTy || !resultObjTy->isAny()) {
+          Out << "AnyKeyPath application result must be Any?\n";
+          abort();
+        }
+        return;
       } else if (auto bgt = keyPathTy->getAs<BoundGenericType>()) {
-        if (bgt->getDecl() == Ctx.getPartialKeyPathDecl()) {
+        if (keyPathTy->isPartialKeyPath()) {
           // PartialKeyPath<T> application is rvalue T -> rvalue Any
           if (!baseTy->isEqual(bgt->getGenericArgs()[0])) {
             Out << "PartialKeyPath application base doesn't match type\n";
@@ -2223,7 +2232,7 @@ public:
             abort();
           }
           return;
-        } else if (bgt->getDecl() == Ctx.getKeyPathDecl()) {
+        } else if (keyPathTy->isKeyPath()) {
           // KeyPath<T, U> application is rvalue T -> rvalue U
           if (!baseTy->isEqual(bgt->getGenericArgs()[0])) {
             Out << "KeyPath application base doesn't match type\n";
@@ -2234,7 +2243,7 @@ public:
             abort();
           }
           return;
-        } else if (bgt->getDecl() == Ctx.getWritableKeyPathDecl()) {
+        } else if (keyPathTy->isWritableKeyPath()) {
           // WritableKeyPath<T, U> application is
           //    lvalue T -> lvalue U
           // or rvalue T -> rvalue U
@@ -2256,7 +2265,7 @@ public:
             abort();
           }
           return;
-        } else if (bgt->getDecl() == Ctx.getReferenceWritableKeyPathDecl()) {
+        } else if (keyPathTy->isReferenceWritableKeyPath()) {
           // ReferenceWritableKeyPath<T, U> application is
           //    rvalue T -> lvalue U
           // or lvalue T -> lvalue U
@@ -2620,6 +2629,41 @@ public:
         abort();
       }
 
+      // Tracking for those Objective-C requirements that have witnesses.
+      llvm::SmallDenseSet<std::pair<ObjCSelector, char>> hasObjCWitnessMap;
+      bool populatedObjCWitnesses = false;
+      auto populateObjCWitnesses = [&] {
+        if (populatedObjCWitnesses)
+          return;
+
+        populatedObjCWitnesses = true;
+        for (auto req : proto->getMembers()) {
+          if (auto reqFunc = dyn_cast<AbstractFunctionDecl>(req)) {
+            if (normal->hasWitness(reqFunc)) {
+              hasObjCWitnessMap.insert(
+                  {reqFunc->getObjCSelector(), reqFunc->isInstanceMember()});
+            }
+          }
+        }
+      };
+
+      // Check whether there is a witness with the same selector and kind as
+      // this requirement.
+      auto hasObjCWitness = [&](ValueDecl *req) {
+        if (!proto->isObjC())
+          return false;
+
+        auto func = dyn_cast<AbstractFunctionDecl>(req);
+        if (!func)
+          return false;
+
+        populateObjCWitnesses();
+
+        std::pair<ObjCSelector, char> key(
+            func->getObjCSelector(), func->isInstanceMember());
+        return hasObjCWitnessMap.count(key) > 0;
+      };
+
       // Check that a normal protocol conformance is complete.
       for (auto member : proto->getMembers()) {
         if (auto assocType = dyn_cast<AssociatedTypeDecl>(member)) {
@@ -2649,7 +2693,6 @@ public:
         if (isa<AccessorDecl>(member))
           continue;
 
-
         if (auto req = dyn_cast<ValueDecl>(member)) {
           if (!normal->hasWitness(req)) {
             if ((req->getAttrs().isUnavailable(Ctx) ||
@@ -2657,6 +2700,10 @@ public:
                 proto->isObjC()) {
               continue;
             }
+
+            // Check if *any* witness matches the Objective-C selector.
+            if (hasObjCWitness(req))
+              continue;
 
             dumpRef(decl);
             Out << " is missing witness for "
@@ -2699,8 +2746,7 @@ public:
             abort();
           }
 
-          auto reqProto =
-            req.getSecondType()->castTo<ProtocolType>()->getDecl();
+          auto reqProto = req.getProtocolDecl();
           if (reqProto != conformances[idx].getRequirement()) {
             Out << "error: wrong protocol in signature conformances: have "
               << conformances[idx].getRequirement()->getName().str()
@@ -2893,8 +2939,7 @@ public:
       // Verify that the optionality of the result type of the
       // initializer matches the failability of the initializer.
       if (!CD->isInvalid() &&
-          CD->getDeclContext()->getDeclaredInterfaceType()->getAnyNominal() !=
-              Ctx.getOptionalDecl()) {
+          !CD->getDeclContext()->getDeclaredInterfaceType()->isOptional()) {
         bool resultIsOptional = (bool) CD->getResultInterfaceType()
             ->getOptionalObjectType();
         auto declIsOptional = CD->isFailable();
@@ -3634,15 +3679,36 @@ public:
   };
 } // end anonymous namespace
 
+static bool shouldVerifyGivenContext(const ASTContext &ctx) {
+  using ASTVerifierOverrideKind = LangOptions::ASTVerifierOverrideKind;
+  switch (ctx.LangOpts.ASTVerifierOverride) {
+  case ASTVerifierOverrideKind::EnableVerifier:
+    return true;
+  case ASTVerifierOverrideKind::DisableVerifier:
+    return false;
+  case ASTVerifierOverrideKind::NoOverride:
+#ifndef NDEBUG
+    // asserts. Default behavior is to run.
+    return true;
+#else
+    // no-asserts. Default behavior is not to run the verifier.
+    return false;
+#endif
+  }
+  llvm_unreachable("Covered switch isn't covered?!");
+}
+
 void swift::verify(SourceFile &SF) {
-#if !(defined(NDEBUG) || defined(SWIFT_DISABLE_AST_VERIFIER))
+  if (!shouldVerifyGivenContext(SF.getASTContext()))
+    return;
   Verifier verifier(SF, &SF);
   SF.walk(verifier);
-#endif
 }
 
 bool swift::shouldVerify(const Decl *D, const ASTContext &Context) {
-#if !(defined(NDEBUG) || defined(SWIFT_DISABLE_AST_VERIFIER))
+  if (!shouldVerifyGivenContext(Context))
+    return false;
+
   if (const auto *ED = dyn_cast<ExtensionDecl>(D)) {
     return shouldVerify(ED->getExtendedNominal(), Context);
   }
@@ -3654,15 +3720,13 @@ bool swift::shouldVerify(const Decl *D, const ASTContext &Context) {
   }
 
   return true;
-#else
-  return false;
-#endif
 }
 
 void swift::verify(Decl *D) {
-#if !(defined(NDEBUG) || defined(SWIFT_DISABLE_AST_VERIFIER))
+  if (!shouldVerifyGivenContext(D->getASTContext()))
+    return;
+
   Verifier V = Verifier::forDecl(D);
   D->walk(V);
-#endif
 }
 

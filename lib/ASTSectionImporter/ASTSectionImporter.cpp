@@ -17,6 +17,7 @@
 
 #include "swift/ASTSectionImporter/ASTSectionImporter.h"
 #include "../Serialization/ModuleFormat.h"
+#include "swift/AST/ASTContext.h"
 #include "swift/Basic/Dwarf.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/Serialization/Validation.h"
@@ -34,7 +35,8 @@ bool swift::parseASTSection(MemoryBufferSerializedModuleLoader &Loader,
   // An AST section consists of one or more AST modules, optionally with
   // headers. Iterate over all AST modules.
   while (!buf.empty()) {
-    auto info = serialization::validateSerializedAST(buf);
+    auto info = serialization::validateSerializedAST(
+        buf, Loader.isRequiredOSSAModules());
 
     assert(info.name.size() < (2 << 10) && "name failed sanity check");
 
@@ -46,7 +48,8 @@ bool swift::parseASTSection(MemoryBufferSerializedModuleLoader &Loader,
           llvm::MemoryBuffer::getMemBuffer(moduleData, info.name, false));
 
         // Register the memory buffer.
-        Loader.registerMemoryBuffer(info.name, std::move(bitstream));
+        Loader.registerMemoryBuffer(info.name, std::move(bitstream),
+                                    info.userModuleVersion);
         foundModules.push_back(info.name.str());
       }
     } else {

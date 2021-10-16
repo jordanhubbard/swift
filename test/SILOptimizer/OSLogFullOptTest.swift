@@ -1,7 +1,8 @@
-// RUN: %target-swift-frontend -emit-ir -swift-version 5 -O -primary-file %s | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-ptrsize
+// RUN: %target-swift-frontend -emit-ir -swift-version 5 -O -enable-copy-propagation -primary-file %s | %FileCheck %s --check-prefix=CHECK --check-prefix=CHECK-%target-ptrsize
 //
 // REQUIRES: VENDOR=apple
 // REQUIRES: swift_stdlib_no_asserts
+// REQUIRES: PTRSIZE=64
 
 // This tests the optimality of the IR generated for the new os log APIs. This
 // is not testing the output of a specific optimization pass (which has separate
@@ -132,9 +133,7 @@ func testNSObjectInterpolation(nsArray: NSArray) {
     // TODO: check why the ARC optimizer cannot eliminate the many retain/release pairs here.
     // CHECK: entry:
     // CHECK-NEXT: bitcast %TSo7NSArrayC* %0 to i8*
-    // CHECK-NEXT: tail call i8* @llvm.objc.retain
     // CHECK-NEXT: [[NSARRAY_ARG:%.+]] = tail call i8* @llvm.objc.retain
-    // CHECK: tail call %swift.refcounted* @swift_retain
     // CHECK: tail call swiftcc i1 @"${{.*}}isLoggingEnabled{{.*}}"()
     // CHECK-NEXT: br i1 {{%.*}}, label %[[ENABLED:[0-9]+]], label %[[NOT_ENABLED:[0-9]+]]
 
@@ -171,7 +170,6 @@ func testNSObjectInterpolation(nsArray: NSArray) {
     // CHECK-NEXT: [[BITCASTED_SRC2:%.+]] = bitcast i8* [[NSARRAY_ARG]] to %TSo7NSArrayC*
     // CHECK-64-NEXT: store %TSo7NSArrayC* [[BITCASTED_SRC2]], %TSo7NSArrayC** [[BITCASTED_DEST2]], align 8
     // CHECK-32-NEXT: store %TSo7NSArrayC* [[BITCASTED_SRC2]], %TSo7NSArrayC** [[BITCASTED_DEST2]], align 4
-
     // CHECK-64-NEXT: tail call swiftcc void @"${{.*}}_os_log_impl_test{{.*}}"({{.*}}, {{.*}}, {{.*}}, {{.*}}, i8* getelementptr inbounds ([20 x i8], [20 x i8]* @{{.*}}, i64 0, i64 0), i8* {{(nonnull )?}}[[BUFFER]], i32 12)
     // CHECK-32-NEXT: tail call swiftcc void @"${{.*}}_os_log_impl_test{{.*}}"({{.*}}, {{.*}}, {{.*}}, {{.*}}, i8* getelementptr inbounds ([20 x i8], [20 x i8]* @{{.*}}, i32 0, i32 0), i8* {{(nonnull )?}}[[BUFFER]], i32 8)
     // CHECK-NEXT: [[BITCASTED_OBJ_STORAGE:%.+]] = bitcast i8* [[OBJ_STORAGE]] to %swift.opaque*
@@ -182,8 +180,6 @@ func testNSObjectInterpolation(nsArray: NSArray) {
     // CHECK-NEXT: br label %[[EXIT]]
   
     // CHECK: [[EXIT]]:
-    // CHECK-NEXT: tail call void @llvm.objc.release(i8* [[NSARRAY_ARG]])
-    // CHECK-NEXT: tail call void @swift_release
     // CHECK-NEXT: ret void
 }
 
@@ -351,7 +347,7 @@ func testMetatypeInterpolation<T>(of type: T.Type) {
 
     // CHECK: [[NOT_ENABLED]]:
     // CHECK-NEXT: call void @swift_release
-    // CHECK-NEXT: br label %[[EXIT:[0-9]+]]
+    // CHECK: br label %[[EXIT:[0-9]+]]
 
     // CHECK: [[ENABLED]]:
     //

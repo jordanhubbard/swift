@@ -36,6 +36,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Defer.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Parse/Lexer.h"
@@ -88,18 +89,16 @@ static bool isKeyPathCurriedThunkCallExpr(Expr *E) {
       thunk->getParameters()->get(0)->getParameterName().str() != "$kp$")
     return false;
 
-  auto PE = dyn_cast<ParenExpr>(CE->getArg());
-  if (!PE)
+  auto *unaryArg = CE->getArgs()->getUnlabeledUnaryExpr();
+  if (!unaryArg)
     return false;
-  return isa<KeyPathExpr>(PE->getSubExpr());
+  return isa<KeyPathExpr>(unaryArg);
 }
 
 // Extract the keypath expression from the curried thunk expression.
 static Expr *extractKeyPathFromCurryThunkCall(Expr *E) {
   assert(isKeyPathCurriedThunkCallExpr(E));
-  auto call = cast<CallExpr>(E);
-  auto arg = cast<ParenExpr>(call->getArg());
-  return arg->getSubExpr();
+  return cast<CallExpr>(E)->getArgs()->getUnlabeledUnaryExpr();
 }
 
 namespace {
@@ -117,6 +116,13 @@ public:
   SanitizeExpr(ASTContext &C,
                bool shouldReusePrecheckedType)
     : C(C), ShouldReusePrecheckedType(shouldReusePrecheckedType) { }
+
+  std::pair<bool, ArgumentList *>
+  walkToArgumentListPre(ArgumentList *argList) override {
+    // Return the argument list to the state prior to being rewritten. This will
+    // strip default arguments and expand variadic args.
+    return {true, argList->getOriginalArgs()};
+  }
 
   std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
     while (true) {
@@ -197,42 +203,33 @@ public:
         EPE->setSemanticExpr(nullptr);
       }
 
-      // Strip default arguments and varargs from type-checked call
-      // argument lists.
-      if (isa<ParenExpr>(expr) || isa<TupleExpr>(expr)) {
-        if (shouldSanitizeArgumentList(expr))
-          expr = sanitizeArgumentList(expr);
-      }
-
       // If this expression represents keypath based dynamic member
       // lookup, let's convert it back to the original form of
       // member or subscript reference.
       if (auto *SE = dyn_cast<SubscriptExpr>(expr)) {
-        if (auto *TE = dyn_cast<TupleExpr>(SE->getIndex())) {
-          auto isImplicitKeyPathExpr = [](Expr *argExpr) -> bool {
-            if (auto *KP = dyn_cast<KeyPathExpr>(argExpr))
-              return KP->isImplicit();
-            return false;
-          };
+        auto *args = SE->getArgs();
+        auto isImplicitKeyPathExpr = [](Expr *argExpr) -> bool {
+          if (auto *KP = dyn_cast<KeyPathExpr>(argExpr))
+            return KP->isImplicit();
+          return false;
+        };
 
-          if (TE->isImplicit() && TE->getNumElements() == 1 &&
-              TE->getElementName(0) == C.Id_dynamicMember &&
-              isImplicitKeyPathExpr(TE->getElement(0))) {
-            auto *keyPathExpr = cast<KeyPathExpr>(TE->getElement(0));
-            auto *componentExpr = keyPathExpr->getParsedPath();
+        if (SE->isImplicit() && args->isUnary() &&
+            args->front().getLabel() == C.Id_dynamicMember &&
+            isImplicitKeyPathExpr(args->front().getExpr())) {
+          auto *keyPathExpr = cast<KeyPathExpr>(args->front().getExpr());
+          auto *componentExpr = keyPathExpr->getParsedPath();
 
-            if (auto *UDE = dyn_cast<UnresolvedDotExpr>(componentExpr)) {
-              UDE->setBase(SE->getBase());
-              return {true, UDE};
-            }
-
-            if (auto *subscript = dyn_cast<SubscriptExpr>(componentExpr)) {
-              subscript->setBase(SE->getBase());
-              return {true, subscript};
-            }
-
-            llvm_unreachable("unknown keypath component type");
+          if (auto *UDE = dyn_cast<UnresolvedDotExpr>(componentExpr)) {
+            UDE->setBase(SE->getBase());
+            return {true, UDE};
           }
+
+          if (auto *subscript = dyn_cast<SubscriptExpr>(componentExpr)) {
+            subscript->setBase(SE->getBase());
+            return {true, subscript};
+          }
+          llvm_unreachable("unknown keypath component type");
         }
       }
 
@@ -241,62 +238,14 @@ public:
       if (auto closure = dyn_cast<ClosureExpr>(expr)) {
         if (!shouldTypeCheckInEnclosingExpression(closure))
           return { false, expr };
+        for (auto &Param : *closure->getParameters()) {
+          Param->setSpecifier(swift::ParamSpecifier::Default);
+        }
       }
 
       // Now, we're ready to walk into sub expressions.
       return {true, expr};
     }
-  }
-
-  bool isSyntheticArgumentExpr(const Expr *expr) {
-    if (isa<DefaultArgumentExpr>(expr))
-      return true;
-
-    if (auto *varargExpr = dyn_cast<VarargExpansionExpr>(expr))
-      if (isa<ArrayExpr>(varargExpr->getSubExpr()))
-        return true;
-
-    return false;
-  }
-
-  bool shouldSanitizeArgumentList(const Expr *expr) {
-    if (auto *parenExpr = dyn_cast<ParenExpr>(expr)) {
-      return isSyntheticArgumentExpr(parenExpr->getSubExpr());
-    } else if (auto *tupleExpr = dyn_cast<TupleExpr>(expr)) {
-      for (auto *arg : tupleExpr->getElements()) {
-        if (isSyntheticArgumentExpr(arg))
-          return true;
-      }
-
-      return false;
-    } else {
-      return isSyntheticArgumentExpr(expr);
-    }
-  }
-
-  Expr *sanitizeArgumentList(Expr *original) {
-    auto argList = getOriginalArgumentList(original);
-
-    if (argList.args.size() == 1 &&
-        argList.labels[0].empty() &&
-        !isa<VarargExpansionExpr>(argList.args[0])) {
-      auto *result =
-        new (C) ParenExpr(argList.lParenLoc,
-                          argList.args[0],
-                          argList.rParenLoc,
-                          argList.hasTrailingClosure);
-      result->setImplicit();
-      return result;
-    }
-
-    return TupleExpr::create(C,
-                             argList.lParenLoc,
-                             argList.args,
-                             argList.labels,
-                             argList.labelLocs,
-                             argList.rParenLoc,
-                             argList.hasTrailingClosure,
-                             /*implicit=*/true);
   }
 
   Expr *walkToExprPost(Expr *expr) override {
@@ -417,8 +366,8 @@ getTypeOfExpressionWithoutApplying(Expr *&expr, DeclContext *dc,
 
   assert(exprType && !exprType->hasTypeVariable() &&
          "free type variable with FreeTypeVariableBinding::GenericParameters?");
-  assert(exprType && !exprType->hasHole() &&
-         "type hole with FreeTypeVariableBinding::GenericParameters?");
+  assert(exprType && !exprType->hasPlaceholder() &&
+         "type placeholder with FreeTypeVariableBinding::GenericParameters?");
 
   if (exprType->hasError()) {
     recoverOriginalType();
@@ -514,16 +463,15 @@ getTypeOfCompletionOperatorImpl(DeclContext *DC, Expr *expr,
   // Return '(ArgType[, ArgType]) -> ResultType' as a function type.
   // We don't use the type of the operator expression because we want the types
   // of the *arguments* instead of the types of the parameters.
-  Expr *argsExpr = cast<ApplyExpr>(expr)->getArg();
+  auto *args = cast<ApplyExpr>(expr)->getArgs();
   SmallVector<FunctionType::Param, 2> argTypes;
-  if (auto *PE = dyn_cast<ParenExpr>(argsExpr)) {
-    argTypes.emplace_back(solution.simplifyType(CS.getType(PE->getSubExpr())));
-  } else if (auto *TE = dyn_cast<TupleExpr>(argsExpr)) {
-    for (auto arg : TE->getElements())
-      argTypes.emplace_back(solution.simplifyType(CS.getType(arg)));
-  }
+  for (auto arg : *args)
+    argTypes.emplace_back(solution.simplifyType(CS.getType(arg.getExpr())));
 
-  return FunctionType::get(argTypes, solution.simplifyType(CS.getType(expr)));
+  // FIXME: Verify ExtInfo state is correct, not working by accident.
+  FunctionType::ExtInfo info;
+  return FunctionType::get(argTypes, solution.simplifyType(CS.getType(expr)),
+                           info);
 }
 
 /// Return the type of operator function for specified LHS, or a null
@@ -559,33 +507,27 @@ TypeChecker::getTypeOfCompletionOperator(DeclContext *DC, Expr *LHS,
   auto *opExpr = TypeChecker::resolveDeclRefExpr(
       &UDRE, DC, /*replaceInvalidRefsWithErrors=*/true);
 
+  auto &ctx = DC->getASTContext();
   switch (refKind) {
   case DeclRefKind::PostfixOperator: {
     // (postfix_unary_expr
     //   (declref_expr name=<opName>)
-    //   (paren_expr
+    //   (argument_list
     //     (<LHS>)))
-    ParenExpr Args(SourceLoc(), LHS, SourceLoc(),
-                   /*hasTrailingClosure=*/false);
-    PostfixUnaryExpr postfixExpr(opExpr, &Args);
-    return getTypeOfCompletionOperatorImpl(DC, &postfixExpr,
-                                           referencedDecl);
+    auto *postfixExpr = PostfixUnaryExpr::create(ctx, opExpr, LHS);
+    return getTypeOfCompletionOperatorImpl(DC, postfixExpr, referencedDecl);
   }
 
   case DeclRefKind::BinaryOperator: {
     // (binary_expr
     //   (declref_expr name=<opName>)
-    //   (tuple_expr
+    //   (argument_list
     //     (<LHS>)
     //     (code_completion_expr)))
     CodeCompletionExpr dummyRHS(Loc);
-    auto Args = TupleExpr::create(
-        DC->getASTContext(), SourceLoc(), {LHS, &dummyRHS}, {}, {}, SourceLoc(),
-        /*hasTrailingClosure=*/false, /*isImplicit=*/true);
-    BinaryExpr binaryExpr(opExpr, Args, /*isImplicit=*/true);
-
-    return getTypeOfCompletionOperatorImpl(DC, &binaryExpr,
-                                           referencedDecl);
+    auto *binaryExpr = BinaryExpr::create(ctx, LHS, opExpr, &dummyRHS,
+                                          /*implicit*/ true);
+    return getTypeOfCompletionOperatorImpl(DC, binaryExpr, referencedDecl);
   }
 
   default:
@@ -611,7 +553,15 @@ class CompletionContextFinder : public ASTWalker {
 
   /// Stack of all "interesting" contexts up to code completion expression.
   llvm::SmallVector<Context, 4> Contexts;
-  CodeCompletionExpr *CompletionExpr = nullptr;
+
+  /// If we are completing inside an expression, the \c CodeCompletionExpr that
+  /// represents the code completion token.
+
+  /// The AST node that represents the code completion token, either as a
+  /// \c CodeCompletionExpr or a \c KeyPathExpr which contains a code completion
+  /// component.
+  llvm::PointerUnion<CodeCompletionExpr *, const KeyPathExpr *> CompletionNode;
+
   Expr *InitialExpr = nullptr;
   DeclContext *InitialDC;
 
@@ -657,8 +607,20 @@ public:
     }
 
     if (auto *CCE = dyn_cast<CodeCompletionExpr>(E)) {
-      CompletionExpr = CCE;
+      CompletionNode = CCE;
       return std::make_pair(false, nullptr);
+    }
+    if (auto *KeyPath = dyn_cast<KeyPathExpr>(E)) {
+      for (auto &component : KeyPath->getComponents()) {
+        if (component.getKind() ==
+            KeyPathExpr::Component::Kind::CodeCompletion) {
+          CompletionNode = KeyPath;
+          return std::make_pair(false, nullptr);
+        }
+      }
+      // Code completion in key paths is modelled by a code completion component
+      // Don't walk the key path's parsed expressions.
+      return std::make_pair(false, E);
     }
 
     return std::make_pair(true, E);
@@ -684,12 +646,42 @@ public:
   }
 
   bool hasCompletionExpr() const {
-    return CompletionExpr;
+    return CompletionNode.dyn_cast<CodeCompletionExpr *>() != nullptr;
   }
 
   CodeCompletionExpr *getCompletionExpr() const {
-    assert(CompletionExpr);
-    return CompletionExpr;
+    assert(hasCompletionExpr());
+    return CompletionNode.get<CodeCompletionExpr *>();
+  }
+
+  bool hasCompletionKeyPathComponent() const {
+    return CompletionNode.dyn_cast<const KeyPathExpr *>() != nullptr;
+  }
+
+  /// If we are completing in a key path, returns the \c KeyPath that contains
+  /// the code completion component.
+  const KeyPathExpr *getKeyPathContainingCompletionComponent() const {
+    assert(hasCompletionKeyPathComponent());
+    return CompletionNode.get<const KeyPathExpr *>();
+  }
+
+  /// If we are completing in a key path, returns the index at which the key
+  /// path has the code completion component.
+  size_t getKeyPathCompletionComponentIndex() const {
+    assert(hasCompletionKeyPathComponent());
+    size_t ComponentIndex = 0;
+    auto Components =
+        getKeyPathContainingCompletionComponent()->getComponents();
+    for (auto &Component : Components) {
+      if (Component.getKind() == KeyPathExpr::Component::Kind::CodeCompletion) {
+        break;
+      } else {
+        ComponentIndex++;
+      }
+    }
+    assert(ComponentIndex < Components.size() &&
+           "No completion component in the key path?");
+    return ComponentIndex;
   }
 
   struct Fallback {
@@ -703,7 +695,11 @@ public:
   /// of the enclosing context e.g. when completion is an argument
   /// to a call.
   Optional<Fallback> getFallbackCompletionExpr() const {
-    assert(CompletionExpr);
+    if (!hasCompletionExpr()) {
+      // Creating a fallback expression only makes sense if we are completing in
+      // an expression, not when we're completing in a key path.
+      return None;
+    }
 
     Optional<Fallback> fallback;
     bool separatePrecheck = false;
@@ -739,8 +735,8 @@ public:
     if (fallback)
       return fallback;
 
-    if (CompletionExpr->getBase() && CompletionExpr != InitialExpr)
-      return Fallback{CompletionExpr, fallbackDC, separatePrecheck};
+    if (getCompletionExpr()->getBase() && getCompletionExpr() != InitialExpr)
+      return Fallback{getCompletionExpr(), fallbackDC, separatePrecheck};
     return None;
   }
 
@@ -754,73 +750,22 @@ private:
 
 } // end namespace
 
-// Determine if the target expression is the implicit BinaryExpr generated for
-// pattern-matching in a switch/if/guard case (<completion> ~= matchValue).
-static bool isForPatternMatch(SolutionApplicationTarget &target) {
-  if (target.getExprContextualTypePurpose() != CTP_Condition)
-    return false;
-  Expr *condition = target.getAsExpr();
-  if (!condition->isImplicit())
-    return false;
-  if (auto *BE = dyn_cast<BinaryExpr>(condition)) {
-    Identifier id;
-    if (auto *ODRE = dyn_cast<OverloadedDeclRefExpr>(BE->getFn())) {
-      id = ODRE->getDecls().front()->getBaseIdentifier();
-    } else if (auto *DRE = dyn_cast<DeclRefExpr>(BE->getFn())) {
-      id = DRE->getDecl()->getBaseIdentifier();
-    }
-    if (id != target.getDeclContext()->getASTContext().Id_MatchOperator)
-      return false;
-    return isa<CodeCompletionExpr>(BE->getArg()->getElement(0));
-  }
-  return false;
-}
-
-/// Remove any solutions from the provided vector with a score less than the best solution's.
+/// Remove any solutions from the provided vector that both require fixes and
+/// have a score worse than the best.
 static void filterSolutions(SolutionApplicationTarget &target,
-                            SmallVectorImpl<Solution> &solutions) {
-  // FIXME: this is only needed because in pattern matching position, the
-  // code completion expression always becomes an expression pattern, which
-  // requires the ~= operator to be defined on the type being matched against.
-  // Pattern matching against an enum doesn't require that however, so valid
-  // solutions always end up having fixes. This is a problem because there will
-  // always be a valid solution as well. Optional defines ~= between Optional
-  // and _OptionalNilComparisonType (which defines a nilLiteral initializer),
-  // and the matched-against value can implicitly be made Optional if it isn't
-  // already, so _OptionalNilComparisonType is always a valid solution for the
-  // completion. That only generates the 'nil' completion, which is rarely what
-  // the user intends to write in this position and shouldn't be preferred over
-  // the other formed solutions (which require fixes). We should generate enum
-  // pattern completions separately.
-  if (isForPatternMatch(target))
-    return;
-
+                            SmallVectorImpl<Solution> &solutions,
+                            CodeCompletionExpr *completionExpr) {
   if (solutions.size() <= 1)
     return;
 
-  auto min = std::min_element(solutions.begin(), solutions.end(),
-                              [](const Solution &a, const Solution &b) {
+  Score minScore = std::min_element(solutions.begin(), solutions.end(),
+                                    [](const Solution &a, const Solution &b) {
     return a.getFixedScore() < b.getFixedScore();
-  });
-  auto fixStart = llvm::partition(solutions, [&](const Solution &S) {
-    return S.getFixedScore() == min->getFixedScore();
-  });
+  })->getFixedScore();
 
-  if (fixStart != solutions.begin() && fixStart != solutions.end())
-    solutions.erase(fixStart, solutions.end());
-}
-
-/// When solving for code completion we still consider solutions with holes as
-/// valid. Regular type-checking does not. This is intended to return true only
-/// if regular type-checking would consider this solution viable.
-static bool isViableForReTypeCheck(const Solution &S) {
-  if (llvm::any_of(S.Fixes, [&](const ConstraintFix *CF) {
-    return !CF->isWarning();
-  }))
-    return false;
-  using Binding = std::pair<swift::TypeVariableType *, swift::Type>;
-  return llvm::none_of(S.typeBindings, [&](const Binding& binding) {
-    return binding.second->hasHole();
+  llvm::erase_if(solutions, [&](const Solution &S) {
+    return S.getFixedScore().Data[SK_Fix] != 0 &&
+        S.getFixedScore() > minScore;
   });
 }
 
@@ -855,7 +800,8 @@ bool TypeChecker::typeCheckForCodeCompletion(
 
   // If there was no completion expr (e.g. if the code completion location was
   // among tokens that were skipped over during parser error recovery) bail.
-  if (!contextAnalyzer.hasCompletionExpr())
+  if (!contextAnalyzer.hasCompletionExpr() &&
+      !contextAnalyzer.hasCompletionKeyPathComponent())
     return false;
 
   // Interpolation components are type-checked separately.
@@ -899,8 +845,13 @@ bool TypeChecker::typeCheckForCodeCompletion(
       return CompletionResult::Fallback;
 
     // FIXME: instead of filtering, expose the score and viability to clients.
-    // Only keep the solution(s) with the best score.
-    filterSolutions(target, solutions);
+    // Remove any solutions that both require fixes and have a score that is
+    // worse than the best.
+    CodeCompletionExpr *completionExpr = nullptr;
+    if (contextAnalyzer.hasCompletionExpr()) {
+      completionExpr = contextAnalyzer.getCompletionExpr();
+    }
+    filterSolutions(target, solutions, completionExpr);
 
     // Similarly, if the type-check didn't produce any solutions, fall back
     // to type-checking a sub-expression in isolation.
@@ -913,21 +864,27 @@ bool TypeChecker::typeCheckForCodeCompletion(
     if (contextAnalyzer.locatedInMultiStmtClosure()) {
       auto &solution = solutions.front();
 
-      if (solution.hasType(contextAnalyzer.getCompletionExpr())) {
-        llvm::for_each(solutions, callback);
-        return CompletionResult::Ok;
+      bool HasTypeForCompletionNode = false;
+      if (completionExpr) {
+        HasTypeForCompletionNode = solution.hasType(completionExpr);
+      } else {
+        assert(contextAnalyzer.hasCompletionKeyPathComponent());
+        HasTypeForCompletionNode = solution.hasType(
+            contextAnalyzer.getKeyPathContainingCompletionComponent(),
+            contextAnalyzer.getKeyPathCompletionComponentIndex());
       }
 
-      // At this point we know the code completion expression wasn't checked
-      // with the closure's surrounding context. If a single valid solution
-      // was formed we can wait until the body of the closure is type-checked
-      // and gather completions then.
-      if (solutions.size() == 1 && isViableForReTypeCheck(solution))
+      if (!HasTypeForCompletionNode) {
+        // At this point we know the code completion node wasn't checked with
+        // the closure's surrounding context, so can defer to regular
+        // type-checking for the current call to typeCheckExpression. If that
+        // succeeds we will get a second call to typeCheckExpression for the
+        // body of the closure later and can gather completions then. If it
+        // doesn't we rely on the fallback typechecking in the subclasses of
+        // TypeCheckCompletionCallback that considers in isolation a
+        // sub-expression of the closure that contains the completion location.
         return CompletionResult::NotApplicable;
-
-      // Otherwise, it's unlikely the body will ever be type-checked, so fall
-      // back to manually checking a sub-expression within the closure body.
-      return CompletionResult::Fallback;
+      }
     }
 
     llvm::for_each(solutions, callback);
@@ -1078,70 +1035,122 @@ void DotExprTypeCheckCompletionCallback::fallbackTypeCheck() {
       [&](const Solution &S) { sawSolution(S); });
 }
 
+void UnresolvedMemberTypeCheckCompletionCallback::
+fallbackTypeCheck(DeclContext *DC) {
+  assert(!gotCallback());
+
+  CompletionContextFinder finder(DC);
+  if (!finder.hasCompletionExpr())
+    return;
+
+  auto fallback = finder.getFallbackCompletionExpr();
+  if (!fallback)
+    return;
+
+
+  SolutionApplicationTarget completionTarget(fallback->E, fallback->DC,
+                                             CTP_Unused, Type(),
+                                             /*isDiscared=*/true);
+  TypeChecker::typeCheckForCodeCompletion(
+      completionTarget, /*needsPrecheck*/true,
+      [&](const Solution &S) { sawSolution(S); });
+}
+
+static Type getTypeForCompletion(const constraints::Solution &S, Expr *E) {
+  if (!S.hasType(E)) {
+    assert(false && "Expression wasn't type checked?");
+    return nullptr;
+  }
+
+  auto &CS = S.getConstraintSystem();
+
+  // To aid code completion, we need to attempt to convert type placeholders
+  // back into underlying generic parameters if possible, since type
+  // of the code completion expression is used as "expected" (or contextual)
+  // type so it's helpful to know what requirements it has to filter
+  // the list of possible member candidates e.g.
+  //
+  // \code
+  // func test<T: P>(_: [T]) {}
+  //
+  // test(42.#^MEMBERS^#)
+  // \code
+  //
+  // It's impossible to resolve `T` in this case but code completion
+  // expression should still have a type of `[T]` instead of `[<<hole>>]`
+  // because it helps to produce correct contextual member list based on
+  // a conformance requirement associated with generic parameter `T`.
+  if (isa<CodeCompletionExpr>(E)) {
+    auto completionTy = S.getType(E).transform([&](Type type) -> Type {
+      if (auto *typeVar = type->getAs<TypeVariableType>())
+        return S.getFixedType(typeVar);
+      return type;
+    });
+
+    return S.simplifyType(completionTy.transform([&](Type type) {
+      if (auto *placeholder = type->getAs<PlaceholderType>()) {
+        if (auto *typeVar =
+                placeholder->getOriginator().dyn_cast<TypeVariableType *>()) {
+          if (auto *GP = typeVar->getImpl().getGenericParameter()) {
+            // Code completion depends on generic parameter type being
+            // represented in terms of `ArchetypeType` since it's easy
+            // to extract protocol requirements from it.
+            if (auto *GPD = GP->getDecl())
+              return GPD->getInnermostDeclContext()->mapTypeIntoContext(GP);
+          }
+        }
+
+        return Type(CS.getASTContext().TheUnresolvedType);
+      }
+
+      return type;
+    }));
+  }
+
+  return S.getResolvedType(E);
+};
+
+/// Whether the given completion expression is the only expression in its
+/// containing closure or function body and its value is implicitly returned.
+///
+/// If these conditions are met, code completion needs to avoid penalizing
+/// completion results that don't match the expected return type when computing
+/// type relations, as since no return statement was explicitly written by the
+/// user, it's possible they intend the single expression not as the return
+/// value but merely the first entry in a multi-statement body they just haven't
+/// finished writing yet.
+static bool isImplicitSingleExpressionReturn(ConstraintSystem &CS,
+                                             Expr *CompletionExpr) {
+  Expr *ParentExpr = CS.getParentExpr(CompletionExpr);
+  if (!ParentExpr)
+    return CS.getContextualTypePurpose(CompletionExpr) == CTP_ReturnSingleExpr;
+
+  if (auto *ParentCE = dyn_cast<ClosureExpr>(ParentExpr)) {
+    if (ParentCE->hasSingleExpressionBody() &&
+        ParentCE->getSingleExpressionBody() == CompletionExpr) {
+      ASTNode Last = ParentCE->getBody()->getLastElement();
+      return !Last.isStmt(StmtKind::Return) || Last.isImplicit();
+    }
+  }
+  return false;
+}
+
 void DotExprTypeCheckCompletionCallback::
 sawSolution(const constraints::Solution &S) {
   GotCallback = true;
   auto &CS = S.getConstraintSystem();
-
-  auto GetType = [&](Expr *E) {
-    // To aid code completion, we need to attempt to convert type holes
-    // back into underlying generic parameters if possible, since type
-    // of the code completion expression is used as "expected" (or contextual)
-    // type so it's helpful to know what requirements it has to filter
-    // the list of possible member candidates e.g.
-    //
-    // \code
-    // func test<T: P>(_: [T]) {}
-    //
-    // test(42.#^MEMBERS^#)
-    // \code
-    //
-    // It's impossible to resolve `T` in this case but code completion
-    // expression should still have a type of `[T]` instead of `[<<hole>>]`
-    // because it helps to produce correct contextual member list based on
-    // a conformance requirement associated with generic parameter `T`.
-    if (isa<CodeCompletionExpr>(E)) {
-      auto completionTy = S.getType(E).transform([&](Type type) -> Type {
-        if (auto *typeVar = type->getAs<TypeVariableType>())
-          return S.getFixedType(typeVar);
-        return type;
-      });
-
-      return S.simplifyType(completionTy.transform([&](Type type) {
-        if (auto *hole = type->getAs<HoleType>()) {
-          if (auto *typeVar =
-                  hole->getOriginator().dyn_cast<TypeVariableType *>()) {
-            if (auto *GP = typeVar->getImpl().getGenericParameter()) {
-              // Code completion depends on generic parameter type being
-              // represented in terms of `ArchetypeType` since it's easy
-              // to extract protocol requirements from it.
-              if (auto *GPD = GP->getDecl())
-                return GPD->getInnermostDeclContext()->mapTypeIntoContext(GP);
-            }
-          }
-
-          return Type(CS.getASTContext().TheUnresolvedType);
-        }
-
-        return type;
-      }));
-    }
-
-    return S.getResolvedType(E);
-  };
-
   auto *ParsedExpr = CompletionExpr->getBase();
   auto *SemanticExpr = ParsedExpr->getSemanticsProvidingExpr();
 
-  auto BaseTy = GetType(ParsedExpr);
+  auto BaseTy = getTypeForCompletion(S, ParsedExpr);
   // If base type couldn't be determined (e.g. because base expression
   // is an invalid reference), let's not attempt to do a lookup since
   // it wouldn't produce any useful results anyway.
-  if (!BaseTy || BaseTy->is<UnresolvedType>())
+  if (!BaseTy || BaseTy->getRValueType()->is<UnresolvedType>())
     return;
 
   auto *Locator = CS.getConstraintLocator(SemanticExpr);
-  Type ExpectedTy = GetType(CompletionExpr);
+  Type ExpectedTy = getTypeForCompletion(S, CompletionExpr);
   Expr *ParentExpr = CS.getParentExpr(CompletionExpr);
   if (!ParentExpr)
     ExpectedTy = CS.getContextualType(CompletionExpr);
@@ -1153,31 +1162,174 @@ sawSolution(const constraints::Solution &S) {
 
   auto Key = std::make_pair(BaseTy, ReferencedDecl);
   auto Ret = BaseToSolutionIdx.insert({Key, Results.size()});
-  if (!Ret.second && ExpectedTy) {
-    Results[Ret.first->getSecond()].ExpectedTypes.push_back(ExpectedTy);
-  } else {
+  if (Ret.second) {
     bool ISDMT = S.isStaticallyDerivedMetatype(ParsedExpr);
-    bool SingleExprBody = false;
+    bool ImplicitReturn = isImplicitSingleExpressionReturn(CS, CompletionExpr);
     bool DisallowVoid = ExpectedTy
                             ? !ExpectedTy->isVoid()
                             : !ParentExpr && CS.getContextualTypePurpose(
                                                  CompletionExpr) != CTP_Unused;
 
-    if (!ParentExpr) {
-      if (CS.getContextualTypePurpose(CompletionExpr) == CTP_ReturnSingleExpr)
-        SingleExprBody = true;
-    } else if (auto *ParentCE = dyn_cast<ClosureExpr>(ParentExpr)) {
-      if (ParentCE->hasSingleExpressionBody() &&
-          ParentCE->getSingleExpressionBody() == CompletionExpr) {
-        ASTNode Last = ParentCE->getBody()->getLastElement();
-        if (!Last.isStmt(StmtKind::Return) || Last.isImplicit())
-          SingleExprBody = true;
-      }
-    }
-
     Results.push_back(
-        {BaseTy, ReferencedDecl, {}, DisallowVoid, ISDMT, SingleExprBody});
+        {BaseTy, ReferencedDecl, {}, DisallowVoid, ISDMT, ImplicitReturn});
     if (ExpectedTy)
       Results.back().ExpectedTypes.push_back(ExpectedTy);
+  } else if (ExpectedTy) {
+    auto &ExpectedTys = Results[Ret.first->getSecond()].ExpectedTypes;
+    auto IsEqual = [&](Type Ty) { return ExpectedTy->isEqual(Ty); };
+    if (!llvm::any_of(ExpectedTys, IsEqual))
+      ExpectedTys.push_back(ExpectedTy);
   }
+}
+
+/// If the code completion variable occurs in a pattern matching position, we
+/// have an AST that looks like this.
+/// \code
+/// (binary_expr implicit type='$T3'
+///   (overloaded_decl_ref_expr function_ref=compound decls=[
+///     Swift.(file).~=,
+///     Swift.(file).Optional extension.~=])
+///   (argument_list implicit
+///     (argument
+///       (code_completion_expr implicit type='$T1'))
+///     (argument
+///       (declref_expr implicit decl=swift_ide_test.(file).foo(x:).$match))))
+/// \endcode
+/// If the code completion expression occurs in such an AST, return the
+/// declaration of the \c $match variable, otherwise return \c nullptr.
+VarDecl *getMatchVarIfInPatternMatch(CodeCompletionExpr *CompletionExpr,
+                                     ConstraintSystem &CS) {
+  auto &Context = CS.getASTContext();
+
+  auto *Binary = dyn_cast_or_null<BinaryExpr>(CS.getParentExpr(CompletionExpr));
+  if (!Binary || !Binary->isImplicit() || Binary->getLHS() != CompletionExpr) {
+    return nullptr;
+  }
+
+  auto CalledOperator = Binary->getFn();
+  if (!CalledOperator || !CalledOperator->isImplicit()) {
+    return nullptr;
+  }
+  // The reference to the ~= operator might be an OverloadedDeclRefExpr or a
+  // DeclRefExpr, depending on how many ~= operators are viable.
+  if (auto Overloaded =
+          dyn_cast_or_null<OverloadedDeclRefExpr>(CalledOperator)) {
+    if (!llvm::all_of(Overloaded->getDecls(), [&Context](ValueDecl *D) {
+          return D->getBaseName() == Context.Id_MatchOperator;
+        })) {
+      return nullptr;
+    }
+  } else if (auto Ref = dyn_cast_or_null<DeclRefExpr>(CalledOperator)) {
+    if (Ref->getDecl()->getBaseName() != Context.Id_MatchOperator) {
+      return nullptr;
+    }
+  } else {
+    return nullptr;
+  }
+
+  auto MatchArg = dyn_cast_or_null<DeclRefExpr>(Binary->getRHS());
+  if (!MatchArg || !MatchArg->isImplicit()) {
+    return nullptr;
+  }
+
+  auto MatchVar = MatchArg->getDecl();
+  if (MatchVar && MatchVar->isImplicit() &&
+      MatchVar->getBaseName() == Context.Id_PatternMatchVar) {
+    return dyn_cast<VarDecl>(MatchVar);
+  } else {
+    return nullptr;
+  }
+}
+
+void UnresolvedMemberTypeCheckCompletionCallback::
+sawSolution(const constraints::Solution &S) {
+  GotCallback = true;
+
+  auto &CS = S.getConstraintSystem();
+  Type ExpectedTy = getTypeForCompletion(S, CompletionExpr);
+  // If the type couldn't be determined (e.g. because there isn't any context
+  // to derive it from), let's not attempt to do a lookup since it wouldn't
+  // produce any useful results anyway.
+  if (ExpectedTy && !ExpectedTy->is<UnresolvedType>()) {
+    // If ExpectedTy is a duplicate of any other result, ignore this solution.
+    if (!llvm::any_of(ExprResults, [&](const ExprResult &R) {
+          return R.ExpectedTy->isEqual(ExpectedTy);
+        })) {
+      bool SingleExprBody =
+          isImplicitSingleExpressionReturn(CS, CompletionExpr);
+      ExprResults.push_back({ExpectedTy, SingleExprBody});
+    }
+  }
+
+  if (auto MatchVar = getMatchVarIfInPatternMatch(CompletionExpr, CS)) {
+    Type MatchVarType;
+    // If the MatchVar has an explicit type, it's not part of the solution. But
+    // we can look it up in the constraint system directly.
+    if (auto T = S.getConstraintSystem().getVarType(MatchVar)) {
+      MatchVarType = T;
+    } else {
+      MatchVarType = S.getResolvedType(MatchVar);
+    }
+    if (MatchVarType && !MatchVarType->is<UnresolvedType>()) {
+      if (!llvm::any_of(EnumPatternTypes, [&](const Type &R) {
+            return R->isEqual(MatchVarType);
+          })) {
+        EnumPatternTypes.push_back(MatchVarType);
+      }
+    }
+  }
+}
+
+void KeyPathTypeCheckCompletionCallback::sawSolution(
+    const constraints::Solution &S) {
+  // Determine the code completion.
+  size_t ComponentIndex = 0;
+  for (auto &Component : KeyPath->getComponents()) {
+    if (Component.getKind() == KeyPathExpr::Component::Kind::CodeCompletion) {
+      break;
+    } else {
+      ComponentIndex++;
+    }
+  }
+  assert(ComponentIndex < KeyPath->getComponents().size() &&
+         "Didn't find a code compleiton component?");
+
+  Type BaseType;
+  if (ComponentIndex == 0) {
+    // We are completing on the root and need to extract the key path's root
+    // type.
+    if (KeyPath->getRootType()) {
+      BaseType = S.getResolvedType(KeyPath->getRootType());
+    } else {
+      // The key path doesn't have a root TypeRepr set, so we can't look the key
+      // path's root up through it. Build a constraint locator and look the
+      // root type up through it.
+      // FIXME: Improve the linear search over S.typeBindings when it's possible
+      // to look up type variables by their locators.
+      auto RootLocator =
+          S.getConstraintLocator(KeyPath, {ConstraintLocator::KeyPathRoot});
+      auto BaseVariableTypeBinding =
+          llvm::find_if(S.typeBindings, [&RootLocator](const auto &Entry) {
+            return Entry.first->getImpl().getLocator() == RootLocator;
+          });
+      if (BaseVariableTypeBinding != S.typeBindings.end()) {
+        BaseType = S.simplifyType(BaseVariableTypeBinding->getSecond());
+      }
+    }
+  } else {
+    // We are completing after a component. Get the previous component's result
+    // type.
+    BaseType = S.simplifyType(S.getType(KeyPath, ComponentIndex - 1));
+  }
+  if (BaseType.isNull()) {
+    return;
+  }
+
+  // If ExpectedTy is a duplicate of any other result, ignore this solution.
+  if (llvm::any_of(Results, [&](const Result &R) {
+    return R.BaseType->isEqual(BaseType);
+  })) {
+    return;
+  }
+  Results.push_back({BaseType, /*OnRoot=*/(ComponentIndex == 0)});
 }

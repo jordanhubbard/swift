@@ -10,6 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#if SWIFT_ENABLE_REFLECTION
+
 /// Dumps the given object's contents using its mirror to the specified output
 /// stream.
 ///
@@ -99,7 +101,7 @@ internal func _dump_unlocked<TargetStream: TextOutputStream>(
   for _ in 0..<indent { target.write(" ") }
 
   let mirror = Mirror(reflecting: value)
-  let count = mirror._children.count
+  let count = mirror.children.count
   let bullet = count == 0    ? "-"
              : maxDepth <= 0 ? "▹" : "▿"
   target.write(bullet)
@@ -149,7 +151,7 @@ internal func _dump_unlocked<TargetStream: TextOutputStream>(
       visitedItems: &visitedItems)
   }
 
-  var currentIndex = mirror._children.startIndex
+  var currentIndex = mirror.children.startIndex
   for i in 0..<count {
     if maxItemCounter <= 0 {
       for _ in 0..<(indent+4) {
@@ -167,8 +169,8 @@ internal func _dump_unlocked<TargetStream: TextOutputStream>(
       return
     }
 
-    let (name, child) = mirror._children[currentIndex]
-    mirror._children.formIndex(after: &currentIndex)
+    let (name, child) = mirror.children[currentIndex]
+    mirror.children.formIndex(after: &currentIndex)
     _dump_unlocked(
       child,
       to: &target,
@@ -196,7 +198,7 @@ internal func _dumpSuperclass_unlocked<TargetStream: TextOutputStream>(
 
   for _ in 0..<indent { target.write(" ") }
 
-  let count = mirror._children.count
+  let count = mirror.children.count
   let bullet = count == 0    ? "-"
              : maxDepth <= 0 ? "▹" : "▿"
   target.write(bullet)
@@ -216,7 +218,7 @@ internal func _dumpSuperclass_unlocked<TargetStream: TextOutputStream>(
       visitedItems: &visitedItems)
   }
 
-  var currentIndex = mirror._children.startIndex
+  var currentIndex = mirror.children.startIndex
   for i in 0..<count {
     if maxItemCounter <= 0 {
       for _ in 0..<(indent+4) {
@@ -234,8 +236,8 @@ internal func _dumpSuperclass_unlocked<TargetStream: TextOutputStream>(
       return
     }
 
-    let (name, child) = mirror._children[currentIndex]
-    mirror._children.formIndex(after: &currentIndex)
+    let (name, child) = mirror.children[currentIndex]
+    mirror.children.formIndex(after: &currentIndex)
     _dump_unlocked(
       child,
       to: &target,
@@ -247,3 +249,4 @@ internal func _dumpSuperclass_unlocked<TargetStream: TextOutputStream>(
   }
 }
 
+#endif // SWIFT_ENABLE_REFLECTION

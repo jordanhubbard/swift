@@ -21,11 +21,11 @@ class D : B {
   }
 
   override init(x:Int) {
-    let _: () -> B = super.init // expected-error {{partial application of 'super.init' initializer chain is not allowed}}
+    let _: () -> B = super.init // expected-error {{cannot reference 'super.init' initializer chain as function value}}
   }
 
   convenience init(y:Int) {
-    let _: () -> D = self.init // expected-error {{partial application of 'self.init' initializer delegation is not allowed}}
+    let _: () -> D = self.init // expected-error {{cannot reference 'self.init' initializer delegation as function value}}
   }
 
   init(z: Int) {
@@ -34,15 +34,15 @@ class D : B {
   }
 
   func super_calls() {
-    super.foo        // expected-error {{expression resolves to an unused property}}
+    super.foo        // expected-warning {{property is accessed but result is unused}}
     super.foo.bar    // expected-error {{value of type 'Int' has no member 'bar'}}
-    super.bar        // expected-error {{expression resolves to an unused function}}
+    super.bar        // expected-error {{function is unused}}
     super.bar()
     // FIXME: should also say "'super.init' cannot be referenced outside of an initializer"
     super.init // expected-error{{no exact matches in reference to initializer}}
     super.init() // expected-error{{'super.init' cannot be called outside of an initializer}}
     super.init(0) // expected-error{{'super.init' cannot be called outside of an initializer}} // expected-error {{missing argument label 'x:' in call}}
-    super[0]        // expected-error {{expression resolves to an unused subscript}}
+    super[0]        // expected-warning {{subscript is accessed but result is unused}}
     super
       .bar()
   }

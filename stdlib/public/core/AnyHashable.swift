@@ -252,11 +252,24 @@ extension AnyHashable: CustomDebugStringConvertible {
   }
 }
 
+#if SWIFT_ENABLE_REFLECTION
 extension AnyHashable: CustomReflectable {
   public var customMirror: Mirror {
     return Mirror(
       self,
       children: ["value": base])
+  }
+}
+#endif
+
+@available(macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0, *)
+extension AnyHashable: _HasCustomAnyHashableRepresentation {
+}
+
+extension AnyHashable {
+  @_alwaysEmitIntoClient
+  public __consuming func _toCustomAnyHashable() -> AnyHashable? {
+    return self
   }
 }
 

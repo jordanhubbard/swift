@@ -16,9 +16,9 @@ var d2 : () -> Int = { 4 }
 
 var d3 : () -> Float = { 4 }
 
-var d4 : () -> Int = { d2 }  // expected-error{{function produces expected type 'Int'; did you mean to call it with '()'?}} {{26-26=()}}
+var d4 : () -> Int = { d2 }  // expected-error{{function 'd2' was used as a property; add () to call it}} {{26-26=()}}
 
-if #available(macOS 9999, iOS 9999, tvOS 9999, watchOS 9999, *) {
+if #available(macOS 12.0, iOS 15.0, watchOS 8.0, tvOS 15.0, *) {
   var e0 : [Int]
   e0[] // expected-error {{missing argument for parameter #1 in call}} {{6-6=<#Int#>}}
 }

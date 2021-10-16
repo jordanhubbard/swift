@@ -97,7 +97,8 @@ struct SwiftCodeCompletionConsumer
   }
   void clearContext() { swiftContext = SwiftCompletionInfo(); }
 
-  void handleResults(MutableArrayRef<CodeCompletionResult *> Results) override {
+  void handleResults(CodeCompletionContext &context) override {
+    MutableArrayRef<CodeCompletionResult *> Results = context.takeResults();
     assert(swiftContext.swiftASTContext);
     handleResultsImpl(Results, swiftContext);
   }
@@ -121,7 +122,7 @@ static bool swiftCodeCompleteImpl(
     unsigned Offset, SwiftCodeCompletionConsumer &SwiftConsumer,
     ArrayRef<const char *> Args,
     llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
-    bool annotateDescription, std::string &Error) {
+    const CodeCompletion::Options &opts, std::string &Error) {
   return Lang.performCompletionLikeOperation(
       UnresolvedInputFile, Offset, Args, FileSystem, Error,
       [&](CompilerInstance &CI, bool reusingASTContext) {
@@ -130,7 +131,10 @@ static bool swiftCodeCompleteImpl(
         auto swiftCache = Lang.getCodeCompletionCache(); // Pin the cache.
         ide::CodeCompletionContext CompletionContext(swiftCache->getCache());
         CompletionContext.ReusingASTContext = reusingASTContext;
-        CompletionContext.setAnnotateResult(annotateDescription);
+        CompletionContext.setAnnotateResult(opts.annotatedDescription);
+        CompletionContext.setIncludeObjectLiterals(opts.includeObjectLiterals);
+        CompletionContext.setAddInitsToTopLevel(opts.addInitsToTopLevel);
+        CompletionContext.setCallPatternHeuristics(opts.callPatternHeuristics);
         std::unique_ptr<CodeCompletionCallbacksFactory> callbacksFactory(
             ide::makeCodeCompletionCallbacksFactory(CompletionContext,
                                                     SwiftConsumer));
@@ -214,8 +218,7 @@ void SwiftLangSupport::codeComplete(
 
   std::string Error;
   if (!swiftCodeCompleteImpl(*this, UnresolvedInputFile, Offset, SwiftConsumer,
-                             Args, fileSystem,
-                             CCOpts.annotatedDescription, Error)) {
+                             Args, fileSystem, CCOpts, Error)) {
     SKConsumer.failed(Error);
   }
 }
@@ -242,14 +245,14 @@ static void getResultStructure(
   for (; i < chunks.size(); ++i) {
     auto C = chunks[i];
     if (C.is(ChunkKind::TypeAnnotation) ||
-        C.is(ChunkKind::CallParameterClosureType) ||
-        C.is(ChunkKind::CallParameterClosureExpr) ||
+        C.is(ChunkKind::CallArgumentClosureType) ||
+        C.is(ChunkKind::CallArgumentClosureExpr) ||
         C.is(ChunkKind::Whitespace))
       continue;
 
     if (C.is(ChunkKind::LeftParen) || C.is(ChunkKind::LeftBracket) ||
         C.is(ChunkKind::BraceStmtWithCursor) ||
-        C.is(ChunkKind::CallParameterBegin))
+        C.is(ChunkKind::CallArgumentBegin))
       break;
 
     if (C.hasText())
@@ -263,21 +266,15 @@ static void getResultStructure(
   for (; i < chunks.size(); ++i) {
     auto &C = chunks[i];
     if (C.is(ChunkKind::TypeAnnotation) ||
-        C.is(ChunkKind::CallParameterClosureType) ||
-        C.is(ChunkKind::CallParameterClosureExpr) ||
+        C.is(ChunkKind::CallArgumentClosureType) ||
+        C.is(ChunkKind::CallArgumentClosureExpr) ||
         C.is(ChunkKind::Whitespace))
       continue;
 
     if (C.is(ChunkKind::BraceStmtWithCursor))
       break;
 
-    if (C.is(ChunkKind::ThrowsKeyword) ||
-        C.is(ChunkKind::RethrowsKeyword)) {
-      structure.throwsRange.begin = textSize;
-      structure.throwsRange.end = textSize + C.getText().size();
-    }
-
-    if (C.is(ChunkKind::CallParameterBegin)) {
+    if (C.is(ChunkKind::CallArgumentBegin)) {
       CodeCompletionInfo::ParameterStructure param;
 
       ++i;
@@ -286,23 +283,23 @@ static void getResultStructure(
       for (; i < chunks.size(); ++i) {
         if (chunks[i].endsPreviousNestedGroup(C.getNestingLevel()))
           break;
-        if (chunks[i].is(ChunkKind::CallParameterClosureType) ||
-            chunks[i].is(ChunkKind::CallParameterClosureExpr))
+        if (chunks[i].is(ChunkKind::CallArgumentClosureType) ||
+            chunks[i].is(ChunkKind::CallArgumentClosureExpr))
           continue;
-        if (isOperator && chunks[i].is(ChunkKind::CallParameterType))
+        if (isOperator && chunks[i].is(ChunkKind::CallArgumentType))
           continue;
 
         // Parameter name
-        if (chunks[i].is(ChunkKind::CallParameterName) ||
-            chunks[i].is(ChunkKind::CallParameterInternalName)) {
+        if (chunks[i].is(ChunkKind::CallArgumentName) ||
+            chunks[i].is(ChunkKind::CallArgumentInternalName)) {
           param.name.begin = textSize;
           param.isLocalName =
-              chunks[i].is(ChunkKind::CallParameterInternalName);
+              chunks[i].is(ChunkKind::CallArgumentInternalName);
           inName = true;
         }
 
         // Parameter type
-        if (chunks[i].is(ChunkKind::CallParameterType)) {
+        if (chunks[i].is(ChunkKind::CallArgumentType)) {
           unsigned start = textSize;
           unsigned prev = i - 1; // if i == 0, prev = ~0u.
 
@@ -313,7 +310,7 @@ static void getResultStructure(
           }
 
           // Combine the whitespace after ':' into the type name.
-          if (prev != ~0u && chunks[prev].is(ChunkKind::CallParameterColon))
+          if (prev != ~0u && chunks[prev].is(ChunkKind::CallArgumentColon))
             start -= 1;
 
           param.afterColon.begin = start;
@@ -498,23 +495,28 @@ bool SwiftToSourceKitCompletionAdapter::handleResult(
   static UIdent CCCtxCurrentModule("source.codecompletion.context.thismodule");
   static UIdent CCCtxOtherModule("source.codecompletion.context.othermodule");
 
-  switch (Result->getSemanticContext()) {
-  case SemanticContextKind::None:
-    Info.SemanticContext = CCCtxNone; break;
-  case SemanticContextKind::ExpressionSpecific:
-    Info.SemanticContext = CCCtxExpressionSpecific; break;
-  case SemanticContextKind::Local:
-    Info.SemanticContext = CCCtxLocal; break;
-  case SemanticContextKind::CurrentNominal:
-    Info.SemanticContext = CCCtxCurrentNominal; break;
-  case SemanticContextKind::Super:
-    Info.SemanticContext = CCCtxSuper; break;
-  case SemanticContextKind::OutsideNominal:
-    Info.SemanticContext = CCCtxOutsideNominal; break;
-  case SemanticContextKind::CurrentModule:
-    Info.SemanticContext = CCCtxCurrentModule; break;
-  case SemanticContextKind::OtherModule:
-    Info.SemanticContext = CCCtxOtherModule; break;
+
+  if (Result->getFlair().contains(CodeCompletionFlairBit::ExpressionSpecific) ||
+      Result->getFlair().contains(CodeCompletionFlairBit::SuperChain)) {
+    // NOTE: `CCCtxExpressionSpecific` is to maintain compatibility.
+    Info.SemanticContext = CCCtxExpressionSpecific;
+  } else {
+    switch (Result->getSemanticContext()) {
+    case SemanticContextKind::None:
+      Info.SemanticContext = CCCtxNone; break;
+    case SemanticContextKind::Local:
+      Info.SemanticContext = CCCtxLocal; break;
+    case SemanticContextKind::CurrentNominal:
+      Info.SemanticContext = CCCtxCurrentNominal; break;
+    case SemanticContextKind::Super:
+      Info.SemanticContext = CCCtxSuper; break;
+    case SemanticContextKind::OutsideNominal:
+      Info.SemanticContext = CCCtxOutsideNominal; break;
+    case SemanticContextKind::CurrentModule:
+      Info.SemanticContext = CCCtxCurrentModule; break;
+    case SemanticContextKind::OtherModule:
+      Info.SemanticContext = CCCtxOtherModule; break;
+    }
   }
 
   static UIdent CCTypeRelNotApplicable("source.codecompletion.typerelation.notapplicable");
@@ -734,6 +736,7 @@ static void translateCodeCompletionOptions(OptionsDictionary &from,
   static UIdent KeyFuzzyWeight("key.codecomplete.sort.fuzzyweight");
   static UIdent KeyPopularityBonus("key.codecomplete.sort.popularitybonus");
   static UIdent KeyAnnotatedDescription("key.codecomplete.annotateddescription");
+  static UIdent KeyIncludeObjectLiterals("key.codecomplete.includeobjectliterals");
 
   from.valueForOption(KeySortByName, to.sortByName);
   from.valueForOption(KeyUseImportDepth, to.useImportDepth);
@@ -759,6 +762,7 @@ static void translateCodeCompletionOptions(OptionsDictionary &from,
   from.valueForOption(KeyHideByName, to.hideByNameStyle);
   from.valueForOption(KeyTopNonLiteral, to.showTopNonLiteralResults);
   from.valueForOption(KeyAnnotatedDescription, to.annotatedDescription);
+  from.valueForOption(KeyIncludeObjectLiterals, to.includeObjectLiterals);
 }
 
 /// Canonicalize a name that is in the format of a reference to a function into
@@ -918,14 +922,15 @@ static void transformAndForwardResults(
         CodeCompletionString::create(innerSink.allocator, chunks);
     CodeCompletion::SwiftResult paren(
         CodeCompletion::SwiftResult::ResultKind::BuiltinOperator,
-        SemanticContextKind::ExpressionSpecific,
+        SemanticContextKind::CurrentNominal,
+        CodeCompletionFlairBit::ExpressionSpecific,
         exactMatch ? exactMatch->getNumBytesToErase() : 0, completionString,
         CodeCompletionResult::ExpectedTypeRelation::NotApplicable);
 
     SwiftCompletionInfo info;
     std::vector<Completion *> extended =
         extendCompletions(&paren, innerSink, info, nameToPopularity, options,
-                          exactMatch, SemanticContextKind::ExpressionSpecific);
+                          exactMatch);
     assert(extended.size() == 1);
     return extended.front();
   };
@@ -1006,11 +1011,11 @@ static void transformAndForwardResults(
       auto topResults = filterInnerResults(results, options.addInnerResults,
                                            options.addInnerOperators, hasDot,
                                            hasQDot, hasInit, rules);
-      // FIXME: Overriding the default to context "None" is a hack so that they
-      // won't overwhelm other results that also match the filter text.
+      // FIXME: Clearing the flair (and semantic context) is a hack so that
+      // they won't overwhelm other results that also match the filter text.
       innerResults = extendCompletions(
           topResults, innerSink, info, nameToPopularity, options, exactMatch,
-          SemanticContextKind::None, SemanticContextKind::None);
+          /*clearFlair=*/true);
     });
 
     auto *inputBuf = session->getBuffer();
@@ -1029,7 +1034,7 @@ static void transformAndForwardResults(
     std::string error;
     if (!swiftCodeCompleteImpl(lang, buffer.get(), str.size(), swiftConsumer,
                                cargs, session->getFileSystem(),
-                               options.annotatedDescription, error)) {
+                               options, error)) {
       consumer.failed(error);
       return;
     }
@@ -1074,6 +1079,8 @@ void SwiftLangSupport::codeCompleteOpen(
   unsigned resultOffset = 0;
   unsigned maxResults = 0;
   CodeCompletion::Options CCOpts;
+  // Enable "call pattern heuristics" by default for this API.
+  CCOpts.callPatternHeuristics = true;
   if (options)
     translateCodeCompletionOptions(*options, CCOpts, filterText, resultOffset,
                                    maxResults);
@@ -1116,21 +1123,9 @@ void SwiftLangSupport::codeCompleteOpen(
             extendCompletions(results, sink, info, nameToPopularity, CCOpts);
       });
 
-  // Add any codecomplete.open specific flags.
-  std::vector<const char *> extendedArgs(args.begin(), args.end());
-  if (CCOpts.addInitsToTopLevel) {
-    extendedArgs.push_back("-Xfrontend");
-    extendedArgs.push_back("-code-complete-inits-in-postfix-expr");
-  }
-  if (CCOpts.callPatternHeuristics) {
-    extendedArgs.push_back("-Xfrontend");
-    extendedArgs.push_back("-code-complete-call-pattern-heuristics");
-  }
-
   // Invoke completion.
   if (!swiftCodeCompleteImpl(*this, inputBuf, offset, swiftConsumer,
-                             extendedArgs, fileSystem,
-                             CCOpts.annotatedDescription, error)) {
+                             args, fileSystem, CCOpts, error)) {
     consumer.failed(error);
     return;
   }
@@ -1148,7 +1143,7 @@ void SwiftLangSupport::codeCompleteOpen(
   using CodeCompletion::SessionCacheRef;
   auto bufferCopy = llvm::MemoryBuffer::getMemBufferCopy(
       inputBuf->getBuffer(), inputBuf->getBufferIdentifier());
-  std::vector<std::string> argsCopy(extendedArgs.begin(), extendedArgs.end());
+  std::vector<std::string> argsCopy(args.begin(), args.end());
   SessionCacheRef session{new SessionCache(
       std::move(sink), std::move(bufferCopy), std::move(argsCopy), fileSystem,
       completionKind, typeContextKind, mayUseImplicitMemberExpr,
