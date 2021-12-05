@@ -30,6 +30,7 @@
 #include "swift/AST/CanTypeVisitor.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticsCommon.h"
+#include "swift/AST/ExistentialLayout.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -1026,12 +1027,24 @@ RValue RValueEmitter::visitLoadExpr(LoadExpr *E, SGFContext C) {
 }
 
 SILValue SILGenFunction::emitTemporaryAllocation(SILLocation loc, SILType ty,
-                                                 bool hasDynamicLifetime) {
+                                                 bool hasDynamicLifetime,
+                                                 bool isLexical) {
   ty = ty.getObjectType();
   Optional<SILDebugVariable> DbgVar;
   if (auto *VD = loc.getAsASTNode<VarDecl>())
     DbgVar = SILDebugVariable(VD->isLet(), 0);
-  auto alloc = B.createAllocStack(loc, ty, DbgVar, hasDynamicLifetime);
+  // Recognize "catch let errorvar" bindings.
+  if (auto *DRE = loc.getAsASTNode<DeclRefExpr>())
+    if (auto *VD = dyn_cast<VarDecl>(DRE->getDecl()))
+      if (!isa<ParamDecl>(VD) && VD->isImplicit() &&
+          (VD->getType()->is<ProtocolType>() ||
+           VD->getType()->is<ProtocolCompositionType>()) &&
+          VD->getType()->getExistentialLayout().isErrorExistential()) {
+        DbgVar = SILDebugVariable(VD->isLet(), 0);
+        loc = SILLocation(VD);
+      }
+  auto *alloc =
+      B.createAllocStack(loc, ty, DbgVar, hasDynamicLifetime, isLexical);
   enterDeallocStackCleanup(alloc);
   return alloc;
 }
@@ -1410,8 +1423,10 @@ RValueEmitter::visitConditionalBridgeFromObjCExpr(
   auto conversion = cast<FuncDecl>(conversionRef.getDecl());
   auto subs = conversionRef.getSubstitutions();
 
-  auto nativeType =
-    Type(GenericTypeParamType::get(0, 0, SGF.getASTContext())).subst(subs);
+  auto nativeType = Type(GenericTypeParamType::get(/*type sequence*/ false,
+                                                   /*depth*/ 0, /*index*/ 0,
+                                                   SGF.getASTContext()))
+                        .subst(subs);
 
   auto metatypeType = SGF.getLoweredType(MetatypeType::get(nativeType));
   auto metatype =
@@ -3133,10 +3148,12 @@ getOrCreateKeyPathEqualsAndHash(SILGenModule &SGM,
       auto formalCanTy = formalTy->getCanonicalType(genericSig);
       
       // Get the Equatable conformance from the Hashable conformance.
-      auto equatable = hashable.getAssociatedConformance(formalTy,
-        GenericTypeParamType::get(0, 0, C),
-        equatableProtocol);
-      
+      auto equatable = hashable.getAssociatedConformance(
+          formalTy,
+          GenericTypeParamType::get(/*type sequence*/ false,
+                                    /*depth*/ 0, /*index*/ 0, C),
+          equatableProtocol);
+
       assert(equatable.isAbstract() == hashable.isAbstract());
       if (equatable.isConcrete())
         assert(equatable.getConcrete()->getType()->isEqual(
@@ -3405,7 +3422,7 @@ lowerKeyPathSubscriptIndexTypes(
                                     ->getCanonicalType(),
                              indexLoweredTy});
   }
-};
+}
 
 static void
 lowerKeyPathSubscriptIndexPatterns(
@@ -3423,7 +3440,7 @@ lowerKeyPathSubscriptIndexPatterns(
 
     indexPatterns.push_back({baseOperand++, formalTy, loweredTy, hashable});
   }
-};
+}
 
 KeyPathPatternComponent
 SILGenModule::emitKeyPathComponentForDecl(SILLocation loc,

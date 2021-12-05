@@ -183,7 +183,7 @@ public:
   }
 
 private:
-  static const unsigned MaxDepth = 1024;
+  static const unsigned MaxDepth = 768;
 
   /// Called when the node tree in valid.
   ///
@@ -1155,6 +1155,11 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
                                bool asPrefixContext) {
   if (depth > NodePrinter::MaxDepth) {
     Printer << "<<too complex>>";
+    return nullptr;
+  }
+
+  if (!Node) {
+    Printer << "<null node pointer>";
     return nullptr;
   }
 
@@ -3042,7 +3047,7 @@ NodePointer NodePrinter::printEntity(NodePointer Entity, unsigned depth,
     PostfixContext = nullptr;
   }
   return PostfixContext;
-};
+}
 
 void NodePrinter::printEntityType(NodePointer Entity, NodePointer type,
                                   NodePointer genericFunctionTypeList,

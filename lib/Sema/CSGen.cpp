@@ -212,8 +212,8 @@ namespace {
         return { false, expr };
       }
 
-      if (isa<BinaryExpr>(expr)) {
-        LTI.binaryExprs.push_back(dyn_cast<BinaryExpr>(expr));
+      if (auto *binaryExpr = dyn_cast<BinaryExpr>(expr)) {
+        LTI.binaryExprs.push_back(binaryExpr);
       }  
       
       if (auto favoredType = CS.getFavoredType(expr)) {
@@ -230,10 +230,9 @@ namespace {
         return { false, expr };
       }      
 
-      // For exprs of a structural type that are not modeling argument lists,
-      // avoid merging the type variables. (We need to allow for cases like
+      // For exprs of a tuple, avoid favoring. (We need to allow for cases like
       // (Int, Int32).)
-      if (isa<TupleExpr>(expr) && !isa<ApplyExpr>(Parent.getAsExpr())) {
+      if (isa<TupleExpr>(expr)) {
         return { false, expr };
       }
 
@@ -285,10 +284,24 @@ namespace {
   
   /// For a given expression, given information that is global to the
   /// expression, attempt to derive a favored type for it.
-  bool computeFavoredTypeForExpr(Expr *expr, ConstraintSystem &CS) {
+  void computeFavoredTypeForExpr(Expr *expr, ConstraintSystem &CS) {
     LinkedTypeInfo lti;
 
     expr->walk(LinkedExprAnalyzer(lti, CS));
+
+    // Check whether we can proceed with favoring.
+    if (llvm::any_of(lti.binaryExprs, [](const BinaryExpr *op) {
+          auto *ODRE = dyn_cast<OverloadedDeclRefExpr>(op->getFn());
+          if (!ODRE)
+            return false;
+
+          // Attempting to favor based on operand types is wrong for
+          // nil-coalescing operator.
+          auto identifier = ODRE->getDecls().front()->getBaseIdentifier();
+          return identifier.isNilCoalescingOperator();
+        })) {
+      return;
+    }
 
     if (lti.collectedTypes.size() == 1) {
       // TODO: Compute the BCT.
@@ -364,13 +377,9 @@ namespace {
       };
 
       simplifyBinOpExprTyVars();
-
-      return true;
     }
-    
-    return false;
   }
-  
+
   /// Determine whether the given parameter type and argument should be
   /// "favored" because they match exactly.
   bool isFavoredParamAndArg(ConstraintSystem &CS, Type paramTy, Type argTy,
@@ -383,7 +392,7 @@ namespace {
       return true;
 
     // Don't favor narrowing conversions.
-    if (argTy->isDouble() && paramTy->isCGFloatType())
+    if (argTy->isDouble() && paramTy->isCGFloat())
       return false;
 
     llvm::SmallSetVector<ProtocolDecl *, 2> literalProtos;
@@ -420,7 +429,7 @@ namespace {
         // it is the same as the parameter type.
         // Check whether there is a default type to compare against.
         if (paramTy->isEqual(defaultType) ||
-            (defaultType->isDouble() && paramTy->isCGFloatType()))
+            (defaultType->isDouble() && paramTy->isCGFloat()))
           return true;
       }
     }
@@ -560,12 +569,13 @@ namespace {
       // in order to preserve current behavior, let's not favor overloads
       // which would result in conversion from CGFloat to Double; otherwise
       // it would lead to ambiguities.
-      if (argTy->isCGFloatType() && paramTy->isDouble())
+      if (argTy->isCGFloat() && paramTy->isDouble())
         return false;
 
       return isFavoredParamAndArg(CS, paramTy, argTy) &&
-             hasContextuallyFavorableResultType(fnTy,
-                                                CS.getContextualType(expr));
+             hasContextuallyFavorableResultType(
+                 fnTy,
+                 CS.getContextualType(expr, /*forConstraint=*/false));
     };
 
     favorCallOverloads(expr, CS, isFavoredDecl);
@@ -714,15 +724,15 @@ namespace {
       auto firstParamTy = params[0].getOldType();
       auto secondParamTy = params[1].getOldType();
 
-      auto contextualTy = CS.getContextualType(expr);
+      auto contextualTy = CS.getContextualType(expr, /*forConstraint=*/false);
 
       // Avoid favoring overloads that would require narrowing conversion
       // to match the arguments.
       {
-        if (firstArgTy->isDouble() && firstParamTy->isCGFloatType())
+        if (firstArgTy->isDouble() && firstParamTy->isCGFloat())
           return false;
 
-        if (secondArgTy->isDouble() && secondParamTy->isCGFloatType())
+        if (secondArgTy->isDouble() && secondParamTy->isCGFloat())
           return false;
       }
 
@@ -825,6 +835,9 @@ namespace {
         if (arg.isInOut()) {
           ty = ty->getInOutObjectType();
           flags = flags.withInOut(true);
+        }
+        if (arg.isConst()) {
+          flags = flags.withCompileTimeConst(true);
         }
         result.emplace_back(ty, arg.getLabel(), flags);
       }
@@ -1311,12 +1324,15 @@ namespace {
       // Introduce type variables for unbound generics.
       const auto genericOpener = OpenUnboundGenericType(CS, locator);
       const auto placeholderHandler = HandlePlaceholderType(CS, locator);
-      const auto result = TypeResolution::forContextual(CS.DC, resCtx,
-                                                        genericOpener,
-                                                        placeholderHandler)
-              .resolveType(repr);
+      const auto result = TypeResolution::resolveContextualType(
+          repr, CS.DC, resCtx, genericOpener, placeholderHandler);
       if (result->hasError()) {
         return Type();
+      }
+      // Diagnose top-level usages of placeholder types.
+      if (isa<TopLevelCodeDecl>(CS.DC) && isa<PlaceholderTypeRepr>(repr)) {
+        CS.getASTContext().Diags.diagnose(repr->getLoc(),
+                                          diag::placeholder_type_not_allowed);
       }
       return result;
     }
@@ -1512,6 +1528,19 @@ namespace {
         auto methodTy =
             CS.createTypeVariable(memberTypeLoc, TVO_CanBindToNoEscape);
 
+        // HACK: Bind the function's parameter list as a tuple to a type
+        // variable. This only exists to preserve compatibility with
+        // rdar://85263844, as it can affect the prioritization of bindings,
+        // which can affect behavior for tuple matching as tuple subtyping is
+        // currently a *weaker* constraint than tuple conversion.
+        if (!CS.getASTContext().isSwiftVersionAtLeast(6)) {
+          auto paramTypeVar = CS.createTypeVariable(
+              CS.getConstraintLocator(expr, ConstraintLocator::ApplyArgument),
+              TVO_CanBindToLValue | TVO_CanBindToInOut | TVO_CanBindToNoEscape);
+          CS.addConstraint(ConstraintKind::BindTupleOfFunctionParams, methodTy,
+                           paramTypeVar, CS.getConstraintLocator(expr));
+        }
+
         CS.addValueMemberConstraint(
             baseTy, expr->getName(), methodTy, CurDC,
             expr->getFunctionRefKind(),
@@ -1569,13 +1598,12 @@ namespace {
           auto *const locator = CS.getConstraintLocator(expr);
           const auto options =
               TypeResolutionOptions(TypeResolverContext::InExpression);
-          for (size_t i = 0, size = specializations.size(); i < size; ++i) {
-            const auto resolution = TypeResolution::forContextual(
-                CS.DC, options,
+          for (size_t i = 0, e = specializations.size(); i < e; ++i) {
+            const auto result = TypeResolution::resolveContextualType(
+                specializations[i], CS.DC, options,
                 // Introduce type variables for unbound generics.
                 OpenUnboundGenericType(CS, locator),
                 HandlePlaceholderType(CS, locator));
-            const auto result = resolution.resolveType(specializations[i]);
             if (result->hasError())
               return Type();
 
@@ -1701,7 +1729,7 @@ namespace {
         return Type();
 
       auto locator = CS.getConstraintLocator(expr);
-      auto contextualType = CS.getContextualType(expr);
+      auto contextualType = CS.getContextualType(expr, /*forConstraint=*/false);
       auto contextualPurpose = CS.getContextualTypePurpose(expr);
 
       auto joinElementTypes = [&](Optional<Type> elementType) {
@@ -1829,7 +1857,7 @@ namespace {
       auto valueAssocTy = dictionaryProto->getAssociatedType(C.Id_Value);
 
       auto locator = CS.getConstraintLocator(expr);
-      auto contextualType = CS.getContextualType(expr);
+      auto contextualType = CS.getContextualType(expr, /*forConstraint=*/false);
       auto contextualPurpose = CS.getContextualTypePurpose(expr);
 
       // If a contextual type exists for this expression and is a dictionary
@@ -1896,7 +1924,7 @@ namespace {
 
       // If no contextual type is present, Merge equivalence classes of key 
       // and value types as necessary.
-      if (!CS.getContextualType(expr)) {
+      if (!CS.getContextualType(expr, /*forConstraint=*/false)) {
         for (auto element1 : expr->getElements()) {
           for (auto element2 : expr->getElements()) {
             if (element1 == element2)
@@ -2060,7 +2088,13 @@ namespace {
             return resolvedTy;
         }
 
-        if (auto contextualType = CS.getContextualType(closure)) {
+        // Because we are only pulling out the result type from the contextual
+        // type, we avoid prematurely converting any inferrable types by setting
+        // forConstraint=false. Later on in inferClosureType we call
+        // replaceInferableTypesWithTypeVars before returning to ensure we don't
+        // introduce any placeholders into the constraint system.
+        if (auto contextualType =
+                CS.getContextualType(closure, /*forConstraint=*/false)) {
           if (auto fnType = contextualType->getAs<FunctionType>())
             return fnType->getResult();
         }
@@ -3464,7 +3498,8 @@ namespace {
       // Note that the subexpression of a #selector expression is
       // unevaluated.
       if (auto sel = dyn_cast<ObjCSelectorExpr>(expr)) {
-        CG.getConstraintSystem().UnevaluatedRootExprs.insert(sel->getSubExpr());
+        auto *subExpr = sel->getSubExpr()->getSemanticsProvidingExpr();
+        CG.getConstraintSystem().UnevaluatedRootExprs.insert(subExpr);
       }
 
       // Check an objc key-path expression, which fills in its semantic
@@ -4180,9 +4215,9 @@ struct ResolvedMemberResult::Implementation {
   Optional<unsigned> BestIdx;
 };
 
-ResolvedMemberResult::ResolvedMemberResult(): Impl(new Implementation()) {};
+ResolvedMemberResult::ResolvedMemberResult(): Impl(new Implementation()) {}
 
-ResolvedMemberResult::~ResolvedMemberResult() { delete Impl; };
+ResolvedMemberResult::~ResolvedMemberResult() { delete Impl; }
 
 ResolvedMemberResult::operator bool() const {
   return !Impl->AllDecls.empty();

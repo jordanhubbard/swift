@@ -31,8 +31,16 @@
 
 // REQUIRES: executable_test
 
-// Test disabled until LLVM GlobalDCE supports Swift vtables.
-// REQUIRES: rdar81868930
+// FIXME(mracek): More work needed to get this to work on non-Apple platforms.
+// REQUIRES: VENDOR=apple
+
+// For LTO, the linker dlopen()'s the libLTO library, which is a scenario that
+// ASan cannot work in ("Interceptors are not working, AddressSanitizer is
+// loaded too late").
+// REQUIRES: no_asan
+
+// Remote test execution does not support dynamically loaded libraries.
+// UNSUPPORTED: remote_run
 
 #if LIBRARY
 

@@ -432,12 +432,14 @@ ManagedValue SILGenBuilder::createLoadCopy(SILLocation loc, ManagedValue v,
 
 static ManagedValue createInputFunctionArgument(SILGenBuilder &B, SILType type,
                                                 SILLocation loc,
-                                                ValueDecl *decl = nullptr) {
+                                                ValueDecl *decl = nullptr,
+                                                bool isNoImplicitCopy = false) {
   auto &SGF = B.getSILGenFunction();
   SILFunction &F = B.getFunction();
   assert((F.isBare() || decl) &&
          "Function arguments of non-bare functions must have a decl");
   auto *arg = F.begin()->createFunctionArgument(type, decl);
+  arg->setNoImplicitCopy(isNoImplicitCopy);
   switch (arg->getArgumentConvention()) {
   case SILArgumentConvention::Indirect_In_Guaranteed:
   case SILArgumentConvention::Direct_Guaranteed:
@@ -469,8 +471,10 @@ static ManagedValue createInputFunctionArgument(SILGenBuilder &B, SILType type,
 }
 
 ManagedValue SILGenBuilder::createInputFunctionArgument(SILType type,
-                                                        ValueDecl *decl) {
-  return ::createInputFunctionArgument(*this, type, SILLocation(decl), decl);
+                                                        ValueDecl *decl,
+                                                        bool isNoImplicitCopy) {
+  return ::createInputFunctionArgument(*this, type, SILLocation(decl), decl,
+                                       isNoImplicitCopy);
 }
 
 ManagedValue
@@ -532,6 +536,12 @@ void SILGenBuilder::createCheckedCastBranch(SILLocation loc, bool isExact,
                                             SILBasicBlock *falseBlock,
                                             ProfileCounter Target1Count,
                                             ProfileCounter Target2Count) {
+  // Check if our source type is AnyObject. In such a case, we need to ensure
+  // plus one our operand since SIL does not support guaranteed casts from an
+  // AnyObject.
+  if (op.getType().isAnyObject()) {
+    op = op.ensurePlusOne(SGF, loc);
+  }
   createCheckedCastBranch(loc, isExact, op.forward(SGF),
                           destLoweredTy, destFormalTy,
                           trueBlock, falseBlock,

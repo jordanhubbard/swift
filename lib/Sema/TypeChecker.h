@@ -134,6 +134,9 @@ enum class TypeCheckExprFlags {
   /// unchecked. This is used by source tooling functionalities such as code
   /// completion.
   LeaveClosureBodyUnchecked = 0x04,
+
+  /// Don't type check expressions for correct availability.
+  DisableExprAvailabilityChecking = 0x08,
 };
 
 using TypeCheckExprOptions = OptionSet<TypeCheckExprFlags>;
@@ -422,34 +425,6 @@ void checkProtocolSelfRequirements(ValueDecl *decl);
 /// declaration's type, otherwise we have no way to infer them.
 void checkReferencedGenericParams(GenericContext *dc);
 
-/// Construct a new generic environment for the given declaration context.
-///
-/// \param paramSource The source of generic info: either a generic parameter
-/// list or a generic context with a \c where clause dependent on outer
-/// generic parameters.
-///
-/// \param dc The declaration context in which to perform the validation.
-///
-/// \param outerSignature The generic signature of the outer
-/// context, if not available as part of the \c dc argument (used
-/// for SIL parsing).
-///
-/// \param allowConcreteGenericParams Whether or not to allow
-/// same-type constraints between generic parameters and concrete types.
-///
-/// \param additionalRequirements Additional requirements to add
-/// directly to the GSB.
-///
-/// \param inferenceSources Additional types to infer requirements from.
-///
-/// \returns the resulting generic signature.
-GenericSignature
-checkGenericSignature(GenericParamSource paramSource, DeclContext *dc,
-                      GenericSignature outerSignature,
-                      bool allowConcreteGenericParams,
-                      SmallVector<Requirement, 2> additionalRequirements = {},
-                      SmallVector<TypeLoc, 2> inferenceSources = {});
-
 /// Create a text string that describes the bindings of generic parameters
 /// that are relevant to the given set of types, e.g.,
 /// "[with T = Bar, U = Wibble]".
@@ -470,7 +445,7 @@ std::string gatherGenericParamBindingsText(
 /// Check the given set of generic arguments against the requirements in a
 /// generic signature.
 ///
-/// \param dc The context in which the generic arguments should be checked.
+/// \param module The module to use for conformace lookup.
 /// \param loc The location at which any diagnostics should be emitted.
 /// \param noteLoc The location at which any notes will be printed.
 /// \param owner The type that owns the generic signature.
@@ -479,7 +454,7 @@ std::string gatherGenericParamBindingsText(
 /// should be checked.
 /// \param substitutions Substitutions from interface types of the signature.
 RequirementCheckResult checkGenericArguments(
-    DeclContext *dc, SourceLoc loc, SourceLoc noteLoc, Type owner,
+    ModuleDecl *module, SourceLoc loc, SourceLoc noteLoc, Type owner,
     TypeArrayView<GenericTypeParamType> genericParams,
     ArrayRef<Requirement> requirements, TypeSubstitutionFn substitutions,
     SubstOptions options = None);
@@ -490,10 +465,49 @@ RequirementCheckResult checkGenericArguments(
     ArrayRef<Requirement> requirements,
     TypeSubstitutionFn substitutions);
 
-bool checkContextualRequirements(GenericTypeDecl *decl,
-                                 Type parentTy,
-                                 SourceLoc loc,
-                                 DeclContext *dc);
+/// Checks whether the generic requirements imposed on the nested type
+/// declaration \p decl (if present) are in agreement with the substitutions
+/// that are needed to spell it as a member of the given parent type
+/// \p parentTy.
+///
+/// For example, given
+/// \code
+/// struct S<X> {}
+/// extension S where X == Bool {
+///   struct Inner {}
+/// }
+/// \endcode
+/// \c Inner cannot be referenced on \c S<Int>, because its contextual
+/// requirement \c X \c == \c Bool is not satisfied by the substitution
+/// \c [X \c = \c Int].
+///
+/// Similarly, \c typealias \c Y below is a viable type witness in the
+/// conformance of \c S to \c P, because its contextual requirement
+/// \c Self.X \c == \c Bool is satisfied by the substitution
+/// \c [Self \c = \c S].
+/// \code
+/// protocol P {
+///   associatedtype X
+///   associatedtype Y
+/// }
+/// extension P where X == Bool {
+///   typealias Y = Bool
+/// }
+///
+/// struct S: P {
+///   typealias X = Bool
+/// }
+/// \endcode
+///
+/// \param module The module to use for conformace lookup.
+/// \param contextSig The generic signature that should be used to map
+/// \p parentTy into context. We pass a generic signature to secure on-demand
+/// computation of the associated generic enviroment.
+///
+/// \returns \c true on success.
+bool checkContextualRequirements(GenericTypeDecl *decl, Type parentTy,
+                                 SourceLoc loc, ModuleDecl *module,
+                                 GenericSignature contextSig);
 
 /// Add any implicitly-defined constructors required for the given
 /// struct, class or actor.
@@ -1163,7 +1177,25 @@ bool diagnoseInvalidFunctionType(FunctionType *fnTy, SourceLoc loc,
                                  DeclContext *dc,
                                  Optional<TypeResolutionStage> stage);
 
-}; // namespace TypeChecker
+/// Walk the parallel structure of a type with user-provided placeholders and
+/// an inferred type produced by the type checker. Where placeholders can be
+/// found, suggest the corresponding inferred type.
+///
+/// For example,
+///
+/// \code
+///  func foo(_ x: [_] = [0])
+/// \endcode
+///
+/// Has a written type of `(ArraySlice (Placeholder))` and an inferred type of
+/// `(ArraySlice Int)`, so we walk to `Placeholder` and `Int` in each type and
+/// suggest replacing `_` with `Int`.
+///
+/// \param writtenType The interface type usually derived from a user-written
+/// type repr. \param inferredType The type inferred by the type checker.
+void notePlaceholderReplacementTypes(Type writtenType, Type inferredType);
+
+} // namespace TypeChecker
 
 /// Returns the protocol requirement kind of the given declaration.
 /// Used in diagnostics.
@@ -1319,12 +1351,6 @@ void checkUnknownAttrRestrictions(
 /// let vs. var. This function does not perform any of that validation, leaving
 /// it to later stages.
 void bindSwitchCasePatternVars(DeclContext *dc, CaseStmt *stmt);
-
-/// If the given function has a global actor that should be reflected in
-/// references to its function type from the given declaration context,
-/// update the given function type to include the global actor.
-AnyFunctionType *applyGlobalActorType(
-    AnyFunctionType *fnType, ValueDecl *funcOrEnum, DeclContext *dc);
 
 /// If \p attr was added by an access note, wraps the error in
 /// \c diag::wrap_invalid_attr_added_by_access_note and limits it as an access

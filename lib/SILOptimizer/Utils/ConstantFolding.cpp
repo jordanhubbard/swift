@@ -20,6 +20,7 @@
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SILOptimizer/Utils/CastOptimizer.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/InstructionDeleter.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/Statistic.h"
@@ -476,48 +477,6 @@ static SILValue constantFoldCompare(BuiltinInst *BI, BuiltinValueKind ID) {
       return B.createIntegerLiteral(BI->getLoc(), BI->getType(), APInt());
     }
   }
-
-  // Fold x < 0 into false, if x is known to be a result of an unsigned
-  // operation with overflow checks enabled.
-  BuiltinInst *BIOp;
-  if (match(BI, m_BuiltinInst(BuiltinValueKind::ICMP_SLT,
-                              m_TupleExtractOperation(m_BuiltinInst(BIOp), 0),
-                              m_Zero()))) {
-    // Check if Other is a result of an unsigned operation with overflow.
-    switch (BIOp->getBuiltinInfo().ID) {
-    default:
-      break;
-    case BuiltinValueKind::UAddOver:
-    case BuiltinValueKind::USubOver:
-    case BuiltinValueKind::UMulOver:
-      // Was it an operation with an overflow check?
-      if (match(BIOp->getOperand(2), m_One())) {
-        SILBuilderWithScope B(BI);
-        return B.createIntegerLiteral(BI->getLoc(), BI->getType(), APInt());
-      }
-    }
-  }
-
-  // Fold x >= 0 into true, if x is known to be a result of an unsigned
-  // operation with overflow checks enabled.
-  if (match(BI, m_BuiltinInst(BuiltinValueKind::ICMP_SGE,
-                              m_TupleExtractOperation(m_BuiltinInst(BIOp), 0),
-                              m_Zero()))) {
-    // Check if Other is a result of an unsigned operation with overflow.
-    switch (BIOp->getBuiltinInfo().ID) {
-    default:
-      break;
-    case BuiltinValueKind::UAddOver:
-    case BuiltinValueKind::USubOver:
-    case BuiltinValueKind::UMulOver:
-      // Was it an operation with an overflow check?
-      if (match(BIOp->getOperand(2), m_One())) {
-        SILBuilderWithScope B(BI);
-        return B.createIntegerLiteral(BI->getLoc(), BI->getType(), APInt(1, 1));
-      }
-    }
-  }
-
   return nullptr;
 }
 
@@ -1574,6 +1533,14 @@ void ConstantFolder::initializeWorklist(SILFunction &f) {
         continue;
       }
 
+      // Builtin.ifdef only replaced when not building the stdlib.
+      if (isApplyOfBuiltin(*inst, BuiltinValueKind::Ifdef)) {
+        if (!inst->getModule().getASTContext().SILOpts.ParseStdlib) {
+          WorkList.insert(inst);
+          continue;
+        }
+      }
+
       if (isApplyOfKnownAvailability(*inst)) {
         WorkList.insert(inst);
         continue;
@@ -1687,6 +1654,7 @@ ConstantFolder::processWorkList() {
         InvalidateInstructions = true;
         instToDelete->eraseFromParent();
       });
+  InstructionDeleter deleter(std::move(callbacks));
 
   // An out parameter array that we use to return new simplified results from
   // constantFoldInstruction.
@@ -1710,7 +1678,7 @@ ConstantFolder::processWorkList() {
           // Schedule users for constant folding.
           WorkList.insert(AssertConfInt);
           // Delete the call.
-          eliminateDeadInstruction(BI, callbacks);
+          eliminateDeadInstruction(BI, deleter.getCallbacks());
           continue;
         }
 
@@ -1719,7 +1687,7 @@ ConstantFolder::processWorkList() {
         if (isApplyOfBuiltin(*BI, BuiltinValueKind::CondUnreachable)) {
           assert(BI->use_empty() && "use of conditionallyUnreachable?!");
           recursivelyDeleteTriviallyDeadInstructions(BI, /*force*/ true,
-                                                     callbacks);
+                                                     deleter.getCallbacks());
           InvalidateInstructions = true;
           continue;
         }
@@ -1731,7 +1699,7 @@ ConstantFolder::processWorkList() {
         SILBuilderWithScope B(I);
         auto tru = B.createIntegerLiteral(apply->getLoc(), apply->getType(), 1);
         apply->replaceAllUsesWith(tru);
-        eliminateDeadInstruction(I, callbacks);
+        eliminateDeadInstruction(I, deleter.getCallbacks());
         WorkList.insert(tru);
         InvalidateInstructions = true;
       }
@@ -1779,8 +1747,8 @@ ConstantFolder::processWorkList() {
     if (isApplyOfBuiltin(*I, BuiltinValueKind::GlobalStringTablePointer)) {
       if (constantFoldGlobalStringTablePointerBuiltin(cast<BuiltinInst>(I),
                                                       EnableDiagnostics)) {
-        // Here, the bulitin instruction got folded, so clean it up.
-        eliminateDeadInstruction(I, callbacks);
+        // Here, the builtin instruction got folded, so clean it up.
+        eliminateDeadInstruction(I, deleter.getCallbacks());
       }
       continue;
     }
@@ -1796,7 +1764,7 @@ ConstantFolder::processWorkList() {
                                              sli->getValue());
           WorkList.insert(cfi);
           recursivelyDeleteTriviallyDeadInstructions(I, /*force*/ true,
-                                                     callbacks);
+                                                     deleter.getCallbacks());
         }
       }
       continue;
@@ -1804,11 +1772,34 @@ ConstantFolder::processWorkList() {
 
     if (isApplyOfBuiltin(*I, BuiltinValueKind::IsConcrete)) {
       if (constantFoldIsConcrete(cast<BuiltinInst>(I))) {
-        // Here, the bulitin instruction got folded, so clean it up.
+        // Here, the builtin instruction got folded, so clean it up.
         recursivelyDeleteTriviallyDeadInstructions(I, /*force*/ true,
-                                                   callbacks);
+                                                   deleter.getCallbacks());
       }
       continue;
+    }
+
+    // Builtin.ifdef_... is expected to stay unresolved when building the stdlib
+    // and must be only used in @_alwaysEmitIntoClient exported functions, which
+    // means we never generate IR for it (when building stdlib). Client code is
+    // then always constant-folding this builtin based on the compilation flags
+    // of the client module.
+    if (isApplyOfBuiltin(*I, BuiltinValueKind::Ifdef)) {
+      if (!I->getModule().getASTContext().SILOpts.ParseStdlib) {
+        auto *BI = cast<BuiltinInst>(I);
+        StringRef flagName = BI->getName().str().drop_front(strlen("ifdef_"));
+        const LangOptions &langOpts = I->getModule().getASTContext().LangOpts;
+        bool val = langOpts.isCustomConditionalCompilationFlagSet(flagName);
+
+        SILBuilderWithScope builder(BI);
+        auto *inst = builder.createIntegerLiteral(
+            BI->getLoc(),
+            SILType::getBuiltinIntegerType(1, builder.getASTContext()), val);
+        BI->replaceAllUsesWith(inst);
+
+        eliminateDeadInstruction(I, deleter.getCallbacks());
+        continue;
+      }
     }
 
     if (auto *bi = dyn_cast<BuiltinInst>(I)) {
@@ -1827,7 +1818,15 @@ ConstantFolder::processWorkList() {
     }
 
     // Go through all users of the constant and try to fold them.
-    InstructionDeleter deleter(callbacks);
+    //
+    // FIXME: remove this temporary deleter. It is dangerous because any use of
+    // the original deleter will invalidate its iterators. It is currently used
+    // to work around bugs that are exposed in the -Onone stdlib build when the
+    // same deleter is used for both the dead code elimination above and the
+    // dead use elimination below.
+    auto tempCallbacks = deleter.getCallbacks();
+    InstructionDeleter tempDeleter(std::move(tempCallbacks));
+
     for (auto Result : I->getResults()) {
       for (auto *Use : Result->getUses()) {
         SILInstruction *User = Use->getUser();
@@ -1851,7 +1850,7 @@ ConstantFolder::processWorkList() {
         // this as part of the constant folding logic, because there is no value
         // they can produce (other than empty tuple, which is wasteful).
         if (isa<CondFailInst>(User))
-          deleter.trackIfDead(User);
+          tempDeleter.trackIfDead(User);
 
         // See if we have an instruction that is read none and has a stateless
         // inverse. If we do, add it to the worklist so we can check its users
@@ -1957,7 +1956,7 @@ ConstantFolder::processWorkList() {
           // it, we exit the worklist as expected.
           SILValue r = User->getResult(Index);
           if (r->use_empty()) {
-            deleter.trackIfDead(User);
+            tempDeleter.trackIfDead(User);
             continue;
           }
 
@@ -1965,7 +1964,7 @@ ConstantFolder::processWorkList() {
           User->getResult(Index)->replaceAllUsesWith(C);
           // Record the user if it is dead to perform the necessary cleanups
           // later.
-          deleter.trackIfDead(User);
+          tempDeleter.trackIfDead(User);
 
           // The new constant could be further folded now, add it to the
           // worklist.
@@ -1977,7 +1976,7 @@ ConstantFolder::processWorkList() {
 
     // Eagerly DCE. We do this after visiting all users to ensure we don't
     // invalidate the uses iterator.
-    deleter.cleanupDeadInstructions();
+    tempDeleter.cleanupDeadInstructions();
   }
 
   // TODO: refactor this code outside of the method. Passes should not merge

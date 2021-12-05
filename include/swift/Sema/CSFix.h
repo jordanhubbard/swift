@@ -376,6 +376,12 @@ enum class FixKind : uint8_t {
   /// Ignore a type mismatch between deduced element type and externally
   /// imposed one.
   IgnoreCollectionElementContextualMismatch,
+
+  /// Produce a warning for a tuple label mismatch.
+  AllowTupleLabelMismatch,
+
+  /// Produce an error for not getting a compile-time constant
+  NotCompileTimeConst,
 };
 
 class ConstraintFix {
@@ -644,9 +650,9 @@ class ContextualMismatch : public ConstraintFix {
   Type LHS, RHS;
 
   ContextualMismatch(ConstraintSystem &cs, Type lhs, Type rhs,
-                     ConstraintLocator *locator)
-      : ConstraintFix(cs, FixKind::ContextualMismatch, locator), LHS(lhs),
-        RHS(rhs) {}
+                     ConstraintLocator *locator, bool warning)
+      : ConstraintFix(cs, FixKind::ContextualMismatch, locator, warning),
+        LHS(lhs), RHS(rhs) {}
 
 protected:
   ContextualMismatch(ConstraintSystem &cs, FixKind kind, Type lhs, Type rhs,
@@ -735,9 +741,9 @@ public:
 /// Mark function type as being part of a global actor.
 class MarkGlobalActorFunction final : public ContextualMismatch {
   MarkGlobalActorFunction(ConstraintSystem &cs, Type lhs, Type rhs,
-                         ConstraintLocator *locator)
+                         ConstraintLocator *locator, bool warning)
       : ContextualMismatch(cs, FixKind::MarkGlobalActorFunction, lhs, rhs,
-                           locator) {
+                           locator, warning) {
   }
 
 public:
@@ -746,7 +752,8 @@ public:
   bool diagnose(const Solution &solution, bool asNote = false) const override;
 
   static MarkGlobalActorFunction *create(ConstraintSystem &cs, Type lhs,
-                                         Type rhs, ConstraintLocator *locator);
+                                         Type rhs, ConstraintLocator *locator,
+                                         bool warning);
 
   static bool classof(ConstraintFix *fix) {
     return fix->getKind() == FixKind::MarkGlobalActorFunction;
@@ -781,9 +788,10 @@ public:
 /// function types, repair it by adding @Sendable attribute.
 class AddSendableAttribute final : public ContextualMismatch {
   AddSendableAttribute(ConstraintSystem &cs, FunctionType *fromType,
-                       FunctionType *toType, ConstraintLocator *locator)
+                       FunctionType *toType, ConstraintLocator *locator,
+                       bool warning)
       : ContextualMismatch(cs, FixKind::AddSendableAttribute, fromType, toType,
-                           locator) {
+                           locator, warning) {
     assert(fromType->isSendable() != toType->isSendable());
   }
 
@@ -795,7 +803,8 @@ public:
   static AddSendableAttribute *create(ConstraintSystem &cs,
                                       FunctionType *fromType,
                                       FunctionType *toType,
-                                      ConstraintLocator *locator);
+                                      ConstraintLocator *locator,
+                                      bool warning);
 
   static bool classof(ConstraintFix *fix) {
     return fix->getKind() == FixKind::AddSendableAttribute;
@@ -1858,16 +1867,50 @@ public:
   }
 };
 
-class CollectionElementContextualMismatch final : public ContextualMismatch {
-  CollectionElementContextualMismatch(ConstraintSystem &cs, Type srcType,
-                                      Type dstType, ConstraintLocator *locator)
+class NotCompileTimeConst final : public ContextualMismatch {
+  NotCompileTimeConst(ConstraintSystem &cs, Type paramTy, ConstraintLocator *locator);
+
+public:
+  std::string getName() const override { return "replace with an literal"; }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static NotCompileTimeConst *create(ConstraintSystem &cs,
+                                     Type paramTy,
+                                     ConstraintLocator *locator);
+
+  static bool classof(ConstraintFix *fix) {
+    return fix->getKind() == FixKind::NotCompileTimeConst;
+  }
+};
+
+class CollectionElementContextualMismatch final
+    : public ContextualMismatch,
+      private llvm::TrailingObjects<CollectionElementContextualMismatch,
+                                    Expr *> {
+  friend TrailingObjects;
+
+  unsigned NumElements;
+
+  CollectionElementContextualMismatch(ConstraintSystem &cs,
+                                      ArrayRef<Expr *> affectedElements,
+                                      Type srcType, Type dstType,
+                                      ConstraintLocator *locator)
       : ContextualMismatch(cs,
                            FixKind::IgnoreCollectionElementContextualMismatch,
-                           srcType, dstType, locator) {}
+                           srcType, dstType, locator),
+        NumElements(affectedElements.size()) {
+    std::uninitialized_copy(affectedElements.begin(), affectedElements.end(),
+                            getElementBuffer().begin());
+  }
 
 public:
   std::string getName() const override {
     return "fix collection element contextual mismatch";
+  }
+
+  ArrayRef<Expr *> getElements() const {
+    return {getTrailingObjects<Expr *>(), NumElements};
   }
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
@@ -1878,6 +1921,11 @@ public:
 
   static bool classof(ConstraintFix *fix) {
     return fix->getKind() == FixKind::IgnoreCollectionElementContextualMismatch;
+  }
+
+private:
+  MutableArrayRef<Expr *> getElementBuffer() {
+    return {getTrailingObjects<Expr *>(), NumElements};
   }
 };
 
@@ -2773,6 +2821,27 @@ public:
   static bool classof(ConstraintFix *fix) {
     return fix->getKind() ==
            FixKind::AllowInvalidStaticMemberRefOnProtocolMetatype;
+  }
+};
+
+/// Emit a warning for mismatched tuple labels.
+class AllowTupleLabelMismatch final : public ContextualMismatch {
+  AllowTupleLabelMismatch(ConstraintSystem &cs, Type fromType, Type toType,
+                          ConstraintLocator *locator)
+      : ContextualMismatch(cs, FixKind::AllowTupleLabelMismatch, fromType,
+                           toType, locator, /*warning*/ true) {}
+
+public:
+  std::string getName() const override { return "allow tuple label mismatch"; }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static AllowTupleLabelMismatch *create(ConstraintSystem &cs, Type fromType,
+                                         Type toType,
+                                         ConstraintLocator *locator);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::AllowTupleLabelMismatch;
   }
 };
 

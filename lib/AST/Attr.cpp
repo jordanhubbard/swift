@@ -131,6 +131,8 @@ DeclAttrKind DeclAttribute::getAttrKindFromString(StringRef Str) {
 
 /// Returns true if this attribute can appear on the specified decl.
 bool DeclAttribute::canAttributeAppearOnDecl(DeclAttrKind DK, const Decl *D) {
+  if ((getOptions(DK) & OnAnyClangDecl) && D->hasClangNode())
+    return true;
   return canAttributeAppearOnDeclKind(DK, D->getKind());
 }
 
@@ -699,6 +701,13 @@ void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
     if (Options.excludeAttrKind(DA->getKind()))
       continue;
 
+    // If this attribute is only allowed because this is a Clang decl, don't
+    // print it.
+    if (D && D->hasClangNode()
+        && !DeclAttribute::canAttributeAppearOnDeclKind(
+                               DA->getKind(), D->getKind()))
+      continue;
+
     // Be careful not to coalesce `@available(swift 5)` with other short
     // `available' attributes.
     if (auto *availableAttr = dyn_cast<AvailableAttr>(DA)) {
@@ -982,6 +991,12 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     if (!Options.PrintSPIs && !attr->getSPIGroups().empty())
       return false;
 
+    // Don't print the _specialize attribute if we are asked to skip the ones
+    // with availability parameters.
+    if (!Options.PrintSpecializeAttributeWithAvailability &&
+        !attr->getAvailableAttrs().empty())
+      return false;
+
     Printer << "@" << getAttrName() << "(";
     auto exported = attr->isExported() ? "true" : "false";
     auto kind = attr->isPartialSpecialization() ? "partial" : "full";
@@ -993,7 +1008,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     Printer << "kind: " << kind << ", ";
     if (target)
       Printer << "target: " << target << ", ";
-    auto availAttrs = attr->getAvailabeAttrs();
+    auto availAttrs = attr->getAvailableAttrs();
     if (!availAttrs.empty()) {
       Printer << "availability: ";
       auto numAttrs = availAttrs.size();
@@ -1141,6 +1156,11 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     if (!transParamsString.empty())
       Printer << ", " << transParamsString;
     Printer << ')';
+    break;
+  }
+
+  case DAK_TypeSequence: {
+    Printer.printAttrName("@_typeSequence");
     break;
   }
 
@@ -1295,6 +1315,8 @@ StringRef DeclAttribute::getAttrName() const {
     return "derivative";
   case DAK_Transpose:
     return "transpose";
+  case DAK_TypeSequence:
+    return "_typeSequence";
   }
   llvm_unreachable("bad DeclAttrKind");
 }
@@ -2078,6 +2100,32 @@ bool CustomAttr::isArgUnsafe() const {
   }
 
   return isArgUnsafeBit;
+}
+
+TypeSequenceAttr::TypeSequenceAttr(SourceLoc atLoc, SourceRange range)
+    : DeclAttribute(DAK_TypeSequence, atLoc, range, /*Implicit=*/false) {}
+
+TypeSequenceAttr *TypeSequenceAttr::create(ASTContext &Ctx, SourceLoc atLoc,
+                                           SourceRange range) {
+  void *mem = Ctx.Allocate(sizeof(TypeSequenceAttr), alignof(TypeSequenceAttr));
+  return new (mem) TypeSequenceAttr(atLoc, range);
+}
+
+const DeclAttribute *
+DeclAttributes::getEffectiveSendableAttr() const {
+  const NonSendableAttr *assumedAttr = nullptr;
+
+  for (auto attr : getAttributes<NonSendableAttr>()) {
+    if (attr->Specificity == NonSendableKind::Specific)
+      return attr;
+    if (!assumedAttr)
+      assumedAttr = attr;
+  }
+
+  if (auto sendableAttr = getAttribute<SendableAttr>())
+    return sendableAttr;
+
+  return assumedAttr;
 }
 
 void swift::simple_display(llvm::raw_ostream &out, const DeclAttribute *attr) {

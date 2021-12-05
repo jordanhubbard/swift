@@ -111,30 +111,6 @@ function(get_bootstrapping_swift_lib_dir bs_lib_dir bootstrapping)
   set(bs_lib_dir ${bs_lib_dir} PARENT_SCOPE)
 endfunction()
 
-function(add_bootstrapping_target bootstrapping)
-  if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING" OR
-     ${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING-WITH-HOSTLIBS")
-
-    set(target "bootstrapping${bootstrapping}-all")
-    add_custom_target(${target})
-
-    if(SWIFT_PATH_TO_LIBICU_BUILD)
-      # Need to symlink the libicu libraries to be able to run
-      # the bootstrapping compiler with a custom library path.
-      get_bootstrapping_path(output_dir
-          "${SWIFTLIB_DIR}/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}" "${bootstrapping}")
-      if("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
-        message("TODO: support for copying ICU libraries on Windows")
-      endif()
-      add_custom_command(TARGET "${target}" POST_BUILD
-        COMMAND
-          "ln" "-s" "-f" "${SWIFT_PATH_TO_LIBICU_BUILD}/lib/libicu*" "."
-        WORKING_DIRECTORY "${output_dir}"
-        COMMENT "symlink ICU libraries for bootstrapping stage ${bootstrapping}")
-    endif()
-  endif()
-endfunction()
-
 function(is_build_type_optimized build_type result_var_name)
   if("${build_type}" STREQUAL "Debug")
     set("${result_var_name}" FALSE PARENT_SCOPE)
@@ -207,7 +183,7 @@ endfunction()
 # Once swift-frontend is built, if the standalone (early) swift-driver has been built,
 # we create a `swift-driver` symlink adjacent to the `swift` and `swiftc` executables
 # to ensure that `swiftc` forwards to the standalone driver when invoked.
-function(swift_create_early_driver_symlinks target)
+function(swift_create_early_driver_copies target)
   # Early swift-driver is built adjacent to the compiler (swift build dir)
   set(driver_bin_dir "${CMAKE_BINARY_DIR}/../earlyswiftdriver-${SWIFT_HOST_VARIANT}-${SWIFT_HOST_VARIANT_ARCH}/release/bin")
   set(swift_bin_dir "${SWIFT_RUNTIME_OUTPUT_INTDIR}")
@@ -217,20 +193,18 @@ function(swift_create_early_driver_symlinks target)
       return()
   endif()
 
-  message(STATUS "Creating early SwiftDriver symlinks.")
+  message(STATUS "Copying over early SwiftDriver executable.")
   message(STATUS "From: ${driver_bin_dir}/swift-driver")
   message(STATUS "To: ${swift_bin_dir}/swift-driver")
-  swift_create_post_build_symlink(swift-frontend
-    SOURCE "${driver_bin_dir}/swift-driver"
-    DESTINATION "${swift_bin_dir}/swift-driver"
-    COMMENT "Creating early SwiftDriver symlinks: swift-driver")
+  # Use configure_file instead of file(COPY...) to establish a dependency.
+  # Further Changes to `swift-driver` will cause it to be copied over.
+  configure_file(${driver_bin_dir}/swift-driver ${swift_bin_dir}/swift-driver COPYONLY)
 
   message(STATUS "From: ${driver_bin_dir}/swift-help")
   message(STATUS "To: ${swift_bin_dir}/swift-help")
-  swift_create_post_build_symlink(swift-frontend
-    SOURCE "${driver_bin_dir}/swift-help"
-    DESTINATION "${swift_bin_dir}/swift-help"
-    COMMENT "Creating early SwiftDriver symlinks: swift-help")
+  # Use configure_file instead of file(COPY...) to establish a dependency.
+  # Further Changes to `swift-driver` will cause it to be copied over.  
+  configure_file(${driver_bin_dir}/swift-help ${swift_bin_dir}/swift-help COPYONLY)
 endfunction()
 
 function(dump_swift_vars)

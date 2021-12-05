@@ -24,7 +24,7 @@
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PrunedLiveness.h"
 #include "swift/SIL/SILModule.h"
-#include "swift/SILOptimizer/Utils/InstOptUtils.h"
+#include "swift/SILOptimizer/Utils/InstructionDeleter.h"
 
 namespace swift {
 
@@ -72,6 +72,11 @@ void extendLocalBorrow(BeginBorrowInst *beginBorrow,
 /// Note: This may be called on partially invalid OSSA form, where multiple
 /// newly created phis do not yet have a borrow scope.
 bool createBorrowScopeForPhiOperands(SILPhiArgument *newPhi);
+
+SILValue
+makeGuaranteedValueAvailable(SILValue value, SILInstruction *user,
+                             DeadEndBlocks &deBlocks,
+                             InstModCallbacks callbacks = InstModCallbacks());
 
 //===----------------------------------------------------------------------===//
 //                        GuaranteedOwnershipExtension
@@ -148,11 +153,10 @@ struct OwnershipFixupContext {
   InstModCallbacks &callbacks;
   DeadEndBlocks &deBlocks;
 
-
-  // FIXME: remove these two vectors once BorrowedLifetimeExtender is used
-  // everywhere.
-  SmallVector<Operand *, 8> transitiveBorrowedUses;
-  SmallVector<PhiOperand, 8> recursiveReborrows;
+  // Cache the use-points for the lifetime of an inner guaranteed value (which
+  // does not introduce a borrow scope) after checking validity. These will be
+  // used again to extend the lifetime of the replacement value.
+  SmallVector<Operand *, 8> guaranteedUsePoints;
 
   /// Extra state initialized by OwnershipRAUWFixupHelper::get() that we use
   /// when RAUWing addresses. This ensures we do not need to recompute this
@@ -162,6 +166,8 @@ struct OwnershipFixupContext {
     /// compute all transitive address uses of oldValue. If we find that we do
     /// need this fixed up, then we will copy our interior pointer base value
     /// and use this to seed that new lifetime.
+    ///
+    /// FIXME: shouldn't these already be covered by guaranteedUsePoints?
     SmallVector<Operand *, 8> allAddressUsesFromOldValue;
 
     /// This is the interior pointer (e.g. ref_element_addr)
@@ -184,8 +190,7 @@ struct OwnershipFixupContext {
       : callbacks(callbacks), deBlocks(deBlocks) {}
 
   void clear() {
-    transitiveBorrowedUses.clear();
-    recursiveReborrows.clear();
+    guaranteedUsePoints.clear();
     extraAddressFixupInfo.allAddressUsesFromOldValue.clear();
     extraAddressFixupInfo.base = AccessBase();
   }
@@ -212,6 +217,8 @@ public:
 private:
   OwnershipFixupContext *ctx;
   SILValue oldValue;
+  // newValue is the aspirational replacement. It might not be the actual
+  // replacement after SILCombine fixups (like type casting) and OSSA fixups.
   SILValue newValue;
 
 public:
@@ -253,21 +260,27 @@ public:
   /// Perform OSSA fixup on newValue and return a fixed-up value based that can
   /// be used to replace all uses of oldValue.
   ///
-  /// This is so that we can avoid creating "forwarding" transformation
-  /// instructions before we know if we can perform the RAUW. Any such
-  /// "forwarding" transformation must be performed upon \p newValue at \p
-  /// oldValue's insertion point so that we can then here RAUW the transformed
-  /// \p newValue.
+  /// This is only used by clients that must transform \p newValue, such as
+  /// adding type casts, before it can be used to replace \p oldValue.
+  ///
+  /// \p rewrittenNewValue is only passed when the client needs to regenerate
+  /// newValue after checking its RAUW validity, but before performing OSSA
+  /// fixup on it.
+  SILValue prepareReplacement(SILValue rewrittenNewValue = SILValue());
+
+  /// Perform the actual RAUW--replace all uses if \p oldValue.
+  ///
+  /// Precondition: \p replacementValue is either invalid or has the same type
+  /// as \p oldValue and is a valid OSSA replacement.
   SILBasicBlock::iterator
-  perform(SingleValueInstruction *maybeTransformedNewValue = nullptr);
+  perform(SILValue replacementValue = SILValue());
 
 private:
-  SILBasicBlock::iterator replaceAddressUses(SingleValueInstruction *oldValue,
-                                             SILValue newValue);
-
   void invalidate() {
     ctx = nullptr;
   }
+
+  SILValue getReplacementAddress();
 };
 
 /// A utility composed ontop of OwnershipFixupContext that knows how to replace

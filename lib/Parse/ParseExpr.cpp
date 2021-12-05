@@ -656,17 +656,17 @@ ParserResult<Expr> Parser::parseExprKeyPath() {
     // Add the code completion expression to the path result.
     CodeCompletionExpr *CC = new (Context)
         CodeCompletionExpr(pathResult.getPtrOrNull(), Tok.getLoc());
-    auto keypath = new (Context)
-        KeyPathExpr(backslashLoc, rootResult.getPtrOrNull(), CC, hasLeadingDot);
+    auto *keypath = KeyPathExpr::createParsed(
+        Context, backslashLoc, rootResult.getPtrOrNull(), CC, hasLeadingDot);
     if (CodeCompletion)
       CodeCompletion->completeExprKeyPath(keypath, DotLoc);
     consumeToken(tok::code_complete);
     return makeParserCodeCompletionResult(keypath);
   }
 
-  auto keypath =
-      new (Context) KeyPathExpr(backslashLoc, rootResult.getPtrOrNull(),
-                                pathResult.getPtrOrNull(), hasLeadingDot);
+  auto *keypath = KeyPathExpr::createParsed(
+      Context, backslashLoc, rootResult.getPtrOrNull(),
+      pathResult.getPtrOrNull(), hasLeadingDot);
   return makeParserResult(parseStatus, keypath);
 }
 
@@ -690,8 +690,8 @@ ParserResult<Expr> Parser::parseExprKeyPathObjC() {
   auto handleCodeCompletion = [&](SourceLoc DotLoc) -> ParserResult<Expr> {
     KeyPathExpr *expr = nullptr;
     if (!components.empty()) {
-      expr = new (Context)
-          KeyPathExpr(Context, keywordLoc, lParenLoc, components, Tok.getLoc());
+      expr = KeyPathExpr::createParsedPoundKeyPath(
+          Context, keywordLoc, lParenLoc, components, Tok.getLoc());
     }
 
     if (CodeCompletion)
@@ -764,7 +764,7 @@ ParserResult<Expr> Parser::parseExprKeyPathObjC() {
   }
 
   // We're done: create the key-path expression.
-  return makeParserResult<Expr>(new (Context) KeyPathExpr(
+  return makeParserResult<Expr>(KeyPathExpr::createParsedPoundKeyPath(
       Context, keywordLoc, lParenLoc, components, rParenLoc));
 }
 
@@ -3121,10 +3121,6 @@ ParserStatus Parser::parseExprList(tok leftTok, tok rightTok,
                                    SourceLoc &rightLoc, SyntaxKind Kind) {
   StructureMarkerRAII ParsingExprList(*this, Tok);
   
-  if (ParsingExprList.isFailed()) {
-    return makeParserError();
-  }
-
   leftLoc = consumeToken(leftTok);
   return parseList(rightTok, leftLoc, rightLoc, /*AllowSepAfterLast=*/false,
                    rightTok == tok::r_paren ? diag::expected_rparen_expr_list

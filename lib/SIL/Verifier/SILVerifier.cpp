@@ -20,10 +20,12 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Range.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/ApplySite.h"
+#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/BasicBlockUtils.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/Dominance.h"
@@ -32,7 +34,6 @@
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/PostOrder.h"
 #include "swift/SIL/PrettyStackTrace.h"
-#include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/SILDebugScope.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILModule.h"
@@ -85,8 +86,8 @@ static llvm::cl::opt<bool> AllowCriticalEdges("allow-critical-edges",
 /// Returns true if A is an opened existential type or is equal to an
 /// archetype from F's generic context.
 static bool isArchetypeValidInFunction(ArchetypeType *A, const SILFunction *F) {
-  auto root = dyn_cast<PrimaryArchetypeType>(A->getRoot());
-  if (!root)
+  auto root = A->getRoot();
+  if (!isa<PrimaryArchetypeType>(root) && !isa<SequenceArchetypeType>(root))
     return true;
   if (isa<OpenedArchetypeType>(A->getRoot()))
     return true;
@@ -1984,6 +1985,38 @@ public:
                         "result of build*ExecutorRef");
       return;
     }
+
+    if (builtinKind == BuiltinValueKind::Move) {
+      // We expect that this builtin will be specialized during transparent
+      // inlining into move_value if we inline into a non-generic context. If
+      // the builtin still remains and is not in the specific move semantic
+      // function (which is the only function marked with
+      // semantics::LIFETIMEMANAGEMENT_MOVE), then we know that we did
+      // transparent inlining into a function that did not result in the Builtin
+      // being specialized out which is user error.
+      //
+      // NOTE: Once we have opaque values, this restriction will go away. This
+      // is just so we can call Builtin.move outside of the stdlib.
+      auto semanticName = semantics::LIFETIMEMANAGEMENT_MOVE;
+      require(BI->getFunction()->hasSemanticsAttr(semanticName),
+              "_move used within a generic context");
+    }
+
+    if (builtinKind == BuiltinValueKind::Copy) {
+      // We expect that this builtin will be specialized during transparent
+      // inlining into explicit_copy_value if we inline into a non-generic
+      // context. If the builtin still remains and is not in the specific copy
+      // semantic function (which is the only function marked with
+      // semantics::LIFETIMEMANAGEMENT_COPY), then we know that we did
+      // transparent inlining into a function that did not result in the Builtin
+      // being specialized out which is user error.
+      //
+      // NOTE: Once we have opaque values, this restriction will go away. This
+      // is just so we can call Builtin.copy outside of the stdlib.
+      auto semanticName = semantics::LIFETIMEMANAGEMENT_COPY;
+      require(BI->getFunction()->hasSemanticsAttr(semanticName),
+              "_copy used within a generic context");
+    }
   }
   
   void checkFunctionRefBaseInst(FunctionRefBaseInst *FRI) {
@@ -3007,6 +3040,14 @@ public:
                     "bind_memory index must be a Word");
   }
 
+  void checkRebindMemoryInst(RebindMemoryInst *rbi) {
+    require(rbi->getBase()->getType().is<BuiltinRawPointerType>(),
+            "rebind_memory base be a RawPointer");
+    requireSameType(rbi->getInToken()->getType(),
+                    SILType::getBuiltinWordType(F.getASTContext()),
+                    "rebind_memory token must be a Builtin.Int64");
+  }
+
   void checkIndexAddrInst(IndexAddrInst *IAI) {
     require(IAI->getType().isAddress(), "index_addr must produce an address");
     requireSameType(
@@ -4007,6 +4048,24 @@ public:
                   CBI->getOperand().getOwnershipKind()),
               "failure dest block argument must have ownership compatible with "
               "the checked_cast_br operand");
+
+      // Do not allow for checked_cast_br to forward guaranteed ownership if the
+      // source type is an AnyObject.
+      //
+      // EXPLANATION: A checked_cast_br from an AnyObject may return a different
+      // object. This occurs for instance if one has an AnyObject that is a
+      // boxed AnyHashable (ClassType). This breaks with the guarantees of
+      // checked_cast_br guaranteed, so we ban it.
+      require(!CBI->getOperand()->getType().isAnyObject() ||
+                  CBI->getOperand().getOwnershipKind() !=
+                      OwnershipKind::Guaranteed,
+              "checked_cast_br with an AnyObject typed source cannot forward "
+              "guaranteed ownership");
+      require(CBI->isDirectlyForwarding() ||
+                  CBI->getOperand().getOwnershipKind() !=
+                      OwnershipKind::Guaranteed,
+              "If checked_cast_br is not directly forwarding, it can not have "
+              "guaranteed ownership");
     } else {
       require(CBI->getFailureBB()->args_empty(),
               "Failure dest of checked_cast_br must not take any argument in "
@@ -5410,6 +5469,7 @@ public:
                   "stack dealloc with empty stack");
           if (op != state.Stack.back()) {
             llvm::errs() << "Recent stack alloc: " << *state.Stack.back();
+            llvm::errs() << "Matching stack alloc: " << *op;
             require(op == state.Stack.back(),
                     "stack dealloc does not match most recent stack alloc");
           }

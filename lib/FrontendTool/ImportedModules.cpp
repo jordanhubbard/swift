@@ -59,6 +59,8 @@ bool swift::emitImportedModules(ModuleDecl *mainModule,
   llvm::SetVector<StringRef> Modules;
 
   // Find the imports in the main Swift code.
+  // We don't need `getTopLevelDeclsForDisplay()` here because we only care
+  // about `ImportDecl`s.
   llvm::SmallVector<Decl *, 32> Decls;
   mainModule->getDisplayDecls(Decls);
   for (auto D : Decls) {
@@ -66,7 +68,8 @@ bool swift::emitImportedModules(ModuleDecl *mainModule,
     if (!ID)
       continue;
 
-    auto modulePath = ID->getModulePath();
+    ImportPath::Builder scratch;
+    auto modulePath = ID->getRealModulePath(scratch);
     // only the top-level name is needed (i.e. A in A.B.C)
     Modules.insert(modulePath[0].Item.str());
   }

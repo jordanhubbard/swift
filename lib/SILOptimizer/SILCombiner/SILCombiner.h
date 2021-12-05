@@ -345,7 +345,6 @@ public:
 #include "swift/SILOptimizer/PassManager/Passes.def"
 
   /// Instruction visitor helpers.
-  SILInstruction *optimizeBuiltinCanBeObjCClass(BuiltinInst *AI);
 
   // Optimize the "isConcrete" builtin.
   SILInstruction *optimizeBuiltinIsConcrete(BuiltinInst *I);
@@ -406,6 +405,8 @@ public:
   SILInstruction *tryFoldComposedUnaryForwardingInstChain(
       SingleValueInstruction *user, SingleValueInstruction *value,
       function_ref<SILValue()> newValueGenerator);
+
+  SILInstruction *optimizeAlignment(PointerToAddressInst *ptrAdrInst);
 
   InstModCallbacks &getInstModCallbacks() { return deleter.getCallbacks(); }
 

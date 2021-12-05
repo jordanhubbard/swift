@@ -1351,6 +1351,15 @@ SILCloner<ImplClass>::visitBindMemoryInst(BindMemoryInst *Inst) {
                 getOpValue(Inst->getIndex()), getOpType(Inst->getBoundType())));
 }
 
+template <typename ImplClass>
+void SILCloner<ImplClass>::visitRebindMemoryInst(RebindMemoryInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  recordClonedInstruction(
+      Inst, getBuilder().createRebindMemory(getOpLocation(Inst->getLoc()),
+                                            getOpValue(Inst->getBase()),
+                                            getOpValue(Inst->getInToken())));
+}
+
 template<typename ImplClass>
 void
 SILCloner<ImplClass>::visitConvertFunctionInst(ConvertFunctionInst *Inst) {
@@ -1421,11 +1430,11 @@ template<typename ImplClass>
 void
 SILCloner<ImplClass>::visitPointerToAddressInst(PointerToAddressInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  recordClonedInstruction(Inst, getBuilder().createPointerToAddress(
-                                    getOpLocation(Inst->getLoc()),
-                                    getOpValue(Inst->getOperand()),
-                                    getOpType(Inst->getType()),
-                                    Inst->isStrict(), Inst->isInvariant()));
+  recordClonedInstruction(
+      Inst, getBuilder().createPointerToAddress(
+                getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()),
+                getOpType(Inst->getType()), Inst->isStrict(),
+                Inst->isInvariant(), Inst->alignment()));
 }
 
 template<typename ImplClass>
@@ -1714,11 +1723,27 @@ void SILCloner<ImplClass>::visitCopyValueInst(CopyValueInst *Inst) {
 }
 
 template <typename ImplClass>
+void SILCloner<ImplClass>::visitExplicitCopyValueInst(
+    ExplicitCopyValueInst *Inst) {
+  getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
+  if (!getBuilder().hasOwnership()) {
+    SILValue newValue = getBuilder().emitCopyValueOperation(
+        getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand()));
+    return recordFoldedValue(Inst, newValue);
+  }
+
+  recordClonedInstruction(
+      Inst, getBuilder().createExplicitCopyValue(
+                getOpLocation(Inst->getLoc()), getOpValue(Inst->getOperand())));
+}
+
+template <typename ImplClass>
 void SILCloner<ImplClass>::visitMoveValueInst(MoveValueInst *Inst) {
   getBuilder().setCurrentDebugScope(getOpScope(Inst->getDebugScope()));
-  recordClonedInstruction(
-      Inst, getBuilder().createMoveValue(getOpLocation(Inst->getLoc()),
-                                         getOpValue(Inst->getOperand())));
+  auto *MVI = getBuilder().createMoveValue(getOpLocation(Inst->getLoc()),
+                                           getOpValue(Inst->getOperand()));
+  MVI->setAllowsDiagnostics(Inst->getAllowDiagnostics());
+  recordClonedInstruction(Inst, MVI);
 }
 
 template <typename ImplClass>

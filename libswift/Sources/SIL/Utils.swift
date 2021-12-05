@@ -64,6 +64,17 @@ public struct ReverseList<NodeType: ListNode> :
   }
 }
 
+
+//===----------------------------------------------------------------------===//
+//                            General Utilities
+//===----------------------------------------------------------------------===//
+
+extension Sequence {
+  public var isEmpty: Bool {
+    !contains(where: { _ in true })
+  }
+}
+
 //===----------------------------------------------------------------------===//
 //                            Bridging Utilities
 //===----------------------------------------------------------------------===//
@@ -78,15 +89,6 @@ extension BridgedStringRef {
     let str = string
     freeBridgedStringRef(self)
     return str
-  }
-}
-
-extension std.__1.string {
-  public var string: String {
-    // TODO: remove this once a new version of Swift is released (and call
-    // c_str() directly).
-    var mutableSelf = self
-    return String(cString: mutableSelf.c_str())
   }
 }
 

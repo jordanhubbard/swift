@@ -2319,7 +2319,7 @@ static bool fixItOverrideDeclarationTypesImpl(
 
   llvm_unreachable("unknown overridable member");
 }
-};
+}
 
 bool swift::computeFixitsForOverridenDeclaration(
     ValueDecl *decl, const ValueDecl *base,
@@ -2710,6 +2710,65 @@ public:
   bool walkToDeclPre(Decl *D) override {
     return false;
   }
+};
+
+class ReturnTypePlaceholderReplacer : public ASTWalker {
+  FuncDecl *Implementation;
+  BraceStmt *Body;
+  SmallVector<Type, 4> Candidates;
+
+  bool HasInvalidReturn = false;
+
+public:
+  ReturnTypePlaceholderReplacer(FuncDecl *Implementation, BraceStmt *Body)
+      : Implementation(Implementation), Body(Body) {}
+
+  void check() {
+    auto *resultRepr = Implementation->getResultTypeRepr();
+    if (!resultRepr) {
+      return;
+    }
+
+    Implementation->getASTContext()
+        .Diags
+        .diagnose(resultRepr->getLoc(),
+                  diag::placeholder_type_not_allowed_in_return_type)
+        .highlight(resultRepr->getSourceRange());
+
+    Body->walk(*this);
+
+    // If given function has any invalid returns in the body
+    // let's not try to validate the types, since it wouldn't
+    // be accurate.
+    if (HasInvalidReturn)
+      return;
+
+    auto writtenType = Implementation->getResultInterfaceType();
+    llvm::SmallPtrSet<TypeBase *, 8> seenTypes;
+    for (auto candidate : Candidates) {
+      if (!seenTypes.insert(candidate.getPointer()).second) {
+        continue;
+      }
+      TypeChecker::notePlaceholderReplacementTypes(writtenType, candidate);
+    }
+  }
+
+  std::pair<bool, Expr *> walkToExprPre(Expr *E) override { return {true, E}; }
+
+  std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
+    if (auto *RS = dyn_cast<ReturnStmt>(S)) {
+      if (RS->hasResult()) {
+        auto resultTy = RS->getResult()->getType();
+        HasInvalidReturn |= resultTy.isNull() || resultTy->hasError();
+        Candidates.push_back(resultTy);
+      }
+    }
+
+    return {true, S};
+  }
+
+  // Don't descend into nested decls.
+  bool walkToDeclPre(Decl *D) override { return false; }
 };
 
 } // end anonymous namespace
@@ -3277,6 +3336,13 @@ void swift::performAbstractFuncDeclDiagnostics(AbstractFunctionDecl *AFD) {
         OpaqueUnderlyingTypeChecker(AFD, opaqueResultTy, body).check();
       }
     }
+  } else if (auto *FD = dyn_cast<FuncDecl>(AFD)) {
+    auto resultIFaceTy = FD->getResultInterfaceType();
+    // If the result has a placeholder, we need to try to use the contextual
+    // type inferred in the body to replace it.
+    if (resultIFaceTy && resultIFaceTy->hasPlaceholder()) {
+      ReturnTypePlaceholderReplacer(FD, body).check();
+    }
   }
 }
 
@@ -3432,6 +3498,13 @@ static void checkStmtConditionTrailingClosure(ASTContext &ctx, const Expr *E) {
     bool shouldWalkCaptureInitializerExpressions() override { return true; }
 
     bool shouldWalkIntoTapExpression() override { return false; }
+
+    std::pair<bool, ArgumentList *>
+    walkToArgumentListPre(ArgumentList *args) override {
+      // Don't walk into an explicit argument list, as trailing closures that
+      // appear in child arguments are fine.
+      return {args->isImplicit(), args};
+    }
 
     std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
       switch (E->getKind()) {
@@ -4732,7 +4805,8 @@ void swift::checkPatternBindingDeclAsyncUsage(PatternBindingDecl *decl) {
 /// Emit diagnostics for syntactic restrictions on a given expression.
 void swift::performSyntacticExprDiagnostics(const Expr *E,
                                             const DeclContext *DC,
-                                            bool isExprStmt) {
+                                            bool isExprStmt,
+                                            bool disableExprAvailabiltyChecking) {
   auto &ctx = DC->getASTContext();
   TypeChecker::diagnoseSelfAssignment(E);
   diagSyntacticUseRestrictions(E, DC, isExprStmt);
@@ -4744,7 +4818,7 @@ void swift::performSyntacticExprDiagnostics(const Expr *E,
   diagnoseComparisonWithNaN(E, DC);
   if (!ctx.isSwiftVersionAtLeast(5))
     diagnoseDeprecatedWritableKeyPath(E, DC);
-  if (!ctx.LangOpts.DisableAvailabilityChecking)
+  if (!ctx.LangOpts.DisableAvailabilityChecking && !disableExprAvailabiltyChecking)
     diagnoseExprAvailability(E, const_cast<DeclContext*>(DC));
   if (ctx.LangOpts.EnableObjCInterop)
     diagDeprecatedObjCSelectors(DC, E);

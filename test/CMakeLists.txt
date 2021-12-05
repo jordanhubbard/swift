@@ -145,8 +145,12 @@ if(NOT SWIFT_INCLUDE_TOOLS)
   else()
     list(APPEND SWIFT_LIT_ARGS
       "--path=${SWIFT_NATIVE_LLVM_TOOLS_PATH}"
+      "--param" "swift_native_llvm_tools_path=${SWIFT_NATIVE_LLVM_TOOLS_PATH}"
       "--path=${SWIFT_NATIVE_CLANG_TOOLS_PATH}"
-      "--path=${SWIFT_NATIVE_SWIFT_TOOLS_PATH}")
+      "--param" "swift_native_clang_tools_path=${SWIFT_NATIVE_CLANG_TOOLS_PATH}"
+      "--path=${SWIFT_NATIVE_SWIFT_TOOLS_PATH}"
+      "--param" "swift_native_swift_tools_path=${SWIFT_NATIVE_SWIFT_TOOLS_PATH}"
+      )
   endif()
   if(SWIFT_BUILD_STDLIB)
     list(APPEND SWIFT_LIT_ARGS
@@ -189,6 +193,7 @@ normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
 normalize_boolean_spelling(SWIFT_BACK_DEPLOY_CONCURRENCY)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
+normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
 normalize_boolean_spelling(SWIFT_ENABLE_MACCATALYST)
 normalize_boolean_spelling(SWIFT_RUN_TESTS_WITH_HOST_COMPILER)
 normalize_boolean_spelling(SWIFT_RUNTIME_ENABLE_LEAK_CHECKER)
@@ -197,6 +202,7 @@ normalize_boolean_spelling(SWIFT_STDLIB_SINGLE_THREADED_RUNTIME)
 normalize_boolean_spelling(SWIFT_ENABLE_RUNTIME_FUNCTION_COUNTERS)
 normalize_boolean_spelling(SWIFT_HAVE_LIBXML2)
 normalize_boolean_spelling(SWIFT_INCLUDE_TOOLS)
+normalize_boolean_spelling(SWIFT_STDLIB_STATIC_PRINT)
 is_build_type_optimized("${SWIFT_STDLIB_BUILD_TYPE}" SWIFT_OPTIMIZED)
 
 set(profdata_merge_worker
@@ -379,6 +385,10 @@ foreach(SDK ${SWIFT_SDKS})
 
         if(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
           list(APPEND LIT_ARGS "--param" "distributed")
+        endif()
+
+        if(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
+          list(APPEND LIT_ARGS "--param" "string_processing")
         endif()
 
         foreach(test_subset ${TEST_SUBSETS})

@@ -187,8 +187,8 @@ static ValueDecl *generateSpecializedCXXFunctionTemplate(
   // Generate a name for the specialized function.
   std::string newNameStr;
   llvm::raw_string_ostream buffer(newNameStr);
-  clang::MangleContext *mangler =
-      specialized->getASTContext().createMangleContext();
+  std::unique_ptr<clang::MangleContext> mangler(
+      specialized->getASTContext().createMangleContext());
   mangler->mangleName(specialized, buffer);
   buffer.flush();
   // Add all parameters as empty parameters.
@@ -678,6 +678,10 @@ namespace {
                                   QueryTypeSubstitutionMap{subs},
                                   LookUpConformanceInModule(cs.DC->getParentModule()));
     }
+
+    /// Determine whether the given reference is to a method on
+    /// a remote distributed actor in the given context.
+    bool isDistributedThunk(ConcreteDeclRef ref, Expr *context);
 
   public:
     /// Build a reference to the given declaration.
@@ -2218,23 +2222,23 @@ namespace {
     Expr *buildKeyPathDynamicMemberArgExpr(BoundGenericType *keyPathTy,
                                            SourceLoc dotLoc,
                                            ConstraintLocator *memberLoc) {
+      using Component = KeyPathExpr::Component;
       auto &ctx = cs.getASTContext();
       auto *anchor = getAsExpr(memberLoc->getAnchor());
 
-      SmallVector<KeyPathExpr::Component, 2> components;
+      auto makeKeyPath = [&](ArrayRef<Component> components) -> Expr * {
+        auto *kp = KeyPathExpr::createImplicit(ctx, /*backslashLoc*/ dotLoc,
+                                               components, anchor->getEndLoc());
+        kp->setType(keyPathTy);
+        cs.cacheExprTypes(kp);
 
-      // Let's create a KeyPath expression and fill in "parsed path"
-      // after component is built.
-      auto *keyPath = new (ctx) KeyPathExpr(/*backslashLoc=*/dotLoc,
-                                            /*parsedRoot=*/nullptr,
-                                            /*parsedPath=*/anchor,
-                                            /*hasLeadingDot=*/false,
-                                            /*isImplicit=*/true);
-      // Type of the keypath expression we are forming is known
-      // in advance, so let's set it right away.
-      keyPath->setType(keyPathTy);
-      cs.cacheType(keyPath);
+        // See whether there's an equivalent ObjC key path string we can produce
+        // for interop purposes.
+        checkAndSetObjCKeyPathString(kp);
+        return kp;
+      };
 
+      SmallVector<Component, 2> components;
       auto *componentLoc = cs.getConstraintLocator(
           memberLoc,
           LocatorPathElt::KeyPathDynamicMember(keyPathTy->getAnyNominal()));
@@ -2247,95 +2251,44 @@ namespace {
       case OverloadChoiceKind::KeyPathDynamicMemberLookup: {
         buildKeyPathSubscriptComponent(overload, dotLoc, /*args=*/nullptr,
                                        componentLoc, components);
-        keyPath->resolveComponents(ctx, components);
-        cs.cacheExprTypes(keyPath);
-        return keyPath;
+        return makeKeyPath(components);
       }
 
       default:
         break;
       }
 
-      // We can't reuse existing expression because type-check
-      // based diagnostics could hold the reference to original AST.
-      Expr *componentExpr = nullptr;
-      auto *dotExpr = new (ctx) KeyPathDotExpr(dotLoc);
-
-      // Determines whether this index is built to be used for
-      // one of the existing keypath components e.g. `\Lens<[Int]>.count`
-      // instead of a regular expression e.g. `lens[0]`.
-      bool forKeyPathComponent = false;
-      // Looks like keypath dynamic member lookup was used inside
-      // of a keypath expression e.g. `\Lens<[Int]>.count` where
-      // `count` is referenced using dynamic lookup.
       if (auto *KPE = dyn_cast<KeyPathExpr>(anchor)) {
+        // Looks like keypath dynamic member lookup was used inside
+        // of a keypath expression e.g. `\Lens<[Int]>.count` where
+        // `count` is referenced using dynamic lookup.
         auto kpElt = memberLoc->findFirst<LocatorPathElt::KeyPathComponent>();
         assert(kpElt && "no keypath component node");
-        auto &origComponent = KPE->getComponents()[kpElt->getIndex()];
+        auto &comp = KPE->getComponents()[kpElt->getIndex()];
 
-        using ComponentKind = KeyPathExpr::Component::Kind;
-        if (origComponent.getKind() == ComponentKind::UnresolvedProperty) {
-          anchor = new (ctx) UnresolvedDotExpr(
-              dotExpr, dotLoc, origComponent.getUnresolvedDeclName(),
-              DeclNameLoc(origComponent.getLoc()),
-              /*Implicit=*/true);
-        } else if (origComponent.getKind() ==
-                   ComponentKind::UnresolvedSubscript) {
-          anchor = SubscriptExpr::create(
-              ctx, dotExpr, origComponent.getSubscriptArgs(), ConcreteDeclRef(),
-              /*implicit=*/true, AccessSemantics::Ordinary);
+        if (comp.getKind() == Component::Kind::UnresolvedProperty) {
+          buildKeyPathPropertyComponent(overload, comp.getLoc(), componentLoc,
+                                        components);
+        } else if (comp.getKind() == Component::Kind::UnresolvedSubscript) {
+          buildKeyPathSubscriptComponent(overload, comp.getLoc(),
+                                         comp.getSubscriptArgs(), componentLoc,
+                                         components);
         } else {
           return nullptr;
         }
-
-        anchor->setType(simplifyType(overload.openedType));
-        cs.cacheType(anchor);
-        forKeyPathComponent = true;
+        return makeKeyPath(components);
       }
 
       if (auto *UDE = dyn_cast<UnresolvedDotExpr>(anchor)) {
-        componentExpr =
-            forKeyPathComponent
-                ? UDE
-                : new (ctx) UnresolvedDotExpr(dotExpr, dotLoc, UDE->getName(),
-                                              UDE->getNameLoc(),
-                                              /*Implicit=*/true);
-
         buildKeyPathPropertyComponent(overload, UDE->getLoc(), componentLoc,
                                       components);
       } else if (auto *SE = dyn_cast<SubscriptExpr>(anchor)) {
-        componentExpr = SE;
-        // If this is not for a keypath component, we have to copy
-        // original subscript expression because expression based
-        // diagnostics might have a reference to it, so it couldn't
-        // be modified.
-        if (!forKeyPathComponent) {
-          componentExpr = SubscriptExpr::create(
-              ctx, dotExpr, SE->getArgs(),
-              SE->hasDecl() ? SE->getDecl() : ConcreteDeclRef(),
-              /*implicit=*/true, SE->getAccessSemantics());
-        }
-
         buildKeyPathSubscriptComponent(overload, SE->getLoc(), SE->getArgs(),
                                        componentLoc, components);
       } else {
         return nullptr;
       }
-
-      assert(componentExpr);
-      Type ty = simplifyType(cs.getType(anchor));
-      componentExpr->setType(ty);
-      cs.cacheType(componentExpr);
-
-      keyPath->setParsedPath(componentExpr);
-      keyPath->resolveComponents(ctx, components);
-      cs.cacheExprTypes(keyPath);
-
-      // See whether there's an equivalent ObjC key path string we can produce
-      // for interop purposes.
-      checkAndSetObjCKeyPathString(keyPath);
-
-      return keyPath;
+      return makeKeyPath(components);
     }
 
     /// Bridge the given value (which is an error type) to NSError.
@@ -4894,7 +4847,7 @@ namespace {
       }
 
       // Set the resolved components, and cache their types.
-      E->resolveComponents(cs.getASTContext(), resolvedComponents);
+      E->setComponents(cs.getASTContext(), resolvedComponents);
       cs.cacheExprTypes(E);
 
       // See whether there's an equivalent ObjC key path string we can produce
@@ -5631,10 +5584,8 @@ static bool hasCurriedSelf(ConstraintSystem &cs, ConcreteDeclRef callee,
 
 /// Apply the contextually Sendable flag to the given expression,
 static void applyContextualClosureFlags(
-      Expr *expr, bool sendable, bool forMainActor, bool implicitSelfCapture,
-      bool inheritActorContext) {
+      Expr *expr, bool implicitSelfCapture, bool inheritActorContext) {
   if (auto closure = dyn_cast<ClosureExpr>(expr)) {
-    closure->setUnsafeConcurrent(sendable, forMainActor);
     closure->setAllowsImplicitSelfCapture(implicitSelfCapture);
     closure->setInheritsActorContext(inheritActorContext);
     return;
@@ -5642,46 +5593,14 @@ static void applyContextualClosureFlags(
 
   if (auto captureList = dyn_cast<CaptureListExpr>(expr)) {
     applyContextualClosureFlags(
-        captureList->getClosureBody(), sendable, forMainActor,
-        implicitSelfCapture, inheritActorContext);
+        captureList->getClosureBody(), implicitSelfCapture,
+        inheritActorContext);
   }
 
   if (auto identity = dyn_cast<IdentityExpr>(expr)) {
     applyContextualClosureFlags(
-        identity->getSubExpr(), sendable, forMainActor,
-        implicitSelfCapture, inheritActorContext);
+        identity->getSubExpr(), implicitSelfCapture, inheritActorContext);
   }
-}
-
-/// Whether this is a reference to a method on the main dispatch queue.
-static bool isMainDispatchQueue(Expr *arg) {
-  auto call = dyn_cast<DotSyntaxCallExpr>(arg);
-  if (!call)
-    return false;
-
-  auto memberRef = dyn_cast<MemberRefExpr>(
-      call->getBase()->getValueProvidingExpr());
-  if (!memberRef)
-    return false;
-
-  auto member = memberRef->getMember();
-  if (member.getDecl()->getName().getBaseName().userFacingName() != "main")
-    return false;
-
-  auto typeExpr = dyn_cast<TypeExpr>(
-      memberRef->getBase()->getValueProvidingExpr());
-  if (!typeExpr)
-    return false;
-
-  Type baseType = typeExpr->getInstanceType();
-  if (!baseType)
-    return false;
-
-  auto baseNominal = baseType->getAnyNominal();
-  if (!baseNominal)
-    return false;
-
-  return baseNominal->getName().str() == "DispatchQueue";
 }
 
 ArgumentList *ExprRewriter::coerceCallArguments(
@@ -5825,16 +5744,12 @@ ArgumentList *ExprRewriter::coerceCallArguments(
     // for things like trailing closures and args to property wrapper params.
     arg.setLabel(param.getLabel());
 
-    // Determine whether the parameter is unsafe Sendable or MainActor, and
-    // record it as such.
-    bool isUnsafeSendable = paramInfo.isUnsafeSendable(paramIdx);
-    bool isMainActor = paramInfo.isUnsafeMainActor(paramIdx) ||
-        (isUnsafeSendable && apply && isMainDispatchQueue(apply->getFn()));
+    // Determine whether the closure argument should be treated as having
+    // implicit self capture or inheriting actor context.
     bool isImplicitSelfCapture = paramInfo.isImplicitSelfCapture(paramIdx);
     bool inheritsActorContext = paramInfo.inheritsActorContext(paramIdx);
     applyContextualClosureFlags(
-        argExpr, isUnsafeSendable && contextUsesConcurrencyFeatures(dc),
-        isMainActor, isImplicitSelfCapture, inheritsActorContext);
+        argExpr, isImplicitSelfCapture, inheritsActorContext);
 
     // If the types exactly match, this is easy.
     auto paramType = param.getOldType();
@@ -6431,7 +6346,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   // Diagnose conversions to invalid function types that couldn't be performed
   // beforehand because of placeholders.
   if (auto *fnTy = toType->getAs<FunctionType>()) {
-    auto contextTy = cs.getContextualType(expr);
+    auto contextTy = cs.getContextualType(expr, /*forConstraint=*/false);
     if (cs.getConstraintLocator(locator)->isForContextualType() && contextTy &&
         contextTy->hasPlaceholder()) {
       bool hadError = TypeChecker::diagnoseInvalidFunctionType(
@@ -6771,6 +6686,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   case TypeKind::OpenedArchetype:
   case TypeKind::NestedArchetype:
   case TypeKind::OpaqueTypeArchetype:
+  case TypeKind::SequenceArchetype:
     if (!cast<ArchetypeType>(desugaredFromType)->requiresClass())
       break;
     LLVM_FALLTHROUGH;
@@ -7090,6 +7006,7 @@ Expr *ExprRewriter::coerceToType(Expr *expr, Type toType,
   case TypeKind::OpenedArchetype:
   case TypeKind::NestedArchetype:
   case TypeKind::OpaqueTypeArchetype:
+  case TypeKind::SequenceArchetype:
   case TypeKind::GenericTypeParam:
   case TypeKind::DependentMember:
   case TypeKind::Function:
@@ -7619,6 +7536,14 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
     apply->setArgs(args);
     cs.setType(apply, fnType->getResult());
 
+    // If this is a call to a distributed method thunk, let's mark the
+    // call as implicitly throwing.
+    if (isDistributedThunk(callee, apply->getFn())) {
+      auto *FD = cast<AbstractFunctionDecl>(callee.getDecl());
+      if (!FD->hasThrows())
+        apply->setImplicitlyThrows(true);
+    }
+
     solution.setExprTypes(apply);
     Expr *result = TypeChecker::substituteInputSugarTypeForResult(apply);
     cs.cacheExprTypes(result);
@@ -7694,6 +7619,90 @@ Expr *ExprRewriter::finishApply(ApplyExpr *apply, Type openedType,
 
   // Tail-recur to actually call the constructor.
   return finishApply(apply, openedType, locator, ctorLocator);
+}
+
+/// Determine whether this closure should be treated as Sendable.
+static bool isSendableClosure(ConstraintSystem &cs,
+                              const AbstractClosureExpr *closure) {
+  if (auto fnType = cs.getType(const_cast<AbstractClosureExpr *>(closure))
+                        ->getAs<FunctionType>()) {
+    if (fnType->isSendable())
+      return true;
+  }
+
+  return false;
+}
+
+bool ExprRewriter::isDistributedThunk(ConcreteDeclRef ref, Expr *context) {
+  auto *FD = dyn_cast_or_null<AbstractFunctionDecl>(ref.getDecl());
+  if (!(FD && FD->isInstanceMember() && FD->isDistributed()))
+    return false;
+
+  if (!isa<SelfApplyExpr>(context))
+    return false;
+
+  auto *actor = getReferencedParamOrCapture(
+      cast<SelfApplyExpr>(context)->getBase(),
+      [&](OpaqueValueExpr *opaqueValue) -> Expr * {
+        for (const auto &existential : OpenedExistentials) {
+          if (existential.OpaqueValue == opaqueValue)
+            return existential.ExistentialValue;
+        }
+        return nullptr;
+      });
+
+  if (!actor)
+    return false;
+
+  // If this is a method reference on an potentially isolated
+  // actor then it cannot be a remote thunk.
+  if (isPotentiallyIsolatedActor(actor, [&](ParamDecl *P) {
+        return P->isIsolated() ||
+               llvm::is_contained(solution.isolatedParams, P);
+      }))
+    return false;
+
+  bool isInAsyncLetInitializer = target && target->isAsyncLetInitializer();
+
+  auto isActorInitOrDeInitContext = [&](const DeclContext *dc) {
+    return ::isActorInitOrDeInitContext(
+        dc, [&](const AbstractClosureExpr *closure) {
+          return isSendableClosure(cs, closure);
+        });
+  };
+
+  switch (ActorIsolationRestriction::forDeclaration(ref, dc)) {
+  case ActorIsolationRestriction::CrossActorSelf: {
+    // Not a thunk if it's used in actor init or de-init.
+    if (!isInAsyncLetInitializer && isActorInitOrDeInitContext(dc))
+      return false;
+
+    // Here we know that the method could be used across actors
+    // and the actor it's used on is non-isolated, which means
+    // that it could be a thunk, so we have to be conservative
+    // about it.
+    return true;
+  }
+
+  case ActorIsolationRestriction::ActorSelf: {
+    // An instance member of an actor can be referenced from an actor's
+    // designated initializer or deinitializer.
+    if (actor->isActorSelf() && !isInAsyncLetInitializer) {
+      if (auto *fn = isActorInitOrDeInitContext(dc)) {
+        if (!(isa<ConstructorDecl>(fn) &&
+              cast<ConstructorDecl>(fn)->isConvenienceInit()))
+          return false;
+      }
+    }
+
+    // Call on a non-isolated actor in async context requires
+    // implicit thunk.
+    return isInAsyncLetInitializer || cs.isAsynchronousContext(dc);
+  }
+
+  default:
+    return false;
+  }
 }
 
 // Return the precedence-yielding parent of 'expr', along with the index of
@@ -8317,12 +8326,9 @@ static Optional<SolutionApplicationTarget> applySolutionToInitialization(
 
   // For an async let, wrap the initializer appropriately to make it a child
   // task.
-  if (auto patternBinding = target.getInitializationPatternBindingDecl()) {
-    if (patternBinding->isAsyncLet()) {
-      resultTarget.setExpr(
-          wrapAsyncLetInitializer(
-            cs, resultTarget.getAsExpr(), resultTarget.getDeclContext()));
-    }
+  if (target.isAsyncLetInitializer()) {
+    resultTarget.setExpr(wrapAsyncLetInitializer(
+        cs, resultTarget.getAsExpr(), resultTarget.getDeclContext()));
   }
 
   return resultTarget;
@@ -8681,6 +8687,7 @@ ExprWalker::rewriteTarget(SolutionApplicationTarget target) {
     Type convertType = target.getExprConversionType();
     auto shouldCoerceToContextualType = [&]() {
       return convertType &&
+          !convertType->hasPlaceholder() &&
           !target.isOptionalSomePatternInit() &&
           !(solution.getType(resultExpr)->isUninhabited() &&
             cs.getContextualTypePurpose(target.getAsExpr())

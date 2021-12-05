@@ -141,6 +141,7 @@ set(SWIFTLIB_ESSENTIAL
   SmallString.swift
   Sort.swift
   StaticString.swift
+  StaticPrint.swift
   Stride.swift
   StringHashable.swift  # ORDER DEPENDENCY: Must precede String.swift
   String.swift
@@ -171,11 +172,13 @@ set(SWIFTLIB_ESSENTIAL
   StringUTF8Validation.swift
   Substring.swift
   SwiftNativeNSArray.swift
+  TemporaryAllocation.swift
   ThreadLocalStorage.swift
   UIntBuffer.swift
   UnavailableStringAPIs.swift
   UnicodeData.swift
   UnicodeEncoding.swift
+  UnicodeGraphemeBreakProperty.swift
   UnicodeHelpers.swift
   UnicodeParser.swift
   UnicodeScalarProperties.swift
@@ -286,8 +289,9 @@ endif()
 if(SWIFT_STDLIB_ENABLE_STDLIBCORE_EXCLUSIVITY_CHECKING)
   list(APPEND swift_stdlib_compile_flags "-enforce-exclusivity=checked")
 endif()
+set(compile_flags_for_final_build)
 if(SWIFT_ENABLE_ARRAY_COW_CHECKS)
-  list(APPEND swift_stdlib_compile_flags "-DCOW_CHECKS_ENABLED")
+  list(APPEND compile_flags_for_final_build "-DCOW_CHECKS_ENABLED")
 endif()
 
 # STAGING: Temporarily avoids having to write #fileID in Swift.swiftinterface.
@@ -316,8 +320,6 @@ set(swiftCore_common_options
                     ${SWIFTLIB_SOURCES}
                   GYB_SOURCES
                     ${SWIFTLIB_GYB_SOURCES}
-                  SWIFT_COMPILE_FLAGS
-                    ${swift_stdlib_compile_flags} -Xcc -DswiftCore_EXPORTS ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
                   LINK_FLAGS
                     ${swift_core_link_flags}
                   PRIVATE_LINK_LIBRARIES
@@ -325,7 +327,9 @@ set(swiftCore_common_options
                   INCORPORATE_OBJECT_LIBRARIES
                     ${swift_core_incorporate_object_libraries}
                   FRAMEWORK_DEPENDS
-                    ${swift_core_framework_depends})
+                    ${swift_core_framework_depends}
+                  SWIFT_COMPILE_FLAGS
+                    ${swift_stdlib_compile_flags} -Xcc -DswiftCore_EXPORTS ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS})
 
 # The copy_shim_headers target dependency is required to let the
 # build system know that there's a rule to produce the shims
@@ -335,8 +339,33 @@ set(swiftCore_common_options
 set(swiftCore_common_dependencies
     copy_shim_headers "${SWIFTLIB_DIR}/shims" ${GROUP_INFO_JSON_FILE})
 
-if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING" OR
-   ${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING-WITH-HOSTLIBS")
+if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING")
+
+  set(b0_deps symlink-headers-bootstrapping0)
+  set(b1_deps symlink-headers-bootstrapping1)
+
+  if(SWIFT_PATH_TO_LIBICU_BUILD)
+    foreach(bootstrapping "0" "1")
+      # Need to symlink the libicu libraries to be able to run
+      # the bootstrapping compiler with a custom library path.
+      get_bootstrapping_path(output_dir
+          "${SWIFTLIB_DIR}/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}" "${bootstrapping}")
+      if("${CMAKE_SYSTEM_NAME}" STREQUAL "Windows")
+        message("TODO: support for copying ICU libraries on Windows")
+      endif()
+      set(target "symlink-icu-bootstrapping${bootstrapping}")
+      add_custom_target(${target})
+      add_custom_command(TARGET ${target} POST_BUILD
+       COMMAND
+          "${CMAKE_COMMAND}" "-E" "make_directory" "${output_dir}"
+        COMMAND
+          "ln" "-s" "-f" "${SWIFT_PATH_TO_LIBICU_BUILD}/lib/libicu*" "."
+        WORKING_DIRECTORY "${output_dir}"
+        COMMENT "symlink ICU libraries for bootstrapping stage ${bootstrapping}")
+    endforeach()
+    set(b0_deps ${b0_deps} symlink-icu-bootstrapping0)
+    set(b1_deps ${b1_deps} symlink-icu-bootstrapping1)
+  endif()
 
   list(FIND SWIFT_STDLIB_LIBRARY_BUILD_TYPES "SHARED" index_of_shared)
   if(index_of_shared EQUAL -1)
@@ -356,8 +385,7 @@ if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING" OR
   add_swift_target_library_single(swiftCore-bootstrapping0 swiftCore
                     ${swiftCore_common_bootstrapping_options}
                     FILE_DEPENDS
-                      symlink-headers-bootstrapping0 ${swiftCore_common_dependencies}
-                    MODULE_DEPENDENCY_TARGET swiftCore_module_bootstrapping0
+                      ${b0_deps} ${swiftCore_common_dependencies}
                     BOOTSTRAPPING 0)
 
   # Bootstrapping - stage 1
@@ -365,24 +393,14 @@ if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING" OR
   add_swift_target_library_single(swiftCore-bootstrapping1 swiftCore
                     ${swiftCore_common_bootstrapping_options}
                     FILE_DEPENDS
-                      symlink-headers-bootstrapping1 ${swiftCore_common_dependencies}
-                    MODULE_DEPENDENCY_TARGET swiftCore_module_bootstrapping1
+                      ${b1_deps} ${swiftCore_common_dependencies}
                     BOOTSTRAPPING 1)
-
-  if(LIBSWIFT_BUILD_MODE STREQUAL "BOOTSTRAPPING-WITH-HOSTLIBS")
-    # When linking swift-frontend against the system swift libraries, it's
-    # sufficient to create the swiftmodule files for bootstrapping.
-    add_dependencies(bootstrapping0-all ${swiftCore_module_bootstrapping0})
-    add_dependencies(bootstrapping1-all ${swiftCore_module_bootstrapping1})
-  else()
-    add_dependencies(bootstrapping1-all swiftCore-bootstrapping1)
-    add_dependencies(bootstrapping0-all swiftCore-bootstrapping0)
-  endif()
 endif()
 
 add_swift_target_library(swiftCore
                   ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES}
                   ${swiftCore_common_options}
+                  ${compile_flags_for_final_build}
                   FILE_DEPENDS
                     ${swiftCore_common_dependencies}
                   INSTALL_IN_COMPONENT

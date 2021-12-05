@@ -984,7 +984,8 @@ void LargeValueVisitor::visitTupleInst(SingleValueInstruction *instr) {
 
 void LargeValueVisitor::visitAllocStackInst(AllocStackInst *instr) {
   SILType currSILType = instr->getType().getObjectType();
-  if (getInnerFunctionType(currSILType)) {
+  if (pass.containsDifferentFunctionSignature(pass.F->getLoweredFunctionType(),
+                                              currSILType)) {
     pass.allocStackInstsToMod.push_back(instr);
   }
 }
@@ -1400,7 +1401,8 @@ SILArgument *LoadableStorageAllocation::replaceArgType(SILBuilder &argBuilder,
 void LoadableStorageAllocation::insertIndirectReturnArgs() {
   GenericEnvironment *genEnv = getSubstGenericEnvironment(pass.F);
   auto loweredTy = pass.F->getLoweredFunctionType();
-  SILType resultStorageType = loweredTy->getAllResultsInterfaceType();
+  SILType resultStorageType = loweredTy->getAllResultsSubstType(pass.F->getModule(),
+                                                                pass.F->getTypeExpansionContext());
   auto canType = resultStorageType.getASTType();
   if (canType->hasTypeParameter()) {
     assert(genEnv && "Expected a GenericEnv");
@@ -2111,7 +2113,7 @@ static void rewriteFunction(StructLoweringState &pass,
                                             currSILType);
     auto *newInstr = pointerBuilder.createPointerToAddress(
         instr->getLoc(), instr->getOperand(), newSILType.getAddressType(),
-        instr->isStrict());
+        instr->isStrict(), instr->isInvariant(), instr->alignment());
     instr->replaceAllUsesWith(newInstr);
     instr->getParent()->erase(instr);
   }

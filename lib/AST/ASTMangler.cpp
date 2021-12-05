@@ -266,8 +266,8 @@ std::string ASTMangler::mangleGlobalVariableFull(const VarDecl *decl) {
       if (clangDecl->getDeclContext()->isTranslationUnit()) {
         Buffer << clangDecl->getName();
       } else {
-        clang::MangleContext *mangler =
-          decl->getClangDecl()->getASTContext().createMangleContext();
+        std::unique_ptr<clang::MangleContext> mangler(
+            decl->getClangDecl()->getASTContext().createMangleContext());
         mangler->mangleName(clangDecl, Buffer);
       }
     }
@@ -756,16 +756,14 @@ std::string ASTMangler::mangleTypeAsUSR(Type Ty) {
   return finalize();
 }
 
-std::string ASTMangler::mangleDeclAsUSR(const ValueDecl *Decl,
-                                        StringRef USRPrefix) {
-#if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
-  return std::string(); // not needed for the parser library.
-#endif
-
+std::string ASTMangler::mangleAnyDecl(const ValueDecl *Decl, bool prefix) {
   DWARFMangling = true;
-  beginManglingWithoutPrefix();
+  if (prefix) {
+    beginMangling();
+  } else {
+    beginManglingWithoutPrefix();
+  }
   llvm::SaveAndRestore<bool> allowUnnamedRAII(AllowNamelessEntities, true);
-  Buffer << USRPrefix;
 
   if (auto Ctor = dyn_cast<ConstructorDecl>(Decl)) {
     appendConstructorEntity(Ctor, /*isAllocating=*/false);
@@ -784,8 +782,16 @@ std::string ASTMangler::mangleDeclAsUSR(const ValueDecl *Decl,
   // We have a custom prefix, so finalize() won't verify for us. If we're not
   // in invalid code (coming from an IDE caller) verify manually.
   if (!Decl->isInvalid())
-    verify(Storage.str().drop_front(USRPrefix.size()));
+    verify(Storage.str());
   return finalize();
+}
+
+std::string ASTMangler::mangleDeclAsUSR(const ValueDecl *Decl,
+                                        StringRef USRPrefix) {
+#if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
+  return std::string(); // not needed for the parser library.
+#endif
+  return (llvm::Twine(USRPrefix) + mangleAnyDecl(Decl, false)).str();
 }
 
 std::string ASTMangler::mangleAccessorEntityAsUSR(AccessorKind kind,
@@ -1067,7 +1073,6 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
   TypeBase *tybase = type.getPointer();
   switch (type->getKind()) {
     case TypeKind::TypeVariable:
-    case TypeKind::Placeholder:
       llvm_unreachable("mangling type variable");
 
     case TypeKind::Module:
@@ -1075,6 +1080,7 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
 
     case TypeKind::Error:
     case TypeKind::Unresolved:
+    case TypeKind::Placeholder:
       appendOperator("Xe");
       return;
 
@@ -1287,6 +1293,7 @@ void ASTMangler::appendType(Type type, GenericSignature sig,
       // type ::= archetype
     case TypeKind::PrimaryArchetype:
     case TypeKind::OpenedArchetype:
+    case TypeKind::SequenceArchetype:
       llvm_unreachable("Cannot mangle free-standing archetypes");
 
     case TypeKind::OpaqueTypeArchetype: {
@@ -1720,7 +1727,7 @@ static char getParamConvention(ParameterConvention conv) {
     case ParameterConvention::Direct_Guaranteed: return 'g';
   }
   llvm_unreachable("bad parameter convention");
-};
+}
 
 static Optional<char>
 getParamDifferentiability(SILParameterDifferentiability diffKind) {
@@ -1731,7 +1738,7 @@ getParamDifferentiability(SILParameterDifferentiability diffKind) {
     return 'w';
   }
   llvm_unreachable("bad parameter differentiability");
-};
+}
 
 static char getResultConvention(ResultConvention conv) {
   switch (conv) {
@@ -1742,7 +1749,7 @@ static char getResultConvention(ResultConvention conv) {
     case ResultConvention::Autoreleased: return 'a';
   }
   llvm_unreachable("bad result convention");
-};
+}
 
 static Optional<char>
 getResultDifferentiability(SILResultDifferentiability diffKind) {
@@ -1753,7 +1760,7 @@ getResultDifferentiability(SILResultDifferentiability diffKind) {
     return 'w';
   }
   llvm_unreachable("bad result differentiability");
-};
+}
 
 void ASTMangler::appendImplFunctionType(SILFunctionType *fn,
                                         GenericSignature outerGenericSig) {
@@ -2962,6 +2969,13 @@ CanType ASTMangler::getDeclTypeForMangling(
 
   Type ty = decl->getInterfaceType()->getReferenceStorageReferent();
 
+  // If this declaration predates concurrency, adjust its type to not
+  // contain type features that were not available pre-concurrency. This
+  // cannot alter the ABI in any way.
+  if (decl->predatesConcurrency()) {
+    ty = ty->stripConcurrency(/*recurse=*/true, /*dropGlobalActor=*/true);
+  }
+
   auto canTy = ty->getCanonicalType();
 
   if (auto gft = dyn_cast<GenericFunctionType>(canTy)) {
@@ -3015,6 +3029,9 @@ bool ASTMangler::tryAppendStandardSubstitution(const GenericTypeDecl *decl) {
   auto dc = decl->getDeclContext();
   if (!dc->isModuleScopeContext() ||
       !dc->getParentModule()->hasStandardSubstitutions())
+    return false;
+
+  if (!AllowStandardSubstitutions)
     return false;
 
   if (isa<NominalTypeDecl>(decl)) {

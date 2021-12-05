@@ -755,8 +755,10 @@ IdentifierID Serializer::addModuleRef(const ModuleDecl *module) {
     return CURRENT_MODULE_ID;
   if (module == this->M->getASTContext().TheBuiltinModule)
     return BUILTIN_MODULE_ID;
+  // Use module 'real name', which can be different from 'name'
+  // in case module aliasing was used (-module-alias flag)
   auto moduleName =
-      module->getASTContext().getIdentifier(module->getName().str());
+      module->getASTContext().getIdentifier(module->getRealName().str());
   return addDeclBaseNameRef(moduleName);
 }
 
@@ -965,7 +967,9 @@ void Serializer::writeHeader(const SerializationOptions &options) {
     control_block::RevisionLayout Revision(Out);
     control_block::IsOSSALayout IsOSSA(Out);
 
-    ModuleName.emit(ScratchRecord, M->getName().str());
+    // Write module 'real name', which can be different from 'name'
+    // in case module aliasing is used (-module-alias flag)
+    ModuleName.emit(ScratchRecord, M->getRealName().str());
 
     SmallString<32> versionStringBuf;
     llvm::raw_svector_ostream versionString(versionStringBuf);
@@ -1027,6 +1031,11 @@ void Serializer::writeHeader(const SerializationOptions &options) {
         IsStaticLibrary.emit(ScratchRecord);
       }
 
+      if (options.HermeticSealAtLink) {
+        options_block::HasHermeticSealAtLinkLayout HasHermeticSealAtLink(Out);
+        HasHermeticSealAtLink.emit(ScratchRecord);
+      }
+
       if (M->isTestingEnabled()) {
         options_block::IsTestableLayout IsTestable(Out);
         IsTestable.emit(ScratchRecord);
@@ -1068,9 +1077,11 @@ void Serializer::writeHeader(const SerializationOptions &options) {
         options_block::XCCLayout XCC(Out);
 
         const auto &PathRemapper = options.DebuggingOptionsPrefixMap;
+        const auto &PathObfuscator = options.PathObfuscator;
+        auto sdkPath = M->getASTContext().SearchPathOpts.SDKPath;
         SDKPath.emit(
             ScratchRecord,
-            PathRemapper.remapPath(M->getASTContext().SearchPathOpts.SDKPath));
+            PathObfuscator.obfuscate(PathRemapper.remapPath(sdkPath)));
         auto &Opts = options.ExtraClangOptions;
         for (auto Arg = Opts.begin(), E = Opts.end(); Arg != E; ++Arg) {
           StringRef arg(*Arg);
@@ -1105,6 +1116,8 @@ void Serializer::writeHeader(const SerializationOptions &options) {
 static void flattenImportPath(const ImportedModule &import,
                               SmallVectorImpl<char> &out) {
   llvm::raw_svector_ostream outStream(out);
+  // This will write the module 'real name', which can be different
+  // from the 'name' in case module aliasing was used (see `-module-alias`)
   import.importedModule->getReverseFullModuleName().printForward(
       outStream, StringRef("\0", 1));
 
@@ -1146,16 +1159,17 @@ void Serializer::writeInputBlock(const SerializationOptions &options) {
   input_block::ModuleInterfaceLayout ModuleInterface(Out);
 
   if (options.SerializeOptionsForDebugging) {
+    const auto &PathObfuscator = options.PathObfuscator;
     const auto &PathMapper = options.DebuggingOptionsPrefixMap;
     const SearchPathOptions &searchPathOpts = M->getASTContext().SearchPathOpts;
     // Put the framework search paths first so that they'll be preferred upon
     // deserialization.
     for (auto &framepath : searchPathOpts.FrameworkSearchPaths)
       SearchPath.emit(ScratchRecord, /*framework=*/true, framepath.IsSystem,
-                      PathMapper.remapPath(framepath.Path));
+                      PathObfuscator.obfuscate(PathMapper.remapPath(framepath.Path)));
     for (auto &path : searchPathOpts.ImportSearchPaths)
       SearchPath.emit(ScratchRecord, /*framework=*/false, /*system=*/false,
-                      PathMapper.remapPath(path));
+                      PathObfuscator.obfuscate(PathMapper.remapPath(path)));
   }
 
   // Note: We're not using StringMap here because we don't need to own the
@@ -2605,14 +2619,14 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       auto numSPIGroups = attr->getSPIGroups().size();
       assert(pieces.size() == numArgs + numSPIGroups ||
              pieces.size() == (numArgs - 1 + numSPIGroups));
-      auto numAvailabilityAttrs = attr->getAvailabeAttrs().size();
+      auto numAvailabilityAttrs = attr->getAvailableAttrs().size();
       SpecializeDeclAttrLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode, (unsigned)attr->isExported(),
           (unsigned)attr->getSpecializationKind(),
           S.addGenericSignatureRef(attr->getSpecializedSignature()),
           S.addDeclRef(targetFunDecl), numArgs, numSPIGroups,
           numAvailabilityAttrs, pieces);
-      for (auto availAttr : attr->getAvailabeAttrs()) {
+      for (auto availAttr : attr->getAvailableAttrs()) {
         writeDeclAttribute(D, availAttr);
       }
       return;
@@ -2732,6 +2746,12 @@ class Serializer::DeclSerializer : public DeclVisitor<DeclSerializer> {
       TransposeDeclAttrLayout::emitRecord(
           S.Out, S.ScratchRecord, abbrCode, attr->isImplicit(), origNameId,
           origDeclID, paramIndicesVector);
+      return;
+    }
+
+    case DAK_TypeSequence: {
+      auto abbrCode = S.DeclTypeAbbrCodes[TypeSequenceDeclAttrLayout::Code];
+      TypeSequenceDeclAttrLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode);
       return;
     }
     }
@@ -3373,11 +3393,11 @@ public:
     verifyAttrSerializable(genericParam);
 
     unsigned abbrCode = S.DeclTypeAbbrCodes[GenericTypeParamDeclLayout::Code];
-    GenericTypeParamDeclLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
-                                S.addDeclBaseNameRef(genericParam->getName()),
-                                genericParam->isImplicit(),
-                                genericParam->getDepth(),
-                                genericParam->getIndex());
+    GenericTypeParamDeclLayout::emitRecord(
+        S.Out, S.ScratchRecord, abbrCode,
+        S.addDeclBaseNameRef(genericParam->getName()),
+        genericParam->isImplicit(), genericParam->isTypeSequence(),
+        genericParam->getDepth(), genericParam->getIndex());
   }
 
   void visitAssociatedTypeDecl(const AssociatedTypeDecl *assocType) {
@@ -3707,6 +3727,8 @@ public:
         param->isImplicitlyUnwrappedOptional(),
         param->isVariadic(),
         param->isAutoClosure(),
+        param->isIsolated(),
+        param->isCompileTimeConst(),
         getRawStableDefaultArgumentKind(argKind),
         defaultArgumentText);
 
@@ -4282,6 +4304,13 @@ public:
   }
 
   void visitPlaceholderType(const PlaceholderType *) {
+    // If for some reason we have a placeholder type while compiling with
+    // errors, just serialize an ErrorType and continue.
+    if (S.getASTContext().LangOpts.AllowModuleWithCompilerErrors) {
+      visitErrorType(
+          cast<ErrorType>(ErrorType::get(S.getASTContext()).getPointer()));
+      return;
+    }
     llvm_unreachable("should not serialize a PlaceholderType");
   }
 
@@ -4442,6 +4471,20 @@ public:
                                           rootTypeID, interfaceTypeID);
   }
 
+  void visitSequenceArchetypeType(const SequenceArchetypeType *archetypeTy) {
+    using namespace decls_block;
+    auto sig = archetypeTy->getGenericEnvironment()->getGenericSignature();
+
+    GenericSignatureID sigID = S.addGenericSignatureRef(sig);
+    auto interfaceType =
+        archetypeTy->getInterfaceType()->castTo<GenericTypeParamType>();
+
+    unsigned abbrCode = S.DeclTypeAbbrCodes[SequenceArchetypeTypeLayout::Code];
+    SequenceArchetypeTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
+                                            sigID, interfaceType->getDepth(),
+                                            interfaceType->getIndex());
+  }
+
   void visitGenericTypeParamType(const GenericTypeParamType *genericParam) {
     using namespace decls_block;
 
@@ -4458,6 +4501,7 @@ public:
       indexPlusOne = genericParam->getIndex() + 1;
     }
     GenericTypeParamTypeLayout::emitRecord(S.Out, S.ScratchRecord, abbrCode,
+                                           genericParam->isTypeSequence(),
                                            declIDOrDepth, indexPlusOne);
   }
 
@@ -4484,7 +4528,8 @@ public:
           S.addDeclBaseNameRef(param.getInternalLabel()),
           S.addTypeRef(param.getPlainType()), paramFlags.isVariadic(),
           paramFlags.isAutoClosure(), paramFlags.isNonEphemeral(), rawOwnership,
-          paramFlags.isIsolated(), paramFlags.isNoDerivative());
+          paramFlags.isIsolated(), paramFlags.isNoDerivative(),
+          paramFlags.isCompileTimeConst());
     }
   }
 
@@ -4825,6 +4870,7 @@ void Serializer::writeAllDeclsAndTypes() {
   registerDeclTypeAbbr<OpenedArchetypeTypeLayout>();
   registerDeclTypeAbbr<OpaqueArchetypeTypeLayout>();
   registerDeclTypeAbbr<NestedArchetypeTypeLayout>();
+  registerDeclTypeAbbr<SequenceArchetypeTypeLayout>();
   registerDeclTypeAbbr<ProtocolCompositionTypeLayout>();
   registerDeclTypeAbbr<BoundGenericTypeLayout>();
   registerDeclTypeAbbr<GenericFunctionTypeLayout>();
@@ -5304,7 +5350,7 @@ static void recordDerivativeFunctionConfig(
         {ctx.getIdentifier(attr->getParameterIndices()->getString()),
          AFD->getGenericSignature()});
   }
-};
+}
 
 /// Recursively walks the members and derived global decls of any nominal types
 /// to build up global tables.
@@ -5746,6 +5792,7 @@ void swift::serializeToBuffers(
 
 void swift::serialize(ModuleOrSourceFile DC,
                       const SerializationOptions &options,
+                      const symbolgraphgen::SymbolGraphOptions &symbolGraphOptions,
                       const SILModule *M,
                       const fine_grained_dependencies::SourceFileDepGraph *DG) {
   assert(!withNullAsEmptyStringRef(options.OutputPath).empty());
@@ -5790,22 +5837,12 @@ void swift::serialize(ModuleOrSourceFile DC,
     });
   }
 
-  if (!options.SymbolGraphOutputDir.empty()) {
+  if (!symbolGraphOptions.OutputDir.empty()) {
     if (DC.is<ModuleDecl *>()) {
       auto *M = DC.get<ModuleDecl*>();
       FrontendStatsTracer tracer(getContext(DC).Stats,
                                  "Serialization, symbolgraph");
-      symbolgraphgen::SymbolGraphOptions SGOpts {
-        options.SymbolGraphOutputDir,
-        M->getASTContext().LangOpts.Target,
-        /* PrettyPrint */false,
-        AccessLevel::Public,
-        /*EmitSynthesizedMembers*/true,
-        /*PrintMessages*/false,
-        /*EmitInheritedDocs*/options.SkipSymbolGraphInheritedDocs,
-        /*IncludeSPISymbols*/options.IncludeSPISymbolsInSymbolGraph,
-      };
-      symbolgraphgen::emitSymbolGraphForModule(M, SGOpts);
+      symbolgraphgen::emitSymbolGraphForModule(M, symbolGraphOptions);
     }
   }
   emitABIDescriptor(DC, options);

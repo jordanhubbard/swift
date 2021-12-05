@@ -390,20 +390,27 @@ void sourcekitd::handleRequest(sourcekitd_object_t Req,
   }
 
   handleRequestImpl(
-      Req, CancellationToken, [Receiver](sourcekitd_response_t Resp) {
+      Req, CancellationToken,
+      [Receiver, CancellationToken](sourcekitd_response_t Resp) {
         LOG_SECTION("handleRequest-after", InfoHighPrio) {
           // Responses are big, print them out with info medium priority.
           if (Logger::isLoggingEnabledForLevel(Logger::Level::InfoMediumPrio))
             sourcekitd::printResponse(Resp, Log->getOS());
         }
 
+        sourcekitd::disposeCancellationToken(CancellationToken);
+
         Receiver(Resp);
       });
 }
 
 void sourcekitd::cancelRequest(SourceKitCancellationToken CancellationToken) {
-  getGlobalContext().getSlowRequestSimulator()->cancel(CancellationToken);
-  getGlobalContext().getSwiftLangSupport().cancelRequest(CancellationToken);
+  getGlobalContext().getRequestTracker()->cancel(CancellationToken);
+}
+
+void sourcekitd::disposeCancellationToken(
+    SourceKitCancellationToken CancellationToken) {
+  getGlobalContext().getRequestTracker()->stopTracking(CancellationToken);
 }
 
 static std::unique_ptr<llvm::MemoryBuffer> getInputBufForRequest(
@@ -1910,6 +1917,8 @@ static void addCursorSymbolInfo(const CursorSymbolInfo &Symbol,
     Elem.setBool(KeyIsSystem, true);
   if (Symbol.IsDynamic)
     Elem.setBool(KeyIsDynamic, true);
+  if (Symbol.IsSynthesized)
+    Elem.setBool(KeyIsSynthesized, true);
 
   if (Symbol.ParentNameOffset)
     Elem.set(KeyParentLoc, Symbol.ParentNameOffset.getValue());
@@ -2136,6 +2145,7 @@ class SKCodeCompletionConsumer : public CodeCompletionConsumer {
   CodeCompletionResultsArrayBuilder ResultsBuilder;
 
   std::string ErrorDescription;
+  bool WasCancelled = false;
 
 public:
   explicit SKCodeCompletionConsumer(ResponseBuilder &RespBuilder)
@@ -2143,16 +2153,20 @@ public:
   }
 
   sourcekitd_response_t createResponse() {
-    if (!ErrorDescription.empty())
+    if (WasCancelled) {
+      return createErrorRequestCancelled();
+    } else if (!ErrorDescription.empty()) {
       return createErrorRequestFailed(ErrorDescription.c_str());
-
-    RespBuilder.getDictionary().setCustomBuffer(KeyResults,
-                                                ResultsBuilder.createBuffer());
-    return RespBuilder.createResponse();
+    } else {
+      RespBuilder.getDictionary().setCustomBuffer(
+          KeyResults, ResultsBuilder.createBuffer());
+      return RespBuilder.createResponse();
+    }
   }
 
 
   void failed(StringRef ErrDescription) override;
+  void cancelled() override;
 
   void setCompletionKind(UIdent kind) override;
   void setReusingASTContext(bool flag) override;
@@ -2182,6 +2196,8 @@ codeComplete(llvm::MemoryBuffer *InputBuf, int64_t Offset,
 void SKCodeCompletionConsumer::failed(StringRef ErrDescription) {
   ErrorDescription = ErrDescription.str();
 }
+
+void SKCodeCompletionConsumer::cancelled() { WasCancelled = true; }
 
 void SKCodeCompletionConsumer::setCompletionKind(UIdent kind) {
   assert(kind.isValid());
@@ -2238,19 +2254,25 @@ class SKGroupedCodeCompletionConsumer : public GroupedCodeCompletionConsumer {
   ResponseBuilder::Dictionary Response;
   SmallVector<ResponseBuilder::Array, 3> GroupContentsStack;
   std::string ErrorDescription;
+  bool WasCancelled = false;
 
 public:
   explicit SKGroupedCodeCompletionConsumer(ResponseBuilder &RespBuilder)
       : RespBuilder(RespBuilder) {}
 
   sourcekitd_response_t createResponse() {
-    if (!ErrorDescription.empty())
+    if (WasCancelled) {
+      return createErrorRequestCancelled();
+    } else if (!ErrorDescription.empty()) {
       return createErrorRequestFailed(ErrorDescription.c_str());
-    assert(GroupContentsStack.empty() && "mismatched start/endGroup");
-    return RespBuilder.createResponse();
+    } else {
+      assert(GroupContentsStack.empty() && "mismatched start/endGroup");
+      return RespBuilder.createResponse();
+    }
   }
 
   void failed(StringRef ErrDescription) override;
+  void cancelled() override;
   bool handleResult(const CodeCompletionInfo &Info) override;
   void startGroup(UIdent kind, StringRef name) override;
   void endGroup() override;
@@ -2376,6 +2398,8 @@ void SKGroupedCodeCompletionConsumer::failed(StringRef ErrDescription) {
   ErrorDescription = ErrDescription.str();
 }
 
+void SKGroupedCodeCompletionConsumer::cancelled() { WasCancelled = true; }
+
 bool SKGroupedCodeCompletionConsumer::handleResult(const CodeCompletionInfo &R) {
   assert(!GroupContentsStack.empty() && "missing root group");
 
@@ -2478,6 +2502,7 @@ static sourcekitd_response_t typeContextInfo(llvm::MemoryBuffer *InputBuf,
     ResponseBuilder RespBuilder;
     ResponseBuilder::Array SKResults;
     Optional<std::string> ErrorDescription;
+    bool WasCancelled = false;
 
   public:
     Consumer(ResponseBuilder Builder)
@@ -2508,6 +2533,9 @@ static sourcekitd_response_t typeContextInfo(llvm::MemoryBuffer *InputBuf,
       ErrorDescription = ErrDescription.str();
     }
 
+    void cancelled() override { WasCancelled = true; }
+
+    bool wasCancelled() const { return WasCancelled; }
     bool isError() const { return ErrorDescription.hasValue(); }
     const char *getErrorDescription() const {
       return ErrorDescription->c_str();
@@ -2522,9 +2550,13 @@ static sourcekitd_response_t typeContextInfo(llvm::MemoryBuffer *InputBuf,
   Lang.getExpressionContextInfo(InputBuf, Offset, options.get(), Args, Consumer,
                                 std::move(vfsOptions));
 
-  if (Consumer.isError())
+  if (Consumer.wasCancelled()) {
+    return createErrorRequestCancelled();
+  } else if (Consumer.isError()) {
     return createErrorRequestFailed(Consumer.getErrorDescription());
-  return RespBuilder.createResponse();
+  } else {
+    return RespBuilder.createResponse();
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -2542,6 +2574,7 @@ conformingMethodList(llvm::MemoryBuffer *InputBuf, int64_t Offset,
   class Consumer : public ConformingMethodListConsumer {
     ResponseBuilder::Dictionary SKResult;
     Optional<std::string> ErrorDescription;
+    bool WasCancelled = false;
 
   public:
     Consumer(ResponseBuilder Builder) : SKResult(Builder.getDictionary()) {}
@@ -2571,6 +2604,9 @@ conformingMethodList(llvm::MemoryBuffer *InputBuf, int64_t Offset,
       ErrorDescription = ErrDescription.str();
     }
 
+    void cancelled() override { WasCancelled = true; }
+
+    bool wasCancelled() const { return WasCancelled; }
     bool isError() const { return ErrorDescription.hasValue(); }
     const char *getErrorDescription() const {
       return ErrorDescription->c_str();
@@ -2585,9 +2621,13 @@ conformingMethodList(llvm::MemoryBuffer *InputBuf, int64_t Offset,
   Lang.getConformingMethodList(InputBuf, Offset, options.get(), Args,
                                ExpectedTypes, Consumer, std::move(vfsOptions));
 
-  if (Consumer.isError())
+  if (Consumer.wasCancelled()) {
+    return createErrorRequestCancelled();
+  } else if (Consumer.isError()) {
     return createErrorRequestFailed(Consumer.getErrorDescription());
-  return RespBuilder.createResponse();
+  } else {
+    return RespBuilder.createResponse();
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -2623,7 +2663,18 @@ public:
   sourcekitd_response_t createResponse();
 
   bool needsSemanticInfo() override {
-    return !Opts.SyntacticOnly && !isSemanticEditorDisabled();
+    if (Opts.SyntacticOnly) {
+      return false;
+    } else if (isSemanticEditorDisabled()) {
+      return false;
+    } else if (!documentStructureEnabled() &&
+               !syntaxMapEnabled() &&
+               !diagnosticsEnabled() &&
+               !syntaxTreeEnabled()) {
+      return false;
+    } else {
+      return true;
+    }
   }
 
   void handleRequestError(const char *Description) override;

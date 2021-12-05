@@ -102,7 +102,10 @@ template <typename... ArgTypes>
 InFlightDiagnostic
 FailureDiagnostic::emitDiagnosticAt(ArgTypes &&... Args) const {
   auto &DE = getASTContext().Diags;
-  return DE.diagnose(std::forward<ArgTypes>(Args)...);
+  auto behavior = isWarning ? DiagnosticBehavior::Warning
+                            : DiagnosticBehavior::Unspecified;
+  return std::move(DE.diagnose(std::forward<ArgTypes>(Args)...)
+                     .limitBehavior(behavior));
 }
 
 Expr *FailureDiagnostic::findParentExpr(const Expr *subExpr) const {
@@ -2416,6 +2419,22 @@ bool ContextualFailure::diagnoseAsError() {
   case ConstraintLocator::ResultBuilderBodyResult: {
     diagnostic = *getDiagnosticFor(CTP_Initialization, toType);
     break;
+  }
+
+  case ConstraintLocator::OptionalPayload: {
+    // If this is an attempt at a Double <-> CGFloat conversion
+    // through optional chaining, let's produce a tailored diagnostic.
+    if (isExpr<OptionalEvaluationExpr>(getAnchor())) {
+      if ((fromType->isDouble() || fromType->isCGFloat()) &&
+          (toType->isDouble() || toType->isCGFloat())) {
+        fromType = OptionalType::get(fromType);
+        toType = OptionalType::get(toType);
+        diagnostic = diag::cannot_implicitly_convert_in_optional_context;
+        break;
+      }
+    }
+
+    return false;
   }
 
   default:
@@ -5418,12 +5437,24 @@ bool ExtraneousReturnFailure::diagnoseAsError() {
   return true;
 }
 
+bool NotCompileTimeConstFailure::diagnoseAsError() {
+  emitDiagnostic(diag::expect_compile_time_const);
+  return true;
+}
+
 bool CollectionElementContextualFailure::diagnoseAsError() {
   auto anchor = getRawAnchor();
   auto *locator = getLocator();
 
   auto eltType = getFromType();
   auto contextualType = getToType();
+
+  auto diagnoseAllOccurances = [&](Diag<Type, Type> diagnostic) {
+    assert(AffectedElements.size() > 1);
+    for (auto *element : AffectedElements) {
+      emitDiagnosticAt(element->getLoc(), diagnostic, eltType, contextualType);
+    }
+  };
 
   auto isFixedToDictionary = [&](ArrayExpr *anchor) {
     return llvm::any_of(getSolution().Fixes, [&](ConstraintFix *fix) {
@@ -5437,8 +5468,10 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
   Optional<InFlightDiagnostic> diagnostic;
   if (auto *AE = getAsExpr<ArrayExpr>(anchor)) {
     if (!(treatAsDictionary = isFixedToDictionary(AE))) {
-      if (diagnoseMergedLiteralElements())
+      if (AffectedElements.size() > 1) {
+        diagnoseAllOccurances(diag::cannot_convert_array_element);
         return true;
+      }
 
       diagnostic.emplace(emitDiagnostic(diag::cannot_convert_array_element,
                                         eltType, contextualType));
@@ -5448,15 +5481,27 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
   if (treatAsDictionary || isExpr<DictionaryExpr>(anchor)) {
     auto eltLoc = locator->castLastElementTo<LocatorPathElt::TupleElement>();
     switch (eltLoc.getIndex()) {
-    case 0: // key
+    case 0: { // key
+      if (AffectedElements.size() > 1) {
+        diagnoseAllOccurances(diag::cannot_convert_dict_key);
+        return true;
+      }
+
       diagnostic.emplace(emitDiagnostic(diag::cannot_convert_dict_key, eltType,
                                         contextualType));
       break;
+    }
 
-    case 1: // value
+    case 1: { // value
+      if (AffectedElements.size() > 1) {
+        diagnoseAllOccurances(diag::cannot_convert_dict_value);
+        return true;
+      }
+
       diagnostic.emplace(emitDiagnostic(diag::cannot_convert_dict_value,
                                         eltType, contextualType));
       break;
+    }
 
     default:
       break;
@@ -5489,30 +5534,6 @@ bool CollectionElementContextualFailure::diagnoseAsError() {
     return false;
 
   (void)trySequenceSubsequenceFixIts(*diagnostic);
-  return true;
-}
-
-bool CollectionElementContextualFailure::diagnoseMergedLiteralElements() {
-  auto elementAnchor = simplifyLocatorToAnchor(getLocator());
-  if (!elementAnchor)
-    return false;
-
-  auto *typeVar = getRawType(elementAnchor)->getAs<TypeVariableType>();
-  if (!typeVar || !typeVar->getImpl().getAtomicLiteralKind())
-    return false;
-
-  // This element is a literal whose type variable could have been merged with others,
-  // but the conversion constraint to the array element type was only placed on one
-  // of them. So, we want to emit the error for each element whose type variable is in
-  // this equivalence class.
-  auto &cs = getConstraintSystem();
-  auto node = cs.getRepresentative(typeVar)->getImpl().getGraphNode();
-  for (const auto *typeVar : node->getEquivalenceClass()) {
-    auto anchor = typeVar->getImpl().getLocator()->getAnchor();
-    emitDiagnosticAt(constraints::getLoc(anchor), diag::cannot_convert_array_element,
-                     getFromType(), getToType());
-  }
-
   return true;
 }
 
@@ -6761,12 +6782,9 @@ bool NonEphemeralConversionFailure::diagnosePointerInit() const {
     return false;
   }
 
-  auto diagID = DowngradeToWarning
-                    ? diag::cannot_construct_dangling_pointer_warning
-                    : diag::cannot_construct_dangling_pointer;
-
   auto anchor = getRawAnchor();
-  emitDiagnosticAt(::getLoc(anchor), diagID, constructedTy, constructorKind)
+  emitDiagnosticAt(::getLoc(anchor), diag::cannot_construct_dangling_pointer,
+                   constructedTy, constructorKind)
       .highlight(::getSourceRange(anchor));
 
   emitSuggestionNotes();
@@ -6796,20 +6814,12 @@ bool NonEphemeralConversionFailure::diagnoseAsError() {
 
   auto *argExpr = getArgExpr();
   if (isa<InOutExpr>(argExpr)) {
-    auto diagID = DowngradeToWarning
-                      ? diag::cannot_use_inout_non_ephemeral_warning
-                      : diag::cannot_use_inout_non_ephemeral;
-
-    emitDiagnosticAt(argExpr->getLoc(), diagID, argDesc, getCallee(),
-                     getCalleeFullName())
+    emitDiagnosticAt(argExpr->getLoc(), diag::cannot_use_inout_non_ephemeral,
+                     argDesc, getCallee(), getCalleeFullName())
         .highlight(argExpr->getSourceRange());
   } else {
-    auto diagID = DowngradeToWarning
-                      ? diag::cannot_pass_type_to_non_ephemeral_warning
-                      : diag::cannot_pass_type_to_non_ephemeral;
-
-    emitDiagnosticAt(argExpr->getLoc(), diagID, getArgType(), argDesc,
-                     getCallee(), getCalleeFullName())
+    emitDiagnosticAt(argExpr->getLoc(), diag::cannot_pass_type_to_non_ephemeral,
+                     getArgType(), argDesc, getCallee(), getCalleeFullName())
         .highlight(argExpr->getSourceRange());
   }
   emitSuggestionNotes();
@@ -7677,8 +7687,11 @@ bool CoercibleOptionalCheckedCastFailure::diagnoseForcedCastExpr() const {
 
   bool isBridged = CastKind == CheckedCastKind::BridgingCoercion;
   if (isCastTypeIUO()) {
-    toType = toType->getOptionalObjectType();
-    extraFromOptionals++;
+    // IUO type could either be optional or unwrapped.
+    if (auto objType = toType->getOptionalObjectType()) {
+      extraFromOptionals++;
+      toType = objType;
+    }
   }
 
   std::string extraFromOptionalsStr(extraFromOptionals, '!');
@@ -7776,7 +7789,8 @@ bool NoopCheckedCast::diagnoseForcedCastExpr() const {
   auto diagLoc = expr->getLoc();
 
   if (isCastTypeIUO()) {
-    toType = toType->getOptionalObjectType();
+    if (auto objType = toType->getOptionalObjectType())
+      toType = objType;
   }
 
   if (fromType->isEqual(toType)) {
@@ -7847,6 +7861,12 @@ bool InvalidWeakAttributeUse::diagnoseAsError() {
         .fixItInsertAfter(typeRange.End, ")?");
   }
 
+  return true;
+}
+
+bool TupleLabelMismatchWarning::diagnoseAsError() {
+  emitDiagnostic(diag::tuple_label_mismatch_warning, getFromType(), getToType())
+      .highlight(getSourceRange());
   return true;
 }
 

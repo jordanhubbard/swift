@@ -1027,6 +1027,13 @@ public:
                                          boundType, getFunction()));
   }
 
+  RebindMemoryInst *createRebindMemory(SILLocation Loc, SILValue base,
+                                       SILValue inToken) {
+    auto tokenTy = SILType::getBuiltinWordType(F->getASTContext());
+    return insert(new (getModule()) RebindMemoryInst(getSILDebugLocation(Loc),
+                                                     base, inToken, tokenTy));
+  }
+
   ConvertFunctionInst *createConvertFunction(SILLocation Loc, SILValue Op,
                                              SILType Ty,
                                              bool WithoutActuallyEscaping) {
@@ -1235,6 +1242,15 @@ public:
            "emitCopyValueOperation");
     return insert(new (getModule())
                       CopyValueInst(getSILDebugLocation(Loc), operand));
+  }
+
+  ExplicitCopyValueInst *createExplicitCopyValue(SILLocation Loc,
+                                                 SILValue operand) {
+    assert(!operand->getType().isTrivial(getFunction()) &&
+           "Should not be passing trivial values to this api. Use instead "
+           "emitCopyValueOperation");
+    return insert(new (getModule())
+                      ExplicitCopyValueInst(getSILDebugLocation(Loc), operand));
   }
 
   DestroyValueInst *createDestroyValue(SILLocation Loc, SILValue operand,

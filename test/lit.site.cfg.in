@@ -42,7 +42,6 @@ config.swift_frontend_test_options = "@SWIFT_FRONTEND_TEST_OPTIONS@"
 config.darwin_xcrun_toolchain = "@SWIFT_DARWIN_XCRUN_TOOLCHAIN@"
 
 # --- android ---
-config.android_linker_name = "lld"
 config.android_ndk_path = "@SWIFT_ANDROID_NDK_PATH@"
 config.android_api_level = "@SWIFT_ANDROID_API_LEVEL@"
 
@@ -138,6 +137,10 @@ if "@SWIFT_BACK_DEPLOY_CONCURRENCY@" == "TRUE":
     config.available_features.add('back_deploy_concurrency')
 if "@SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED@" == "TRUE":
     config.available_features.add('distributed')
+if "@SWIFT_STDLIB_STATIC_PRINT@" == "TRUE":
+    config.available_features.add('stdlib_static_print')
+if "@SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING@" == "TRUE":
+    config.available_features.add('string_processing')
 
 # Let the main config do the real work.
 if config.test_exec_root is None:

@@ -17,7 +17,11 @@
 #include "swift/AST/RawComment.h"
 #include "swift/Basic/BasicSourceInfo.h"
 
+#include "llvm/ADT/PointerIntPair.h"
+
 namespace swift {
+class SynthesizedFileUnit;
+
 /// A container for module-scope declarations that itself provides a scope; the
 /// smallest unit of code organization.
 ///
@@ -33,18 +37,24 @@ class FileUnit : public DeclContext, public ASTAllocated<FileUnit> {
   friend class DirectOperatorLookupRequest;
   friend class DirectPrecedenceGroupLookupRequest;
 
-  // FIXME: Stick this in a PointerIntPair.
-  const FileUnitKind Kind;
+  // The pointer is FileUnit insted of SynthesizedFileUnit to break circularity.
+  llvm::PointerIntPair<FileUnit *, 3, FileUnitKind> SynthesizedFileAndKind;
 
 protected:
   FileUnit(FileUnitKind kind, ModuleDecl &M)
-    : DeclContext(DeclContextKind::FileUnit, &M), Kind(kind) {
+    : DeclContext(DeclContextKind::FileUnit, &M),
+      SynthesizedFileAndKind(nullptr, kind) {
   }
 
 public:
   FileUnitKind getKind() const {
-    return Kind;
+    return SynthesizedFileAndKind.getInt();
   }
+
+  /// Returns the synthesized file for this source file, if it exists.
+  SynthesizedFileUnit *getSynthesizedFile() const;
+
+  SynthesizedFileUnit &getOrCreateSynthesizedFile();
 
   /// Look up a (possibly overloaded) value set at top-level scope
   /// (but with the specified access path, which may come from an import decl)
@@ -288,12 +298,14 @@ public:
     return nullptr;
   }
 
-  /// Returns the name to use when referencing entities in this file.
+  /// Returns the real name of the enclosing module to use when referencing entities in this file.
+  /// The 'real name' is the actual binary name of the module, which can be different from the 'name'
+  /// if module aliasing was used (via -module-alias flag).
   ///
-  /// Usually this is the module name itself, but certain Clang features allow
+  /// Usually this is the module real name itself, but certain Clang features allow
   /// substituting another name instead.
   virtual StringRef getExportedModuleName() const {
-    return getParentModule()->getName().str();
+    return getParentModule()->getRealName().str();
   }
 
   /// Traverse the decls within this file.
@@ -393,6 +405,8 @@ public:
   virtual void collectBasicSourceFileInfo(
       llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const {}
 
+  virtual void collectSerializedSearchPath(
+      llvm::function_ref<void(StringRef)> callback) const {}
   static bool classof(const FileUnit *file) {
     return file->getKind() == FileUnitKind::SerializedAST ||
            file->getKind() == FileUnitKind::ClangModule ||

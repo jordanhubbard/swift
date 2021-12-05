@@ -485,8 +485,8 @@ public:
     auto *repr = IdentTypeRepr::create(Context, components);
 
     // See if the repr resolves to a type.
-    const auto resolution = TypeResolution::forContextual(
-        DC, options,
+    const auto ty = TypeResolution::resolveContextualType(
+        repr, DC, options,
         [](auto unboundTy) {
           // FIXME: Don't let unbound generic types escape type resolution.
           // For now, just return the unbound generic type.
@@ -494,10 +494,8 @@ public:
         },
         // FIXME: Don't let placeholder types escape type resolution.
         // For now, just return the placeholder type.
-        [](auto &ctx, auto *originator) {
-          return Type();
-        });
-    const auto ty = resolution.resolveType(repr);
+        PlaceholderType::get);
+
     auto *enumDecl = dyn_cast_or_null<EnumDecl>(ty->getAnyNominal());
     if (!enumDecl)
       return nullptr;
@@ -608,20 +606,17 @@ public:
       auto *prefixRepr = IdentTypeRepr::create(Context, components);
 
       // See first if the entire repr resolves to a type.
-      const Type enumTy =
-          TypeResolution::forContextual(
-              DC, options,
-              [](auto unboundTy) {
-                // FIXME: Don't let unbound generic types escape type
-                // resolution. For now, just return the unbound generic type.
-                return unboundTy;
-              },
-              // FIXME: Don't let placeholder types escape type resolution.
-              // For now, just return the placeholder type.
-              [](auto &ctx, auto *originator) {
-                return Type();
-              })
-              .resolveType(prefixRepr);
+      const Type enumTy = TypeResolution::resolveContextualType(
+          prefixRepr, DC, options,
+          [](auto unboundTy) {
+            // FIXME: Don't let unbound generic types escape type
+            // resolution. For now, just return the unbound generic type.
+            return unboundTy;
+          },
+          // FIXME: Don't let placeholder types escape type resolution.
+          // For now, just return the placeholder type.
+          PlaceholderType::get);
+
       auto *enumDecl = dyn_cast_or_null<EnumDecl>(enumTy->getAnyNominal());
       if (!enumDecl)
         return nullptr;
@@ -718,7 +713,11 @@ Pattern *TypeChecker::resolvePattern(Pattern *P, DeclContext *DC,
   return P;
 }
 
-static Type validateTypedPattern(TypedPattern *TP, TypeResolution resolution) {
+static Type
+validateTypedPattern(TypedPattern *TP, DeclContext *dc,
+                     TypeResolutionOptions options,
+                     OpenUnboundGenericTypeFn unboundTyOpener,
+                     HandlePlaceholderTypeReprFn placeholderHandler) {
   if (TP->hasType()) {
     return TP->getType();
   }
@@ -726,7 +725,7 @@ static Type validateTypedPattern(TypedPattern *TP, TypeResolution resolution) {
   // If the pattern declares an opaque type, and applies to a single
   // variable binding, then we can bind the opaque return type from the
   // property definition.
-  auto &Context = resolution.getASTContext();
+  auto &Context = dc->getASTContext();
   auto *Repr = TP->getTypeRepr();
   if (Repr && Repr->hasOpaque()) {
     auto named = dyn_cast<NamedPattern>(
@@ -751,7 +750,9 @@ static Type validateTypedPattern(TypedPattern *TP, TypeResolution resolution) {
     return named->getDecl()->getDeclContext()->mapTypeIntoContext(opaqueTy);
   }
 
-  auto ty = resolution.resolveType(Repr);
+  const auto ty = TypeResolution::resolveContextualType(
+      Repr, dc, options, unboundTyOpener, placeholderHandler);
+
   if (ty->hasError()) {
     return ErrorType::get(Context);
   }
@@ -830,14 +831,10 @@ Type PatternTypeRequest::evaluate(Evaluator &evaluator,
       };
       // FIXME: Don't let placeholder types escape type resolution.
       // For now, just return the placeholder type.
-      placeholderHandler = [](auto &ctx, auto *originator) {
-        return Type();
-      };
+      placeholderHandler = PlaceholderType::get;
     }
-    return validateTypedPattern(
-        cast<TypedPattern>(P),
-        TypeResolution::forContextual(dc, options, unboundTyOpener,
-                                      placeholderHandler));
+    return validateTypedPattern(cast<TypedPattern>(P), dc, options,
+                                unboundTyOpener, placeholderHandler);
   }
 
   // A wildcard or name pattern cannot appear by itself in a context
@@ -900,15 +897,14 @@ Type PatternTypeRequest::evaluate(Evaluator &evaluator,
         };
         // FIXME: Don't let placeholder types escape type resolution.
         // For now, just return the placeholder type.
-        placeholderHandler = [](auto &ctx, auto *originator) {
-          return Type();
-        };
+        placeholderHandler = PlaceholderType::get;
       }
-      TypedPattern *TP = cast<TypedPattern>(somePat->getSubPattern());
-      const auto type = validateTypedPattern(
-          TP, TypeResolution::forContextual(dc, options, unboundTyOpener,
-                                            placeholderHandler));
-      if (type && !type->hasError()) {
+
+      const auto type =
+          validateTypedPattern(cast<TypedPattern>(somePat->getSubPattern()), dc,
+                               options, unboundTyOpener, placeholderHandler);
+
+      if (!type->hasError()) {
         return OptionalType::get(type);
       }
     }
@@ -1087,25 +1083,20 @@ Pattern *TypeChecker::coercePatternToType(ContextualPattern pattern,
   case PatternKind::Typed: {
     TypedPattern *TP = cast<TypedPattern>(P);
     Type patternType = TypeChecker::typeCheckPattern(pattern);
-    bool hadError = false;
     if (!patternType->hasError()) {
       if (!type->isEqual(patternType) && !type->hasError()) {
         if (options & TypeResolutionFlags::OverrideType) {
           TP->setType(type);
           // If the pattern type has a placeholder, we need to resolve it here.
           if (patternType->hasPlaceholder()) {
-            validateTypedPattern(
-                cast<TypedPattern>(TP),
-                TypeResolution::forContextual(dc, options, nullptr, nullptr));
+            validateTypedPattern(cast<TypedPattern>(TP), dc, options, nullptr,
+                                 nullptr);
           }
         } else {
           diags.diagnose(P->getLoc(), diag::pattern_type_mismatch_context,
                          type);
-          hadError = true;
         }
       }
-    } else {
-      hadError = true;
     }
 
     Pattern *sub = TP->getSubPattern();
@@ -1315,14 +1306,13 @@ Pattern *TypeChecker::coercePatternToType(ContextualPattern pattern,
     auto IP = cast<IsPattern>(P);
 
     // Type-check the type parameter.
-    const auto castType =
-        TypeResolution::forContextual(dc, TypeResolverContext::InExpression,
-                                      // FIXME: Should we really unconditionally
-                                      // complain about unbound generics and
-                                      // placeholders here?
-                                      /*unboundTyOpener*/ nullptr,
-                                      /*placeholderHandler*/ nullptr)
-            .resolveType(IP->getCastTypeRepr());
+    const auto castType = TypeResolution::resolveContextualType(
+        IP->getCastTypeRepr(), dc, TypeResolverContext::InExpression,
+        // FIXME: Should we really unconditionally
+        // complain about unbound generics and
+        // placeholders here?
+        /*unboundTyOpener*/ nullptr,
+        /*placeholderHandler*/ nullptr);
     if (castType->hasError())
       return nullptr;
     IP->setCastType(castType);

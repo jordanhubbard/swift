@@ -469,7 +469,7 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                       LiteralInst, None, DoesNotRelease)
     BRIDGED_SINGLE_VALUE_INST(GlobalValueInst, global_value,
                       LiteralInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST(IntegerLiteralInst, integer_literal,
+    BRIDGED_SINGLE_VALUE_INST(IntegerLiteralInst, integer_literal,
                       LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(FloatLiteralInst, float_literal,
                       LiteralInst, None, DoesNotRelease)
@@ -575,6 +575,10 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   // A copy_value's retain semantics are fully encapsulated in OSSA
   // invariants. It has no side effects relative to other OSSA values.
   BRIDGED_SINGLE_VALUE_INST(CopyValueInst, copy_value,
+                            SingleValueInstruction, None, DoesNotRelease)
+  // A copy_value instruction that was explicitly asked for by the user. Left
+  // alone by OSSA optimizations.
+  SINGLE_VALUE_INST(ExplicitCopyValueInst, explicit_copy_value,
                     SingleValueInstruction, None, DoesNotRelease)
 #define UNCHECKED_REF_STORAGE(Name, name, ...) \
   SINGLE_VALUE_INST(StrongCopy##Name##ValueInst, strong_copy_##name##_value, \
@@ -746,9 +750,16 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   SINGLE_VALUE_INST(KeyPathInst, keypath,
                     SingleValueInstruction, MayHaveSideEffects, DoesNotRelease)
 
-  SINGLE_VALUE_INST_RANGE(SingleValueInstruction, AllocStackInst, KeyPathInst)
+  // BindMemory and RebindMemory have no physical side effect. Semantically they
+  // write to their affected memory region because any reads or writes accessing
+  // that memory must be dependent on the bind operation.
+  SINGLE_VALUE_INST(BindMemoryInst, bind_memory,
+                    SILInstruction, MayWrite, DoesNotRelease)
+  SINGLE_VALUE_INST(RebindMemoryInst, rebind_memory,
+                    SILInstruction, MayWrite, DoesNotRelease)
 
-NODE_RANGE(ValueBase, SILPhiArgument, KeyPathInst)
+SINGLE_VALUE_INST_RANGE(SingleValueInstruction, AllocStackInst, RebindMemoryInst)
+NODE_RANGE(ValueBase, SILPhiArgument, RebindMemoryInst)
 
 // Terminators
 ABSTRACT_INST(TermInst, SILInstruction)
@@ -835,12 +846,6 @@ ABSTRACT_INST(RefCountingInst, SILInstruction)
                  RefCountingInst, MayHaveSideEffects,
        DoesNotRelease)
   INST_RANGE(RefCountingInst, StrongRetainInst, AutoreleaseValueInst)
-
-// BindMemory has no physical side effect. Semantically it writes to
-// its affected memory region because any reads or writes accessing
-// that memory must be dependent on the bind operation.
-NON_VALUE_INST(BindMemoryInst, bind_memory,
-               SILInstruction, MayWrite, DoesNotRelease)
 
 // FIXME: Is MayHaveSideEffects appropriate?
 BRIDGED_NON_VALUE_INST(FixLifetimeInst, fix_lifetime,

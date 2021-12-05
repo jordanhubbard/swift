@@ -488,6 +488,7 @@ ModuleDecl::ModuleDecl(Identifier name, ASTContext &ctx,
   Bits.ModuleDecl.IsNonSwiftModule = 0;
   Bits.ModuleDecl.IsMainModule = 0;
   Bits.ModuleDecl.HasIncrementalInfo = 0;
+  Bits.ModuleDecl.HasHermeticSealAtLink = 0;
   Bits.ModuleDecl.IsConcurrencyChecked = 0;
 }
 
@@ -1038,7 +1039,8 @@ static ProtocolConformanceRef getBuiltinTupleTypeConformance(
     SmallVector<TupleTypeElt, 4> genericElements;
     SmallVector<Requirement, 4> conditionalRequirements;
     for (const auto &elt : tupleType->getElements()) {
-      auto genericParam = GenericTypeParamType::get(0, genericParams.size(), ctx);
+      auto genericParam = GenericTypeParamType::get(/*type sequence*/ false, 0,
+                                                    genericParams.size(), ctx);
       genericParams.push_back(genericParam);
       typeSubstitutions.push_back(elt.getRawType());
       genericElements.push_back(elt.getWithType(genericParam));
@@ -1499,9 +1501,11 @@ ModuleDecl::ReverseFullNameIterator::ReverseFullNameIterator(
 
 StringRef ModuleDecl::ReverseFullNameIterator::operator*() const {
   assert(current && "all name components exhausted");
-
+  // Return the module's real (binary) name, which can be different from
+  // the name if module aliasing was used (-module-alias flag). The real
+  // name is used for serialization and loading.
   if (auto *swiftModule = current.dyn_cast<const ModuleDecl *>())
-    return swiftModule->getName().str();
+    return swiftModule->getRealName().str();
 
   auto *clangModule =
       static_cast<const clang::Module *>(current.get<const void *>());
@@ -1800,6 +1804,15 @@ void ModuleDecl::collectBasicSourceFileInfo(
       callback(BasicSourceFileInfo(SF));
     } else if (auto *serialized = dyn_cast<LoadedFile>(fileUnit)) {
       serialized->collectBasicSourceFileInfo(callback);
+    }
+  }
+}
+
+void ModuleDecl::collectSerializedSearchPath(
+    llvm::function_ref<void(StringRef)> callback) const {
+  for (const FileUnit *fileUnit : getFiles()) {
+    if (auto *serialized = dyn_cast<LoadedFile>(fileUnit)) {
+      serialized->collectSerializedSearchPath(callback);
     }
   }
 }
@@ -2854,7 +2867,8 @@ ASTScope &SourceFile::getScope() {
 
 Identifier
 SourceFile::getDiscriminatorForPrivateValue(const ValueDecl *D) const {
-  assert(D->getDeclContext()->getModuleScopeContext() == this);
+  assert(D->getDeclContext()->getModuleScopeContext() == this ||
+         D->getDeclContext()->getModuleScopeContext() == getSynthesizedFile());
 
   if (!PrivateDiscriminator.empty())
     return PrivateDiscriminator;
@@ -2893,11 +2907,19 @@ SourceFile::getDiscriminatorForPrivateValue(const ValueDecl *D) const {
   return PrivateDiscriminator;
 }
 
-SynthesizedFileUnit &SourceFile::getOrCreateSynthesizedFile() {
-  if (SynthesizedFile)
-    return *SynthesizedFile;
-  SynthesizedFile = new (getASTContext()) SynthesizedFileUnit(*this);
-  getParentModule()->addFile(*SynthesizedFile);
+SynthesizedFileUnit *FileUnit::getSynthesizedFile() const {
+  return cast_or_null<SynthesizedFileUnit>(SynthesizedFileAndKind.getPointer());
+}
+
+SynthesizedFileUnit &FileUnit::getOrCreateSynthesizedFile() {
+  auto SynthesizedFile = getSynthesizedFile();
+  if (!SynthesizedFile) {
+    if (auto thisSynth = dyn_cast<SynthesizedFileUnit>(this))
+      return *thisSynth;
+    SynthesizedFile = new (getASTContext()) SynthesizedFileUnit(*this);
+    SynthesizedFileAndKind.setPointer(SynthesizedFile);
+    getParentModule()->addFile(*SynthesizedFile);
+  }
   return *SynthesizedFile;
 }
 
@@ -2947,9 +2969,9 @@ SourceFile::lookupOpaqueResultType(StringRef MangledName) {
 // SynthesizedFileUnit Implementation
 //===----------------------------------------------------------------------===//
 
-SynthesizedFileUnit::SynthesizedFileUnit(SourceFile &SF)
-    : FileUnit(FileUnitKind::Synthesized, *SF.getParentModule()), SF(SF) {
-  SF.getASTContext().addDestructorCleanup(*this);
+SynthesizedFileUnit::SynthesizedFileUnit(FileUnit &FU)
+    : FileUnit(FileUnitKind::Synthesized, *FU.getParentModule()), FU(FU) {
+  FU.getASTContext().addDestructorCleanup(*this);
 }
 
 Identifier
@@ -2960,23 +2982,15 @@ SynthesizedFileUnit::getDiscriminatorForPrivateValue(const ValueDecl *D) const {
   if (!PrivateDiscriminator.empty())
     return PrivateDiscriminator;
 
-  StringRef sourceFileName = getSourceFile().getFilename();
-  if (sourceFileName.empty()) {
-    assert(1 == count_if(getParentModule()->getFiles(),
-                         [](const FileUnit *FU) -> bool {
-                           return isa<SourceFile>(FU) &&
-                                  cast<SourceFile>(FU)->getFilename().empty();
-                         }) &&
-           "Cannot promise uniqueness if multiple source files are nameless");
-  }
+  // Start with the discriminator that the file we belong to would use.
+  auto ownerDiscriminator = getFileUnit().getDiscriminatorForPrivateValue(D);
 
-  // Use a discriminator invariant across Swift version: a hash of the module
-  // name, the parent source file name, and a special string.
-  llvm::MD5 hash;
-  hash.update(getParentModule()->getName().str());
-  hash.update(llvm::sys::path::filename(sourceFileName));
+  // Hash that with a special string to produce a different value that preserves
+  // the entropy of the original.
   // TODO: Use a more robust discriminator for synthesized files. Pick something
   // that cannot conflict with `SourceFile` discriminators.
+  llvm::MD5 hash;
+  hash.update(ownerDiscriminator.str());
   hash.update("SYNTHESIZED FILE");
   llvm::MD5::MD5Result result;
   hash.final(result);

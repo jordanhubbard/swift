@@ -21,7 +21,7 @@
 #define DEBUG_TYPE "sil-mem2reg"
 
 #include "swift/AST/DiagnosticsSIL.h"
-#include "swift/Basic/DAGNodeWorklist.h"
+#include "swift/Basic/GraphNodeWorklist.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/Projection.h"
@@ -314,9 +314,10 @@ static SILValue createValueForEmptyTuple(SILType ty,
 static bool shouldAddLexicalLifetime(AllocStackInst *asi) {
   return asi->getFunction()->hasOwnership() &&
          asi->getFunction()
-             ->getModule()
-             .getASTContext()
-             .SILOpts.EnableExperimentalLexicalLifetimes &&
+                 ->getModule()
+                 .getASTContext()
+                 .SILOpts.LexicalLifetimes ==
+             LexicalLifetimesOption::ExperimentalLate &&
          asi->isLexical() &&
          !asi->getElementType().isTrivial(*asi->getFunction());
 }
@@ -666,6 +667,11 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
         runningVals = beginLexicalLifetimeAfterStore(asi, si);
         // Create a use of the newly created copy in order to keep phi pruning
         // from deleting our lifetime beginning instructions.
+        //
+        // TODO: Remove this hack, it is only necessary because erasePhiArgument
+        //       calls deleteEdgeValue which calls
+        //       deleteTriviallyDeadOperandsOfDeadArgument and deletes the copy
+        //       and borrow that we added and want not to have deleted.
         SILBuilderWithScope::insertAfter(
             runningVals->value.copy->getDefiningInstruction(),
             [&](auto builder) {
@@ -1028,15 +1034,20 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSetVector &phiBlocks,
     }
     // Go over all proactively added phis, and delete those that were not marked
     // live above.
+    auto eraseLastPhiFromBlock = [](SILBasicBlock *block) {
+      auto *phi = cast<SILPhiArgument>(
+          block->getArgument(block->getNumArguments() - 1));
+      phi->replaceAllUsesWithUndef();
+      erasePhiArgument(block, block->getNumArguments() - 1);
+    };
     for (auto *block : phiBlocks) {
       auto *proactivePhi = cast<SILPhiArgument>(
           block->getArgument(block->getNumArguments() - 1));
       if (!livePhis.contains(proactivePhi)) {
-        proactivePhi->replaceAllUsesWithUndef();
-        erasePhiArgument(block, block->getNumArguments() - 1);
+        eraseLastPhiFromBlock(block);
         if (shouldAddLexicalLifetime(asi)) {
-          erasePhiArgument(block, block->getNumArguments() - 1);
-          erasePhiArgument(block, block->getNumArguments() - 1);
+          eraseLastPhiFromBlock(block);
+          eraseLastPhiFromBlock(block);
         }
       } else {
         phiBlocksOut.insert(block);
@@ -1132,7 +1143,7 @@ void StackAllocationPromoter::endLexicalLifetime(BlockSetVector &phiBlocks) {
   using ScopeEndPosition =
       llvm::PointerIntPair<SILBasicBlock *, 1, AvailableValuesKind>;
 
-  DAGNodeWorklist<ScopeEndPosition, 16> worklist;
+  GraphNodeWorklist<ScopeEndPosition, 16> worklist;
   for (auto pair : initializationPoints) {
     worklist.insert({pair.getFirst(), AvailableValuesKind::Out});
   }
@@ -1646,12 +1657,50 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
 
   if (runningVals && runningVals->isStorageValid &&
       shouldAddLexicalLifetime(asi)) {
-    assert(isa<UnreachableInst>(parentBlock->getTerminator()) &&
-           "valid storage after reaching end of single-block allocation not "
-           "terminated by unreachable?!");
-    endLexicalLifetimeBeforeInst(
-        asi, /*beforeInstruction=*/parentBlock->getTerminator(), ctx,
-        runningVals->value);
+    // There is still valid storage after visiting all instructions in this
+    // block which are the only instructions involving this alloc_stack.
+    // This can only happen if all paths from this block end in unreachable.
+    //
+    // We need to end the lexical lifetime at the last possible location, either
+    // just before an unreachable instruction or just before a branch to a block
+    // that is not dominated by parentBlock.
+
+    // Walk forward from parentBlock until finding blocks which either
+    // (1) terminate in unreachable
+    // (2) have successors which are not dominated by parentBlock
+    GraphNodeWorklist<SILBasicBlock *, 2> worklist;
+    worklist.initialize(parentBlock);
+    while (auto *block = worklist.pop()) {
+      assert(domInfo->dominates(parentBlock, block));
+      auto *terminator = block->getTerminator();
+      if (isa<UnreachableInst>(terminator)) {
+        endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/terminator, ctx,
+                                     runningVals->value);
+        continue;
+      }
+      SILBasicBlock *successor = nullptr;
+      // If any successor is not dominated by the parentBlock, then we must end
+      // the lifetime before that successor.
+      //
+      // Suppose that a successor is not dominated by parentBlock.  Recall that
+      // block _is_ dominated by parentBlock.  Thus that successor must have
+      // more than one predecessor: block, and at least one other.  (Otherwise
+      // it would be dominated by parentBlock contrary to our assumption.)
+      // Recall that SIL does not allow critical edges.  Therefore block has
+      // only a single successor.
+      //
+      // Use the above fact to only look for lack of domination of a successor
+      // if that successor is the single successor of block.
+      if ((successor = block->getSingleSuccessorBlock()) &&
+          (!domInfo->dominates(parentBlock, successor))) {
+        endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/terminator, ctx,
+                                     runningVals->value);
+        continue;
+      }
+      for (auto *successor : block->getSuccessorBlocks()) {
+        worklist.insert(successor);
+      }
+    }
   }
 }
 
@@ -1728,6 +1777,10 @@ bool MemoryToRegisters::run() {
     f.verifyCriticalEdges();
 
   for (auto &block : f) {
+    // Don't waste time optimizing unreachable blocks.
+    if (!domInfo->isReachableFromEntry(&block)) {
+      continue;
+    }
     for (SILInstruction *inst : deleter.updatingReverseRange(&block)) {
       auto *asi = dyn_cast<AllocStackInst>(inst);
       if (!asi)

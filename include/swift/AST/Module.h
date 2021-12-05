@@ -176,6 +176,9 @@ public:
   ///
   /// For a Swift module, this will only ever have one component, but an
   /// imported Clang module might actually be a submodule.
+  ///
+  /// *Note: see `StringRef operator*()` for details on the returned name for printing
+  /// for a Swift module.
   class ReverseFullNameIterator {
   public:
     // Make this look like a valid STL iterator.
@@ -194,6 +197,9 @@ public:
       current = clangModule;
     }
 
+    /// Returns the name of the current module.
+    /// Note that for a Swift module, it returns the current module's real (binary) name,
+    /// which can be different from the name if module aliasing was used (see `-module-alias`).
     StringRef operator*() const;
     ReverseFullNameIterator &operator++();
 
@@ -208,6 +214,9 @@ public:
 
     /// This is a convenience function that writes the entire name, in forward
     /// order, to \p out.
+    ///
+    /// It calls `StringRef operator*()` under the hood (see for more detail on the
+    /// returned name for a Swift module).
     void printForward(raw_ostream &out, StringRef delim = ".") const;
   };
 
@@ -508,6 +517,15 @@ public:
     Bits.ModuleDecl.HasIncrementalInfo = enabled;
   }
 
+  /// Returns true if this module was built with
+  /// -experimental-hermetic-seal-at-link.
+  bool hasHermeticSealAtLink() const {
+    return Bits.ModuleDecl.HasHermeticSealAtLink;
+  }
+  void setHasHermeticSealAtLink(bool enabled = true) {
+    Bits.ModuleDecl.HasHermeticSealAtLink = enabled;
+  }
+
   /// \returns true if this module is a system module; note that the StdLib is
   /// considered a system module.
   bool isSystemModule() const {
@@ -749,7 +767,9 @@ public:
   /// The order of the results is not guaranteed to be meaningful.
   ///
   /// This can differ from \c getTopLevelDecls, e.g. it returns decls from a
-  /// shadowed clang module.
+  /// shadowed clang module. It does not force synthesized top-level decls that
+  /// should be printed to be added; use \c swift::getTopLevelDeclsForDisplay()
+  /// for that.
   void getDisplayDecls(SmallVectorImpl<Decl*> &results) const;
 
   using LinkLibraryCallback = llvm::function_ref<void(LinkLibrary)>;
@@ -802,6 +822,9 @@ public:
   ///
   /// For a Swift module, this will only ever have one component, but an
   /// imported Clang module might actually be a submodule.
+  ///
+  /// *Note: see `StringRef operator*()` for details on the returned name for printing
+  /// for a Swift module.
   ReverseFullNameIterator getReverseFullModuleName() const {
     return ReverseFullNameIterator(this);
   }
@@ -810,6 +833,8 @@ public:
   void collectBasicSourceFileInfo(
       llvm::function_ref<void(const BasicSourceFileInfo &)> callback) const;
 
+  void collectSerializedSearchPath(
+      llvm::function_ref<void(StringRef)> callback) const;
   /// Retrieve a fingerprint value that summarizes the contents of this module.
   ///
   /// This interface hash a of a module is guaranteed to change if the interface

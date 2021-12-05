@@ -1061,7 +1061,7 @@ static bool errorAndSkipUntilConsumeRightParen(Parser &P, StringRef attrName,
     }
   }
   return true;
-};
+}
 
 /// Parse a differentiability parameters 'wrt:' clause, returning true on error.
 /// If `allowNamedParameters` is false, allow only index parameters and 'self'.
@@ -1631,6 +1631,9 @@ Parser::parseAvailabilityMacro(SmallVectorImpl<AvailabilitySpec *> &Specs) {
   auto NameMatch = Map.find(MacroName);
   if (NameMatch == Map.end())
     return makeParserSuccess(); // No match, it could be a standard platform.
+
+  SyntaxParsingContext VersionRestrictionContext(
+      SyntaxContext, SyntaxKind::AvailabilityVersionRestriction);
 
   consumeToken();
 
@@ -2741,6 +2744,11 @@ bool Parser::parseNewDeclAttribute(DeclAttributes &Attributes, SourceLoc AtLoc,
         name, AtLoc, range, /*implicit*/ false));
     break;
   }
+  case DAK_TypeSequence: {
+    auto range = SourceRange(Loc, Tok.getRange().getStart());
+    Attributes.add(TypeSequenceAttr::create(Context, AtLoc, range));
+    break;
+  }
   }
 
   if (DuplicateAttribute) {
@@ -3069,6 +3077,17 @@ ParserStatus Parser::parseDeclAttribute(
       .fixItRemove(SourceRange(AtLoc, rParenLoc));
 
     // Recovered.
+    return makeParserSuccess();
+  }
+
+  // @_unsafeSendable and @_unsafeMainActor have been removed; warn about them.
+  if (DK == DAK_Count &&
+      (Tok.getText() == "_unsafeSendable" ||
+       Tok.getText() == "_unsafeMainActor")) {
+    StringRef attrName = Tok.getText();
+    SourceLoc attrLoc = consumeToken();
+    diagnose(AtLoc, diag::warn_attr_unsafe_removed, attrName)
+      .fixItRemove(SourceRange(AtLoc, attrLoc));
     return makeParserSuccess();
   }
 
@@ -3757,13 +3776,15 @@ ParserStatus
 Parser::parseTypeAttributeListPresent(ParamDecl::Specifier &Specifier,
                                       SourceLoc &SpecifierLoc,
                                       SourceLoc &IsolatedLoc,
+                                      SourceLoc &ConstLoc,
                                       TypeAttributes &Attributes) {
   PatternBindingInitializer *initContext = nullptr;
   Specifier = ParamDecl::Specifier::Default;
   while (Tok.is(tok::kw_inout) ||
          Tok.isContextualKeyword("__shared") ||
          Tok.isContextualKeyword("__owned") ||
-         Tok.isContextualKeyword("isolated")) {
+         Tok.isContextualKeyword("isolated") ||
+         Tok.isContextualKeyword("_const")) {
 
     if (Tok.isContextualKeyword("isolated")) {
       if (IsolatedLoc.isValid()) {
@@ -3771,6 +3792,11 @@ Parser::parseTypeAttributeListPresent(ParamDecl::Specifier &Specifier,
           .fixItRemove(SpecifierLoc);
       }
       IsolatedLoc = consumeToken();
+      continue;
+    }
+
+    if (Tok.isContextualKeyword("_const")) {
+      ConstLoc = consumeToken();
       continue;
     }
 
@@ -4816,6 +4842,20 @@ ParserResult<ImportDecl> Parser::parseDeclImport(ParseDeclOptions Flags,
 
   if (Kind != ImportKind::Module && importPath.size() == 1) {
     diagnose(importPath.front().Loc, diag::decl_expected_module_name);
+    return nullptr;
+  }
+
+  // Look up if the imported module is being aliased via -module-alias,
+  // and check that the module alias appeared in source files instead of
+  // its corresponding real name
+  auto parsedModuleID = importPath.get().front().Item;
+  if (Context.getRealModuleName(parsedModuleID, ASTContext::ModuleAliasLookupOption::realNameFromAlias).empty()) {
+    // If reached here, it means the parsed module name is a real module name
+    // which appeared in the source file; only a module alias should be allowed
+    auto aliasName = Context.getRealModuleName(parsedModuleID, ASTContext::ModuleAliasLookupOption::aliasFromRealName);
+    diagnose(importPath.front().Loc, diag::expected_module_alias,
+                     parsedModuleID, aliasName)
+      .fixItReplace(importPath.front().Loc, aliasName.str());
     return nullptr;
   }
 

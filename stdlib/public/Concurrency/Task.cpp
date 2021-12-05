@@ -36,8 +36,19 @@
 #endif
 
 #if defined(SWIFT_CONCURRENCY_BACK_DEPLOYMENT)
+#include <Availability.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_WATCH
+// Bitcode compilation for the watch device precludes defining the following asm
+// symbols, so we don't use them... but simulators are okay.
+#if TARGET_OS_SIMULATOR
 asm("\n .globl _swift_async_extendedFramePointerFlags" \
     "\n _swift_async_extendedFramePointerFlags = 0x0");
+#endif
+#else
+asm("\n .globl _swift_async_extendedFramePointerFlags" \
+    "\n _swift_async_extendedFramePointerFlags = 0x0");
+#endif
 #else
 #ifdef __APPLE__
 #if __POINTER_WIDTH__ == 64
@@ -56,6 +67,10 @@ asm("\n .globl _swift_async_extendedFramePointerFlags" \
 using namespace swift;
 using FutureFragment = AsyncTask::FutureFragment;
 using TaskGroup = swift::TaskGroup;
+
+Metadata swift::TaskAllocatorSlabMetadata;
+const void *const swift::_swift_concurrency_debug_asyncTaskSlabMetadata =
+    &TaskAllocatorSlabMetadata;
 
 void FutureFragment::destroy() {
   auto queueHead = waitQueue.load(std::memory_order_acquire);
@@ -230,6 +245,19 @@ AsyncTask::~AsyncTask() {
   }
 
   Private.destroy();
+}
+
+void AsyncTask::setTaskId() {
+  static std::atomic<uint64_t> NextId(1);
+
+  // We want the 32-bit Job::Id to be non-zero, so loop if we happen upon zero.
+  uint64_t Fetched;
+  do {
+    Fetched = NextId.fetch_add(1, std::memory_order_relaxed);
+    Id = Fetched & 0xffffffff;
+  } while (Id == 0);
+
+  _private().Id = (Fetched >> 32) & 0xffffffff;
 }
 
 SWIFT_CC(swift)
@@ -433,7 +461,6 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
   ExecutorRef executor = ExecutorRef::generic();
   TaskGroup *group = nullptr;
   AsyncLet *asyncLet = nullptr;
-  void *asyncLetBuffer = nullptr;
   bool hasAsyncLetResultBuffer = false;
   for (auto option = options; option; option = option->getParent()) {
     switch (option->getKind()) {
@@ -461,7 +488,6 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
       // context, so that we can emplace the eventual result there instead
       // of in a FutureFragment.
       hasAsyncLetResultBuffer = true;
-      asyncLetBuffer = aletRecord->getResultBuffer();
       assert(asyncLet && "Missing async let storage");
         
       jobFlags.task_setIsAsyncLetTask(true);
@@ -513,7 +539,7 @@ static AsyncTaskAndContext swift_task_create_commonImpl(
     headerSize += sizeof(AsyncTask::GroupChildFragment);
   }
   if (futureResultType) {
-    headerSize += FutureFragment::fragmentSize(futureResultType);
+    headerSize += FutureFragment::fragmentSize(headerSize, futureResultType);
     // Add the future async context prefix.
     headerSize += sizeof(FutureAsyncContextPrefix);
   } else {
@@ -1087,13 +1113,13 @@ static void swift_task_asyncMainDrainQueueImpl() {
 
   HMODULE hModule = LoadLibraryW(L"dispatch.dll");
   if (hModule == NULL)
-    abort();
+    swift_reportError(0, "unable to load dispatch.dll");
 
   pfndispatch_main =
       reinterpret_cast<void (FAR *)(void)>(GetProcAddress(hModule,
                                                           "dispatch_main"));
   if (pfndispatch_main == NULL)
-    abort();
+    swift_reportError(0, "unable to locate dispatch_main in dispatch.dll");
 
   pfndispatch_main();
   exit(0);

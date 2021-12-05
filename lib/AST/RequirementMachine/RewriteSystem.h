@@ -16,7 +16,7 @@
 #include "llvm/ADT/DenseSet.h"
 
 #include "Debug.h"
-#include "ProtocolGraph.h"
+#include "RewriteLoop.h"
 #include "Symbol.h"
 #include "Term.h"
 #include "Trie.h"
@@ -42,12 +42,13 @@ class Rule final {
   Term LHS;
   Term RHS;
 
-  /// Associated type introduction rules are 'permanent', meaning they cannot
-  /// be deleted by homotopy reduction. This is because they do not correspond
-  /// to generic requirements and are re-added when the rewrite system is
-  /// built, so by leaving them in place we can find other redundancies
-  /// instead.
+  /// A 'permanent' rule cannot be deleted by homotopy reduction. These
+  /// do not correspond to generic requirements and are re-added when the
+  /// rewrite system is built.
   unsigned Permanent : 1;
+
+  /// An 'explicit' rule is a generic requirement written by the user.
+  unsigned Explicit : 1;
 
   /// A 'simplified' rule was eliminated by simplifyRewriteSystem() if one of two
   /// things happen:
@@ -69,6 +70,7 @@ public:
   Rule(Term lhs, Term rhs)
       : LHS(lhs), RHS(rhs) {
     Permanent = false;
+    Explicit = false;
     Simplified = false;
     Redundant = false;
   }
@@ -80,36 +82,42 @@ public:
 
   const ProtocolDecl *isProtocolConformanceRule() const;
 
+  bool isIdentityConformanceRule() const;
+
   bool isProtocolRefinementRule() const;
 
-  /// See above for an explanation.
+  /// See above for an explanation of these predicates.
   bool isPermanent() const {
     return Permanent;
   }
 
-  /// See above for an explanation.
+  bool isExplicit() const {
+    return Explicit;
+  }
+
   bool isSimplified() const {
     return Simplified;
   }
 
-  /// See above for an explanation.
   bool isRedundant() const {
     return Redundant;
   }
 
-  /// Deletes the rule, which removes it from consideration in term
-  /// simplification and completion. Deleted rules are simply marked as
-  /// such instead of being physically removed from the rules vector
-  /// in the rewrite system, to ensure that indices remain valid across
-  /// deletion.
   void markSimplified() {
     assert(!Simplified);
     Simplified = true;
   }
 
   void markPermanent() {
-    assert(!Permanent);
+    assert(!Explicit && !Permanent &&
+           "Permanent and explicit are mutually exclusive");
     Permanent = true;
+  }
+
+  void markExplicit() {
+    assert(!Explicit && !Permanent &&
+           "Permanent and explicit are mutually exclusive");
+    Explicit = true;
   }
 
   void markRedundant() {
@@ -117,12 +125,9 @@ public:
     Redundant = true;
   }
 
-  /// Returns the length of the left hand side.
-  unsigned getDepth() const {
-    return LHS.size();
-  }
+  unsigned getDepth() const;
 
-  int compare(const Rule &other, const ProtocolGraph &protos) const;
+  int compare(const Rule &other, RewriteContext &ctx) const;
 
   void dump(llvm::raw_ostream &out) const;
 
@@ -133,182 +138,18 @@ public:
   }
 };
 
-struct AppliedRewriteStep {
-  Term lhs;
-  Term rhs;
-  MutableTerm prefix;
-  MutableTerm suffix;
-};
+/// Result type for RewriteSystem::computeConfluentCompletion() and
+/// PropertyMap::buildPropertyMap().
+enum class CompletionResult {
+  /// Confluent completion was computed successfully.
+  Success,
 
-/// Records the application of a rewrite rule to a term.
-///
-/// Formally, this is a whiskered, oriented rewrite rule. For example, given a
-/// rule (X => Y) and the term A.X.B, the application at offset 1 yields A.Y.B.
-///
-/// This can be represented as A.(X => Y).B.
-///
-/// Similarly, going in the other direction, if we start from A.Y.B and apply
-/// the inverse rule, we get A.(Y => X).B.
-struct RewriteStep {
-  enum StepKind {
-    /// Apply a rewrite rule at the stored offset.
-    ApplyRewriteRule,
+  /// Maximum number of iterations reached.
+  MaxIterations,
 
-    /// Prepend the prefix to each concrete substitution.
-    AdjustConcreteType
-  };
-
-  /// The rewrite step kind.
-  unsigned Kind : 1;
-
-  /// The size of the left whisker, which is the position within the term where
-  /// the rule is being applied. In A.(X => Y).B, this is |A|=1.
-  unsigned StartOffset : 7;
-
-  /// The size of the right whisker, which is the length of the remaining suffix
-  /// after the rule is applied. In A.(X => Y).B, this is |B|=1.
-  unsigned EndOffset : 7;
-
-  /// The index of the rule in the rewrite system.
-  unsigned RuleID : 15;
-
-  /// If false, the step replaces an occurrence of the rule's left hand side
-  /// with the right hand side. If true, vice versa.
-  unsigned Inverse : 1;
-
-  RewriteStep(StepKind kind, unsigned startOffset, unsigned endOffset,
-              unsigned ruleID, bool inverse) {
-    Kind = unsigned(kind);
-
-    StartOffset = startOffset;
-    assert(StartOffset == startOffset && "Overflow");
-    EndOffset = endOffset;
-    assert(EndOffset == endOffset && "Overflow");
-    RuleID = ruleID;
-    assert(RuleID == ruleID && "Overflow");
-    Inverse = inverse;
-  }
-
-  static RewriteStep forRewriteRule(unsigned startOffset, unsigned endOffset,
-                                    unsigned ruleID, bool inverse) {
-    return RewriteStep(ApplyRewriteRule, startOffset, endOffset, ruleID, inverse);
-  }
-
-  static RewriteStep forAdjustment(unsigned offset, bool inverse) {
-    return RewriteStep(AdjustConcreteType, offset, /*endOffset=*/0,
-                       /*ruleID=*/0, inverse);
-  }
-
-  bool isInContext() const {
-    return StartOffset > 0 || EndOffset > 0;
-  }
-
-  void invert() {
-    Inverse = !Inverse;
-  }
-
-  AppliedRewriteStep applyRewriteRule(MutableTerm &term,
-                                      const RewriteSystem &system) const;
-
-  MutableTerm applyAdjustment(MutableTerm &term,
-                              const RewriteSystem &system) const;
-
-  void apply(MutableTerm &term, const RewriteSystem &system) const;
-
-  bool isInverseOf(const RewriteStep &other) const;
-
-  bool maybeSwapRewriteSteps(RewriteStep &other,
-                             const RewriteSystem &system);
-
-  void dump(llvm::raw_ostream &out,
-            MutableTerm &term,
-            const RewriteSystem &system) const;
-};
-
-/// Records a sequence of zero or more rewrite rules applied to a term.
-class RewritePath {
-  SmallVector<RewriteStep, 3> Steps;
-
-public:
-  bool empty() const {
-    return Steps.empty();
-  }
-
-  unsigned size() const {
-    return Steps.size();
-  }
-
-  void add(RewriteStep step) {
-    Steps.push_back(step);
-  }
-
-  // Horizontal composition of paths.
-  void append(RewritePath other) {
-    Steps.append(other.begin(), other.end());
-  }
-
-  decltype(Steps)::const_iterator begin() const {
-    return Steps.begin();
-  }
-
-  decltype(Steps)::const_iterator end() const {
-    return Steps.end();
-  }
-
-  llvm::SmallVector<unsigned, 1> findRulesAppearingOnceInEmptyContext() const;
-
-  RewritePath splitCycleAtRule(unsigned ruleID) const;
-
-  bool replaceRuleWithPath(unsigned ruleID, const RewritePath &path);
-
-  bool computeFreelyReducedPath();
-
-  bool computeCyclicallyReducedLoop(MutableTerm &basepoint,
-                                    const RewriteSystem &system);
-
-  bool computeLeftCanonicalForm(const RewriteSystem &system);
-
-  void invert();
-
-  void dump(llvm::raw_ostream &out,
-            MutableTerm term,
-            const RewriteSystem &system) const;
-};
-
-/// A loop (3-cell) that rewrites the basepoint back to the basepoint.
-class HomotopyGenerator {
-public:
-  MutableTerm Basepoint;
-  RewritePath Path;
-
-private:
-  bool Deleted;
-
-public:
-  HomotopyGenerator(MutableTerm basepoint, RewritePath path)
-    : Basepoint(basepoint), Path(path), Deleted(false) {}
-
-  bool isDeleted() const {
-    return Deleted;
-  }
-
-  void markDeleted() {
-    assert(!Deleted);
-    Deleted = true;
-  }
-
-  void normalize(const RewriteSystem &system);
-
-  bool isInContext() const;
-
-  void findProtocolConformanceRules(
-      llvm::SmallDenseMap<const ProtocolDecl *,
-                          std::pair<SmallVector<unsigned, 2>,
-                                    SmallVector<std::pair<MutableTerm, unsigned>, 2>>>
-                          &result,
-      const RewriteSystem &system) const;
-
-  void dump(llvm::raw_ostream &out, const RewriteSystem &system) const;
+  /// Completion produced a rewrite rule whose left hand side has a length
+  /// exceeding the limit.
+  MaxDepth
 };
 
 /// A term rewrite system for working with types in a generic signature.
@@ -325,10 +166,6 @@ class RewriteSystem final {
   /// A prefix trie of rule left hand sides to optimize lookup. The value
   /// type is an index into the Rules array defined above.
   Trie<unsigned, MatchKind::Shortest> Trie;
-
-  /// The graph of all protocols transitively referenced via our set of
-  /// rewrite rules, used for the linear order on symbols.
-  ProtocolGraph Protos;
 
   /// Constructed from a rule of the form X.[P2:T] => X.[P1:T] by
   /// checkMergedAssociatedType().
@@ -353,7 +190,7 @@ class RewriteSystem final {
   llvm::DenseSet<std::pair<unsigned, unsigned>> CheckedOverlaps;
 
   /// Homotopy generators for this rewrite system. These are the
-  /// cyclic rewrite paths which rewrite a term back to itself.
+  /// rewrite loops which rewrite a term back to itself.
   ///
   /// In the category theory interpretation, a rewrite rule is a generating
   /// 2-cell, and a rewrite path is a 2-cell made from a composition of
@@ -364,8 +201,9 @@ class RewriteSystem final {
   /// 2-cells; this is actually represented as a single 2-cell forming a
   /// loop around a base point.
   ///
-  /// This data informs the generic signature minimization algorithm.
-  std::vector<HomotopyGenerator> HomotopyGenerators;
+  /// This data is used by the homotopy reduction and generating conformances
+  /// algorithms.
+  std::vector<RewriteLoop> Loops;
 
   DebugOptions Debug;
 
@@ -381,8 +219,9 @@ class RewriteSystem final {
   /// Whether we've minimized the rewrite system.
   unsigned Minimized : 1;
 
-  /// If set, record homotopy generators in the completion procedure.
-  unsigned RecordHomotopyGenerators : 1;
+  /// If set, the completion procedure records rewrite loops describing the
+  /// identities among rewrite rules discovered while resolving critical pairs.
+  unsigned RecordLoops : 1;
 
 public:
   explicit RewriteSystem(RewriteContext &ctx);
@@ -396,13 +235,9 @@ public:
   /// Return the rewrite context used for allocating memory.
   RewriteContext &getRewriteContext() const { return Context; }
 
-  /// Return the object recording information about known protocols.
-  const ProtocolGraph &getProtocols() const { return Protos; }
-
-  void initialize(bool recordHomotopyGenerators,
-                  std::vector<std::pair<MutableTerm, MutableTerm>> &&assocaitedTypeRules,
-                  std::vector<std::pair<MutableTerm, MutableTerm>> &&requirementRules,
-                  ProtocolGraph &&protos);
+  void initialize(bool recordLoops,
+                  std::vector<std::pair<MutableTerm, MutableTerm>> &&permanentRules,
+                  std::vector<std::pair<MutableTerm, MutableTerm>> &&requirementRules);
 
   unsigned getRuleID(const Rule &rule) const {
     assert((unsigned)(&rule - &*Rules.begin()) < Rules.size());
@@ -424,25 +259,19 @@ public:
   bool addRule(MutableTerm lhs, MutableTerm rhs,
                const RewritePath *path=nullptr);
 
+  bool addPermanentRule(MutableTerm lhs, MutableTerm rhs);
+
+  bool addExplicitRule(MutableTerm lhs, MutableTerm rhs);
+
   bool simplify(MutableTerm &term, RewritePath *path=nullptr) const;
+
+  void simplifySubstitutions(MutableTerm &term, RewritePath &path) const;
 
   //////////////////////////////////////////////////////////////////////////////
   ///
   /// Completion
   ///
   //////////////////////////////////////////////////////////////////////////////
-
-  enum class CompletionResult {
-    /// Confluent completion was computed successfully.
-    Success,
-
-    /// Maximum number of iterations reached.
-    MaxIterations,
-
-    /// Completion produced a rewrite rule whose left hand side has a length
-    /// exceeding the limit.
-    MaxDepth
-  };
 
   std::pair<CompletionResult, unsigned>
   computeConfluentCompletion(unsigned maxIterations,
@@ -458,19 +287,19 @@ public:
   void verifyRewriteRules(ValidityPolicy policy) const;
 
 private:
-  void recordHomotopyGenerator(HomotopyGenerator loop) {
-    if (!RecordHomotopyGenerators)
+  void recordRewriteLoop(RewriteLoop loop) {
+    if (!RecordLoops)
       return;
 
-    HomotopyGenerators.push_back(loop);
+    Loops.push_back(loop);
   }
 
-  void recordHomotopyGenerator(MutableTerm basepoint,
-                               RewritePath path) {
-    if (!RecordHomotopyGenerators)
+  void recordRewriteLoop(MutableTerm basepoint,
+                         RewritePath path) {
+    if (!RecordLoops)
       return;
 
-    HomotopyGenerators.emplace_back(basepoint, path);
+    Loops.emplace_back(basepoint, path);
   }
 
   bool
@@ -479,7 +308,7 @@ private:
       const Rule &lhs, const Rule &rhs,
       std::vector<std::pair<MutableTerm, MutableTerm>> &pairs,
       std::vector<RewritePath> &paths,
-      std::vector<HomotopyGenerator> &loops) const;
+      std::vector<RewriteLoop> &loops) const;
 
   void processMergedAssociatedTypes();
 
@@ -493,28 +322,29 @@ public:
   ///
   //////////////////////////////////////////////////////////////////////////////
 
+  void propagateExplicitBits();
+
   bool
   isCandidateForDeletion(unsigned ruleID,
-                         bool firstPass,
                          const llvm::DenseSet<unsigned> *redundantConformances) const;
 
   Optional<unsigned>
-  findRuleToDelete(bool firstPass,
-                   const llvm::DenseSet<unsigned> *redundantConformances,
+  findRuleToDelete(const llvm::DenseSet<unsigned> *redundantConformances,
                    RewritePath &replacementPath);
 
   void deleteRule(unsigned ruleID, const RewritePath &replacementPath);
 
   void performHomotopyReduction(
-      bool firstPass,
       const llvm::DenseSet<unsigned> *redundantConformances);
 
   void minimizeRewriteSystem();
 
   llvm::DenseMap<const ProtocolDecl *, std::vector<unsigned>>
-  getMinimizedRules(ArrayRef<const ProtocolDecl *> protos);
+  getMinimizedProtocolRules(ArrayRef<const ProtocolDecl *> protos) const;
 
-  void verifyHomotopyGenerators() const;
+  std::vector<unsigned> getMinimizedGenericSignatureRules() const;
+
+  void verifyRewriteLoops() const;
 
   void verifyRedundantConformances(
       llvm::DenseSet<unsigned> redundantConformances) const;
@@ -567,17 +397,6 @@ public:
 
   void computeGeneratingConformances(
       llvm::DenseSet<unsigned> &redundantConformances);
-
-  //////////////////////////////////////////////////////////////////////////////
-  ///
-  /// Property map
-  ///
-  //////////////////////////////////////////////////////////////////////////////
-
-  std::pair<CompletionResult, unsigned>
-  buildPropertyMap(PropertyMap &map,
-                   unsigned maxIterations,
-                   unsigned maxDepth);
 
   void dump(llvm::raw_ostream &out) const;
 };

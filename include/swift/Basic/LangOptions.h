@@ -144,6 +144,9 @@ namespace swift {
     /// PackageDescription version to compile for.
     version::Version PackageDescriptionVersion;
 
+    /// Enable experimental string processing
+    bool EnableExperimentalStringProcessing = false;
+
     /// Disable API availability checking.
     bool DisableAvailabilityChecking = false;
 
@@ -307,10 +310,6 @@ namespace swift {
     /// `func f() -> <T> T`.
     bool EnableExperimentalNamedOpaqueTypes = false;
 
-    /// Enable experimental support for structural opaque result types, e.g.
-    /// `func f() -> (some P)?`.
-    bool EnableExperimentalStructuralOpaqueTypes = false;
-
     /// Enable experimental flow-sensitive concurrent captures.
     bool EnableExperimentalFlowSensitiveConcurrentCaptures = false;
 
@@ -319,6 +318,9 @@ namespace swift {
 
     /// Enable experimental 'distributed' actors and functions.
     bool EnableExperimentalDistributed = false;
+
+    /// Enable experimental 'move only' features.
+    bool EnableExperimentalMoveOnly = false;
 
     /// Disable the implicit import of the _Concurrency module.
     bool DisableImplicitConcurrencyModuleImport =
@@ -433,6 +435,11 @@ namespace swift {
     /// Load swiftmodule files in memory as volatile and avoid mmap.
     bool EnableVolatileModules = false;
 
+    /// Enable experimental 'hermetic seal at link' feature. Turns on
+    /// dead-stripping optimizations assuming that all users of library code
+    /// are present at LTO time.
+    bool HermeticSealAtLink = false;
+
     /// Allow deserializing implementation only dependencies. This should only
     /// be set true by lldb and other tooling, so that deserilization
     /// recovery issues won't bring down the debugger.
@@ -470,17 +477,27 @@ namespace swift {
     /// Enables fine-grained debug output from the requirement machine.
     std::string DebugRequirementMachine;
 
-    /// Maximum iteration count for requirement machine confluent completion
+    /// Maximum iteration count for requirement machine Knuth-Bendix completion
     /// algorithm.
     unsigned RequirementMachineStepLimit = 4000;
 
-    /// Maximum term length for requirement machine confluent completion
+    /// Maximum term length for requirement machine Knuth-Bendix completion
     /// algorithm.
     unsigned RequirementMachineDepthLimit = 10;
 
     /// Enable the new experimental protocol requirement signature minimization
     /// algorithm.
     RequirementMachineMode RequirementMachineProtocolSignatures =
+        RequirementMachineMode::Disabled;
+
+    /// Enable the new experimental generic signature minimization algorithm
+    /// for abstract generic signatures.
+    RequirementMachineMode RequirementMachineAbstractSignatures =
+        RequirementMachineMode::Disabled;
+
+    /// Enable the new experimental generic signature minimization algorithm
+    /// for user-written generic signatures.
+    RequirementMachineMode RequirementMachineInferredSignatures =
         RequirementMachineMode::Disabled;
 
     /// Sets the target we are building for and updates platform conditions

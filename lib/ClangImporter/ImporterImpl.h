@@ -317,6 +317,19 @@ public:
   explicit operator bool() const { return type.getPointer() != nullptr; }
 };
 
+/// Wraps a Clang source location with additional optional information used to
+/// resolve it for diagnostics.
+struct HeaderLoc {
+  clang::SourceLocation clangLoc;
+  SourceLoc fallbackLoc;
+  const clang::SourceManager *sourceMgr;
+
+  explicit HeaderLoc(clang::SourceLocation clangLoc,
+                     SourceLoc fallbackLoc = SourceLoc(),
+                     const clang::SourceManager *sourceMgr = nullptr)
+    : clangLoc(clangLoc), fallbackLoc(fallbackLoc), sourceMgr(sourceMgr) {}
+};
+
 /// Implementation of the Clang importer.
 class LLVM_LIBRARY_VISIBILITY ClangImporter::Implementation 
   : public LazyMemberLoader,
@@ -350,9 +363,6 @@ public:
     "<bridging-header-import>";
 
 private:
-  /// The Swift lookup table for the bridging header.
-  std::unique_ptr<SwiftLookupTable> BridgingHeaderLookupTable;
-
   /// The Swift lookup tables, per module.
   ///
   /// Annoyingly, we list this table early so that it gets torn down after
@@ -416,6 +426,9 @@ private:
   llvm::SmallDenseMap<ModuleDecl *, SourceFile *> ClangSwiftAttrSourceFiles;
 
 public:
+  /// The Swift lookup table for the bridging header.
+  std::unique_ptr<SwiftLookupTable> BridgingHeaderLookupTable;
+
   /// Mapping of already-imported declarations.
   llvm::DenseMap<std::pair<const clang::Decl *, Version>, Decl *> ImportedDecls;
 
@@ -685,19 +698,6 @@ public:
     decl->setImplicitlyUnwrappedOptional(true);
   }
 
-  void recordUnsafeConcurrencyForDecl(
-      ValueDecl *decl, bool isUnsafeSendable, bool isUnsafeMainActor) {
-    if (isUnsafeSendable) {
-      decl->getAttrs().add(
-          new (SwiftContext) UnsafeSendableAttr(/*implicit=*/true));
-    }
-
-    if (isUnsafeMainActor) {
-      decl->getAttrs().add(
-          new (SwiftContext) UnsafeMainActorAttr(/*implicit=*/true));
-    }
-  }
-
   /// Retrieve the Clang AST context.
   clang::ASTContext &getClangASTContext() const {
     return Instance->getASTContext();
@@ -791,6 +791,31 @@ public:
     SwiftContext.Diags.diagnose(loc, std::forward<Args>(args)...);
   }
 
+  /// Emit a diagnostic at a clang source location, falling back to a Swift
+  /// location if the clang one is invalid.
+  ///
+  /// The diagnostic will appear in the header file rather than in a generated
+  /// interface. Use this to diagnose issues with declarations that are not
+  /// imported or that are not reflected in a generated interface.
+  template<typename ...Args>
+  void diagnose(HeaderLoc loc, Args &&...args) {
+    // If we're in the middle of pretty-printing, suppress diagnostics.
+    if (SwiftContext.Diags.isPrettyPrintingDecl()) {
+      return;
+    }
+
+    auto swiftLoc = loc.fallbackLoc;
+    if (loc.clangLoc.isValid()) {
+      auto &clangSrcMgr = loc.sourceMgr ? *loc.sourceMgr
+                        : getClangASTContext().getSourceManager();
+      auto &bufferImporter = getBufferImporterForDiagnostics();
+      swiftLoc = bufferImporter.resolveSourceLocation(clangSrcMgr,
+                                                      loc.clangLoc);
+    }
+
+    SwiftContext.Diags.diagnose(swiftLoc, std::forward<Args>(args)...);
+  }
+
   /// Import the given Clang identifier into Swift.
   ///
   /// \param identifier The Clang identifier to map into Swift.
@@ -848,8 +873,7 @@ public:
   void importAttributes(const clang::NamedDecl *ClangDecl, Decl *MappedDecl,
                         const clang::ObjCContainerDecl *NewContext = nullptr);
 
-  Type applyParamAttributes(const clang::ParmVarDecl *param, Type type,
-                            bool &isUnsafeSendable, bool &isUnsafeMainActor);
+  Type applyParamAttributes(const clang::ParmVarDecl *param, Type type);
 
   /// If we already imported a given decl, return the corresponding Swift decl.
   /// Otherwise, return nullptr.
@@ -1366,6 +1390,8 @@ private:
   void
   loadAllMembersOfObjcContainer(Decl *D,
                                 const clang::ObjCContainerDecl *objcContainer);
+  void loadAllMembersOfRecordDecl(StructDecl *recordDecl);
+
   void collectMembersToAdd(const clang::ObjCContainerDecl *objcContainer,
                            Decl *D, DeclContext *DC,
                            SmallVectorImpl<Decl *> &members);
@@ -1441,8 +1467,15 @@ public:
     D->setAccess(access);
     if (auto ASD = dyn_cast<AbstractStorageDecl>(D))
       ASD->setSetterAccess(access);
+
+    // SwiftAttrs on ParamDecls are interpreted by applyParamAttributes().
+    if (!isa<ParamDecl>(D))
+      importSwiftAttrAttributes(D);
+
     return D;
   }
+
+  void importSwiftAttrAttributes(Decl *decl);
 
   /// Find the lookup table that corresponds to the given Clang module.
   ///
@@ -1632,11 +1665,7 @@ public:
 
 /// Determines whether the given swift_attr attribute describes the main
 /// actor.
-///
-/// \returns None if this is not a main-actor attribute, and a Boolean
-/// indicating whether (unsafe) was provided in the attribute otherwise.
-Optional<bool> isMainActorAttr(
-    ASTContext &ctx, const clang::SwiftAttrAttr *swiftAttr);
+bool isMainActorAttr(const clang::SwiftAttrAttr *swiftAttr);
 
 }
 }

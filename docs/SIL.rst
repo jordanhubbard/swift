@@ -1107,6 +1107,15 @@ Specifies for which types specialized code should be generated.
   sil-function-attribute ::= '[clang "' identifier '"]'
 
 The clang node owner.
+::
+
+  sil-function-attribute ::= '[' performance-constraint ']'
+  performance-constraint :: 'no_locks'
+  performance-constraint :: 'no_allocation'
+
+Specifies the performance constraints for the function, which defines which type
+of runtime functions are allowed to be called from the function.
+
 
 Basic Blocks
 ~~~~~~~~~~~~
@@ -3976,12 +3985,40 @@ bind_memory
 
   sil-instruction ::= 'bind_memory' sil-operand ',' sil-operand 'to' sil-type
 
-  bind_memory %0 : $Builtin.RawPointer, %1 : $Builtin.Word to $T
+  %token = bind_memory %0 : $Builtin.RawPointer, %1 : $Builtin.Word to $T
   // %0 must be of $Builtin.RawPointer type
   // %1 must be of $Builtin.Word type
+  // %token is an opaque $Builtin.Word representing the previously bound types
+  // for this memory region.
 
 Binds memory at ``Builtin.RawPointer`` value ``%0`` to type ``$T`` with enough
 capacity to hold ``%1`` values. See SE-0107: UnsafeRawPointer.
+
+Produces a opaque token representing the previous memory state. For
+memory binding semantics, this state includes the type that the memory
+was previously bound to. The token cannot, however, be used to
+retrieve a metatype. It's value is only meaningful to the Swift
+runtime for typed pointer verification.
+
+rebind_memory
+`````````````
+
+::
+
+  sil-instruction ::= 'rebind_memory' sil-operand ' 'to' sil-value
+
+  %out_token = rebind_memory %0 : $Builtin.RawPointer to %in_token
+  // %0 must be of $Builtin.RawPointer type
+  // %in_token represents a cached set of bound types from a prior memory state.
+  // %out_token is an opaque $Builtin.Word representing the previously bound
+  // types for this memory region.
+
+This instruction's semantics are identical to ``bind_memory``, except
+that the types to which memory will be bound, and the extent of the
+memory region is unknown at compile time. Instead, the bound-types are
+represented by a token that was produced by a prior memory binding
+operation. ``%in_token`` must be the result of bind_memory or
+rebind_memory.
 
 begin_access
 ````````````
@@ -5195,6 +5232,36 @@ independent of the operand. In terms of specific types:
 
 In ownership qualified functions, a ``copy_value`` produces a +1 value that must
 be consumed at most once along any path through the program.
+
+explicit_copy_value
+```````````````````
+
+::
+
+   sil-instruction ::= 'explicit_copy_value' sil-operand
+
+   %1 = explicit_copy_value %0 : $A
+
+Performs a copy of a loadable value as if by the value's type lowering and
+returns the copy. The returned copy semantically is a value that is completely
+independent of the operand. In terms of specific types:
+
+1. For trivial types, this is equivalent to just propagating through the trivial
+   value.
+2. For reference types, this is equivalent to performing a ``strong_retain``
+   operation and returning the reference.
+3. For ``@unowned`` types, this is equivalent to performing an
+   ``unowned_retain`` and returning the operand.
+4. For aggregate types, this is equivalent to recursively performing a
+   ``copy_value`` on its components, forming a new aggregate from the copied
+   components, and then returning the new aggregate.
+
+In ownership qualified functions, a ``explicit_copy_value`` produces a +1 value
+that must be consumed at most once along any path through the program.
+
+When move only variable checking is performed, ``explicit_copy_value`` is
+treated as an explicit copy asked for by the user that should not be rewritten
+and should be treated as a non-consuming use.
 
 move_value
 ``````````

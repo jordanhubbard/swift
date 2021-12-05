@@ -6,8 +6,6 @@
 // UNSUPPORTED: back_deployment_runtime
 // REQUIRES: concurrency_runtime
 
-// Disabled until test hang can be looked at.
-// UNSUPPORTED: OS=windows-msvc
 
 actor Simple {
   var count = 0
@@ -21,7 +19,7 @@ actor Custom {
   var count = 0
   let simple = Simple()
 
-  @available(SwiftStdlib 5.5, *)
+  @available(SwiftStdlib 5.1, *)
   nonisolated var unownedExecutor: UnownedSerialExecutor {
     print("custom unownedExecutor")
     return simple.unownedExecutor
@@ -35,7 +33,7 @@ actor Custom {
   }
 }
 
-@available(SwiftStdlib 5.5, *)
+@available(SwiftStdlib 5.1, *)
 @main struct Main {
   static func main() async {
     print("begin")

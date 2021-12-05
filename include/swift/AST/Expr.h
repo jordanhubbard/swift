@@ -486,7 +486,9 @@ public:
   bool isSemanticallyInOutExpr() const {
     return getSemanticsProvidingExpr()->getKind() == ExprKind::InOut;
   }
-  
+
+  bool isSemanticallyConstExpr() const;
+
   /// Returns false if this expression needs to be wrapped in parens when
   /// used inside of a any postfix expression, true otherwise.
   ///
@@ -3683,12 +3685,6 @@ public:
     SeparatelyTypeChecked,
   };
 
-  /// Bits used to indicate contextual information that is concurrency-specific.
-  enum UnsafeConcurrencyBits {
-    Sendable = 1 << 0,
-    MainActor = 1 << 1
-  };
-
 private:
   /// The attributes attached to the closure.
   DeclAttributes Attributes;
@@ -3703,10 +3699,7 @@ private:
   /// the CaptureListExpr which would normally maintain this sort of
   /// information about captured variables), we need to have some way to access
   /// this information directly on the ClosureExpr.
-  ///
-  /// The integer indicates how the closure is contextually concurrent.
-  llvm::PointerIntPair<VarDecl *, 2, uint8_t>
-      CapturedSelfDeclAndUnsafeConcurrent;
+  VarDecl *CapturedSelfDecl;
 
   /// The location of the "async", if present.
   SourceLoc AsyncLoc;
@@ -3736,7 +3729,7 @@ public:
     : AbstractClosureExpr(ExprKind::Closure, Type(), /*Implicit=*/false,
                           discriminator, parent),
       Attributes(attributes), BracketRange(bracketRange),
-      CapturedSelfDeclAndUnsafeConcurrent(capturedSelfDecl, 0),
+      CapturedSelfDecl(capturedSelfDecl),
       AsyncLoc(asyncLoc), ThrowsLoc(throwsLoc), ArrowLoc(arrowLoc),
       InLoc(inLoc),
       ExplicitResultTypeAndBodyState(explicitResultType, BodyState::Parsed),
@@ -3864,27 +3857,7 @@ public:
 
   /// VarDecl captured by this closure under the literal name \c self , if any.
   VarDecl *getCapturedSelfDecl() const {
-    return CapturedSelfDeclAndUnsafeConcurrent.getPointer();
-  }
-
-  bool isUnsafeSendable() const {
-    return CapturedSelfDeclAndUnsafeConcurrent.getInt() &
-        UnsafeConcurrencyBits::Sendable;
-  }
-
-  bool isUnsafeMainActor() const {
-    return CapturedSelfDeclAndUnsafeConcurrent.getInt() &
-        UnsafeConcurrencyBits::MainActor;
-  }
-
-  void setUnsafeConcurrent(bool sendable, bool forMainActor) {
-    uint8_t bits = 0;
-    if (sendable)
-      bits |= UnsafeConcurrencyBits::Sendable;
-    if (forMainActor)
-      bits |= UnsafeConcurrencyBits::MainActor;
-
-    CapturedSelfDeclAndUnsafeConcurrent.setInt(bits);
+    return CapturedSelfDecl;
   }
 
   /// Get the type checking state of this closure's body.
@@ -4396,7 +4369,7 @@ public:
   /// Is this application _implicitly_ required to be a throwing call?
   /// This can happen if the function is actually a proxy function invocation,
   /// which may throw, regardless of the target function throwing, e.g.
-  /// a distributed function call on a 'remote' actor, may throw due to network
+  /// a distributed instance method call on a 'remote' actor, may throw due to network
   /// issues reported by the transport, regardless if the actual target function
   /// can throw.
   bool implicitlyThrows() const {
@@ -5591,24 +5564,43 @@ public:
 private:
   llvm::MutableArrayRef<Component> Components;
 
-public:
-  /// Create a new #keyPath expression.
-  KeyPathExpr(ASTContext &C,
-              SourceLoc keywordLoc, SourceLoc lParenLoc,
-              ArrayRef<Component> components,
-              SourceLoc rParenLoc,
-              bool isImplicit = false);
+  KeyPathExpr(SourceLoc startLoc, Expr *parsedRoot, Expr *parsedPath,
+              SourceLoc endLoc, bool hasLeadingDot, bool isObjC,
+              bool isImplicit);
 
+  /// Create a key path with unresolved root and path expressions.
   KeyPathExpr(SourceLoc backslashLoc, Expr *parsedRoot, Expr *parsedPath,
-              bool hasLeadingDot, bool isImplicit = false)
-      : Expr(ExprKind::KeyPath, isImplicit), StartLoc(backslashLoc),
-        EndLoc(parsedPath ? parsedPath->getEndLoc() : parsedRoot->getEndLoc()),
-        ParsedRoot(parsedRoot), ParsedPath(parsedPath),
-        HasLeadingDot(hasLeadingDot) {
-    assert((parsedRoot || parsedPath) &&
-           "keypath must have either root or path");
-    Bits.KeyPathExpr.IsObjC = false;
-  }
+              bool hasLeadingDot, bool isImplicit);
+
+  /// Create a key path with components.
+  KeyPathExpr(ASTContext &ctx, SourceLoc startLoc,
+              ArrayRef<Component> components, SourceLoc endLoc, bool isObjC,
+              bool isImplicit);
+
+public:
+  /// Create a new parsed Swift key path expression.
+  static KeyPathExpr *createParsed(ASTContext &ctx, SourceLoc backslashLoc,
+                                   Expr *parsedRoot, Expr *parsedPath,
+                                   bool hasLeadingDot);
+
+  /// Create a new parsed #keyPath expression.
+  static KeyPathExpr *createParsedPoundKeyPath(ASTContext &ctx,
+                                               SourceLoc keywordLoc,
+                                               SourceLoc lParenLoc,
+                                               ArrayRef<Component> components,
+                                               SourceLoc rParenLoc);
+
+  /// Create an implicit Swift key path expression with a set of resolved
+  /// components.
+  static KeyPathExpr *createImplicit(ASTContext &ctx, SourceLoc backslashLoc,
+                                     ArrayRef<Component> components,
+                                     SourceLoc endLoc);
+
+  /// Create an implicit Swift key path expression with a root and path
+  /// expression to be resolved.
+  static KeyPathExpr *createImplicit(ASTContext &ctx, SourceLoc backslashLoc,
+                                     Expr *parsedRoot, Expr *parsedPath,
+                                     bool hasLeadingDot);
 
   SourceLoc getLoc() const { return StartLoc; }
   SourceRange getSourceRange() const { return SourceRange(StartLoc, EndLoc); }
@@ -5621,10 +5613,9 @@ public:
     return Components;
   }
   
-  /// Resolve the components of an un-type-checked expr. This copies over the
-  /// components from the argument array.
-  void resolveComponents(ASTContext &C,
-                         ArrayRef<Component> resolvedComponents);
+  /// Set the key path components. This copies over the components from the
+  /// argument array.
+  void setComponents(ASTContext &C, ArrayRef<Component> newComponents);
 
   /// Indicates if the key path expression is composed by a single invalid
   /// component. e.g. missing component `\Root`

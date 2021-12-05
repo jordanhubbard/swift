@@ -68,13 +68,6 @@ else()
   set(SWIFT_STDLIB_HAS_ASL_default FALSE)
 endif()
 
-# Only Darwin platforms enable ObjC interop by default.
-if("${SWIFT_HOST_VARIANT_SDK}" MATCHES "(OSX|IOS*|TVOS*|WATCHOS*)")
-  set(SWIFT_STDLIB_ENABLE_OBJC_INTEROP_default TRUE)
-else()
-  set(SWIFT_STDLIB_ENABLE_OBJC_INTEROP_default FALSE)
-endif()
-
 #
 # User-configurable options for the standard library.
 #
@@ -82,13 +75,15 @@ endif()
 # NOTE: Some of these variables are also initialized in StandaloneOverlay.cmake
 # so that interfaces are emitted when overlays are separately built.
 
+set(SWIFT_STDLIB_EXTRA_SWIFT_COMPILE_FLAGS "" CACHE STRING
+    "Extra flags to pass when compiling swift stdlib files")
+
+set(SWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS "" CACHE STRING
+    "Extra flags to pass when compiling C/C++ stdlib files")
+
 option(SWIFT_STDLIB_STABLE_ABI
        "Should stdlib be built with stable ABI (library evolution, resilience)."
        "${SWIFT_STDLIB_STABLE_ABI_default}")
-
-option(SWIFT_STDLIB_ENABLE_OBJC_INTEROP
-       "Should stdlib be built with Obj-C interop."
-       "${SWIFT_STDLIB_ENABLE_OBJC_INTEROP_default}")
 
 option(SWIFT_ENABLE_MODULE_INTERFACES
        "Generate .swiftinterface files alongside .swiftmodule files"
@@ -154,8 +149,12 @@ option(SWIFT_FREESTANDING_FLAVOR
        "When building the FREESTANDING stdlib, which build style to use (options: apple, linux)")
 
 option(SWIFT_STDLIB_ENABLE_PRESPECIALIZATION
-       "Should stdlib be built with generic metadata prespecialization enabled. Defaults to On on Darwin and on "
+       "Should stdlib be built with generic metadata prespecialization enabled. Defaults to On on Darwin and on Linux."
        "${SWIFT_STDLIB_ENABLE_PRESPECIALIZATION_default}")
+
+option(SWIFT_STDLIB_EXPERIMENTAL_HERMETIC_SEAL_AT_LINK
+       "Should stdlib be built with -experimental-hermetic-seal-at-link"
+       FALSE)
 
 set(SWIFT_STDLIB_ENABLE_LTO OFF CACHE STRING "Build Swift stdlib with LTO. One
     must specify the form of LTO by setting this to one of: 'full', 'thin'. This
@@ -178,6 +177,13 @@ set(SWIFT_CONCURRENCY_GLOBAL_EXECUTOR
 #
 # End of user-configurable options.
 #
+
+# Remove llvm-project/llvm/include directory from -I search part when building
+# the stdlib. We have our own fork of LLVM includes (Support, ADT) in
+# stdlib/include/llvm and we don't want to silently use headers from LLVM.
+get_property(stdlib_include_directories DIRECTORY PROPERTY INCLUDE_DIRECTORIES)
+list(REMOVE_ITEM stdlib_include_directories "${LLVM_MAIN_INCLUDE_DIR}")
+set_property(DIRECTORY PROPERTY INCLUDE_DIRECTORIES ${stdlib_include_directories})
 
 include(AddSwiftStdlib)
 

@@ -45,6 +45,7 @@
     "Unicode.swift",
     "UnicodeData.swift",
     "UnicodeEncoding.swift",
+    "UnicodeGraphemeBreakProperty.swift",
     "UnicodeHelpers.swift",
     "UnicodeParser.swift",
     "UnicodeScalar.swift",
@@ -180,6 +181,7 @@
   ],
   "Pointer": [
     "Pointer.swift",
+    "TemporaryAllocation.swift",
     "UnsafePointer.swift",
     "UnsafeRawPointer.swift",
     "UnsafeBufferPointer.swift",
@@ -219,6 +221,7 @@
     "Runtime.swift",
     "RuntimeFunctionCounters.swift",
     "Shims.swift",
+    "StaticPrint.swift",
     "ThreadLocalStorage.swift",
     "Unmanaged.swift",
     "Availability.swift",

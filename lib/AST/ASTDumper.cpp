@@ -17,6 +17,7 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTPrinter.h"
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/Attr.h"
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/ForeignAsyncConvention.h"
 #include "swift/AST/ForeignErrorConvention.h"
@@ -520,7 +521,11 @@ namespace {
         OS << " kind=" << getImportKindString(ID->getImportKind());
 
       OS << " '";
-      ID->getImportPath().print(OS);
+      // Check if module aliasing was used for the given imported module; for
+      // example, if '-module-alias Foo=Bar' was passed and this module has
+      // 'import Foo', its corresponding real module name 'Bar' should be printed.
+      ImportPath::Builder scratch;
+      ID->getRealImportPath(scratch).print(OS);
       OS << "')";
     }
 
@@ -578,11 +583,6 @@ namespace {
     void printAbstractTypeParamCommon(AbstractTypeParamDecl *decl,
                                       const char *name) {
       printCommon(decl, name);
-      if (decl->getDeclContext()->getGenericEnvironmentOfContext()) {
-        if (auto superclassTy = decl->getSuperclass()) {
-          OS << " superclass='" << superclassTy->getString() << "'";
-        }
-      }
     }
 
     void visitGenericTypeParamDecl(GenericTypeParamDecl *decl) {
@@ -933,6 +933,9 @@ namespace {
       if (P->getAttrs().hasAttribute<NonEphemeralAttr>())
         OS << " nonEphemeral";
 
+      if (P->getAttrs().hasAttribute<NoImplicitCopyAttr>())
+        OS << " noImplicitCopy";
+
       if (P->getDefaultArgumentKind() != DefaultArgumentKind::None) {
         printField("default_arg",
                    getDefaultArgumentKindString(P->getDefaultArgumentKind()));
@@ -1224,7 +1227,7 @@ void swift::printContext(raw_ostream &os, DeclContext *dc) {
 
   switch (dc->getContextKind()) {
   case DeclContextKind::Module:
-    printName(os, cast<ModuleDecl>(dc)->getName());
+    printName(os, cast<ModuleDecl>(dc)->getRealName());
     break;
 
   case DeclContextKind::FileUnit:
@@ -1305,10 +1308,12 @@ void ValueDecl::dumpRef(raw_ostream &os) const {
     // Print the context.
     printContext(os, getDeclContext());
     os << ".";
+    // Print name.
+    getName().printPretty(os);
+  } else {
+    auto moduleName = cast<ModuleDecl>(this)->getRealName();
+    os << moduleName;
   }
-
-  // Print name.
-  getName().printPretty(os);
 
   // Print location.
   auto &srcMgr = getASTContext().SourceMgr;
@@ -3054,6 +3059,12 @@ public:
     PrintWithColorRAII(OS, ParenthesisColor) << ')';
   }
 
+  void visitCompileTimeConstTypeRepr(CompileTimeConstTypeRepr *T) {
+    printCommon("_const") << '\n';
+    printRec(T->getBase());
+    PrintWithColorRAII(OS, ParenthesisColor) << ')';
+  }
+
   void visitOptionalTypeRepr(OptionalTypeRepr *T) {
     printCommon("type_optional") << '\n';
     printRec(T->getBase());
@@ -3453,6 +3464,7 @@ namespace {
       printFlag(paramFlags.isVariadic(), "vararg");
       printFlag(paramFlags.isAutoClosure(), "autoclosure");
       printFlag(paramFlags.isNonEphemeral(), "nonEphemeral");
+      printFlag(paramFlags.isCompileTimeConst(), "compileTimeConst");
       switch (paramFlags.getValueOwnership()) {
       case ValueOwnership::Default: break;
       case ValueOwnership::Owned: printFlag("owned"); break;
@@ -3727,6 +3739,13 @@ namespace {
       printArchetypeNestedTypes(T);
       PrintWithColorRAII(OS, ParenthesisColor) << ')';
     }
+    void visitSequenceArchetypeType(SequenceArchetypeType *T, StringRef label) {
+      printArchetypeCommon(T, "sequence_archetype_type", label);
+      printField("name", T->getFullName());
+      OS << "\n";
+      printArchetypeNestedTypes(T);
+      PrintWithColorRAII(OS, ParenthesisColor) << ')';
+    }
 
     void visitGenericTypeParamType(GenericTypeParamType *T, StringRef label) {
       printCommon(label, "generic_type_param_type");
@@ -3784,6 +3803,10 @@ namespace {
       printFlag(T->isAsync(), "async");
       printFlag(T->isThrowing(), "throws");
 
+      if (Type globalActor = T->getGlobalActor()) {
+        printField("global_actor", globalActor.getString());
+      }
+
       OS << "\n";
       Indent += 2;
       // [TODO: Improve-Clang-type-printing]
@@ -3794,10 +3817,6 @@ namespace {
           ->getClangASTContext();
         T->getClangTypeInfo().dump(os, ctx);
         printField("clang_type", os.str());
-      }
-
-      if (Type globalActor = T->getGlobalActor()) {
-        printField("global_actor", globalActor.getString());
       }
 
       printAnyFunctionParams(T->getParams(), "input");

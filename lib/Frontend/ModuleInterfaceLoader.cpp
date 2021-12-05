@@ -1497,7 +1497,9 @@ InterfaceSubContextDelegateImpl::InterfaceSubContextDelegateImpl(
   if (LoaderOpts.remarkOnRebuildFromInterface) {
     GenericArgs.push_back("-Rmodule-interface-rebuild");
   }
-
+  // This flag only matters when we are verifying an textual interface.
+  frontendOpts.DowngradeInterfaceVerificationError =
+    LoaderOpts.downgradeInterfaceVerificationError;
   // Note that we don't assume cachePath is the same as the Clang
   // module cache path at this point.
   if (buildModuleCacheDirIfAbsent && !moduleCachePath.empty())
@@ -1683,6 +1685,7 @@ InterfaceSubContextDelegateImpl::runInSubCompilerInstance(StringRef moduleName,
   if (subInstance.setup(subInvocation)) {
     return std::make_error_code(std::errc::not_supported);
   }
+
   info.BuildArguments = BuildArgs;
   info.Hash = CacheHash;
   auto target = *(std::find(BuildArgs.rbegin(), BuildArgs.rend(), "-target") - 1);
@@ -1824,7 +1827,12 @@ std::error_code ExplicitSwiftModuleLoader::findModuleFilesInDirectory(
 
 bool ExplicitSwiftModuleLoader::canImportModule(
     ImportPath::Element mID, llvm::VersionTuple version, bool underlyingVersion) {
-  StringRef moduleName = mID.Item.str();
+  // Look up the module with the real name (physical name on disk);
+  // in case `-module-alias` is used, the name appearing in source files
+  // and the real module name are different. For example, '-module-alias Foo=Bar'
+  // maps Foo appearing in source files, e.g. 'import Foo', to the real module
+  // name Bar (on-disk name), which should be searched for loading.
+  StringRef moduleName = Ctx.getRealModuleName(mID.Item).str();
   auto it = Impl.ExplicitModuleMap.find(moduleName);
   // If no provided explicit module matches the name, then it cannot be imported.
   if (it == Impl.ExplicitModuleMap.end()) {

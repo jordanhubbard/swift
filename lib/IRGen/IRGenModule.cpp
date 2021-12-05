@@ -81,14 +81,14 @@ static llvm::StructType *createStructType(IRGenModule &IGM,
                                   ArrayRef<llvm::Type*>(types.begin(),
                                                         types.size()),
                                   name, packed);
-};
+}
 
 /// A helper for creating pointer-to-struct types.
 static llvm::PointerType *createStructPointerType(IRGenModule &IGM,
                                                   StringRef name,
                                   std::initializer_list<llvm::Type*> types) {
   return createStructType(IGM, name, types)->getPointerTo(DefaultAS);
-};
+}
 
 static clang::CodeGenerator *createClangCodeGenerator(ASTContext &Context,
                                                  llvm::LLVMContext &LLVMContext,
@@ -698,6 +698,21 @@ namespace RuntimeConstants {
   const auto NoUnwind = llvm::Attribute::NoUnwind;
   const auto ZExt = llvm::Attribute::ZExt;
   const auto FirstParamReturned = llvm::Attribute::Returned;
+  const auto WillReturn = llvm::Attribute::WillReturn;
+
+#ifdef CHECK_RUNTIME_EFFECT_ANALYSIS
+  const auto NoEffect = RuntimeEffect::NoEffect;
+  const auto Locking = RuntimeEffect::Locking;
+  const auto Allocating = RuntimeEffect::Allocating;
+  const auto Deallocating = RuntimeEffect::Deallocating;
+  const auto RefCounting = RuntimeEffect::RefCounting;
+  const auto ObjectiveC = RuntimeEffect::ObjectiveC;
+  const auto Concurrency = RuntimeEffect::Concurrency;
+  const auto AutoDiff = RuntimeEffect::AutoDiff;
+  const auto MetaData = RuntimeEffect::MetaData;
+  const auto Casting = RuntimeEffect::Casting;
+  const auto ExclusivityChecking = RuntimeEffect::ExclusivityChecking;
+#endif
 
   RuntimeAvailability AlwaysAvailable(ASTContext &Context) {
     return RuntimeAvailability::AlwaysAvailable;
@@ -941,23 +956,39 @@ llvm::Constant *IRGenModule::getDeletedAsyncMethodErrorAsyncFunctionPointer() {
       LinkEntity::forKnownAsyncFunctionPointer("swift_deletedAsyncMethodError")).getValue();
 }
 
+#ifdef CHECK_RUNTIME_EFFECT_ANALYSIS
+void IRGenModule::registerRuntimeEffect(ArrayRef<RuntimeEffect> effect,
+                                         const char *funcName) {
+  for (RuntimeEffect rt : effect) {
+    effectOfRuntimeFuncs = RuntimeEffect((unsigned)effectOfRuntimeFuncs |
+                                         (unsigned)rt);
+    emittedRuntimeFuncs.push_back(funcName);
+  }
+}
+#else
+#define registerRuntimeEffect(...)
+#endif
+
 #define QUOTE(...) __VA_ARGS__
 #define STR(X)     #X
 
-#define FUNCTION(ID, NAME, CC, AVAILABILITY, RETURNS, ARGS, ATTRS) \
-  FUNCTION_IMPL(ID, NAME, CC, AVAILABILITY, QUOTE(RETURNS), QUOTE(ARGS), QUOTE(ATTRS))
+#define FUNCTION(ID, NAME, CC, AVAILABILITY, RETURNS, ARGS, ATTRS, EFFECT) \
+  FUNCTION_IMPL(ID, NAME, CC, AVAILABILITY, QUOTE(RETURNS), QUOTE(ARGS), \
+                QUOTE(ATTRS), QUOTE(EFFECT))
 
 #define RETURNS(...) { __VA_ARGS__ }
 #define ARGS(...) { __VA_ARGS__ }
 #define NO_ARGS {}
 #define ATTRS(...) { __VA_ARGS__ }
 #define NO_ATTRS {}
+#define EFFECT(...) { __VA_ARGS__ }
 
-#define FUNCTION_IMPL(ID, NAME, CC, AVAILABILITY, RETURNS, ARGS, ATTRS)        \
+#define FUNCTION_IMPL(ID, NAME, CC, AVAILABILITY, RETURNS, ARGS, ATTRS, EFFECT)\
   llvm::Constant *IRGenModule::get##ID##Fn() {                                 \
     using namespace RuntimeConstants;                                          \
+    registerRuntimeEffect(EFFECT, #NAME);                                      \
     return getRuntimeFn(Module, ID##Fn, #NAME, CC,                             \
-                        AVAILABILITY(this->Context),                          \
+                        AVAILABILITY(this->Context),                           \
                         RETURNS, ARGS, ATTRS);                                 \
   }
 
@@ -1804,6 +1835,19 @@ void IRGenModule::emitSwiftAsyncExtendedFrameInfoWeakRef() {
   extendedFramePointerFlagsWeakRef = new llvm::GlobalVariable(Module, Int8PtrTy, false,
                                          llvm::GlobalValue::ExternalWeakLinkage, nullptr,
                                          symbolName);
+
+  // The weak imported extendedFramePointerFlagsWeakRef gets optimized out
+  // before being added back as a strong import.
+  // Declarations can't be added to the used list, so we create a little
+  // global that can't be used from the program, but can be in the used list to
+  // avoid optimizations.
+  llvm::GlobalVariable *usage = new llvm::GlobalVariable(
+      Module, extendedFramePointerFlagsWeakRef->getType(), false,
+      llvm::GlobalValue::LinkOnceODRLinkage,
+      static_cast<llvm::GlobalVariable *>(extendedFramePointerFlagsWeakRef),
+      "_swift_async_extendedFramePointerFlagsUser");
+  usage->setVisibility(llvm::GlobalValue::HiddenVisibility);
+  addUsedGlobal(usage);
 }
 
 bool IRGenModule::isConcurrencyAvailable() {

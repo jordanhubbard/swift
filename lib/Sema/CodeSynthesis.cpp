@@ -299,13 +299,11 @@ static ConstructorDecl *createImplicitConstructor(NominalTypeDecl *decl,
       // copy access level of distributed actor init from the nominal decl
       accessLevel = decl->getEffectiveAccess();
 
-      auto transportDecl = ctx.getActorTransportDecl();
-
       // Create the parameter.
       auto *arg = new (ctx) ParamDecl(SourceLoc(), Loc, ctx.Id_transport, Loc,
-                                      ctx.Id_transport, transportDecl);
+                                      ctx.Id_transport, decl);
       arg->setSpecifier(ParamSpecifier::Default);
-      arg->setInterfaceType(transportDecl->getDeclaredInterfaceType());
+      arg->setInterfaceType(getDistributedActorTransportType(decl));
       arg->setImplicit();
 
       params.push_back(arg);
@@ -469,11 +467,9 @@ computeDesignatedInitOverrideSignature(ASTContext &ctx,
         depth = genericSig.getGenericParams().back()->getDepth() + 1;
 
       for (auto *param : genericParams->getParams()) {
-        auto *newParam = new (ctx) GenericTypeParamDecl(classDecl,
-                                                        param->getName(),
-                                                        SourceLoc(),
-                                                        depth,
-                                                        param->getIndex());
+        auto *newParam = new (ctx) GenericTypeParamDecl(
+            classDecl, param->getName(), SourceLoc(), param->isTypeSequence(),
+            depth, param->getIndex());
         newParams.push_back(newParam);
       }
 
@@ -537,14 +533,9 @@ computeDesignatedInitOverrideSignature(ASTContext &ctx,
       subMap = SubstitutionMap::get(superclassCtorSig,
                                     substFn, lookupConformanceFn);
 
-      genericSig = evaluateOrDefault(
-          ctx.evaluator,
-          AbstractGenericSignatureRequest{
-            classSig.getPointer(),
-            std::move(newParamTypes),
-            std::move(requirements)
-          },
-          GenericSignature());
+      genericSig = buildGenericSignature(ctx, classSig,
+                                         std::move(newParamTypes),
+                                         std::move(requirements));
     }
   }
 
@@ -669,6 +660,9 @@ synthesizeDesignatedInitOverride(AbstractFunctionDecl *fn, void *context) {
 
   Expr *expr = superclassCallExpr;
 
+  if (superclassCtor->hasAsync()) {
+    expr = new (ctx) AwaitExpr(SourceLoc(), expr, type, /*implicit=*/true);
+  }
   if (superclassCtor->hasThrows()) {
     expr = new (ctx) TryExpr(SourceLoc(), expr, type, /*implicit=*/true);
   }
@@ -784,7 +778,8 @@ createDesignatedInitOverride(ClassDecl *classDecl,
                               classDecl->getBraces().Start,
                               superclassCtor->isFailable(),
                               /*FailabilityLoc=*/SourceLoc(),
-                              /*Async=*/false, /*AsyncLoc=*/SourceLoc(),
+                              /*Async=*/superclassCtor->hasAsync(),
+                              /*AsyncLoc=*/SourceLoc(),
                               /*Throws=*/superclassCtor->hasThrows(),
                               /*ThrowsLoc=*/SourceLoc(),
                               bodyParams, overrideInfo.GenericParams,

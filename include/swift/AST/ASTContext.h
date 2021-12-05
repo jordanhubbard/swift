@@ -140,7 +140,7 @@ namespace namelookup {
 }
 
 namespace rewriting {
-  class RequirementMachine;
+  class RewriteContext;
 }
 
 namespace syntax {
@@ -350,8 +350,14 @@ private:
   /// Cache of module names that fail the 'canImport' test in this context.
   mutable llvm::SmallPtrSet<Identifier, 8> FailedModuleImportNames;
   
-  /// Mapping between aliases and real (physical) names of imported or referenced modules.
-  mutable llvm::DenseMap<Identifier, Identifier> ModuleAliasMap;
+  /// Set if a `-module-alias` was passed. Used to store mapping between module aliases and
+  /// their corresponding real names, and vice versa for a reverse lookup, which is needed to check
+  /// if the module names appearing in source files are aliases or real names.
+  /// \see ASTContext::getRealModuleName.
+  ///
+  /// The boolean in the value indicates whether or not the entry is keyed by an alias vs real name,
+  /// i.e. true if the entry is [key: alias_name, value: (real_name, true)].
+  mutable llvm::DenseMap<Identifier, std::pair<Identifier, bool>> ModuleAliasMap;
 
   /// Retrieve the allocator for the given arena.
   llvm::BumpPtrAllocator &
@@ -483,9 +489,27 @@ public:
   /// are the real (physical) module names on disk.
   void setModuleAliases(const llvm::StringMap<StringRef> &aliasMap);
 
-  /// Retrieve the actual module name if a module alias is used via '-module-alias Foo=X', where Foo is
-  /// a module alias and X is the real (physical) name. Returns \p key if no aliasing is used.
-  Identifier getRealModuleName(Identifier key) const;
+  /// Look up option used in \c getRealModuleName when module aliasing is applied.
+  enum class ModuleAliasLookupOption {
+    alwaysRealName,
+    realNameFromAlias,
+    aliasFromRealName
+  };
+
+  /// Look up the module alias map by the given \p key and a lookup \p option.
+  ///
+  /// \param key A module alias or real name to look up the map by.
+  /// \param option A look up option \c ModuleAliasLookupOption. Defaults to alwaysRealName.
+  ///
+  /// \return The real name or alias mapped to the key.
+  ///         If no aliasing is used, return \p key regardless of \p option.
+  ///         If \p option is alwaysRealName, return the real module name whether the \p key is an alias
+  ///         or a real name.
+  ///         If \p option is realNameFromAlias, only return a real name if \p key is an alias.
+  ///         If \p option is aliasFromRealName, only return an alias if \p key is a real name.
+  ///         Else return a real name or an alias mapped to the \p key.
+  Identifier getRealModuleName(Identifier key,
+                               ModuleAliasLookupOption option = ModuleAliasLookupOption::alwaysRealName) const;
 
   /// Decide how to interpret two precedence groups.
   Associativity associateInfixOperators(PrecedenceGroupDecl *left,
@@ -1191,20 +1215,12 @@ public:
   GenericSignatureBuilder *getOrCreateGenericSignatureBuilder(
                                                      CanGenericSignature sig);
 
-  /// Retrieve or create a term rewriting system for answering queries on
-  /// type parameters written against the given generic signature.
-  rewriting::RequirementMachine *getOrCreateRequirementMachine(
-      CanGenericSignature sig);
+  rewriting::RewriteContext &getRewriteContext();
 
   /// This is a hack to break cycles. Don't introduce new callers of this
   /// method.
   bool isRecursivelyConstructingRequirementMachine(
       CanGenericSignature sig);
-
-  /// Retrieve or create a term rewriting system for answering queries on
-  /// type parameters written against the given protocol requirement signature.
-  rewriting::RequirementMachine *getOrCreateRequirementMachine(
-      const ProtocolDecl *proto);
 
   /// Retrieve a generic signature with a single unconstrained type parameter,
   /// like `<T>`.

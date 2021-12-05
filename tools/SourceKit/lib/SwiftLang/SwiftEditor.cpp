@@ -725,6 +725,7 @@ public:
     registerParseRequestFunctions(Parser->getParser().Context.evaluator);
     registerTypeCheckerRequestFunctions(
         Parser->getParser().Context.evaluator);
+    registerClangImporterRequestFunctions(Parser->getParser().Context.evaluator);
     Parser->getDiagnosticEngine().addConsumer(DiagConsumer);
 
     IncrementalParsingEnabled =
@@ -734,8 +735,17 @@ public:
 
   void parseIfNeeded() {
     if (!IsParsed) {
-      Parser->parse();
-      IsParsed = true;
+      // Perform parsing on a deep stack that's the same size as the main thread
+      // during normal compilation to avoid stack overflows.
+      static WorkQueue BigStackQueue{
+          WorkQueue::Dequeuing::Concurrent,
+          "SwiftDocumentSyntaxInfo::parseIfNeeded.BigStackQueue"};
+      BigStackQueue.dispatchSync(
+          [this]() {
+            Parser->parse();
+            IsParsed = true;
+          },
+          /*isStackDeep=*/true);
     }
   }
 
@@ -958,6 +968,9 @@ public:
   }
 
   void annotate(const Decl *D, bool IsRef, CharSourceRange Range) {
+    if (!Range.isValid())
+      return;
+
     unsigned ByteOffset = SM.getLocOffsetInBuffer(Range.getStart(), BufferID);
     unsigned Length = Range.getByteLength();
     auto Kind = CodeCompletionResult::getCodeCompletionDeclKind(D);

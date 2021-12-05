@@ -270,8 +270,9 @@ public:
 
 /// The size of an allocator slab.
 static constexpr size_t SlabCapacity = 1000;
+extern Metadata TaskAllocatorSlabMetadata;
 
-using TaskAllocator = StackAllocator<SlabCapacity>;
+using TaskAllocator = StackAllocator<SlabCapacity, &TaskAllocatorSlabMetadata>;
 
 /// Private storage in an AsyncTask object.
 struct AsyncTask::PrivateStorage {
@@ -293,6 +294,9 @@ struct AsyncTask::PrivateStorage {
   /// libswiftCore so that libswiftCore can control the layout of our initial
   /// state.
   uintptr_t ExclusivityAccessSet[2] = {0, 0};
+
+  /// The top 32 bits of the task ID. The bottom 32 bits are in Job::Id.
+  uint32_t Id;
 
   PrivateStorage(JobFlags flags)
       : Status(ActiveTaskStatus(flags)), Local(TaskLocal::Storage()) {}

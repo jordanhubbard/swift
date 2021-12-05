@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-distributed -parse-as-library) | %FileCheck %s
+// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-distributed -parse-as-library -Xfrontend -disable-availability-checking) | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
@@ -7,16 +7,12 @@
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
 
-// FIXME(distributed): remote functions dont seem to work on windows?
-// XFAIL: OS=windows-msvc
-
 import _Distributed
 
-@available(SwiftStdlib 5.5, *)
 distributed actor LocalWorker {
-  init(transport: ActorTransport) {
-    defer { transport.actorReady(self) } // FIXME(distributed): rdar://81783599 this should be injected automatically
-  }
+  typealias Transport = FakeTransport
+
+  init(transport: FakeTransport) {}
 
   distributed func function() async throws -> String {
     "local:"
@@ -27,7 +23,6 @@ distributed actor LocalWorker {
   }
 }
 
-@available(SwiftStdlib 5.5, *)
 extension LocalWorker {
   @_dynamicReplacement(for: _remote_function())
   // TODO(distributed): @_remoteDynamicReplacement(for: function()) - could be a nicer spelling, hiding that we use dynamic under the covers
@@ -44,8 +39,6 @@ extension LocalWorker {
 
 // ==== Fake Transport ---------------------------------------------------------
 
-
-@available(SwiftStdlib 5.5, *)
 struct ActorAddress: ActorIdentity {
   let address: String
   init(parse address : String) {
@@ -53,7 +46,6 @@ struct ActorAddress: ActorIdentity {
   }
 }
 
-@available(SwiftStdlib 5.5, *)
 struct FakeTransport: ActorTransport {
   func decodeIdentity(from decoder: Decoder) throws -> AnyActorIdentity {
     fatalError("not implemented:\(#function)")
@@ -81,9 +73,11 @@ struct FakeTransport: ActorTransport {
   }
 }
 
+@available(SwiftStdlib 5.5, *)
+typealias DefaultActorTransport = FakeTransport
+
 // ==== Execute ----------------------------------------------------------------
 
-@available(SwiftStdlib 5.5, *)
 func test_local() async throws {
   let transport = FakeTransport()
 
@@ -95,7 +89,6 @@ func test_local() async throws {
   // CHECK: call: local:
 }
 
-@available(SwiftStdlib 5.5, *)
 func test_remote() async throws {
   let address = ActorAddress(parse: "")
   let transport = FakeTransport()
@@ -110,7 +103,6 @@ func test_remote() async throws {
   // CHECK: call: _cluster_remote_echo(name:):Charlie
 }
 
-@available(SwiftStdlib 5.5, *)
 @main struct Main {
   static func main() async {
     try! await test_local()

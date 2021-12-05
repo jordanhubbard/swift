@@ -169,6 +169,7 @@ enum class DescriptiveDeclKind : uint8_t {
   Method,
   StaticMethod,
   ClassMethod,
+  DistributedMethod,
   Getter,
   Setter,
   Addressor,
@@ -205,6 +206,9 @@ enum class AssociatedValueCheck {
 
 /// Diagnostic printing of \c StaticSpellingKind.
 llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, StaticSpellingKind SSK);
+
+/// Diagnostic printing of \c ReferenceOwnership.
+llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, ReferenceOwnership RO);
 
 /// Encapsulation of the overload signature of a given declaration,
 /// which is used to determine uniqueness of a declaration within a
@@ -486,11 +490,12 @@ protected:
   SWIFT_INLINE_BITFIELD_EMPTY(TypeDecl, ValueDecl);
   SWIFT_INLINE_BITFIELD_EMPTY(AbstractTypeParamDecl, TypeDecl);
 
-  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, AbstractTypeParamDecl, 16+16,
+  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, AbstractTypeParamDecl, 16+16+1,
     : NumPadBits,
 
     Depth : 16,
-    Index : 16
+    Index : 16,
+    TypeSequence : 1
   );
 
   SWIFT_INLINE_BITFIELD_EMPTY(GenericTypeDecl, TypeDecl);
@@ -592,7 +597,7 @@ protected:
     HasAnyUnavailableValues : 1
   );
 
-  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1,
     /// If the module is compiled as static library.
     StaticLibrary : 1,
 
@@ -628,6 +633,9 @@ protected:
 
     /// Whether this module has incremental dependency information available.
     HasIncrementalInfo : 1,
+
+    /// Whether this module was built with -experimental-hermetic-seal-at-link.
+    HasHermeticSealAtLink : 1,
 
     /// Whether this module has been compiled with comprehensive checking for
     /// concurrency, e.g., Sendable checking.
@@ -881,6 +889,9 @@ public:
   /// but should behave like a top-level declaration. This is used by lldb.
   void setHoisted(bool hoisted = true) { Bits.Decl.Hoisted = hoisted; }
 
+  /// Whether this declaration predates the introduction of concurrency.
+  bool predatesConcurrency() const;
+
 public:
   bool escapedFromIfConfig() const {
     return Bits.Decl.EscapedFromIfConfig;
@@ -1131,13 +1142,16 @@ class ImportDecl final : public Decl,
 
   SourceLoc ImportLoc;
   SourceLoc KindLoc;
+  /// Used to store the real module name corresponding to this import decl in
+  /// case module aliasing is used. For example if '-module-alias Foo=Bar' was
+  /// passed and this decl is 'import Foo', the real name 'Bar' will be stored.
+  Identifier RealModuleName;
 
   /// The resolved module.
   ModuleDecl *Mod = nullptr;
 
   ImportDecl(DeclContext *DC, SourceLoc ImportLoc, ImportKind K,
              SourceLoc KindLoc, ImportPath Path);
-
 public:
   static ImportDecl *create(ASTContext &C, DeclContext *DC,
                             SourceLoc ImportLoc, ImportKind Kind,
@@ -1161,13 +1175,55 @@ public:
     return static_cast<ImportKind>(Bits.ImportDecl.ImportKind);
   }
 
+  /// Retrieves the import path as written in the source code.
+  /// 
+  /// \returns An \c ImportPath corresponding to this import decl. If module aliasing
+  ///          was used, this will contain the aliased name of the module; for instance,
+  ///          if you wrote 'import Foo' but passed '-module-alias Foo=Bar', this import
+  ///          path will include 'Foo'. This return value is always owned by \c ImportDecl
+  ///          (which is owned by the AST context), so it can be persisted.
   ImportPath getImportPath() const {
     return ImportPath({ getTrailingObjects<ImportPath::Element>(),
                         static_cast<size_t>(Bits.ImportDecl.NumPathElements) });
   }
 
+  /// Retrieves the import path, replacing any module aliases with real names.
+  /// 
+  /// \param scratch An \c ImportPath::Builder which may, if necessary, be used to
+  ///        construct the return value. It may go unused, so you should not try to
+  ///        read the result from it; use the return value instead.
+  /// \returns An \c ImportPath corresponding to this import decl. If module aliasing
+  ///          was used, this will contain the real name of the module; for instance,
+  ///          if you wrote 'import Foo' but passed '-module-alias Foo=Bar', this import
+  ///          path will include 'Bar'. This return value may be owned by \p scratch,
+  ///          so it should not be used after \p scratch is destroyed.
+  ImportPath getRealImportPath(ImportPath::Builder &scratch) const;
+
+  /// Retrieves the part of the import path that contains the module name,
+  /// as written in the source code.
+  /// 
+  /// \returns A \c ImportPath::Module corresponding to this import decl. If module
+  ///          aliasing was used, this will contain the aliased name of the module; for
+  ///          instance, if you wrote 'import Foo' but passed '-module-alias Foo=Bar',
+  ///          this module path will contain 'Foo'. This return value is always owned by
+  ///          \c ImportDecl (which is owned by the AST context), so it can be persisted.
   ImportPath::Module getModulePath() const {
     return getImportPath().getModulePath(getImportKind());
+  }
+
+  /// Retrieves the part of the import path that contains the module name,
+  /// replacing any module aliases with real names.
+  /// 
+  /// \param scratch An \c ImportPath::Builder which may, if necessary, be used to
+  ///        construct the return value. It may go unused, so you should not try to
+  ///        read the result from it; use the return value instead.
+  /// \returns An \c ImportPath::Module corresponding to this import decl. If module
+  ///          aliasing was used, this will contain the real name of the module; for
+  ///          instance, if you wrote 'import Foo' but passed '-module-alias Foo=Bar',
+  ///          the returned path will contain 'Bar'. This return value may be owned
+  ///          by \p scratch, so it should not be used after \p scratch is destroyed.
+  ImportPath::Module getRealModulePath(ImportPath::Builder &scratch) const {
+    return getRealImportPath(scratch).getModulePath(getImportKind());
   }
 
   ImportPath::Access getAccessPath() const {
@@ -2883,7 +2939,7 @@ public:
   /// \param name The name of the generic parameter.
   /// \param nameLoc The location of the name.
   GenericTypeParamDecl(DeclContext *dc, Identifier name, SourceLoc nameLoc,
-                       unsigned depth, unsigned index);
+                       bool isTypeSequence, unsigned depth, unsigned index);
 
   /// The depth of this generic type parameter, i.e., the number of outer
   /// levels of generic parameter lists that enclose this type parameter.
@@ -2904,6 +2960,15 @@ public:
     Bits.GenericTypeParamDecl.Depth = depth;
     assert(Bits.GenericTypeParamDecl.Depth == depth && "Truncation");
   }
+
+  /// Returns \c true if this generic type parameter is declared as a type
+  /// sequence.
+  ///
+  /// \code
+  /// func foo<@_typeSequence T>(_ : T...) { }
+  /// struct Foo<@_typeSequence T> { }
+  /// \encode
+  bool isTypeSequence() const { return Bits.GenericTypeParamDecl.TypeSequence; }
 
   /// The index of this generic type parameter within its generic parameter
   /// list.
@@ -4166,8 +4231,10 @@ class ProtocolDecl final : public NominalTypeDecl {
   friend class SuperclassDeclRequest;
   friend class SuperclassTypeRequest;
   friend class StructuralRequirementsRequest;
+  friend class TypeAliasRequirementsRequest;
   friend class ProtocolDependenciesRequest;
   friend class RequirementSignatureRequest;
+  friend class RequirementSignatureRequestRQM;
   friend class ProtocolRequiresClassRequest;
   friend class ExistentialConformsToSelfRequest;
   friend class InheritedProtocolsRequest;
@@ -4361,6 +4428,11 @@ public:
   /// instead.
   ArrayRef<StructuralRequirement> getStructuralRequirements() const;
 
+  /// Retrieve same-type requirements implied by protocol typealiases with the
+  /// same name as associated types, and diagnose cases that are better expressed
+  /// via a 'where' clause.
+  ArrayRef<Requirement> getTypeAliasRequirements() const;
+
   /// Get the list of protocols appearing on the right hand side of conformance
   /// requirements. Computed from the structural requirements, above.
   ArrayRef<ProtocolDecl *> getProtocolDependencies() const;
@@ -4523,6 +4595,7 @@ public:
   void setStatic(bool IsStatic) {
     Bits.AbstractStorageDecl.IsStatic = IsStatic;
   }
+  bool isCompileTimeConst() const;
 
   /// \returns the way 'static'/'class' should be spelled for this declaration.
   StaticSpellingKind getCorrectStaticSpelling() const;
@@ -5244,6 +5317,9 @@ public:
   /// Returns true if the name is the self identifier and is implicit.
   bool isSelfParameter() const;
 
+  /// Check whether the variable is the "self" of an actor method.
+  bool isActorSelf() const;
+
   /// Determine whether this property will be part of the implicit memberwise
   /// initializer.
   ///
@@ -5293,7 +5369,7 @@ class ParamDecl : public VarDecl {
 
   TypeRepr *TyRepr = nullptr;
 
-  struct alignas(1 << DeclAlignInBits) StoredDefaultArgument {
+  struct alignas(1 << StoredDefaultArgumentAlignInBits) StoredDefaultArgument {
     PointerUnion<Expr *, VarDecl *> DefaultArg;
 
     /// Stores the context for the default argument as well as a bit to
@@ -5317,10 +5393,13 @@ class ParamDecl : public VarDecl {
 
     /// Whether or not this parameter is 'isolated'.
     IsIsolated = 1 << 2,
+
+    /// Whether or not this parameter is '_const'.
+    IsCompileTimeConst = 1 << 3,
   };
 
   /// The default value, if any, along with flags.
-  llvm::PointerIntPair<StoredDefaultArgument *, 3, OptionSet<Flags>>
+  llvm::PointerIntPair<StoredDefaultArgument *, 4, OptionSet<Flags>>
       DefaultValueAndFlags;
 
   friend class ParamSpecifierRequest;
@@ -5369,6 +5448,10 @@ public:
   }
   void setDefaultArgumentKind(DefaultArgumentKind K) {
     Bits.ParamDecl.defaultArgumentKind = static_cast<unsigned>(K);
+  }
+
+  bool isNoImplicitCopy() const {
+    return getAttrs().hasAttribute<NoImplicitCopyAttr>();
   }
 
   /// Whether this parameter has a default argument expression available.
@@ -5483,6 +5566,17 @@ public:
     auto flags = DefaultValueAndFlags.getInt();
     DefaultValueAndFlags.setInt(value ? flags | Flags::IsIsolated
                                       : flags - Flags::IsIsolated);
+  }
+
+  /// Whether or not this parameter is marked with '_const'.
+  bool isCompileTimeConst() const {
+    return DefaultValueAndFlags.getInt().contains(Flags::IsCompileTimeConst);
+  }
+
+  void setCompileTimeConst(bool value = true) {
+    auto flags = DefaultValueAndFlags.getInt();
+    DefaultValueAndFlags.setInt(value ? flags | Flags::IsCompileTimeConst
+                                      : flags - Flags::IsCompileTimeConst);
   }
 
   /// Does this parameter reject temporary pointer conversions?
@@ -6264,14 +6358,6 @@ public:
   /// its type as above).
   Optional<unsigned> findPotentialCompletionHandlerParam(
       const AbstractFunctionDecl *asyncAlternative = nullptr) const;
-
-  /// Determine whether this function is implicitly known to have its
-  /// parameters of function type be @_unsafeSendable.
-  ///
-  /// This hard-codes knowledge of a number of functions that will
-  /// eventually have @_unsafeSendable and, eventually, @Sendable,
-  /// on their parameters of function type.
-  bool hasKnownUnsafeSendableFunctionParams() const;
 
   using DeclContext::operator new;
   using DeclContext::operator delete;
@@ -7597,7 +7683,8 @@ inline bool Decl::isPotentiallyOverridable() const {
 }
 
 inline GenericParamKey::GenericParamKey(const GenericTypeParamDecl *d)
-  : Depth(d->getDepth()), Index(d->getIndex()) { }
+    : TypeSequence(d->isTypeSequence()), Depth(d->getDepth()),
+      Index(d->getIndex()) {}
 
 inline const GenericContext *Decl::getAsGenericContext() const {
   switch (getKind()) {

@@ -1047,12 +1047,9 @@ ModuleFile::getGenericSignatureChecked(serialization::GenericSignatureID ID) {
       auto paramTy = getType(rawParamIDs[i+1])->castTo<GenericTypeParamType>();
 
       if (!name.empty()) {
-        auto paramDecl =
-          createDecl<GenericTypeParamDecl>(getAssociatedModule(),
-                                           name,
-                                           SourceLoc(),
-                                           paramTy->getDepth(),
-                                           paramTy->getIndex());
+        auto paramDecl = createDecl<GenericTypeParamDecl>(
+            getAssociatedModule(), name, SourceLoc(), paramTy->isTypeSequence(),
+            paramTy->getDepth(), paramTy->getIndex());
         paramTy = paramDecl->getDeclaredInterfaceType()
                    ->castTo<GenericTypeParamType>();
       }
@@ -2680,19 +2677,19 @@ public:
                                   StringRef blobData) {
     IdentifierID nameID;
     bool isImplicit;
+    bool isTypeSequence;
     unsigned depth;
     unsigned index;
 
-    decls_block::GenericTypeParamDeclLayout::readRecord(scratch, nameID,
-                                                        isImplicit,
-                                                        depth,
-                                                        index);
+    decls_block::GenericTypeParamDeclLayout::readRecord(
+        scratch, nameID, isImplicit, isTypeSequence, depth, index);
 
     // Always create GenericTypeParamDecls in the associated file; the real
     // context will reparent them.
     auto *DC = MF.getFile();
     auto genericParam = MF.createDecl<GenericTypeParamDecl>(
-        DC, MF.getIdentifier(nameID), SourceLoc(), depth, index);
+        DC, MF.getIdentifier(nameID), SourceLoc(), isTypeSequence, depth,
+        index);
     declOrOffset = genericParam;
 
     if (isImplicit)
@@ -3145,12 +3142,16 @@ public:
     bool isIUO;
     bool isVariadic;
     bool isAutoClosure;
+    bool isIsolated;
+    bool isCompileTimeConst;
     uint8_t rawDefaultArg;
 
     decls_block::ParamLayout::readRecord(scratch, argNameID, paramNameID,
                                          contextID, rawSpecifier,
                                          interfaceTypeID, isIUO, isVariadic,
-                                         isAutoClosure, rawDefaultArg);
+                                         isAutoClosure, isIsolated,
+                                         isCompileTimeConst,
+                                         rawDefaultArg);
 
     auto argName = MF.getIdentifier(argNameID);
     auto paramName = MF.getIdentifier(paramNameID);
@@ -3184,6 +3185,8 @@ public:
     param->setImplicitlyUnwrappedOptional(isIUO);
     param->setVariadic(isVariadic);
     param->setAutoClosure(isAutoClosure);
+    param->setIsolated(isIsolated);
+    param->setCompileTimeConst(isCompileTimeConst);
 
     // Decode the default argument kind.
     // FIXME: Default argument expression, if available.
@@ -5344,12 +5347,13 @@ public:
       IdentifierID labelID;
       IdentifierID internalLabelID;
       TypeID typeID;
-      bool isVariadic, isAutoClosure, isNonEphemeral, isIsolated;
+      bool isVariadic, isAutoClosure, isNonEphemeral, isIsolated, isCompileTimeConst;
       bool isNoDerivative;
       unsigned rawOwnership;
       decls_block::FunctionParamLayout::readRecord(
           scratch, labelID, internalLabelID, typeID, isVariadic, isAutoClosure,
-          isNonEphemeral, rawOwnership, isIsolated, isNoDerivative);
+          isNonEphemeral, rawOwnership, isIsolated, isNoDerivative,
+          isCompileTimeConst);
 
       auto ownership =
           getActualValueOwnership((serialization::ValueOwnership)rawOwnership);
@@ -5363,7 +5367,8 @@ public:
       params.emplace_back(paramTy.get(), MF.getIdentifier(labelID),
                           ParameterTypeFlags(isVariadic, isAutoClosure,
                                              isNonEphemeral, *ownership,
-                                             isIsolated, isNoDerivative),
+                                             isIsolated, isNoDerivative,
+                                             isCompileTimeConst),
                           MF.getIdentifier(internalLabelID));
     }
 
@@ -5475,7 +5480,8 @@ public:
     if (!sig)
       MF.fatal();
 
-    Type interfaceType = GenericTypeParamType::get(depth, index, ctx);
+    Type interfaceType =
+        GenericTypeParamType::get(/*type sequence*/ false, depth, index, ctx);
     Type contextType = sig.getGenericEnvironment()
         ->mapTypeIntoContext(interfaceType);
 
@@ -5527,13 +5533,37 @@ public:
     return rootTy->getGenericEnvironment()->mapTypeIntoContext(interfaceTy);
   }
 
+  Expected<Type> deserializeSequenceArchetypeType(ArrayRef<uint64_t> scratch,
+                                                  StringRef blobData) {
+    GenericSignatureID sigID;
+    unsigned depth, index;
+
+    decls_block::SequenceArchetypeTypeLayout::readRecord(scratch, sigID, depth,
+                                                         index);
+
+    auto sig = MF.getGenericSignature(sigID);
+    if (!sig)
+      MF.fatal();
+
+    Type interfaceType =
+        GenericTypeParamType::get(/*type sequence*/ true, depth, index, ctx);
+    Type contextType =
+        sig.getGenericEnvironment()->mapTypeIntoContext(interfaceType);
+
+    if (contextType->hasError())
+      MF.fatal();
+
+    return contextType;
+  }
+
   Expected<Type> deserializeGenericTypeParamType(ArrayRef<uint64_t> scratch,
                                                  StringRef blobData) {
+    bool typeSequence;
     DeclID declIDOrDepth;
     unsigned indexPlusOne;
 
-    decls_block::GenericTypeParamTypeLayout::readRecord(scratch, declIDOrDepth,
-                                                        indexPlusOne);
+    decls_block::GenericTypeParamTypeLayout::readRecord(
+        scratch, typeSequence, declIDOrDepth, indexPlusOne);
 
     if (indexPlusOne == 0) {
       auto genericParam
@@ -5545,7 +5575,8 @@ public:
       return genericParam->getDeclaredInterfaceType();
     }
 
-    return GenericTypeParamType::get(declIDOrDepth,indexPlusOne-1,ctx);
+    return GenericTypeParamType::get(typeSequence, declIDOrDepth,
+                                     indexPlusOne - 1, ctx);
   }
 
   Expected<Type> deserializeProtocolCompositionType(ArrayRef<uint64_t> scratch,
@@ -6063,6 +6094,7 @@ Expected<Type> TypeDeserializer::getTypeCheckedImpl() {
   CASE(OpaqueArchetype)
   CASE(OpenedArchetype)
   CASE(NestedArchetype)
+  CASE(SequenceArchetype)
   CASE(GenericTypeParam)
   CASE(ProtocolComposition)
   CASE(DependentMember)

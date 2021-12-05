@@ -548,7 +548,7 @@ void BindingSet::addBinding(PotentialBinding binding) {
   if (!TypeVar->getImpl().isClosureParameterType()) {
     auto type = binding.BindingType;
 
-    if (type->isCGFloatType() &&
+    if (type->isCGFloat() &&
         llvm::any_of(Bindings, [](const PotentialBinding &binding) {
           return binding.BindingType->isDouble();
         }))
@@ -557,7 +557,7 @@ void BindingSet::addBinding(PotentialBinding binding) {
     if (type->isDouble()) {
       auto inferredCGFloat =
           llvm::find_if(Bindings, [](const PotentialBinding &binding) {
-            return binding.BindingType->isCGFloatType();
+            return binding.BindingType->isCGFloat();
           });
 
       if (inferredCGFloat != Bindings.end()) {
@@ -981,7 +981,48 @@ bool BindingSet::isViable(PotentialBinding &binding) {
 }
 
 bool BindingSet::favoredOverDisjunction(Constraint *disjunction) const {
-  if (isHole() || isDelayed())
+  if (isHole())
+    return false;
+
+  if (llvm::any_of(Bindings, [&](const PotentialBinding &binding) {
+        if (binding.Kind == AllowedBindingKind::Supertypes)
+          return false;
+
+        auto type = binding.BindingType;
+
+        if (CS.shouldAttemptFixes())
+          return false;
+
+        if (type->isAnyHashable() || type->isDouble() || type->isCGFloat())
+          return false;
+
+        {
+          PointerTypeKind pointerKind;
+          if (type->getAnyPointerElementType(pointerKind)) {
+            switch (pointerKind) {
+            case PTK_UnsafeRawPointer:
+            case PTK_UnsafeMutableRawPointer:
+              return false;
+
+            default:
+              break;
+            }
+          }
+        }
+
+        return type->is<StructType>() || type->is<EnumType>() ||
+               type->is<BuiltinType>();
+      })) {
+    // Result type of subscript could be l-value so we can't bind it early.
+    if (!TypeVar->getImpl().isSubscriptResultType() &&
+        llvm::none_of(Info.DelayedBy, [](const Constraint *constraint) {
+          return constraint->getKind() == ConstraintKind::Disjunction ||
+                 constraint->getKind() == ConstraintKind::ValueMember;
+        }))
+      return true;
+  }
+
+  if (isDelayed())
     return false;
 
   // If this bindings are for a closure and there are no holes,
@@ -1338,6 +1379,7 @@ void PotentialBindings::infer(Constraint *constraint) {
   case ConstraintKind::KeyPath:
   case ConstraintKind::ClosureBodyElement:
   case ConstraintKind::Conjunction:
+  case ConstraintKind::BindTupleOfFunctionParams:
     // Constraints from which we can't do anything.
     break;
 
@@ -1709,7 +1751,8 @@ bool TypeVarBindingProducer::computeNext() {
     if (NumTries == 0 && binding.hasDefaultedLiteralProtocol()) {
       auto knownKind =
           *(binding.getDefaultedLiteralProtocol()->getKnownProtocolKind());
-      for (auto altType : CS.getAlternativeLiteralTypes(knownKind)) {
+      SmallVector<Type, 2> scratch;
+      for (auto altType : CS.getAlternativeLiteralTypes(knownKind, scratch)) {
         addNewBinding(binding.withSameSource(altType, BindingKind::Subtypes));
       }
     }
@@ -1767,9 +1810,10 @@ bool TypeVarBindingProducer::computeNext() {
       // always preserved.
       auto *BGT = type->castTo<BoundGenericType>();
       auto dstLocator = TypeVar->getImpl().getLocator();
-      auto newType = CS.openUnboundGenericType(BGT->getDecl(), BGT->getParent(),
-                                               dstLocator)
-                         ->reconstituteSugar(/*recursive=*/false);
+      auto newType =
+          CS.openUnboundGenericType(BGT->getDecl(), BGT->getParent(),
+                                    dstLocator, /*isTypeResolution=*/false)
+              ->reconstituteSugar(/*recursive=*/false);
       addNewBinding(binding.withType(newType));
     }
 
@@ -1983,7 +2027,7 @@ bool TypeVariableBinding::attempt(ConstraintSystem &cs) const {
 
   // If this was from a defaultable binding note that.
   if (Binding.isDefaultableBinding()) {
-    cs.DefaultedConstraints.push_back(srcLocator);
+    cs.DefaultedConstraints.insert(srcLocator);
 
     if (type->isPlaceholder() && reportHole())
       return true;

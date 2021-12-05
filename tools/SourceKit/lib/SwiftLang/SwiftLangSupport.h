@@ -14,13 +14,17 @@
 #define LLVM_SOURCEKIT_LIB_SWIFTLANG_SWIFTLANGSUPPORT_H
 
 #include "CodeCompletion.h"
-#include "SwiftInterfaceGenContext.h"
+#include "SourceKit/Core/Context.h"
 #include "SourceKit/Core/LangSupport.h"
 #include "SourceKit/Support/Concurrency.h"
 #include "SourceKit/Support/Statistic.h"
 #include "SourceKit/Support/ThreadSafeRefCntPtr.h"
 #include "SourceKit/Support/Tracing.h"
+#include "SwiftInterfaceGenContext.h"
+#include "swift/AST/DiagnosticConsumer.h"
 #include "swift/Basic/ThreadSafeRefCounted.h"
+#include "swift/IDE/CancellableResult.h"
+#include "swift/IDE/CompletionInstance.h"
 #include "swift/IDE/Indenting.h"
 #include "swift/IDE/Refactoring.h"
 #include "swift/Index/IndexSymbol.h"
@@ -301,6 +305,7 @@ class SwiftLangSupport : public LangSupport {
   std::string DiagnosticDocumentationPath;
   std::shared_ptr<SwiftASTManager> ASTMgr;
   std::shared_ptr<SwiftEditorDocumentFileMap> EditorDocuments;
+  std::shared_ptr<RequestTracker> ReqTracker;
   SwiftInterfaceGenMap IFaceGenContexts;
   ThreadSafeRefCntPtr<SwiftCompletionCache> CCCache;
   ThreadSafeRefCntPtr<SwiftPopularAPI> PopularAPI;
@@ -459,15 +464,22 @@ public:
   /// returns the original path;
   static std::string resolvePathSymlinks(StringRef FilePath);
 
-  /// Perform a completion like operation. It initializes a \c CompilerInstance,
-  /// the calls \p Callback with it. \p Callback must perform the second pass
-  /// using that instance.
-  bool performCompletionLikeOperation(
+  /// The result returned from \c performWithParamsToCompletionLikeOperation.
+  struct CompletionLikeOperationParams {
+    swift::CompilerInvocation &Invocation;
+    llvm::MemoryBuffer *completionBuffer;
+    swift::DiagnosticConsumer *DiagC;
+  };
+
+  /// Execute \p PerformOperation sychronously with the parameters necessary to
+  /// invoke a completion-like operation on \c CompletionInstance.
+  void performWithParamsToCompletionLikeOperation(
       llvm::MemoryBuffer *UnresolvedInputFile, unsigned Offset,
       ArrayRef<const char *> Args,
       llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
-      std::string &Error,
-      llvm::function_ref<void(swift::CompilerInstance &, bool)> Callback);
+      llvm::function_ref<
+          void(swift::ide::CancellableResult<CompletionLikeOperationParams>)>
+          PerformOperation);
 
   //==========================================================================//
   // LangSupport Interface
@@ -476,8 +488,6 @@ public:
   void globalConfigurationUpdated(std::shared_ptr<GlobalConfig> Config) override;
 
   void dependencyUpdated() override;
-
-  void cancelRequest(SourceKitCancellationToken CancellationToken) override;
 
   void indexSource(StringRef Filename, IndexingConsumer &Consumer,
                    ArrayRef<const char *> Args) override;

@@ -216,9 +216,9 @@ static void skt_main(skt_args *args);
 int main(int argc, const char **argv) {
   dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
     skt_args args = {argc, argv, 0};
-    llvm::thread Thread(llvm::thread::DefaultStackSize,
+    llvm::thread thread(llvm::thread::DefaultStackSize,
                         skt_main, &args);
-    Thread.join();
+    thread.join();
     exit(args.ret);
   });
 
@@ -1228,6 +1228,8 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
                             ^(sourcekitd_response_t resp) {
                               auto &info = asyncResponses[respIndex];
                               info.response = resp;
+                              sourcekitd_request_handle_dispose(
+                                  info.requestHandle);
                               info.semaphore.signal(); // Ready to be handled!
                             });
 
@@ -1711,6 +1713,7 @@ struct ResponseSymbolInfo {
   std::vector<const char *> ReceiverUSRs;
   bool IsSystem = false;
   bool IsDynamic = false;
+  bool IsSynthesized = false;
   unsigned ParentOffset = 0;
 
   static ResponseSymbolInfo read(sourcekitd_variant_t Info) {
@@ -1802,6 +1805,8 @@ struct ResponseSymbolInfo {
     Symbol.IsSystem = sourcekitd_variant_dictionary_get_bool(Info, KeyIsSystem);
     Symbol.IsDynamic =
         sourcekitd_variant_dictionary_get_bool(Info, KeyIsDynamic);
+    Symbol.IsSynthesized =
+        sourcekitd_variant_dictionary_get_bool(Info, KeyIsSynthesized);
 
     Symbol.ParentOffset =
         sourcekitd_variant_dictionary_get_int64(Info, KeyParentLoc);
@@ -1864,6 +1869,8 @@ struct ResponseSymbolInfo {
     }
     if (IsDynamic)
       OS << "DYNAMIC\n";
+    if (IsSynthesized)
+      OS << "SYNTHESIZED\n";
     if (ParentOffset) {
       OS << "PARENT OFFSET: " << ParentOffset << "\n";
     }

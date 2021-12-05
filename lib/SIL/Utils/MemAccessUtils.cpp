@@ -13,11 +13,12 @@
 #define DEBUG_TYPE "sil-access-utils"
 
 #include "swift/SIL/MemAccessUtils.h"
+#include "swift/Basic/GraphNodeWorklist.h"
+#include "swift/SIL/Consumption.h"
+#include "swift/SIL/DynamicCasts.h"
+#include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILUndef.h"
-#include "swift/SIL/DynamicCasts.h"
-#include "swift/SIL/Consumption.h"
-#include "swift/SIL/SILInstruction.h"
 #include "llvm/Support/Debug.h"
 
 using namespace swift;
@@ -800,6 +801,61 @@ SILValue swift::findOwnershipReferenceRoot(SILValue ref) {
   return ref;
 }
 
+void swift::findGuaranteedReferenceRoots(SILValue value,
+                                         SmallVectorImpl<SILValue> &roots) {
+  GraphNodeWorklist<SILValue, 4> worklist;
+  auto addAllOperandsToWorklist = [&worklist](SILInstruction *inst) -> bool {
+    if (inst->getNumOperands() > 0) {
+      for (auto operand : inst->getOperandValues()) {
+        worklist.insert(operand);
+      }
+      return true;
+    }
+    return false;
+  };
+  worklist.initialize(value);
+  while (auto value = worklist.pop()) {
+    if (auto *arg = dyn_cast<SILPhiArgument>(value)) {
+      if (auto *terminator = arg->getSingleTerminator()) {
+        worklist.insert(terminator->getOperand(arg->getIndex()));
+        continue;
+      }
+    } else if (auto *inst = value->getDefiningInstruction()) {
+      if (auto *result =
+              dyn_cast<FirstArgOwnershipForwardingSingleValueInst>(inst)) {
+        if (result->getNumOperands() > 0) {
+          worklist.insert(result->getOperand(0));
+          continue;
+        }
+      } else if (auto *result =
+                     dyn_cast<AllArgOwnershipForwardingSingleValueInst>(inst)) {
+        if (addAllOperandsToWorklist(result)) {
+          continue;
+        }
+      } else if (auto *result = dyn_cast<OwnershipForwardingTermInst>(inst)) {
+        assert(false && "value defined by a terminator?!");
+      } else if (auto *result =
+                     dyn_cast<OwnershipForwardingConversionInst>(inst)) {
+        worklist.insert(result->getConverted());
+        continue;
+      } else if (auto *result =
+                     dyn_cast<OwnershipForwardingSelectEnumInstBase>(inst)) {
+        if (addAllOperandsToWorklist(result)) {
+          continue;
+        }
+      } else if (auto *result =
+                     dyn_cast<OwnershipForwardingMultipleValueInstruction>(
+                         inst)) {
+        if (addAllOperandsToWorklist(result)) {
+          continue;
+        }
+      }
+    }
+    if (value.getOwnershipKind() == OwnershipKind::Guaranteed)
+      roots.push_back(value);
+  }
+}
+
 /// Find the first owned aggregate containing the reference, or simply the
 /// reference root if no aggregate is found.
 ///
@@ -821,9 +877,11 @@ SILValue swift::findOwnershipReferenceAggregate(SILValue ref) {
     if (auto *arg = dyn_cast<SILArgument>(root)) {
       if (auto *term = arg->getSingleTerminator()) {
         if (term->isTransformationTerminator()) {
-          assert(OwnershipForwardingTermInst::isa(term));
-          root = term->getOperand(0);
-          continue;
+          auto *ti = cast<OwnershipForwardingTermInst>(term);
+          if (ti->isDirectlyForwarding()) {
+            root = term->getOperand(0);
+            continue;
+          }
         }
       }
     }
@@ -1835,6 +1893,7 @@ static bool isScratchBuffer(SILValue value) {
 
 bool swift::memInstMustInitialize(Operand *memOper) {
   SILValue address = memOper->get();
+
   SILInstruction *memInst = memOper->getUser();
 
   switch (memInst->getKind()) {
@@ -1850,6 +1909,12 @@ bool swift::memInstMustInitialize(Operand *memOper) {
   case SILInstructionKind::InjectEnumAddrInst:
     return true;
 
+  case SILInstructionKind::BeginApplyInst:
+  case SILInstructionKind::TryApplyInst:
+  case SILInstructionKind::ApplyInst: {
+    FullApplySite applySite(memInst);
+    return applySite.isIndirectResultOperand(*memOper);
+  }
   case SILInstructionKind::StoreInst:
     return cast<StoreInst>(memInst)->getOwnershipQualifier()
            == StoreOwnershipQualifier::Init;
@@ -2135,6 +2200,12 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
       visitor(&builtin->getAllOperands()[2]);
       return;
 
+    // These effect both operands.
+    case BuiltinValueKind::Move:
+    case BuiltinValueKind::Copy:
+      visitor(&builtin->getAllOperands()[1]);
+      return;
+
     // These consume values out of their second operand.
     case BuiltinValueKind::ResumeNonThrowingContinuationReturning:
     case BuiltinValueKind::ResumeThrowingContinuationReturning:
@@ -2154,6 +2225,8 @@ static void visitBuiltinAddress(BuiltinInst *builtin,
     case BuiltinValueKind::CondFailMessage:
     case BuiltinValueKind::AllocRaw:
     case BuiltinValueKind::DeallocRaw:
+    case BuiltinValueKind::StackAlloc:
+    case BuiltinValueKind::StackDealloc:
     case BuiltinValueKind::Fence:
     case BuiltinValueKind::StaticReport:
     case BuiltinValueKind::Once:
@@ -2323,6 +2396,7 @@ void swift::visitAccessedAddress(SILInstruction *I,
   case SILInstructionKind::EndCOWMutationInst:
   case SILInstructionKind::BeginUnpairedAccessInst:
   case SILInstructionKind::BindMemoryInst:
+  case SILInstructionKind::RebindMemoryInst:
   case SILInstructionKind::CheckedCastValueBranchInst:
   case SILInstructionKind::CondFailInst:
   case SILInstructionKind::CopyBlockInst:

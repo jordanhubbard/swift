@@ -96,7 +96,7 @@ function(_add_host_variant_swift_sanitizer_flags target)
       # Not supported
     elseif(LLVM_USE_SANITIZER STREQUAL "Address;Undefined" OR
            LLVM_USE_SANITIZER STREQUAL "Undefined;Address")
-      set(_Swift_SANITIZER_FLAGS "-sanitize=address -sanitize=undefined")
+      set(_Swift_SANITIZER_FLAGS "-sanitize=address" "-sanitize=undefined")
     elseif(LLVM_USE_SANITIZER STREQUAL "Leaks")
       # Not supported
     else()
@@ -458,8 +458,7 @@ function(add_swift_host_library name)
         SHARED
         STATIC
         OBJECT
-        PURE_SWIFT
-        HAS_LIBSWIFT)
+        PURE_SWIFT)
   set(single_parameter_options)
   set(multiple_parameter_options
         LLVM_LINK_COMPONENTS)
@@ -511,12 +510,6 @@ function(add_swift_host_library name)
   endif()
 
   add_library(${name} ${libkind} ${ASHL_SOURCES})
-
-  if (ASHL_HAS_LIBSWIFT AND LIBSWIFT_BUILD_MODE)
-    # Workaround for a linker crash related to autolinking: rdar://77839981
-    set_property(TARGET ${name} APPEND_STRING PROPERTY
-                 LINK_FLAGS " -lobjc ")
-  endif()
 
   # Respect LLVM_COMMON_DEPENDS if it is set.
   #
@@ -666,8 +659,8 @@ endfunction()
 function(add_libswift_module module)
   cmake_parse_arguments(ALSM
                         ""
-                        "DEPENDS"
                         ""
+                        "DEPENDS"
                         ${ARGN})
   set(sources ${ALSM_UNPARSED_ARGUMENTS})
   list(TRANSFORM sources PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
@@ -716,13 +709,14 @@ endfunction()
 function(add_libswift name)
   cmake_parse_arguments(ALS
                         ""
-                        "BOOTSTRAPPING;SWIFT_EXEC;DEPENDS"
-                        ""
+                        "BOOTSTRAPPING;SWIFT_EXEC"
+                        "DEPENDS"
                         ${ARGN})
 
   set(libswift_compile_options
       "-Xfrontend" "-validate-tbd-against-ir=none"
-      "-Xfrontend" "-enable-cxx-interop")
+      "-Xfrontend" "-enable-cxx-interop"
+      "-Xcc" "-UIBOutlet" "-Xcc" "-UIBAction" "-Xcc" "-UIBInspectable")
 
   if(CMAKE_BUILD_TYPE STREQUAL Debug)
     list(APPEND libswift_compile_options "-g")
@@ -732,9 +726,19 @@ function(add_libswift name)
 
   get_bootstrapping_path(build_dir ${CMAKE_CURRENT_BINARY_DIR} "${ALS_BOOTSTRAPPING}")
 
+  set(sdk_option "")
+
   if(SWIFT_HOST_VARIANT_SDK IN_LIST SWIFT_DARWIN_PLATFORMS)
     set(deployment_version "10.15") # TODO: once #38675 lands, replace this with
 #   set(deployment_version "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_DEPLOYMENT_VERSION}")
+    set(sdk_option "-sdk" "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH}")
+    if(${LIBSWIFT_BUILD_MODE} STREQUAL "CROSSCOMPILE-WITH-HOSTLIBS")
+      # Let the cross-compiled compile don't pick up the compiled stdlib by providing
+      # an (almost) empty resource dir.
+      # The compiler will instead pick up the stdlib from the SDK.
+      get_filename_component(swift_exec_bin_dir ${ALS_SWIFT_EXEC} DIRECTORY)
+      set(sdk_option ${sdk_option} "-resource-dir" "${swift_exec_bin_dir}/../bootstrapping0/lib/swift")
+    endif()
   endif()
   get_versioned_target_triple(target ${SWIFT_HOST_VARIANT_SDK}
       ${SWIFT_HOST_VARIANT_ARCH} "${deployment_version}")
@@ -768,13 +772,14 @@ function(add_libswift name)
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       DEPENDS ${sources} ${deps} ${ALS_DEPENDS}
       COMMAND ${ALS_SWIFT_EXEC} "-c" "-o" ${module_obj_file}
-              "-sdk" "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH}"
+              ${sdk_option}
               "-target" ${target}
               "-module-name" ${module} "-emit-module"
               "-emit-module-path" "${build_dir}/${module}.swiftmodule"
               "-parse-as-library" ${sources}
               "-wmo" ${libswift_compile_options}
-              "-I" "${CMAKE_SOURCE_DIR}/include/swift"
+              "-I" "${SWIFT_SOURCE_DIR}/include/swift"
+              "-I" "${SWIFT_SOURCE_DIR}/include"
               "-I" "${build_dir}"
       COMMENT "Building libswift module ${module}")
 
@@ -784,6 +789,7 @@ function(add_libswift name)
   # Create a static libswift library containing all module object files.
   add_library(${name} STATIC ${all_obj_files})
   set_target_properties(${name} PROPERTIES LINKER_LANGUAGE CXX)
+  set_property(GLOBAL APPEND PROPERTY SWIFT_BUILDTREE_EXPORTS ${name})
 endfunction()
 
 macro(add_swift_tool_subdirectory name)
@@ -793,16 +799,6 @@ endmacro()
 macro(add_swift_lib_subdirectory name)
   add_llvm_subdirectory(SWIFT LIB ${name})
 endmacro()
-
-function(_link_built_compatibility_libs executable)
-  set(platform ${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR})
-  target_link_directories(${executable} PRIVATE
-    ${SWIFTLIB_DIR}/${platform})
-  add_dependencies(${executable}
-    "swiftCompatibility50-${platform}"
-    "swiftCompatibility51-${platform}"
-    "swiftCompatibilityDynamicReplacements-${platform}")
-endfunction()
 
 function(add_swift_host_tool executable)
   set(options HAS_LIBSWIFT)
@@ -866,6 +862,7 @@ function(add_swift_host_tool executable)
     # Please add each rpath separately below to the list, explaining why you are
     # adding it.
     set(RPATH_LIST)
+    set(sdk_dir "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH}/usr/lib/swift")
 
     # If we found a swift compiler and are going to use swift code in swift
     # host side tools but link with clang, add the appropriate -L paths so we
@@ -878,32 +875,48 @@ function(add_swift_host_tool executable)
         get_filename_component(TOOLCHAIN_LIB_DIR "${TOOLCHAIN_BIN_DIR}/../lib/swift/macosx" ABSOLUTE)
         target_link_directories(${executable} PUBLIC ${TOOLCHAIN_LIB_DIR})
 
-        # Add in the SDK directory for the host platform.
-        target_link_directories(${executable} PRIVATE
-          ${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH}/usr/lib/swift)
+        # Add the SDK directory for the host platform.
+        target_link_directories(${executable} PRIVATE "${sdk_dir}")
+
+        # Include the abi stable system stdlib in our rpath.
+        list(APPEND RPATH_LIST "/usr/lib/swift")
+
+      elseif(LIBSWIFT_BUILD_MODE STREQUAL "CROSSCOMPILE-WITH-HOSTLIBS")
+
+        # Intentinally don't add the lib dir of the cross-compiled compiler, so that
+        # the stdlib is not picked up from there, but from the SDK.
+        # This requires to explicitly add all the needed compatibility libraries. We
+        # can take them from the current build.
+        set(vsuffix "-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}")
+        set(conctarget "swiftCompatibilityConcurrency${vsuffix}")
+        target_link_libraries(${executable} PUBLIC ${conctarget})
+
+        # Add the SDK directory for the host platform.
+        target_link_directories(${executable} PRIVATE "${sdk_dir}")
 
         # Include the abi stable system stdlib in our rpath.
         list(APPEND RPATH_LIST "/usr/lib/swift")
 
       elseif(LIBSWIFT_BUILD_MODE STREQUAL "BOOTSTRAPPING-WITH-HOSTLIBS")
-        # Pick up the built libswiftCompatibility<n>.a libraries
-        _link_built_compatibility_libs(${executable})
+        # Add the SDK directory for the host platform.
+        target_link_directories(${executable} PRIVATE "${sdk_dir}")
 
-        # Add in the SDK directory for the host platform.
+        # A backup in case the toolchain doesn't have one of the compatibility libraries.
         target_link_directories(${executable} PRIVATE
-          ${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH}/usr/lib/swift)
+          "${SWIFTLIB_DIR}/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}")
 
         # Include the abi stable system stdlib in our rpath.
         list(APPEND RPATH_LIST "/usr/lib/swift")
 
       elseif(LIBSWIFT_BUILD_MODE STREQUAL "BOOTSTRAPPING")
-        # Pick up the built libswiftCompatibility<n>.a libraries
-        _link_built_compatibility_libs(${executable})
-
         # At build time link against the built swift libraries from the
         # previous bootstrapping stage.
-        get_bootstrapping_swift_lib_dir(bs_lib_dir "${bootstrapping}")
+        get_bootstrapping_swift_lib_dir(bs_lib_dir "${ASHT_BOOTSTRAPPING}")
         target_link_directories(${executable} PRIVATE ${bs_lib_dir})
+
+        # Required to pick up the built libswiftCompatibility<n>.a libraries
+        target_link_directories(${executable} PRIVATE
+          "${SWIFTLIB_DIR}/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}")
 
         # At runtime link against the built swift libraries from the current
         # bootstrapping stage.
@@ -937,8 +950,7 @@ function(add_swift_host_tool executable)
       # NOTE: We do this /after/ target_link_directorying TOOLCHAIN_LIB_DIR to
       # ensure that we first find libraries from the toolchain, rather than from
       # the SDK.
-      target_link_directories(${executable} PRIVATE
-        ${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${SWIFT_HOST_VARIANT_ARCH}_PATH}/usr/lib/swift)
+      target_link_directories(${executable} PRIVATE "${sdk_dir}")
 
       # We also want to be able to find libraries from the base toolchain
       # directory. This is so swiftc can rely on its own host side dylibs that may
@@ -954,6 +966,7 @@ function(add_swift_host_tool executable)
       INSTALL_RPATH "${RPATH_LIST}")
 
   elseif(SWIFT_HOST_VARIANT_SDK STREQUAL "LINUX" AND ASHT_HAS_LIBSWIFT AND LIBSWIFT_BUILD_MODE)
+    set(swiftrt "swiftImageRegistrationObject${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_OBJECT_FORMAT}-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}")
     if(LIBSWIFT_BUILD_MODE STREQUAL "HOSTTOOLS")
       # At build time and and run time, link against the swift libraries in the
       # installed host toolchain.
@@ -961,6 +974,7 @@ function(add_swift_host_tool executable)
       get_filename_component(swift_dir ${swift_bin_dir} DIRECTORY)
       set(host_lib_dir "${swift_dir}/lib/swift/linux")
 
+      target_link_libraries(${executable} PRIVATE ${swiftrt})
       target_link_libraries(${executable} PRIVATE "swiftCore")
 
       target_link_directories(${executable} PRIVATE ${host_lib_dir})
@@ -971,8 +985,12 @@ function(add_swift_host_tool executable)
     elseif(LIBSWIFT_BUILD_MODE STREQUAL "BOOTSTRAPPING")
       # At build time link against the built swift libraries from the
       # previous bootstrapping stage.
-      get_bootstrapping_swift_lib_dir(bs_lib_dir "${bootstrapping}")
-      target_link_directories(${executable} PRIVATE ${bs_lib_dir})
+      if (NOT "${ASHT_BOOTSTRAPPING}" STREQUAL "0")
+        get_bootstrapping_swift_lib_dir(bs_lib_dir "${ASHT_BOOTSTRAPPING}")
+        target_link_directories(${executable} PRIVATE ${bs_lib_dir})
+        target_link_libraries(${executable} PRIVATE ${swiftrt})
+        target_link_libraries(${executable} PRIVATE "swiftCore")
+      endif()
 
       # At runtime link against the built swift libraries from the current
       # bootstrapping stage.

@@ -18,6 +18,7 @@
 #ifndef SWIFT_DEMANGLING_ASSERT_H
 #define SWIFT_DEMANGLING_ASSERT_H
 
+#include "llvm/Support/Compiler.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/Demangling/NamespaceMacros.h"
 
@@ -50,8 +51,8 @@ namespace swift {
 namespace Demangle {
 SWIFT_BEGIN_INLINE_NAMESPACE
 
-SWIFT_NORETURN void failAssert(const char *file, unsigned line,
-                               NodePointer node, const char *expr);
+LLVM_ATTRIBUTE_NORETURN void failAssert(const char *file, unsigned line,
+                                        NodePointer node, const char *expr);
 
 SWIFT_END_INLINE_NAMESPACE
 } // end namespace Demangle

@@ -168,8 +168,9 @@ protected:
     );
 
     SWIFT_INLINE_BITFIELD(SynthesizedProtocolAttr, DeclAttribute,
-                          NumKnownProtocolKindBits,
-      kind : NumKnownProtocolKindBits
+                          NumKnownProtocolKindBits+1,
+      kind : NumKnownProtocolKindBits,
+      isUnchecked : 1
     );
   } Bits;
 
@@ -288,6 +289,9 @@ public:
 
     /// Whether this attribute is only valid when distributed is enabled.
     DistributedOnly = 1ull << (unsigned(DeclKindIndex::Last_Decl) + 17),
+
+    /// Whether this attribute is valid on additional decls in ClangImporter.
+    OnAnyClangDecl = 1ull << (unsigned(DeclKindIndex::Last_Decl) + 18),
   };
 
   LLVM_READNONE
@@ -1276,17 +1280,23 @@ class SynthesizedProtocolAttr : public DeclAttribute {
 
 public:
   SynthesizedProtocolAttr(KnownProtocolKind protocolKind,
-                          LazyConformanceLoader *Loader)
+                          LazyConformanceLoader *Loader,
+                          bool isUnchecked)
     : DeclAttribute(DAK_SynthesizedProtocol, SourceLoc(), SourceRange(),
                     /*Implicit=*/true), Loader(Loader)
   {
     Bits.SynthesizedProtocolAttr.kind = unsigned(protocolKind);
+    Bits.SynthesizedProtocolAttr.isUnchecked = unsigned(isUnchecked);
   }
 
   /// Retrieve the known protocol kind naming the protocol to be
   /// synthesized.
   KnownProtocolKind getProtocolKind() const {
     return KnownProtocolKind(Bits.SynthesizedProtocolAttr.kind);
+  }
+
+  bool isUnchecked() const {
+    return bool(Bits.SynthesizedProtocolAttr.isUnchecked);
   }
 
   /// Retrieve the lazy loader that will be used to populate the
@@ -1369,7 +1379,7 @@ public:
              numSPIGroups };
   }
 
-  ArrayRef<AvailableAttr *> getAvailabeAttrs() const {
+  ArrayRef<AvailableAttr *> getAvailableAttrs() const {
     return {this->template getTrailingObjects<AvailableAttr *>(),
             numAvailableAttrs};
   }
@@ -2061,6 +2071,20 @@ public:
   }
 };
 
+/// The @_typeSequence attribute, which treats a generic param decl as a variadic
+/// sequence of value/type pairs.
+class TypeSequenceAttr : public DeclAttribute {
+  TypeSequenceAttr(SourceLoc atLoc, SourceRange Range);
+
+public:
+  static TypeSequenceAttr *create(ASTContext &Ctx, SourceLoc atLoc,
+                                  SourceRange Range);
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_TypeSequence;
+  }
+};
+
 /// Attributes that may be applied to declarations.
 class DeclAttributes {
   /// Linked list of declaration attributes.
@@ -2201,6 +2225,15 @@ public:
       if (Attr->getKind() == DK && (Attr->isValid() || AllowInvalid))
         return Attr;
     return nullptr;
+  }
+
+  /// Returns the "winning" \c NonSendableAttr or \c SendableAttr in this
+  /// attribute list, or \c nullptr if there are none.
+  const DeclAttribute *getEffectiveSendableAttr() const;
+
+  DeclAttribute *getEffectiveSendableAttr() {
+    return const_cast<DeclAttribute *>(
+         const_cast<const DeclAttributes *>(this)->getEffectiveSendableAttr());
   }
 
 private:

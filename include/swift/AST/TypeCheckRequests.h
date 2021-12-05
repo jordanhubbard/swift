@@ -387,6 +387,25 @@ public:
   bool isCached() const { return true; }
 };
 
+class TypeAliasRequirementsRequest :
+    public SimpleRequest<TypeAliasRequirementsRequest,
+                         ArrayRef<Requirement>(ProtocolDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ArrayRef<Requirement>
+  evaluate(Evaluator &evaluator, ProtocolDecl *proto) const;
+
+public:
+  // Caching.
+  bool isCached() const { return true; }
+};
+
 class ProtocolDependenciesRequest :
     public SimpleRequest<ProtocolDependenciesRequest,
                          ArrayRef<ProtocolDecl *>(ProtocolDecl *),
@@ -403,6 +422,27 @@ private:
 
 public:
   // Caching.
+  bool isCached() const { return true; }
+};
+
+/// Compute a protocol's requirement signature using the RequirementMachine.
+/// This is temporary; once the GenericSignatureBuilder goes away this will
+/// be folded into RequirementSignatureRequest.
+class RequirementSignatureRequestRQM :
+    public SimpleRequest<RequirementSignatureRequestRQM,
+                         ArrayRef<Requirement>(ProtocolDecl *),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  ArrayRef<Requirement>
+  evaluate(Evaluator &evaluator, ProtocolDecl *proto) const;
+
+public:
   bool isCached() const { return true; }
 };
 
@@ -459,6 +499,8 @@ struct WhereClauseOwner {
                      SpecializeAttr *, DifferentiableAttr *>
       source;
 
+  WhereClauseOwner() : dc(nullptr) {}
+
   WhereClauseOwner(GenericContext *genCtx);
   WhereClauseOwner(AssociatedTypeDecl *atd);
 
@@ -478,6 +520,10 @@ struct WhereClauseOwner {
 
   friend hash_code hash_value(const WhereClauseOwner &owner) {
     return llvm::hash_value(owner.source.getOpaqueValue());
+  }
+
+  operator bool() const {
+    return dc != nullptr;
   }
 
   friend bool operator==(const WhereClauseOwner &lhs,
@@ -1405,11 +1451,17 @@ public:
 
 void simple_display(llvm::raw_ostream &out, AncestryFlags value);
 
+/// AbstractGenericSignatureRequest and InferredGenericSignatureRequest
+/// return this type, which stores a GenericSignature together with a bit
+/// indicating if there were any errors detected in the original
+/// requirements.
+using GenericSignatureWithError = llvm::PointerIntPair<GenericSignature, 1>;
+
 class AbstractGenericSignatureRequest :
     public SimpleRequest<AbstractGenericSignatureRequest,
-                         GenericSignature (const GenericSignatureImpl *,
-                                           SmallVector<GenericTypeParamType *, 2>,
-                                           SmallVector<Requirement, 2>),
+                         GenericSignatureWithError (const GenericSignatureImpl *,
+                                                    SmallVector<GenericTypeParamType *, 2>,
+                                                    SmallVector<Requirement, 2>),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -1418,7 +1470,39 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  GenericSignature
+  GenericSignatureWithError
+  evaluate(Evaluator &evaluator,
+           const GenericSignatureImpl *baseSignature,
+           SmallVector<GenericTypeParamType *, 2> addedParameters,
+           SmallVector<Requirement, 2> addedRequirements) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+
+  /// Abstract generic signature requests never have source-location info.
+  SourceLoc getNearestLoc() const {
+    return SourceLoc();
+  }
+};
+
+/// Build a generic signature using the RequirementMachine. This is temporary;
+/// once the GenericSignatureBuilder goes away this will be folded into
+/// AbstractGenericSignatureRequest.
+class AbstractGenericSignatureRequestRQM :
+    public SimpleRequest<AbstractGenericSignatureRequestRQM,
+                         GenericSignatureWithError (const GenericSignatureImpl *,
+                                                    SmallVector<GenericTypeParamType *, 2>,
+                                                    SmallVector<Requirement, 2>),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  GenericSignatureWithError
   evaluate(Evaluator &evaluator,
            const GenericSignatureImpl *baseSignature,
            SmallVector<GenericTypeParamType *, 2> addedParameters,
@@ -1436,12 +1520,13 @@ public:
 
 class InferredGenericSignatureRequest :
     public SimpleRequest<InferredGenericSignatureRequest,
-                         GenericSignature (ModuleDecl *,
-                                            const GenericSignatureImpl *,
-                                            GenericParamSource,
-                                            SmallVector<Requirement, 2>,
-                                            SmallVector<TypeLoc, 2>,
-                                            bool),
+                         GenericSignatureWithError (ModuleDecl *,
+                                                    const GenericSignatureImpl *,
+                                                    GenericParamList *,
+                                                    WhereClauseOwner,
+                                                    SmallVector<Requirement, 2>,
+                                                    SmallVector<TypeLoc, 2>,
+                                                    bool),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -1450,11 +1535,12 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  GenericSignature
+  GenericSignatureWithError
   evaluate(Evaluator &evaluator,
-           ModuleDecl *module,
+           ModuleDecl *parentModule,
            const GenericSignatureImpl *baseSignature,
-           GenericParamSource paramSource,
+           GenericParamList *genericParams,
+           WhereClauseOwner whereClause,
            SmallVector<Requirement, 2> addedRequirements,
            SmallVector<TypeLoc, 2> inferenceSources,
            bool allowConcreteGenericParams) const;
@@ -1467,7 +1553,50 @@ public:
   SourceLoc getNearestLoc() const {
     return SourceLoc();
   }
-                           
+
+  // Cycle handling.
+  void noteCycleStep(DiagnosticEngine &diags) const;
+};
+
+/// Build a generic signature using the RequirementMachine. This is temporary;
+/// once the GenericSignatureBuilder goes away this will be folded into
+/// InferredGenericSignatureRequest.
+class InferredGenericSignatureRequestRQM :
+    public SimpleRequest<InferredGenericSignatureRequestRQM,
+                         GenericSignatureWithError (ModuleDecl *,
+                                                    const GenericSignatureImpl *,
+                                                    GenericParamList *,
+                                                    WhereClauseOwner,
+                                                    SmallVector<Requirement, 2>,
+                                                    SmallVector<TypeLoc, 2>,
+                                                    bool),
+                         RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  GenericSignatureWithError
+  evaluate(Evaluator &evaluator,
+           ModuleDecl *parentModule,
+           const GenericSignatureImpl *baseSignature,
+           GenericParamList *genericParams,
+           WhereClauseOwner whereClause,
+           SmallVector<Requirement, 2> addedRequirements,
+           SmallVector<TypeLoc, 2> inferenceSources,
+           bool allowConcreteGenericParams) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+
+  /// Inferred generic signature requests don't have source-location info.
+  SourceLoc getNearestLoc() const {
+    return SourceLoc();
+  }
+
   // Cycle handling.
   void noteCycleStep(DiagnosticEngine &diags) const;
 };

@@ -38,6 +38,14 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
   list(APPEND SWIFT_RUNTIME_CORE_CXX_FLAGS "-xc++")
 endif()
 
+# We should avoid non-literals in format strings, or appropriately mark
+# functions.
+check_cxx_compiler_flag("-Wformat-nonliteral -Werror=format-nonliteral" CXX_SUPPORTS_FORMAT_NONLITERAL_WARNING)
+if (CXX_SUPPORTS_FORMAT_NONLITERAL_WARNING)
+  list(APPEND SWIFT_RUNTIME_CORE_CXX_FLAGS "-Wformat-nonliteral"
+    "-Werror=format-nonliteral")
+endif()
+
 # C++ code in the runtime and standard library should generally avoid
 # introducing static constructors or destructors.
 check_cxx_compiler_flag("-Wglobal-constructors -Werror=global-constructors" CXX_SUPPORTS_GLOBAL_CONSTRUCTORS_WARNING)
@@ -106,6 +114,11 @@ if(SWIFT_BUILD_STDLIB)
 
   if(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
     add_subdirectory(Distributed)
+  endif()
+
+  if(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
+    add_subdirectory(MatchingEngine)
+    add_subdirectory(StringProcessing)
   endif()
 endif()
 

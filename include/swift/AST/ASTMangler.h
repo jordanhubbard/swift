@@ -57,11 +57,20 @@ protected:
   bool AllowSymbolicReferences = false;
 
   /// If enabled, allows the use of standard substitutions for types in the
+  /// standard library.
+  bool AllowStandardSubstitutions = true;
+
+  /// If enabled, allows the use of standard substitutions for types in the
   /// concurrency library.
   bool AllowConcurrencyStandardSubstitutions = true;
 
   /// If enabled, marker protocols can be encoded in the mangled name.
   bool AllowMarkerProtocols = true;
+
+  /// Whether the mangling predates concurrency, and therefore shouldn't
+  /// include concurrency features such as global actors or @Sendable
+  /// function types.
+  bool PredatesConcurrency = false;
 
 public:
   using SymbolicReferent = llvm::PointerUnion<const NominalTypeDecl *,
@@ -271,6 +280,7 @@ public:
 
   std::string mangleTypeAsContextUSR(const NominalTypeDecl *type);
 
+  std::string mangleAnyDecl(const ValueDecl *Decl, bool prefix);
   std::string mangleDeclAsUSR(const ValueDecl *Decl, StringRef USRPrefix);
 
   std::string mangleAccessorEntityAsUSR(AccessorKind kind,

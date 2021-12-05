@@ -18,7 +18,6 @@
 #include <vector>
 
 #include "PropertyMap.h"
-#include "ProtocolGraph.h"
 #include "RewriteContext.h"
 #include "RewriteSystem.h"
 
@@ -28,10 +27,12 @@ class raw_ostream;
 
 namespace swift {
 
+class AbstractGenericSignatureRequestRQM;
 class ASTContext;
 class AssociatedTypeDecl;
 class CanType;
 class GenericTypeParamType;
+class InferredGenericSignatureRequestRQM;
 class LayoutConstraint;
 class ProtocolDecl;
 class Requirement;
@@ -46,8 +47,11 @@ class RewriteContext;
 class RequirementMachine final {
   friend class swift::ASTContext;
   friend class swift::rewriting::RewriteContext;
+  friend class swift::AbstractGenericSignatureRequestRQM;
+  friend class swift::InferredGenericSignatureRequestRQM;
 
   CanGenericSignature Sig;
+  SmallVector<Type, 2> Params;
   ArrayRef<const ProtocolDecl *> Protos;
 
   RewriteContext &Context;
@@ -81,6 +85,12 @@ class RequirementMachine final {
 
   void initWithGenericSignature(CanGenericSignature sig);
   void initWithProtocols(ArrayRef<const ProtocolDecl *> protos);
+  void initWithAbstractRequirements(
+      ArrayRef<GenericTypeParamType *> genericParams,
+      ArrayRef<Requirement> requirements);
+  void initWithWrittenRequirements(
+      ArrayRef<GenericTypeParamType *> genericParams,
+      ArrayRef<StructuralRequirement> requirements);
 
   bool isComplete() const;
 
@@ -88,8 +98,14 @@ class RequirementMachine final {
 
   MutableTerm getLongestValidPrefix(const MutableTerm &term) const;
 
-  std::vector<Requirement> buildRequirementSignature(
-    ArrayRef<unsigned> rules, const ProtocolDecl *proto) const;
+  std::vector<Requirement> buildRequirementsFromRules(
+    ArrayRef<unsigned> rules,
+    TypeArrayView<GenericTypeParamType> genericParams) const;
+
+  TypeArrayView<GenericTypeParamType> getGenericParams() const {
+    return TypeArrayView<GenericTypeParamType>(
+      ArrayRef<Type>(Params));
+  }
 
 public:
   ~RequirementMachine();
@@ -117,7 +133,9 @@ public:
   TypeDecl *lookupNestedType(Type depType, Identifier name) const;
 
   llvm::DenseMap<const ProtocolDecl *, std::vector<Requirement>>
-  computeMinimalRequirements();
+  computeMinimalProtocolRequirements();
+
+  std::vector<Requirement> computeMinimalGenericSignatureRequirements();
 
   void verify(const MutableTerm &term) const;
   void dump(llvm::raw_ostream &out) const;

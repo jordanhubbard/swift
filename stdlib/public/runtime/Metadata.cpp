@@ -42,13 +42,6 @@
 // Avoid defining macro max(), min() which conflict with std::max(), std::min()
 #define NOMINMAX
 #include <windows.h>
-#else
-#include <sys/mman.h>
-#include <unistd.h>
-// WASI doesn't support dynamic linking yet.
-#if !defined(__wasi__)
-#include <dlfcn.h>
-#endif // !defined(__wasi__)
 #endif
 #if SWIFT_PTRAUTH
 #include <ptrauth.h>
@@ -64,10 +57,6 @@ extern "C" void _objc_setClassCopyFixupHandler(void (* _Nonnull newFixupHandler)
 #include "ExistentialMetadataImpl.h"
 #include "swift/Runtime/Debug.h"
 #include "Private.h"
-
-#if defined(__APPLE__)
-#include <mach/vm_page_size.h>
-#endif
 
 #if SWIFT_OBJC_INTEROP
 #include "ObjCRuntimeGetImageNameFromClass.h"
@@ -3273,7 +3262,9 @@ swift::swift_lookUpClassMethod(const ClassMetadata *metadata,
                                const ClassDescriptor *description) {
   assert(metadata->isTypeMetadata());
 
+#ifndef NDEBUG
   assert(isAncestorOf(metadata, description));
+#endif
 
   auto *vtable = description->getVTableDescriptor();
   assert(vtable != nullptr);
@@ -4032,9 +4023,11 @@ swift::swift_getExistentialTypeMetadata(
   
   // Ensure that the "class constraint" bit is set whenever we have a
   // superclass or a one of the protocols is class-bound.
+#ifndef NDEBUG
   assert(classConstraint == ProtocolClassConstraint::Class ||
          (!superclassConstraint &&
           !anyProtocolIsClassBound(numProtocols, protocols)));
+#endif
   ExistentialCacheEntry::Key key = {
     superclassConstraint, classConstraint, (uint32_t)numProtocols, protocols
   };
@@ -5751,7 +5744,7 @@ diagnoseMetadataDependencyCycle(const Metadata *start,
                             &details);
   }
 
-  fatalError(0, diagnostic.c_str());
+  fatalError(0, "%s", diagnostic.c_str());
 }
 
 /// Check whether the given metadata dependency is satisfied, and if not,
@@ -5953,9 +5946,9 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
   static OnceToken_t getenvToken;
   SWIFT_ONCE_F(getenvToken, checkAllocatorDebugEnvironmentVariables, nullptr);
 
-  // If the size is larger than the maximum, just use malloc.
+  // If the size is larger than the maximum, just do a normal heap allocation.
   if (size > PoolRange::MaxPoolAllocationSize) {
-    void *allocation = malloc(size);
+    void *allocation = swift_slowAlloc(size, alignment - 1);
     memsetScribble(allocation, size);
     return allocation;
   }
@@ -5993,6 +5986,21 @@ void *MetadataAllocator::Allocate(size_t size, size_t alignment) {
       newState = PoolRange{allocation + sizeWithHeader,
                            poolSize - sizeWithHeader};
       __asan_poison_memory_region(allocation, newState.Remaining);
+    }
+
+    // NULL should be impossible, but check anyway in case of bugs or corruption
+    if (SWIFT_UNLIKELY(!allocation)) {
+      PoolRange curStateReRead = AllocationPool.load(std::memory_order_relaxed);
+      swift::fatalError(
+          0,
+          "Metadata allocator corruption: allocation is NULL. "
+          "curState: {%p, %zu} - curStateReRead: {%p, %zu} - "
+          "newState: {%p, %zu} - allocatedNewPage: %s - requested size: %zu - "
+          "sizeWithHeader: %zu - alignment: %zu - Tag: %d\n",
+          curState.Begin, curState.Remaining, curStateReRead.Begin,
+          curStateReRead.Remaining, newState.Begin, newState.Remaining,
+          allocatedNewPage ? "true" : "false", size, sizeWithHeader, alignment,
+          Tag);
     }
 
     // Swap in the new state.
@@ -6035,7 +6043,7 @@ void MetadataAllocator::Deallocate(const void *allocation, size_t size,
   __asan_poison_memory_region(allocation, size);
 
   if (size > PoolRange::MaxPoolAllocationSize) {
-    free(const_cast<void*>(allocation));
+    swift_slowDealloc(const_cast<void *>(allocation), size, Alignment - 1);
     return;
   }
 

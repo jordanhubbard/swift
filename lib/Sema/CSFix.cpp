@@ -169,7 +169,7 @@ bool TreatArrayLiteralAsDictionary::diagnose(const Solution &solution,
                                                     getToType(), getFromType(),
                                                     getLocator());
   return failure.diagnose(asNote);
-};
+}
 
 TreatArrayLiteralAsDictionary *
 TreatArrayLiteralAsDictionary::create(ConstraintSystem &cs,
@@ -178,7 +178,7 @@ TreatArrayLiteralAsDictionary::create(ConstraintSystem &cs,
   assert(getAsExpr<ArrayExpr>(locator->getAnchor())->getNumElements() <= 1);
   return new (cs.getAllocator())
       TreatArrayLiteralAsDictionary(cs, dictionaryTy, arrayTy, locator);
-};
+}
 
 bool MarkExplicitlyEscaping::diagnose(const Solution &solution,
                                       bool asNote) const {
@@ -201,39 +201,41 @@ MarkExplicitlyEscaping::create(ConstraintSystem &cs, Type lhs, Type rhs,
 bool MarkGlobalActorFunction::diagnose(const Solution &solution,
                                       bool asNote) const {
   DroppedGlobalActorFunctionAttr failure(
-      solution, getFromType(), getToType(), getLocator());
+      solution, getFromType(), getToType(), getLocator(), isWarning());
   return failure.diagnose(asNote);
 }
 
 MarkGlobalActorFunction *
 MarkGlobalActorFunction::create(ConstraintSystem &cs, Type lhs, Type rhs,
-                               ConstraintLocator *locator) {
+                               ConstraintLocator *locator, bool warning) {
   if (locator->isLastElement<LocatorPathElt::ApplyArgToParam>())
     locator = cs.getConstraintLocator(
         locator, LocatorPathElt::ArgumentAttribute::forGlobalActor());
 
-  return new (cs.getAllocator()) MarkGlobalActorFunction(cs, lhs, rhs, locator);
+  return new (cs.getAllocator()) MarkGlobalActorFunction(
+      cs, lhs, rhs, locator, warning);
 }
 
 bool AddSendableAttribute::diagnose(const Solution &solution,
                                       bool asNote) const {
   AttributedFuncToTypeConversionFailure failure(
       solution, getFromType(), getToType(), getLocator(),
-      AttributedFuncToTypeConversionFailure::Concurrent);
+      AttributedFuncToTypeConversionFailure::Concurrent, isWarning());
   return failure.diagnose(asNote);
 }
 
 AddSendableAttribute *
 AddSendableAttribute::create(ConstraintSystem &cs,
-                               FunctionType *fromType,
-                               FunctionType *toType,
-                               ConstraintLocator *locator) {
+                             FunctionType *fromType,
+                             FunctionType *toType,
+                             ConstraintLocator *locator,
+                             bool warning) {
   if (locator->isLastElement<LocatorPathElt::ApplyArgToParam>())
     locator = cs.getConstraintLocator(
         locator, LocatorPathElt::ArgumentAttribute::forConcurrent());
 
   return new (cs.getAllocator()) AddSendableAttribute(
-      cs, fromType, toType, locator);
+      cs, fromType, toType, locator, warning);
 }
 bool RelabelArguments::diagnose(const Solution &solution, bool asNote) const {
   LabelingFailure failure(solution, getLocator(), getLabels());
@@ -369,7 +371,8 @@ bool ContextualMismatch::diagnoseForAmbiguity(
 ContextualMismatch *ContextualMismatch::create(ConstraintSystem &cs, Type lhs,
                                                Type rhs,
                                                ConstraintLocator *locator) {
-  return new (cs.getAllocator()) ContextualMismatch(cs, lhs, rhs, locator);
+  return new (cs.getAllocator()) ContextualMismatch(
+      cs, lhs, rhs, locator, /*warning=*/false);
 }
 
 bool AllowWrappedValueMismatch::diagnose(const Solution &solution, bool asError) const {
@@ -398,7 +401,7 @@ getStructuralTypeContext(const Solution &solution, ConstraintLocator *locator) {
 
     auto &cs = solution.getConstraintSystem();
     auto anchor = locator->getAnchor();
-    auto contextualType = cs.getContextualType(anchor);
+    auto contextualType = cs.getContextualType(anchor, /*forConstraint=*/false);
     auto exprType = cs.getType(anchor);
     return std::make_tuple(contextualTypeElt->getPurpose(), exprType,
                            contextualType);
@@ -1126,10 +1129,34 @@ RemoveReturn *RemoveReturn::create(ConstraintSystem &cs, Type resultTy,
   return new (cs.getAllocator()) RemoveReturn(cs, resultTy, locator);
 }
 
+NotCompileTimeConst::NotCompileTimeConst(ConstraintSystem &cs, Type paramTy,
+                                         ConstraintLocator *locator):
+  ContextualMismatch(cs, FixKind::NotCompileTimeConst, paramTy,
+                     cs.getASTContext().TheEmptyTupleType, locator,
+                     /*warning*/true) {}
+
+NotCompileTimeConst *
+NotCompileTimeConst::create(ConstraintSystem &cs, Type paramTy,
+                            ConstraintLocator *locator) {
+  return new (cs.getAllocator()) NotCompileTimeConst(cs, paramTy, locator);
+}
+
+bool NotCompileTimeConst::diagnose(const Solution &solution, bool asNote) const {
+  auto *locator = getLocator();
+  // Referencing an enum element directly is considered a compile-time literal.
+  if (auto *d = solution.resolveLocatorToDecl(locator).getDecl()) {
+    if (isa<EnumElementDecl>(d)) {
+      return true;
+    }
+  }
+  NotCompileTimeConstFailure failure(solution, locator);
+  return failure.diagnose(asNote);
+}
+
 bool CollectionElementContextualMismatch::diagnose(const Solution &solution,
                                                    bool asNote) const {
-  CollectionElementContextualFailure failure(solution, getFromType(),
-                                             getToType(), getLocator());
+  CollectionElementContextualFailure failure(
+      solution, getElements(), getFromType(), getToType(), getLocator());
   return failure.diagnose(asNote);
 }
 
@@ -1137,8 +1164,31 @@ CollectionElementContextualMismatch *
 CollectionElementContextualMismatch::create(ConstraintSystem &cs, Type srcType,
                                             Type dstType,
                                             ConstraintLocator *locator) {
-  return new (cs.getAllocator())
-      CollectionElementContextualMismatch(cs, srcType, dstType, locator);
+  // It's common for a single literal element to represent types of other
+  // literal elements of the same kind, let's check whether that is the case
+  // here and record all of the affected positions.
+
+  SmallVector<Expr *, 4> affected;
+  {
+    if (auto *elementLoc = getAsExpr(simplifyLocatorToAnchor(locator))) {
+      auto *typeVar = cs.getType(elementLoc)->getAs<TypeVariableType>();
+      if (typeVar && typeVar->getImpl().getAtomicLiteralKind()) {
+        const auto *node =
+            cs.getRepresentative(typeVar)->getImpl().getGraphNode();
+        for (auto *typeVar : node->getEquivalenceClass()) {
+          auto *locator = typeVar->getImpl().getLocator();
+          if (auto *eltLoc = getAsExpr(simplifyLocatorToAnchor(locator)))
+            affected.push_back(eltLoc);
+        }
+      }
+    }
+  }
+
+  unsigned size = totalSizeToAlloc<Expr *>(affected.size());
+  void *mem = cs.getAllocator().Allocate(
+      size, alignof(CollectionElementContextualMismatch));
+  return new (mem) CollectionElementContextualMismatch(cs, affected, srcType,
+                                                       dstType, locator);
 }
 
 bool DefaultGenericArgument::coalesceAndDiagnose(
@@ -1999,6 +2049,20 @@ bool AllowNonOptionalWeak::diagnose(const Solution &solution,
 AllowNonOptionalWeak *AllowNonOptionalWeak::create(ConstraintSystem &cs,
                                                    ConstraintLocator *locator) {
   return new (cs.getAllocator()) AllowNonOptionalWeak(cs, locator);
+}
+
+AllowTupleLabelMismatch *
+AllowTupleLabelMismatch::create(ConstraintSystem &cs, Type fromType,
+                                Type toType, ConstraintLocator *locator) {
+  return new (cs.getAllocator())
+      AllowTupleLabelMismatch(cs, fromType, toType, locator);
+}
+
+bool AllowTupleLabelMismatch::diagnose(const Solution &solution,
+                                       bool asNote) const {
+  TupleLabelMismatchWarning warning(solution, getFromType(), getToType(),
+                                    getLocator());
+  return warning.diagnose(asNote);
 }
 
 bool AllowSwiftToCPointerConversion::diagnose(const Solution &solution,

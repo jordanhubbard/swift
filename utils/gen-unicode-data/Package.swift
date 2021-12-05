@@ -11,7 +11,15 @@ let package = Package(
       dependencies: []
     ),
     .executableTarget(
+      name: "GenGraphemeBreakProperty",
+      dependencies: ["GenUtils"]
+    ),
+    .executableTarget(
       name: "GenNormalization",
+      dependencies: ["GenUtils"]
+    ),
+    .executableTarget(
+      name: "GenScalarProps",
       dependencies: ["GenUtils"]
     )
   ]

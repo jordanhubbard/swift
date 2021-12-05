@@ -30,7 +30,7 @@
 #include "swift/AST/FileSystem.h"
 #include "swift/AST/FineGrainedDependencies.h"
 #include "swift/AST/FineGrainedDependencyFormat.h"
-#include "swift/AST/GenericSignatureBuilder.h"
+#include "swift/AST/GenericSignature.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/IRGenRequests.h"
 #include "swift/AST/NameLookup.h"
@@ -49,6 +49,7 @@
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/UUID.h"
 #include "swift/Basic/Version.h"
+#include "swift/Basic/TargetInfo.h"
 #include "swift/Option/Options.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/AccumulatingDiagnosticConsumer.h"
@@ -65,6 +66,7 @@
 #include "swift/Serialization/SerializationOptions.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
+#include "swift/SymbolGraphGen/SymbolGraphOptions.h"
 #include "swift/Syntax/Serialization/SyntaxSerialization.h"
 #include "swift/Syntax/SyntaxNodes.h"
 #include "swift/TBDGen/TBDGen.h"
@@ -468,7 +470,7 @@ static void verifyGenericSignaturesIfNeeded(const FrontendOptions &opts,
   if (verifyGenericSignaturesInModule.empty())
     return;
   if (auto module = Context.getModuleByName(verifyGenericSignaturesInModule))
-    GenericSignatureBuilder::verifyGenericSignaturesInModule(module);
+    swift::validateGenericSignaturesInModule(module);
 }
 
 static bool dumpAndPrintScopeMap(const CompilerInstance &Instance,
@@ -1301,7 +1303,9 @@ static bool serializeSIB(SILModule *SM, const PrimarySpecificPaths &PSPs,
   serializationOpts.SerializeAllSIL = true;
   serializationOpts.IsSIB = true;
 
-  serialize(MSF, serializationOpts, SM);
+  symbolgraphgen::SymbolGraphOptions symbolGraphOptions;
+
+  serialize(MSF, serializationOpts, symbolGraphOptions, SM);
   return Context.hadError();
 }
 
@@ -1554,11 +1558,11 @@ static bool performCompileStepsPostSILGen(CompilerInstance &Instance,
       fine_grained_dependencies::withReferenceDependencies(
           Mod, *Instance.getDependencyTracker(), Mod->getModuleFilename(),
           alsoEmitDotFile, [&](SourceFileDepGraph &&g) {
-            serialize(MSF, serializationOpts, SM.get(), &g);
+            serialize(MSF, serializationOpts, Invocation.getSymbolGraphOptions(), SM.get(), &g);
             return false;
           });
     } else {
-      serialize(MSF, serializationOpts, SM.get());
+      serialize(MSF, serializationOpts, Invocation.getSymbolGraphOptions(), SM.get());
     }
   };
 
@@ -1807,155 +1811,23 @@ createJSONFixItDiagnosticConsumerIfNeeded(
       });
 }
 
-/// Print information about a
-static void printCompatibilityLibrary(
-    llvm::VersionTuple runtimeVersion, llvm::VersionTuple maxVersion,
-    StringRef filter, StringRef libraryName, bool &printedAny,
-    llvm::raw_ostream &out) {
-  if (runtimeVersion > maxVersion)
-    return;
-
-  if (printedAny) {
-    out << ",";
-  }
-
-  out << "\n";
-  out << "      {\n";
-
-  out << "        \"libraryName\": \"";
-  out.write_escaped(libraryName);
-  out << "\",\n";
-
-  out << "        \"filter\": \"";
-  out.write_escaped(filter);
-  out << "\"\n";
-  out << "      }";
-
-  printedAny = true;
-}
-
-/// Print information about the target triple in JSON.
-static void printTripleInfo(const llvm::Triple &triple,
-                            llvm::Optional<llvm::VersionTuple> runtimeVersion,
-                            llvm::raw_ostream &out) {
-  out << "{\n";
-
-  out << "    \"triple\": \"";
-  out.write_escaped(triple.getTriple());
-  out << "\",\n";
-
-  out << "    \"unversionedTriple\": \"";
-  out.write_escaped(getUnversionedTriple(triple).getTriple());
-  out << "\",\n";
-
-  out << "    \"moduleTriple\": \"";
-  out.write_escaped(getTargetSpecificModuleTriple(triple).getTriple());
-  out << "\",\n";
-
-  if (runtimeVersion) {
-    out << "    \"swiftRuntimeCompatibilityVersion\": \"";
-    out.write_escaped(runtimeVersion->getAsString());
-    out << "\",\n";
-
-    // Compatibility libraries that need to be linked.
-    out << "    \"compatibilityLibraries\": [";
-    bool printedAnyCompatibilityLibrary = false;
-    #define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName)           \
-      printCompatibilityLibrary(                                        \
-        *runtimeVersion, llvm::VersionTuple Version, #Filter, LibraryName, \
-        printedAnyCompatibilityLibrary, out);
-    #include "swift/Frontend/BackDeploymentLibs.def"
-
-    if (printedAnyCompatibilityLibrary) {
-      out << "\n   ";
-    }
-    out << " ],\n";
-  } else {
-    out << "    \"compatibilityLibraries\": [ ],\n";
-  }
-
-  out << "    \"librariesRequireRPath\": "
-      << (tripleRequiresRPathForSwiftLibrariesInOS(triple) ? "true" : "false")
-      << "\n";
-
-  out << "  }";
-
-}
-
-/// Print information about the selected target in JSON.
-static void printTargetInfo(const CompilerInvocation &invocation,
-                            llvm::raw_ostream &out) {
-  out << "{\n";
-
-  // Compiler version, as produced by --version.
-  out << "  \"compilerVersion\": \"";
-  out.write_escaped(version::getSwiftFullVersion(
-                                                 version::Version::getCurrentLanguageVersion()));
-  out << "\",\n";
-
-  // Target triple and target variant triple.
-  auto runtimeVersion =
-    invocation.getIRGenOptions().AutolinkRuntimeCompatibilityLibraryVersion;
-  auto &langOpts = invocation.getLangOptions();
-  out << "  \"target\": ";
-  printTripleInfo(langOpts.Target, runtimeVersion, out);
-  out << ",\n";
-
-  if (auto &variant = langOpts.TargetVariant) {
-    out << "  \"targetVariant\": ";
-    printTripleInfo(*variant, runtimeVersion, out);
-    out << ",\n";
-  }
-
-  // Various paths.
-  auto &searchOpts = invocation.getSearchPathOptions();
-  out << "  \"paths\": {\n";
-
-  if (!searchOpts.SDKPath.empty()) {
-    out << "    \"sdkPath\": \"";
-    out.write_escaped(searchOpts.SDKPath);
-    out << "\",\n";
-  }
-
-  auto outputPaths = [&](StringRef name, const std::vector<std::string> &paths){
-    out << "    \"" << name << "\": [\n";
-    llvm::interleave(paths, [&out](const std::string &path) {
-      out << "      \"";
-      out.write_escaped(path);
-      out << "\"";
-    }, [&out] {
-      out << ",\n";
-    });
-    out << "\n    ],\n";
-  };
-
-  outputPaths("runtimeLibraryPaths", searchOpts.RuntimeLibraryPaths);
-  outputPaths("runtimeLibraryImportPaths",
-              searchOpts.RuntimeLibraryImportPaths);
-
-  out << "    \"runtimeResourcePath\": \"";
-  out.write_escaped(searchOpts.RuntimeResourcePath);
-  out << "\"\n";
-
-  out << "  }\n";
-
-  out << "}\n";
-}
-
 /// A PrettyStackTraceEntry to print frontend information useful for debugging.
 class PrettyStackTraceFrontend : public llvm::PrettyStackTraceEntry {
-  const LangOptions &LangOpts;
+  const CompilerInvocation &Invocation;
 
 public:
-  PrettyStackTraceFrontend(const LangOptions &langOpts)
-      : LangOpts(langOpts) {}
+  PrettyStackTraceFrontend(const CompilerInvocation &invocation)
+      : Invocation(invocation) {}
 
   void print(llvm::raw_ostream &os) const override {
-    auto effective = LangOpts.EffectiveLanguageVersion;
+    auto effective = Invocation.getLangOptions().EffectiveLanguageVersion;
     if (effective != version::Version::getCurrentLanguageVersion()) {
       os << "Compiling with effective version " << effective;
     } else {
       os << "Compiling with the current language version";
+    }
+    if (Invocation.getFrontendOptions().AllowModuleWithCompilerErrors) {
+      os << " while allowing modules with compiler errors";
     }
     os << "\n";
   };
@@ -2062,8 +1934,12 @@ int swift::performFrontend(ArrayRef<const char *> Args,
       FrontendOptions::ActionType::Immediate) {
     llvm::setBugReportMsg(nullptr);
   }
+  
+  /// Enable leaks checking because this SILModule is the only one in the process
+  /// (leaks checking is not thread safe).
+  Invocation.getSILOptions().checkSILModuleLeaks = true;
 
-  PrettyStackTraceFrontend frontendTrace(Invocation.getLangOptions());
+  PrettyStackTraceFrontend frontendTrace(Invocation);
 
   // Make an array of PrettyStackTrace objects to dump the configuration files
   // we used to parse the arguments. These are RAII objects, so they and the
@@ -2108,7 +1984,7 @@ int swift::performFrontend(ArrayRef<const char *> Args,
   }
 
   if (Invocation.getFrontendOptions().PrintTargetInfo) {
-    printTargetInfo(Invocation, llvm::outs());
+    swift::targetinfo::printTargetInfo(Invocation, llvm::outs());
     return finishDiagProcessing(0, /*verifierEnabled*/ false);
   }
 

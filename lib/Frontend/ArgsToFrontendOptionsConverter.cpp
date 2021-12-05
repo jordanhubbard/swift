@@ -141,6 +141,8 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.RemarkOnRebuildFromModuleInterface |=
     Args.hasArg(OPT_Rmodule_interface_rebuild);
 
+  Opts.DowngradeInterfaceVerificationError |=
+    Args.hasArg(OPT_downgrade_typecheck_interface_error);
   computePrintStatsOptions();
   computeDebugTimeOptions();
   computeTBDOptions();
@@ -229,13 +231,19 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (checkUnusedSupplementaryOutputPaths())
     return true;
 
-  if (FrontendOptions::doesActionGenerateIR(Opts.RequestedAction) &&
-      (Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies) ||
-       Args.hasArg(OPT_experimental_skip_all_function_bodies) ||
-       Args.hasArg(
-         OPT_experimental_skip_non_inlinable_function_bodies_without_types))) {
-    Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_skipping_function_bodies);
-    return true;
+  if (FrontendOptions::doesActionGenerateIR(Opts.RequestedAction)) {
+    if (Args.hasArg(OPT_experimental_skip_non_inlinable_function_bodies) ||
+        Args.hasArg(OPT_experimental_skip_all_function_bodies) ||
+        Args.hasArg(
+         OPT_experimental_skip_non_inlinable_function_bodies_without_types)) {
+      Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_skipping_function_bodies);
+      return true;
+    }
+
+    if (Args.hasArg(OPT_check_api_availability_only)) {
+      Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_checking_api_availability_only);
+      return true;
+    }
   }
 
   if (const Arg *A = Args.getLastArg(OPT_module_abi_name))
@@ -282,6 +290,12 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   Opts.Static = Args.hasArg(OPT_static);
 
+  Opts.HermeticSealAtLink = Args.hasArg(OPT_experimental_hermetic_seal_at_link);
+
+  for (auto A : Args.getAllArgValues(options::OPT_serialized_path_obfuscate)) {
+    auto SplitMap = StringRef(A).split('=');
+    Opts.serializedPathObfuscator.addMapping(SplitMap.first, SplitMap.second);
+  }
   return false;
 }
 
@@ -562,7 +576,10 @@ bool ArgsToFrontendOptionsConverter::computeModuleAliases() {
 }
 
 bool ArgsToFrontendOptionsConverter::computeModuleName() {
-  assert(Opts.ModuleAliasMap.empty() && "Module name must be computed before computing module aliases");
+  // Module name must be computed before computing module
+  // aliases. Instead of asserting, clearing ModuleAliasMap
+  // here since it can be called redundantly in batch-mode
+  Opts.ModuleAliasMap.clear();
 
   const Arg *A = Args.getLastArg(options::OPT_module_name);
   if (A) {

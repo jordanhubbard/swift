@@ -193,6 +193,7 @@ def _apply_default_arguments(args):
         args.test_swiftformat = False
         args.test_swiftevolve = False
         args.test_toolchainbenchmarks = False
+        args.test_swiftdocc = False
 
     # --test implies --test-early-swift-driver
     # (unless explicitly skipped with `--skip-test-early-swift-driver`)
@@ -518,7 +519,7 @@ def create_argument_parser():
            default=defaults.DSYMUTIL_JOBS,
            metavar='COUNT',
            help='the maximum number of parallel dsymutil jobs to use when '
-                'extracting symbols. Tweak with caution, since dsymutil'
+                'extracting symbols. Tweak with caution, since dsymutil '
                 'is memory intensive.')
 
     option('--disable-guaranteed-normal-arguments', store_true,
@@ -545,8 +546,6 @@ def create_argument_parser():
 
     option('--libswift', store('libswift_mode'),
            choices=['off', 'hosttools', 'bootstrapping', 'bootstrapping-with-hostlibs'],
-           const='hosttools',
-           default=None,
            help='The libswift build mode. For details see libswift/README.md')
 
     # -------------------------------------------------------------------------
@@ -632,6 +631,8 @@ def create_argument_parser():
 
     option(['--swift-driver'], toggle_true('build_swift_driver'),
            help='build swift-driver')
+    option(['--swiftdocc'], toggle_true('build_swiftdocc'),
+           help='build Swift DocC')
 
     option(['--skip-early-swift-driver'], toggle_false('build_early_swift_driver'),
            help='skip building the early swift-driver')
@@ -660,6 +661,8 @@ def create_argument_parser():
            help='install new Swift driver')
     option(['--install-swiftevolve'], toggle_true('install_swiftevolve'),
            help='install SwiftEvolve')
+    option(['--install-swiftdocc'], toggle_true('install_swiftdocc'),
+           help='install Swift DocC')
     option(['--toolchain-benchmarks'],
            toggle_true('build_toolchainbenchmarks'),
            help='build Swift Benchmarks using swiftpm against the just built '
@@ -972,6 +975,9 @@ def create_argument_parser():
     option('--build-swift-stdlib-unittest-extra', toggle_true,
            help='Build optional StdlibUnittest components')
 
+    option('--build-swift-stdlib-static-print', toggle_true,
+           help='Build constant_vprintf support')
+
     option(['-S', '--skip-build'], store_true,
            help='generate build directory only without building')
 
@@ -1119,6 +1125,8 @@ def create_argument_parser():
     option('--skip-test-swift-inspect',
            toggle_false('test_swift_inspect'),
            help='skip testing swift_inspect')
+    option('--skip-test-swiftdocc', toggle_false('test_swiftdocc'),
+           help='skip testing swift-docc')
 
     # -------------------------------------------------------------------------
     in_group('Build settings specific for LLVM')
@@ -1183,8 +1191,7 @@ def create_argument_parser():
 
     option('--enable-experimental-differentiable-programming', toggle_true,
            default=True,
-           help='Enable experimental Swift differentiable programming language'
-                ' features.')
+           help='Enable experimental Swift differentiable programming.')
 
     option('--enable-experimental-concurrency', toggle_true,
            default=True,
@@ -1193,6 +1200,10 @@ def create_argument_parser():
     option('--enable-experimental-distributed', toggle_true,
            default=True,
            help='Enable experimental Swift distributed actors.')
+
+    option('--enable-experimental-string-processing', toggle_true,
+           default=True,
+           help='Enable experimental Swift string processing.')
 
     # -------------------------------------------------------------------------
     in_group('Unsupported options')

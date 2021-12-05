@@ -285,8 +285,16 @@ function(_add_target_variant_swift_compile_flags
     list(APPEND result "-D" "SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING")
   endif()
 
+  if(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
+    list(APPEND result "-D" "SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING")
+  endif()
+
   if(SWIFT_STDLIB_OS_VERSIONING)
     list(APPEND result "-D" "SWIFT_RUNTIME_OS_VERSIONING")
+  endif()
+  
+  if(SWIFT_STDLIB_STATIC_PRINT)
+    list(APPEND result "-D" "SWIFT_STDLIB_STATIC_PRINT")
   endif()
 
   if(SWIFT_STDLIB_HAS_COMMANDLINE)
@@ -494,6 +502,10 @@ function(_compile_swift_files
     list(APPEND swift_flags "-Xfrontend" "-disable-autolinking-runtime-compatibility-concurrency")
   endif()
 
+  if(NOT SWIFT_STDLIB_SHORT_MANGLING_LOOKUPS)
+    list(APPEND swift_flags "-Xfrontend" "-disable-standard-substitutions-in-reflection-mangling")
+  endif()
+
   if (SWIFTFILE_IS_STDLIB_CORE OR SWIFTFILE_IS_SDK_OVERLAY)
     list(APPEND swift_flags "-warn-swift3-objc-inference-complete")
   endif()
@@ -501,6 +513,12 @@ function(_compile_swift_files
   if(NOT SWIFT_STDLIB_ENABLE_OBJC_INTEROP)
     list(APPEND swift_flags "-Xfrontend" "-disable-objc-interop")
   endif()
+
+  if(SWIFT_STDLIB_EXPERIMENTAL_HERMETIC_SEAL_AT_LINK)
+    list(APPEND swift_flags "-experimental-hermetic-seal-at-link")
+  endif()
+
+  list(APPEND swift_flags ${SWIFT_STDLIB_EXTRA_SWIFT_COMPILE_FLAGS})
 
   list(APPEND swift_flags ${SWIFT_EXPERIMENTAL_EXTRA_FLAGS})
 

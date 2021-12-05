@@ -364,6 +364,8 @@ function(_add_target_variant_c_compile_flags)
     list(APPEND result "-DSWIFT_STDLIB_SUPPORTS_BACKTRACE_REPORTING")
   endif()
 
+  list(APPEND result ${SWIFT_STDLIB_EXTRA_C_COMPILE_FLAGS})
+
   set("${CFLAGS_RESULT_VAR_NAME}" "${result}" PARENT_SCOPE)
 endfunction()
 
@@ -430,9 +432,6 @@ function(_add_target_variant_link_flags)
     list(APPEND result "-Wl,-Bsymbolic")
   elseif("${LFLAGS_SDK}" STREQUAL "ANDROID")
     list(APPEND link_libraries "dl" "log")
-    if("${LFLAGS_ARCH}" STREQUAL "armv7")
-      list(APPEND link_libraries "atomic")
-    endif()
     # We need to add the math library, which is linked implicitly by libc++
     list(APPEND result "-lm")
     if(NOT "${SWIFT_ANDROID_NDK_PATH}" STREQUAL "")
@@ -680,8 +679,7 @@ function(add_swift_target_library_single target name)
         MACCATALYST_BUILD_FLAVOR
         BACK_DEPLOYMENT_LIBRARY
         ENABLE_LTO
-        BOOTSTRAPPING
-        MODULE_DEPENDENCY_TARGET)  
+        BOOTSTRAPPING)
   set(SWIFTLIB_SINGLE_multiple_parameter_options
         C_COMPILE_FLAGS
         DEPENDS
@@ -869,10 +867,6 @@ function(add_swift_target_library_single target name)
       MACCATALYST_BUILD_FLAVOR "${SWIFTLIB_SINGLE_MACCATALYST_BUILD_FLAVOR}"
       ${BOOTSTRAPPING_arg})
   add_swift_source_group("${SWIFTLIB_SINGLE_EXTERNAL_SOURCES}")
-
-  if(SWIFTLIB_SINGLE_MODULE_DEPENDENCY_TARGET)
-    set(${SWIFTLIB_SINGLE_MODULE_DEPENDENCY_TARGET} ${swift_module_dependency_target} PARENT_SCOPE)
-  endif()
 
   # If there were any swift sources, then a .swiftmodule may have been created.
   # If that is the case, then add a target which is an alias of the module files.
@@ -1268,7 +1262,9 @@ function(add_swift_target_library_single target name)
   set(PLIST_INFO_PLIST "Info.plist" CACHE STRING "Plist name")
   if("${SWIFTLIB_SINGLE_SDK}" IN_LIST SWIFT_DARWIN_PLATFORMS AND SWIFTLIB_SINGLE_IS_STDLIB)
     set(PLIST_INFO_NAME ${name})
-    set(PLIST_INFO_UTI "com.apple.dt.runtime.${name}")
+
+    # Underscores aren't permitted in the bundle identifier.
+    string(REPLACE "_" "" PLIST_INFO_UTI "com.apple.dt.runtime.${name}")
     set(PLIST_INFO_VERSION "${SWIFT_VERSION}")
     if (SWIFT_COMPILER_VERSION)
       set(PLIST_INFO_BUILD_VERSION
@@ -1725,6 +1721,11 @@ function(add_swift_target_library name)
         "Either SHARED, STATIC, or OBJECT_LIBRARY must be specified")
   endif()
 
+  # Define availability macros.
+  foreach(def ${SWIFT_STDLIB_AVAILABILITY_DEFINITIONS})
+    list(APPEND SWIFTLIB_SWIFT_COMPILE_FLAGS "-Xfrontend" "-define-availability" "-Xfrontend" "${def}") 
+  endforeach()
+  
   # In the standard library and overlays, warn about implicit overrides
   # as a reminder to consider when inherited protocols need different
   # behavior for their requirements.

@@ -184,6 +184,7 @@ bool CanType::isReferenceTypeImpl(CanType type, const GenericSignatureImpl *sig,
   case TypeKind::OpenedArchetype:
   case TypeKind::NestedArchetype:
   case TypeKind::OpaqueTypeArchetype:
+  case TypeKind::SequenceArchetype:
     return cast<ArchetypeType>(type)->requiresClass();
   case TypeKind::Protocol:
     return cast<ProtocolType>(type)->requiresClass();
@@ -754,6 +755,94 @@ Type TypeBase::lookThroughAllOptionalTypes(SmallVectorImpl<Type> &optionals){
   return type;
 }
 
+Type TypeBase::stripConcurrency(bool recurse, bool dropGlobalActor) {
+  // Look through optionals.
+  if (Type optionalObject = getOptionalObjectType()) {
+    Type newOptionalObject =
+        optionalObject->stripConcurrency(recurse, dropGlobalActor);
+    if (optionalObject->isEqual(newOptionalObject))
+      return Type(this);
+
+    return OptionalType::get(newOptionalObject);
+  }
+
+  // Function types.
+  if (auto fnType = getAs<AnyFunctionType>()) {
+    // Strip off Sendable and (possibly) the global actor.
+    ASTExtInfo extInfo =
+        fnType->hasExtInfo() ? fnType->getExtInfo() : ASTExtInfo();
+    extInfo = extInfo.withConcurrent(false);
+    if (dropGlobalActor)
+      extInfo = extInfo.withGlobalActor(Type());
+
+    ArrayRef<AnyFunctionType::Param> params = fnType->getParams();
+    Type resultType = fnType->getResult();
+
+    SmallVector<AnyFunctionType::Param, 4> newParams;
+    if (recurse) {
+      for (unsigned paramIdx : indices(params)) {
+        const auto &param = params[paramIdx];
+        Type newParamType = param.getPlainType()->stripConcurrency(
+            recurse, dropGlobalActor);
+
+        if (!newParams.empty()) {
+          newParams.push_back(param.withType(newParamType));
+          continue;
+        }
+
+        if (newParamType->isEqual(param.getPlainType()))
+          continue;
+
+        newParams.append(params.begin(), params.begin() + paramIdx);
+        newParams.push_back(param.withType(newParamType));
+      }
+
+      if (!newParams.empty())
+        params = newParams;
+
+      resultType = resultType->stripConcurrency(recurse, dropGlobalActor);
+    }
+
+    // Drop Sendable requirements.
+    GenericSignature genericSig;
+    if (auto genericFnType = dyn_cast<GenericFunctionType>(fnType)) {
+      auto requirements = genericFnType->getRequirements();
+      SmallVector<Requirement, 4> newRequirements;
+      for (unsigned reqIdx : indices(requirements)) {
+        // If it's a Sendable requirement, skip it.
+        const auto &req = requirements[reqIdx];
+        if (req.getKind() == RequirementKind::Conformance &&
+            req.getSecondType()->castTo<ProtocolType>()->getDecl()
+              ->isSpecificProtocol(KnownProtocolKind::Sendable))
+          continue;
+
+        newRequirements.push_back(req);
+      }
+
+      if (newRequirements.size() == requirements.size()) {
+        genericSig = genericFnType->getGenericSignature();
+      } else {
+        genericSig = GenericSignature::get(
+            genericFnType->getGenericParams(), newRequirements);
+      }
+    }
+
+    Type newFnType;
+    if (genericSig) {
+      newFnType = GenericFunctionType::get(
+          genericSig, params, resultType, extInfo);
+    } else {
+      newFnType = FunctionType::get(params, resultType, extInfo);
+    }
+    if (newFnType->isEqual(this))
+      return Type(this);
+
+    return newFnType;
+  }
+
+  return Type(this);
+}
+
 bool TypeBase::isAnyObject() {
   auto canTy = getCanonicalType();
 
@@ -813,7 +902,7 @@ bool TypeBase::isStdlibType() {
   return false;
 }
 
-bool TypeBase::isCGFloatType() {
+bool TypeBase::isCGFloat() {
   auto *NTD = getAnyNominal();
   if (!NTD)
     return false;
@@ -826,7 +915,8 @@ bool TypeBase::isCGFloatType() {
   // On macOS `CGFloat` is part of a `CoreGraphics` module,
   // but on Linux it could be found in `Foundation`.
   return (module->getName().is("CoreGraphics") ||
-          module->getName().is("Foundation")) &&
+          module->getName().is("Foundation")   ||
+          module->getName().is("CoreFoundation")) &&
          NTD->getName().is("CGFloat");
 }
 
@@ -928,36 +1018,12 @@ static bool allowsUnlabeledTrailingClosureParameter(const ParamDecl *param) {
   return paramType->is<AnyFunctionType>();
 }
 
-/// Determine whether the parameter is contextually Sendable.
-static bool isParamUnsafeSendable(const ParamDecl *param) {
-  // Check for @_unsafeSendable.
-  if (param->getAttrs().hasAttribute<UnsafeSendableAttr>())
-    return true;
-
-  // Check that the parameter is of function type.
-  Type paramType = param->isVariadic() ? param->getVarargBaseTy()
-                                       : param->getInterfaceType();
-  paramType = paramType->getRValueType()->lookThroughAllOptionalTypes();
-  if (!paramType->is<FunctionType>())
-    return false;
-
-  // Check whether this function is known to have @_unsafeSendable function
-  // parameters.
-  auto func = dyn_cast<AbstractFunctionDecl>(param->getDeclContext());
-  if (!func)
-    return false;
-
-  return func->hasKnownUnsafeSendableFunctionParams();
-}
-
 ParameterListInfo::ParameterListInfo(
     ArrayRef<AnyFunctionType::Param> params,
     const ValueDecl *paramOwner,
     bool skipCurriedSelf) {
   defaultArguments.resize(params.size());
   propertyWrappers.resize(params.size());
-  unsafeSendable.resize(params.size());
-  unsafeMainActor.resize(params.size());
   implicitSelfCapture.resize(params.size());
   inheritActorContext.resize(params.size());
 
@@ -1012,14 +1078,6 @@ ParameterListInfo::ParameterListInfo(
       propertyWrappers.set(i);
     }
 
-    if (isParamUnsafeSendable(param)) {
-      unsafeSendable.set(i);
-    }
-
-    if (param->getAttrs().hasAttribute<UnsafeMainActorAttr>()) {
-      unsafeMainActor.set(i);
-    }
-
     if (param->getAttrs().hasAttribute<ImplicitSelfCaptureAttr>()) {
       implicitSelfCapture.set(i);
     }
@@ -1045,18 +1103,6 @@ bool ParameterListInfo::hasExternalPropertyWrapper(unsigned paramIdx) const {
   return paramIdx < propertyWrappers.size() ? propertyWrappers[paramIdx] : false;
 }
 
-bool ParameterListInfo::isUnsafeSendable(unsigned paramIdx) const {
-  return paramIdx < unsafeSendable.size()
-      ? unsafeSendable[paramIdx]
-      : false;
-}
-
-bool ParameterListInfo::isUnsafeMainActor(unsigned paramIdx) const {
-  return paramIdx < unsafeMainActor.size()
-      ? unsafeMainActor[paramIdx]
-      : false;
-}
-
 bool ParameterListInfo::isImplicitSelfCapture(unsigned paramIdx) const {
   return paramIdx < implicitSelfCapture.size()
       ? implicitSelfCapture[paramIdx]
@@ -1070,8 +1116,7 @@ bool ParameterListInfo::inheritsActorContext(unsigned paramIdx) const {
 }
 
 bool ParameterListInfo::anyContextualInfo() const {
-  return unsafeSendable.any() || unsafeMainActor.any() ||
-      implicitSelfCapture.any() || inheritActorContext.any();
+  return implicitSelfCapture.any() || inheritActorContext.any();
 }
 
 /// Turn a param list into a symbolic and printable representation that does not
@@ -1321,8 +1366,9 @@ CanType TypeBase::computeCanonicalType() {
 
     assert(gpDecl->getDepth() != GenericTypeParamDecl::InvalidDepth &&
            "parameter hasn't been validated");
-    Result = GenericTypeParamType::get(gpDecl->getDepth(), gpDecl->getIndex(),
-                                       gpDecl->getASTContext());
+    Result =
+        GenericTypeParamType::get(gpDecl->isTypeSequence(), gpDecl->getDepth(),
+                                  gpDecl->getIndex(), gpDecl->getASTContext());
     break;
   }
 
@@ -1569,7 +1615,7 @@ unsigned GenericTypeParamType::getDepth() const {
   }
 
   auto fixedNum = ParamOrDepthIndex.get<DepthIndexTy>();
-  return fixedNum >> 16;
+  return (fixedNum & ~GenericTypeParamType::TYPE_SEQUENCE_BIT) >> 16;
 }
 
 unsigned GenericTypeParamType::getIndex() const {
@@ -1579,6 +1625,16 @@ unsigned GenericTypeParamType::getIndex() const {
 
   auto fixedNum = ParamOrDepthIndex.get<DepthIndexTy>();
   return fixedNum & 0xFFFF;
+}
+
+bool GenericTypeParamType::isTypeSequence() const {
+  if (auto param = getDecl()) {
+    return param->isTypeSequence();
+  }
+
+  auto fixedNum = ParamOrDepthIndex.get<DepthIndexTy>();
+  return (fixedNum & GenericTypeParamType::TYPE_SEQUENCE_BIT) ==
+         GenericTypeParamType::TYPE_SEQUENCE_BIT;
 }
 
 Identifier GenericTypeParamType::getName() const {
@@ -1935,13 +1991,11 @@ public:
       
       // Build the generic signature with the additional collected requirements.
       if (!addedRequirements.empty()) {
-        upperBoundGenericSig = evaluateOrDefault(
-                                           decl->getASTContext().evaluator,
-                                           AbstractGenericSignatureRequest{
-                                             upperBoundGenericSig.getPointer(),
-                                             /*genericParams=*/{ },
-                                             std::move(addedRequirements)},
-                                           nullptr);
+        upperBoundGenericSig = buildGenericSignature(decl->getASTContext(),
+                                                     upperBoundGenericSig,
+                                                     /*genericParams=*/{ },
+                                                     std::move(addedRequirements));
+
         upperBoundSubstMap = SubstitutionMap::get(upperBoundGenericSig,
           [&](SubstitutableType *t) -> Type {
             // Type substitutions remain the same as the original substitution
@@ -3097,6 +3151,9 @@ GenericEnvironment *ArchetypeType::getGenericEnvironment() const {
   if (auto opaque = dyn_cast<OpaqueTypeArchetypeType>(root)) {
     return opaque->getGenericEnvironment();
   }
+  if (auto opaque = dyn_cast<SequenceArchetypeType>(root)) {
+    return opaque->getGenericEnvironment();
+  }
   llvm_unreachable("unhandled root archetype kind?!");
 }
 
@@ -3180,6 +3237,17 @@ OpaqueTypeArchetypeType::OpaqueTypeArchetypeType(OpaqueTypeDecl *OpaqueDecl,
 {
 }
 
+SequenceArchetypeType::SequenceArchetypeType(
+    const ASTContext &Ctx, GenericEnvironment *GenericEnv, Type InterfaceType,
+    ArrayRef<ProtocolDecl *> ConformsTo, Type Superclass,
+    LayoutConstraint Layout)
+    : ArchetypeType(TypeKind::SequenceArchetype, Ctx,
+                    RecursiveTypeProperties::HasArchetype, InterfaceType,
+                    ConformsTo, Superclass, Layout),
+      Environment(GenericEnv) {
+  assert(cast<GenericTypeParamType>(InterfaceType.getPointer())->isTypeSequence());
+}
+
 GenericSignature OpaqueTypeArchetypeType::getBoundSignature() const {
   return Environment->getGenericSignature();
 }
@@ -3261,7 +3329,14 @@ static bool canSubstituteTypeInto(Type ty, const DeclContext *dc,
                                   bool isContextWholeModule) {
   TypeDecl *typeDecl = ty->getAnyNominal();
   if (!typeDecl) {
-    // We also need to check that the opaque type descriptor is accessible.
+    // The referenced type might be a different opaque result type.
+
+    // First, unwrap any nested associated types to get the root archetype.
+    while (auto nestedTy = ty->getAs<NestedArchetypeType>())
+      ty = nestedTy->getParent();
+
+    // If the root archetype is an opaque result type, check that its
+    // descriptor is accessible.
     if (auto opaqueTy = ty->getAs<OpaqueTypeArchetypeType>())
       typeDecl = opaqueTy->getDecl();
   }
@@ -3484,6 +3559,29 @@ PrimaryArchetypeType::getNew(const ASTContext &Ctx,
       alignof(PrimaryArchetypeType), arena);
 
   return CanPrimaryArchetypeType(::new (mem) PrimaryArchetypeType(
+      Ctx, GenericEnv, InterfaceType, ConformsTo, Superclass, Layout));
+}
+
+CanSequenceArchetypeType
+SequenceArchetypeType::get(const ASTContext &Ctx,
+                           GenericEnvironment *GenericEnv,
+                           GenericTypeParamType *InterfaceType,
+                           SmallVectorImpl<ProtocolDecl *> &ConformsTo,
+                           Type Superclass, LayoutConstraint Layout) {
+  assert(!Superclass || Superclass->getClassOrBoundGenericClass());
+  assert(GenericEnv && "missing generic environment for archetype");
+
+  // Gather the set of protocol declarations to which this archetype conforms.
+  ProtocolType::canonicalizeProtocols(ConformsTo);
+
+  auto arena = AllocationArena::Permanent;
+  void *mem =
+      Ctx.Allocate(SequenceArchetypeType::totalSizeToAlloc<ProtocolDecl *, Type,
+                                                           LayoutConstraint>(
+                       ConformsTo.size(), Superclass ? 1 : 0, Layout ? 1 : 0),
+                   alignof(SequenceArchetypeType), arena);
+
+  return CanSequenceArchetypeType(::new (mem) SequenceArchetypeType(
       Ctx, GenericEnv, InterfaceType, ConformsTo, Superclass, Layout));
 }
 
@@ -4033,10 +4131,8 @@ static Type substGenericFunctionType(GenericFunctionType *genericFnType,
     // If there were semantic changes, we need to build a new generic
     // signature.
     ASTContext &ctx = genericFnType->getASTContext();
-    genericSig = evaluateOrDefault(
-        ctx.evaluator,
-        AbstractGenericSignatureRequest{nullptr, genericParams, requirements},
-        GenericSignature());
+    genericSig = buildGenericSignature(ctx, GenericSignature(),
+                                       genericParams, requirements);
   } else {
     // Use the mapped generic signature.
     genericSig = GenericSignature::get(genericParams, requirements);
@@ -4155,6 +4251,9 @@ static Type substType(Type derivedType,
     if (isa<PrimaryArchetypeType>(substOrig))
       return ErrorType::get(type);
 
+    if (isa<SequenceArchetypeType>(substOrig))
+      return ErrorType::get(type);
+
     // Opened existentials cannot be substituted in this manner,
     // but if they appear in the original type this is not an
     // error.
@@ -4194,13 +4293,6 @@ Type Type::subst(TypeSubstitutionFn substitutions,
                  LookupConformanceFn conformances,
                  SubstOptions options) const {
   return substType(*this, substitutions, conformances, options);
-}
-
-Type Type::substDependentTypesWithErrorTypes() const {
-  return substType(*this,
-                   [](SubstitutableType *t) -> Type { return Type(); },
-                   MakeAbstractConformanceForGenericType(),
-                   SubstFlags::AllowLoweredTypes);
 }
 
 const DependentMemberType *TypeBase::findUnresolvedDependentMemberType() {
@@ -4571,6 +4663,7 @@ case TypeKind::Id:
 #include "swift/AST/TypeNodes.def"
   case TypeKind::PrimaryArchetype:
   case TypeKind::OpenedArchetype:
+  case TypeKind::SequenceArchetype:
   case TypeKind::Error:
   case TypeKind::Unresolved:
   case TypeKind::TypeVariable:
@@ -5316,7 +5409,8 @@ ReferenceCounting TypeBase::getReferenceCounting() {
   case TypeKind::PrimaryArchetype:
   case TypeKind::OpenedArchetype:
   case TypeKind::NestedArchetype:
-  case TypeKind::OpaqueTypeArchetype: {
+  case TypeKind::OpaqueTypeArchetype:
+  case TypeKind::SequenceArchetype: {
     auto archetype = cast<ArchetypeType>(type);
     auto layout = archetype->getLayoutConstraint();
     (void)layout;

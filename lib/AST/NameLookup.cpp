@@ -34,8 +34,10 @@
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
+#include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Parse/Lexer.h"
 #include "clang/AST/DeclObjC.h"
+#include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Debug.h"
@@ -1448,15 +1450,51 @@ DirectLookupRequest::evaluate(Evaluator &evaluator,
 
     Table.updateLookupTable(decl);
   } else if (!Table.isLazilyComplete(name.getBaseName())) {
-    // The lookup table believes it doesn't have a complete accounting of this
-    // name - either because we're never seen it before, or another extension
-    // was registered since the last time we searched. Ask the loaders to give
-    // us a hand.
     DeclBaseName baseName(name.getBaseName());
-    populateLookupTableEntryFromLazyIDCLoader(ctx, Table, baseName, decl);
-    populateLookupTableEntryFromExtensions(ctx, Table, baseName, decl);
 
-    Table.markLazilyComplete(baseName);
+    if (isa_and_nonnull<clang::NamespaceDecl>(decl->getClangDecl())) {
+      auto allFound = evaluateOrDefault(
+          ctx.evaluator, CXXNamespaceMemberLookup({cast<EnumDecl>(decl), name}),
+          {});
+      populateLookupTableEntryFromExtensions(ctx, Table, baseName, decl);
+
+      // Bypass the regular member lookup table if we find something in
+      // the original C++ namespace. We don't want to store the C++ decl in the
+      // lookup table as the decl can be referenced  from multiple namespace
+      // declarations due to inline namespaces. We still merge in the other
+      // entries found in the lookup table, to support finding members in
+      // namespace extensions.
+      if (!allFound.empty()) {
+        auto known = Table.find(name);
+        if (known != Table.end()) {
+          auto swiftLookupResult = maybeFilterOutAttrImplements(
+              known->second, name, includeAttrImplements);
+          for (auto foundSwiftDecl : swiftLookupResult) {
+            allFound.push_back(foundSwiftDecl);
+          }
+        }
+        return allFound;
+      }
+    } else if (isa_and_nonnull<clang::RecordDecl>(decl->getClangDecl())) {
+      auto allFound = evaluateOrDefault(
+          ctx.evaluator,
+          ClangRecordMemberLookup({cast<StructDecl>(decl), name}), {});
+      // Add all the members we found, later we'll combine these with the
+      // existing members.
+      for (auto found : allFound)
+        Table.addMember(found);
+
+      populateLookupTableEntryFromExtensions(ctx, Table, baseName, decl);
+    } else {
+      // The lookup table believes it doesn't have a complete accounting of this
+      // name - either because we're never seen it before, or another extension
+      // was registered since the last time we searched. Ask the loaders to give
+      // us a hand.
+      populateLookupTableEntryFromLazyIDCLoader(ctx, Table, baseName, decl);
+      populateLookupTableEntryFromExtensions(ctx, Table, baseName, decl);
+    }
+
+    Table.markLazilyComplete(name.getBaseName());
   }
 
   // Look for a declaration with this name.
@@ -2270,6 +2308,7 @@ directReferencesForTypeRepr(Evaluator &evaluator,
   case TypeReprKind::Function:
   case TypeReprKind::InOut:
   case TypeReprKind::Isolated:
+  case TypeReprKind::CompileTimeConst:
   case TypeReprKind::Metatype:
   case TypeReprKind::Owned:
   case TypeReprKind::Protocol:
@@ -2545,8 +2584,9 @@ GenericParamListRequest::evaluate(Evaluator &evaluator, GenericContext *value) c
     // The generic parameter 'Self'.
     auto &ctx = value->getASTContext();
     auto selfId = ctx.Id_Self;
-    auto selfDecl = new (ctx) GenericTypeParamDecl(
-        proto, selfId, SourceLoc(), /*depth=*/0, /*index=*/0);
+    auto selfDecl = new (ctx)
+        GenericTypeParamDecl(proto, selfId, SourceLoc(),
+                             /*type sequence=*/false, /*depth=*/0, /*index=*/0);
     auto protoType = proto->getDeclaredInterfaceType();
     InheritedEntry selfInherited[1] = {
       InheritedEntry(TypeLoc::withoutLoc(protoType)) };

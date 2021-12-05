@@ -249,7 +249,8 @@ Type SubstitutionMap::lookupSubstitution(CanSubstitutableType type) const {
   // If we have an archetype, map out of the context so we can compute a
   // conformance access path.
   if (auto archetype = dyn_cast<ArchetypeType>(type)) {
-    if (!isa<PrimaryArchetypeType>(archetype))
+    if (!isa<PrimaryArchetypeType>(archetype) &&
+        !isa<SequenceArchetypeType>(archetype))
       return Type();
 
     type = cast<GenericTypeParamType>(
@@ -586,19 +587,18 @@ SubstitutionMap::combineSubstitutionMaps(SubstitutionMap firstSubMap,
       if (how == CombineSubstitutionMaps::AtDepth) {
         if (gp->getDepth() < firstDepthOrIndex)
           return Type();
-        return GenericTypeParamType::get(
-          gp->getDepth() + secondDepthOrIndex - firstDepthOrIndex,
-          gp->getIndex(),
-          ctx);
+        return GenericTypeParamType::get(gp->isTypeSequence(),
+                                         gp->getDepth() + secondDepthOrIndex -
+                                             firstDepthOrIndex,
+                                         gp->getIndex(), ctx);
       }
 
       assert(how == CombineSubstitutionMaps::AtIndex);
       if (gp->getIndex() < firstDepthOrIndex)
         return Type();
       return GenericTypeParamType::get(
-        gp->getDepth(),
-        gp->getIndex() + secondDepthOrIndex - firstDepthOrIndex,
-        ctx);
+          gp->isTypeSequence(), gp->getDepth(),
+          gp->getIndex() + secondDepthOrIndex - firstDepthOrIndex, ctx);
     }
 
     return type;
