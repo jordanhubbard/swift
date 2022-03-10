@@ -306,6 +306,10 @@ enum class ConversionRestrictionKind {
   //    - Unsafe[Mutable]RawPointer -> Unsafe[Mutable]Pointer<[U]Int>
   //    - Unsafe[Mutable]Pointer<Int{8, 16, ...}> <-> Unsafe[Mutable]Pointer<UInt{8, 16, ...}>
   PointerToCPointer,
+  // Convert a pack into a type with an equivalent arity.
+  // - If the arity of the pack is 1, drops the pack structure <T> => T
+  // - If the arity of the pack is n >= 1, converts the pack structure into a tuple <T, U, V> => (T, U, V)
+  ReifyPackToType,
 };
 
 /// Specifies whether a given conversion requires the creation of a temporary
@@ -442,6 +446,8 @@ class Constraint final : public llvm::ilist_node<Constraint>,
       ASTNode Element;
       /// Contextual information associated with the element (if any).
       ContextualTypeInfo Context;
+      /// Identifies whether result of this node is unused.
+      bool IsDiscarded;
     } ClosureElement;
   };
 
@@ -495,7 +501,7 @@ class Constraint final : public llvm::ilist_node<Constraint>,
              SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
   /// Construct a closure body element constraint.
-  Constraint(ASTNode node, ContextualTypeInfo context,
+  Constraint(ASTNode node, ContextualTypeInfo context, bool isDiscarded,
              ConstraintLocator *locator,
              SmallPtrSetImpl<TypeVariableType *> &typeVars);
 
@@ -585,12 +591,14 @@ public:
 
   static Constraint *createClosureBodyElement(ConstraintSystem &cs,
                                               ASTNode node,
-                                              ConstraintLocator *locator);
+                                              ConstraintLocator *locator,
+                                              bool isDiscarded = false);
 
   static Constraint *createClosureBodyElement(ConstraintSystem &cs,
                                               ASTNode node,
                                               ContextualTypeInfo context,
-                                              ConstraintLocator *locator);
+                                              ConstraintLocator *locator,
+                                              bool isDiscarded = false);
 
   /// Determine the kind of constraint.
   ConstraintKind getKind() const { return Kind; }
@@ -855,6 +863,11 @@ public:
   ContextualTypeInfo getElementContext() const {
     assert(Kind == ConstraintKind::ClosureBodyElement);
     return ClosureElement.Context;
+  }
+
+  bool isDiscardedElement() const {
+    assert(Kind == ConstraintKind::ClosureBodyElement);
+    return ClosureElement.IsDiscarded;
   }
 
   /// For an applicable function constraint, retrieve the trailing closure

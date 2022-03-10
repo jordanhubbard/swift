@@ -98,7 +98,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "TypeLayout.h"
 #define DEBUG_TYPE "enum-layout"
 #include "llvm/Support/Debug.h"
 
@@ -386,10 +385,9 @@ namespace {
          return IGM.typeLayoutCache.getEmptyEntry();
        if (!ElementsAreABIAccessible)
          return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
-
-       if (TIK >= Loadable && !IGM.getOptions().ForceStructTypeLayouts)
-         return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(getTypeInfo(),
-                                                                  T);
+       if (TIK >= Loadable) {
+         return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
+       }
 
        return getSingleton()->buildTypeLayoutEntry(IGM,
                                                    getSingletonType(IGM, T));
@@ -1081,8 +1079,7 @@ namespace {
 
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T,
-                                                        ScalarKind::POD);
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
     }
 
 
@@ -1234,8 +1231,7 @@ namespace {
 
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T,
-                                                        ScalarKind::POD);
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
     }
 
     /// \group Extra inhabitants for C-compatible enums.
@@ -3511,10 +3507,9 @@ namespace {
       if (!ElementsAreABIAccessible)
         return IGM.typeLayoutCache.getOrCreateResilientEntry(T);
 
-      if (!IGM.getOptions().ForceStructTypeLayouts && (AllowFixedLayoutOptimizations && TIK >= Loadable)) {
+      if (AllowFixedLayoutOptimizations && TIK >= Loadable) {
         // The type layout entry code does not handle spare bits atm.
-        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(getTypeInfo(),
-                                                                 T);
+        return IGM.typeLayoutCache.getOrCreateScalarEntry(getTypeInfo(), T);
       }
 
       unsigned emptyCases = ElementsWithNoPayload.size();
@@ -3870,8 +3865,7 @@ namespace {
       auto call = IGF.Builder.CreateCall(IGM.getGetEnumCaseMultiPayloadFn(),
                                          {addr.getAddress(), metadata});
       call->setDoesNotThrow();
-      call->addAttribute(llvm::AttributeList::FunctionIndex,
-                         llvm::Attribute::ReadOnly);
+      call->addFnAttr(llvm::Attribute::ReadOnly);
 
       return call;
     }

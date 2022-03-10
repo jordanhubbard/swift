@@ -1135,8 +1135,7 @@ namespace {
 
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
-                                                        ScalarKind::POD);
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
     }
 
     unsigned getExplosionSize() const override {
@@ -1200,11 +1199,17 @@ namespace {
 
     void consume(IRGenFunction &IGF, Explosion &explosion,
                  Atomicity atomicity) const override {
-      (void)explosion.claimAll();
+      for (auto scalarTy: ScalarTypes) {
+        (void)scalarTy;
+        (void)explosion.claimNext();
+      }
     }
     
     void fixLifetime(IRGenFunction &IGF, Explosion &explosion) const override {
-      (void)explosion.claimAll();
+      for (auto scalarTy: ScalarTypes) {
+        (void)scalarTy;
+        (void)explosion.claimNext();
+      }
     }
 
     void destroy(IRGenFunction &IGF, Address address, SILType T,
@@ -1257,8 +1262,7 @@ namespace {
                          IsNotPOD, IsNotBitwiseTakable, IsFixedSize) {}
     TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                           SILType T) const override {
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T,
-                                                        ScalarKind::Immovable);
+      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
     }
 
     void assignWithCopy(IRGenFunction &IGF, Address dest, Address src,
@@ -1596,6 +1600,7 @@ IRGenModule::getReferenceObjectTypeInfo(ReferenceCounting refcounting) {
   case ReferenceCounting::Block:
   case ReferenceCounting::Error:
   case ReferenceCounting::ObjC:
+  case ReferenceCounting::None:
     llvm_unreachable("not implemented");
   }
 
@@ -2153,7 +2158,6 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
 
   case TypeKind::PrimaryArchetype:
   case TypeKind::OpenedArchetype:
-  case TypeKind::NestedArchetype:
   case TypeKind::OpaqueTypeArchetype:
   case TypeKind::SequenceArchetype:
     return convertArchetypeType(cast<ArchetypeType>(ty));
@@ -2178,6 +2182,10 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
     return convertProtocolType(cast<ProtocolType>(ty));
   case TypeKind::ProtocolComposition:
     return convertProtocolCompositionType(cast<ProtocolCompositionType>(ty));
+  case TypeKind::ParameterizedProtocol:
+    return convertParameterizedProtocolType(cast<ParameterizedProtocolType>(ty));
+  case TypeKind::Existential:
+    return convertExistentialType(cast<ExistentialType>(ty));
   case TypeKind::GenericTypeParam:
   case TypeKind::DependentMember:
     llvm_unreachable("can't convert dependent type");
@@ -2191,6 +2199,9 @@ const TypeInfo *TypeConverter::convertType(CanType ty) {
     return convertBoxType(cast<SILBoxType>(ty));
   case TypeKind::SILToken:
     llvm_unreachable("should not be asking for representation of a SILToken");
+  case TypeKind::Pack:
+  case TypeKind::PackExpansion:
+    llvm_unreachable("Unimplemented!");
   }
   }
   llvm_unreachable("bad type kind");
@@ -2352,7 +2363,7 @@ public:
 
   TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,
                                         SILType T) const override {
-    llvm_unreachable("Cannot construct type layout for legacy types");
+    return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);
   }
 
   virtual unsigned getFixedExtraInhabitantCount(IRGenModule &IGM) const override {

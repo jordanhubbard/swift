@@ -736,6 +736,12 @@ Remangler::mangleDistributedThunk(Node *node, unsigned depth) {
 }
 
 ManglingError
+Remangler::mangleDistributedAccessor(Node *node, unsigned depth) {
+  Buffer << "TF";
+  return ManglingError::Success;
+}
+
+ManglingError
 Remangler::mangleDynamicallyReplaceableFunctionImpl(Node *node,
                                                     unsigned depth) {
   Buffer << "TI";
@@ -1817,6 +1823,11 @@ ManglingError Remangler::mangleIsolated(Node *node, unsigned depth) {
   return mangleSingleChildNode(node, depth + 1); // type
 }
 
+ManglingError Remangler::mangleCompileTimeConst(Node *node, unsigned depth) {
+  Buffer << "Yt";
+  return mangleSingleChildNode(node, depth + 1); // type
+}
+
 ManglingError Remangler::mangleNoDerivative(Node *node, unsigned depth) {
   Buffer << 'k';
   return mangleSingleChildNode(node, depth + 1); // type
@@ -2637,6 +2648,11 @@ ManglingError Remangler::mangleOpaqueReturnType(Node *node, unsigned depth) {
   Buffer << "Qu";
   return ManglingError::Success;
 }
+ManglingError Remangler::mangleOpaqueReturnTypeIndexed(Node *node, unsigned depth) {
+  Buffer << "QU";
+  mangleIndex(node->getIndex());
+  return ManglingError::Success;
+}
 ManglingError Remangler::mangleOpaqueReturnTypeOf(Node *node,
                                                   EntityContext &ctx,
                                                   unsigned depth) {
@@ -2698,7 +2714,10 @@ ManglingError Remangler::mangleObjCAsyncCompletionHandlerImpl(Node *node,
                                                               unsigned depth) {
   return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
 }
-
+ManglingError Remangler::mangleParameterizedProtocol(Node *node,
+                                                     unsigned int depth) {
+  return MANGLING_ERROR(ManglingError::UnsupportedNodeKind, node);
+}
 ManglingError
 Remangler::mangleCanonicalSpecializedGenericMetaclass(Node *node,
                                                       unsigned depth) {
@@ -2777,4 +2796,21 @@ Demangle::mangleNodeAsObjcCString(NodePointer node,
   remangler.append(StringRef("_", 2)); // Include the trailing 0 char.
 
   return remangler.getBufferStr().data();
+}
+
+ManglingError Remangler::mangleAccessibleFunctionRecord(Node *node,
+                                                        unsigned depth) {
+  Buffer << "HF";
+  return ManglingError::Success;
+}
+
+ManglingError Remangler::mangleBackDeploymentThunk(Node *node, unsigned depth) {
+  Buffer << "Twb";
+  return ManglingError::Success;
+}
+
+ManglingError Remangler::mangleBackDeploymentFallback(Node *node,
+                                                      unsigned depth) {
+  Buffer << "TwB";
+  return ManglingError::Success;
 }

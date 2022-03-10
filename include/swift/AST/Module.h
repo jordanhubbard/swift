@@ -26,6 +26,7 @@
 #include "swift/AST/Type.h"
 #include "swift/Basic/BasicSourceInfo.h"
 #include "swift/Basic/Compiler.h"
+#include "swift/Basic/Debug.h"
 #include "swift/Basic/OptionSet.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Basic/SourceLoc.h"
@@ -759,6 +760,15 @@ public:
   /// The order of the results is not guaranteed to be meaningful.
   void getPrecedenceGroups(SmallVectorImpl<PrecedenceGroupDecl*> &Results) const;
 
+  /// Determines whether this module should be recursed into when calling
+  /// \c getDisplayDecls.
+  ///
+  /// Some modules should not call \c getDisplayDecls, due to assertions
+  /// in their implementation. These are usually implicit imports that would be
+  /// recursed into for parsed modules. This function provides a guard against
+  /// recusing into modules that should not have decls collected.
+  bool shouldCollectDisplayDecls() const;
+
   /// Finds all top-level decls that should be displayed to a client of this
   /// module.
   ///
@@ -770,7 +780,7 @@ public:
   /// shadowed clang module. It does not force synthesized top-level decls that
   /// should be printed to be added; use \c swift::getTopLevelDeclsForDisplay()
   /// for that.
-  void getDisplayDecls(SmallVectorImpl<Decl*> &results) const;
+  void getDisplayDecls(SmallVectorImpl<Decl*> &results, bool recursive = false) const;
 
   using LinkLibraryCallback = llvm::function_ref<void(LinkLibrary)>;
 
@@ -856,6 +866,9 @@ public:
   /// transferred from module files to the dSYMs, remove this.
   bool isExternallyConsumed() const;
 
+  SWIFT_DEBUG_DUMPER(dumpDisplayDecls());
+  SWIFT_DEBUG_DUMPER(dumpTopLevelDecls());
+
   SourceRange getSourceRange() const { return SourceRange(); }
 
   static bool classof(const DeclContext *DC) {
@@ -882,8 +895,19 @@ public:
   ModuleEntity(const ModuleDecl *Mod) : Mod(Mod) {}
   ModuleEntity(const clang::Module *Mod) : Mod(static_cast<const void *>(Mod)){}
 
-  StringRef getName() const;
-  std::string getFullName() const;
+  /// @param useRealNameIfAliased Whether to use the module's real name in case
+  ///                             module aliasing is used. For example, if a file
+  ///                             has `import Foo` and `-module-alias Foo=Bar` is
+  ///                             passed, treat Foo as an alias and Bar as the real
+  ///                             module name as its dependency. This only applies
+  ///                             to Swift modules.
+  /// @return The module name; for Swift modules, the real module name could be
+  ///         different from the name if module aliasing is used.
+  StringRef getName(bool useRealNameIfAliased = false) const;
+
+  /// For Swift modules, it returns the same result as \c ModuleEntity::getName(bool).
+  /// For Clang modules, it returns the result of \c clang::Module::getFullModuleName.
+  std::string getFullName(bool useRealNameIfAliased = false) const;
 
   bool isSystemModule() const;
   bool isBuiltinModule() const;
@@ -914,6 +938,9 @@ inline bool DeclContext::isModuleScopeContext() const {
 inline SourceLoc extractNearestSourceLoc(const ModuleDecl *mod) {
   return extractNearestSourceLoc(static_cast<const Decl *>(mod));
 }
+
+/// Collects modules that this module imports via `@_exported import`.
+void collectParsedExportedImports(const ModuleDecl *M, SmallPtrSetImpl<ModuleDecl *> &Imports);
 
 } // end namespace swift
 

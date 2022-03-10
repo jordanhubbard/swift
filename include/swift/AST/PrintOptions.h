@@ -95,7 +95,6 @@ public:
     static_assert(DAK_Count < UINT_MAX, "DeclAttrKind is > 31 bits");
   }
   AnyAttrKind() : kind(TAK_Count), isType(1) {}
-  AnyAttrKind(const AnyAttrKind &) = default;
 
   /// Returns the TypeAttrKind, or TAK_Count if this is not a type attribute.
   TypeAttrKind type() const {
@@ -129,6 +128,9 @@ struct PrintOptions {
   /// Whether to print function definitions.
   bool FunctionDefinitions = false;
 
+  /// Whether to print expressions.
+  bool PrintExprs = false;
+  
   /// Whether to print '{ get set }' on readwrite computed properties.
   bool PrintGetSetOnRWProperties = true;
 
@@ -197,6 +199,9 @@ struct PrintOptions {
 
   /// Print fully qualified extended types if ambiguous.
   bool FullyQualifiedExtendedTypesIfAmbiguous = false;
+
+  /// Whether to protocol-qualify DependentMemberTypes.
+  bool ProtocolQualifiedDependentMemberTypes = false;
 
   /// If true, printed module names will use the "exported" name, which may be
   /// different from the regular name.
@@ -275,6 +280,10 @@ struct PrintOptions {
   bool PrintLongAttrsOnSeparateLines = false;
 
   bool PrintImplicitAttrs = true;
+
+  /// Whether to print the \c any keyword for existential
+  /// types.
+  bool PrintExplicitAny = false;
 
   /// Whether to skip keywords with a prefix of underscore such as __consuming.
   bool SkipUnderscoredKeywords = false;
@@ -477,6 +486,10 @@ struct PrintOptions {
   /// Whether to print inheritance lists for types.
   bool PrintInherited = true;
 
+  /// Whether to print a space before the `:` of an inheritance list in a type
+  /// decl.
+  bool PrintSpaceBeforeInheritance = true;
+
   /// Whether to print feature checks for compatibility with older Swift
   /// compilers that might parse the result.
   bool PrintCompatibilityFeatureChecks = false;
@@ -497,6 +510,12 @@ struct PrintOptions {
   /// part of the context).
   QualifyNestedDeclarations ShouldQualifyNestedDeclarations =
       QualifyNestedDeclarations::Never;
+
+  /// If true, we print a protocol's primary associated types using the
+  /// primary associated type syntax: protocol Foo<Type1, ...>.
+  ///
+  /// If false, we print them as ordinary associated types.
+  bool PrintPrimaryAssociatedTypes = true;
 
   /// If this is not \c nullptr then function bodies (including accessors
   /// and constructors) will be printed by this function.
@@ -526,6 +545,13 @@ struct PrintOptions {
     result.PrintRegularClangComments = true;
     result.PrintLongAttrsOnSeparateLines = true;
     result.AlwaysTryPrintParameterLabels = true;
+    return result;
+  }
+
+  /// The print options used for formatting diagnostic arguments.
+  static PrintOptions forDiagnosticArguments() {
+    PrintOptions result;
+    result.PrintExplicitAny = true;
     return result;
   }
 
@@ -645,6 +671,13 @@ struct PrintOptions {
   ///
   /// This is only intended for debug output.
   static PrintOptions printEverything() {
+    PrintOptions result = printDeclarations();
+    result.FunctionDefinitions = true;
+    result.PrintExprs = true;
+    return result;
+  }
+
+  static PrintOptions printDeclarations() {
     PrintOptions result = printVerbose();
     result.ExcludeAttrList.clear();
     result.ExcludeAttrList.push_back(DAK_FixedLayout);

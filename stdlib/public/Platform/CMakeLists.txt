@@ -17,7 +17,7 @@ if(SWIFT_ENABLE_REFLECTION)
 endif()
 
 set(swiftDarwin_target_sdks ALL_APPLE_PLATFORMS)
-if(SWIFT_FREESTANDING_FLAVOR STREQUAL "apple")
+if(SWIFT_FREESTANDING_FLAVOR STREQUAL "apple" AND NOT SWIFT_FREESTANDING_IS_DARWIN)
   set(swiftDarwin_target_sdks ALL_APPLE_PLATFORMS FREESTANDING)
 endif()
 
@@ -42,7 +42,7 @@ set(swiftDarwin_common_options
       DEPENDS ${darwin_depends})
 
 
-if(${LIBSWIFT_BUILD_MODE} STREQUAL "BOOTSTRAPPING" AND
+if(${BOOTSTRAPPING_MODE} STREQUAL "BOOTSTRAPPING" AND
    ${SWIFT_HOST_VARIANT_SDK} IN_LIST SWIFT_DARWIN_PLATFORMS)
 
   set(swiftDarwin_common_bootstrapping_options
@@ -130,13 +130,7 @@ foreach(sdk ${SWIFT_SDKS})
     set(module_dir "${SWIFTLIB_DIR}/${arch_subdir}")
     set(module_dir_static "${SWIFTSTATICLIB_DIR}/${arch_subdir}")
 
-    if(${sdk} STREQUAL ANDROID)
-      set(glibc_modulemap_source "bionic.modulemap.gyb")
-    elseif(${sdk} STREQUAL OPENBSD)
-      set(glibc_modulemap_source "libc-openbsd.modulemap.gyb")
-    else()
-      set(glibc_modulemap_source "glibc.modulemap.gyb")
-    endif()
+    set(glibc_modulemap_source "glibc.modulemap.gyb")
     set(glibc_modulemap_out "${module_dir}/glibc.modulemap")
     set(glibc_modulemap_out_static "${module_dir_static}/glibc.modulemap")
 
@@ -149,8 +143,7 @@ foreach(sdk ${SWIFT_SDKS})
         OUTPUT "${glibc_modulemap_out}"
         FLAGS
             "-DCMAKE_SDK=${sdk}"
-            "-DGLIBC_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}"
-            "-DGLIBC_ARCH_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_ARCHITECTURE_INCLUDE_DIRECTORY}")
+            "-DGLIBC_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}")
 
     list(APPEND glibc_modulemap_target_list ${glibc_modulemap_target})
 
@@ -185,15 +178,12 @@ foreach(sdk ${SWIFT_SDKS})
 
       string(REPLACE "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${arch}_PATH}"
         "" absolute_libc_include_path "${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}")
-      string(REPLACE "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${arch}_PATH}"
-        "" absolute_libc_arch_include_path ${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_ARCHITECTURE_INCLUDE_DIRECTORY})
 
       handle_gyb_source_single(glibc_modulemap_native_target
         SOURCE "${glibc_modulemap_source}"
         OUTPUT "${glibc_sysroot_relative_modulemap_out}"
         FLAGS "-DCMAKE_SDK=${sdk}"
-              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}"
-              "-DGLIBC_ARCH_INCLUDE_PATH=${absolute_libc_arch_include_path}")
+              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}")
 
       list(APPEND glibc_modulemap_target_list ${glibc_modulemap_native_target})
       set(glibc_modulemap_out ${glibc_sysroot_relative_modulemap_out})

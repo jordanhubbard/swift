@@ -190,9 +190,9 @@ namespace {
   class UnknownTypeInfo : public HeapTypeInfo<UnknownTypeInfo> {
   public:
     UnknownTypeInfo(llvm::PointerType *storageType, Size size,
-                    SpareBitVector spareBits, Alignment align)
-        : HeapTypeInfo(ReferenceCounting::Unknown, storageType, size, spareBits,
-                       align) {}
+                 SpareBitVector spareBits, Alignment align)
+      : HeapTypeInfo(storageType, size, spareBits, align) {
+    }
 
     /// AnyObject requires ObjC reference-counting.
     ReferenceCounting getReferenceCounting() const {
@@ -219,9 +219,9 @@ namespace {
   class BridgeObjectTypeInfo : public HeapTypeInfo<BridgeObjectTypeInfo> {
   public:
     BridgeObjectTypeInfo(llvm::PointerType *storageType, Size size,
-                         SpareBitVector spareBits, Alignment align)
-        : HeapTypeInfo(ReferenceCounting::Bridge, storageType, size, spareBits,
-                       align) {}
+                 SpareBitVector spareBits, Alignment align)
+      : HeapTypeInfo(storageType, size, spareBits, align) {
+    }
 
     /// Builtin.BridgeObject uses its own specialized refcounting implementation.
     ReferenceCounting getReferenceCounting() const {
@@ -721,8 +721,8 @@ static llvm::Function *emitObjCPartialApplicationForwarder(IRGenModule &IGM,
   // Merge initial attributes with attrs.
   llvm::AttrBuilder b;
   IGM.constructInitialFnAttributes(b);
-  fwd->addAttributes(llvm::AttributeList::FunctionIndex, b);
-  
+  fwd->addFnAttrs(b);
+
   IRGenFunction subIGF(IGM, fwd);
   if (IGM.DebugInfo)
     IGM.DebugInfo->emitArtificialFunction(subIGF, fwd);

@@ -333,7 +333,7 @@ private:
   /// Retrieve generic signature where this parameter originates from.
   GenericSignature getSignature(ConstraintLocator *locator);
 
-  void emitRequirementNote(const Decl *anchor, Type lhs, Type rhs) const;
+  void maybeEmitRequirementNote(const Decl *anchor, Type lhs, Type rhs) const;
 
   /// If this is a failure in conditional requirement, retrieve
   /// conformance information.
@@ -2661,6 +2661,28 @@ public:
   SwiftToCPointerConversionInInvalidContext(const Solution &solution,
                                             ConstraintLocator *locator)
       : FailureDiagnostic(solution, locator) {}
+
+  bool diagnoseAsError() override;
+};
+
+/// Diagnose situations where the type of default expression doesn't
+/// match expected type of the argument i.e. generic parameter type
+/// was inferred from result:
+///
+/// \code
+/// func test<T>(_: T = 42) -> T { ... }
+///
+/// let _: String = test() // conflict between `String` and `Int`.
+/// \endcode
+class DefaultExprTypeMismatch final : public ContextualFailure {
+public:
+  DefaultExprTypeMismatch(const Solution &solution, Type argType,
+                          Type paramType, ConstraintLocator *locator)
+      : ContextualFailure(solution, argType, paramType, locator) {}
+
+  SourceLoc getLoc() const override {
+    return constraints::getLoc(getLocator()->getAnchor());
+  }
 
   bool diagnoseAsError() override;
 };

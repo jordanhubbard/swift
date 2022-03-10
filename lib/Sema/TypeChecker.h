@@ -245,6 +245,26 @@ Type getOptionalType(SourceLoc loc, Type elementType);
 Expr *resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *Context,
                          bool replaceInvalidRefsWithErrors);
 
+/// Check for invalid existential types in the given declaration.
+void checkExistentialTypes(Decl *decl);
+
+/// Check for invalid existential types in the given statement.
+void checkExistentialTypes(ASTContext &ctx, Stmt *stmt);
+
+/// Check for invalid existential types in the underlying type of
+/// the given type alias.
+void checkExistentialTypes(ASTContext &ctx, TypeAliasDecl *typeAlias);
+
+/// Check for invalid existential types in the given generic requirement
+/// list.
+void checkExistentialTypes(ASTContext &ctx,
+                           TrailingWhereClause *whereClause);
+
+/// Check for invalid existential types in the given generic requirement
+/// list.
+void checkExistentialTypes(ASTContext &ctx,
+                           GenericParamList *genericParams);
+
 /// Substitute the given base type into the type of the given nested type,
 /// producing the effective type that the nested type will have.
 ///
@@ -400,7 +420,7 @@ Type typeCheckParameterDefault(Expr *&defaultValue, DeclContext *DC,
 
 void typeCheckTopLevelCodeDecl(TopLevelCodeDecl *TLCD);
 
-void typeCheckDecl(Decl *D);
+void typeCheckDecl(Decl *D, bool LeaveClosureBodiesUnchecked = false);
 
 void addImplicitDynamicAttribute(Decl *D);
 void checkDeclAttributes(Decl *D);
@@ -657,6 +677,12 @@ Pattern *coercePatternToType(ContextualPattern pattern, Type type,
                              TypeResolutionOptions options);
 bool typeCheckExprPattern(ExprPattern *EP, DeclContext *DC, Type type);
 
+/// Synthesize ~= operator application used to infer enum members
+/// in `case` patterns.
+Optional<std::pair<VarDecl *, BinaryExpr *>>
+synthesizeTildeEqualsOperatorApplication(ExprPattern *EP, DeclContext *DC,
+                                         Type enumType);
+
 /// Coerce the specified parameter list of a ClosureExpr to the specified
 /// contextual type.
 void coerceParameterListToType(ParameterList *P, AnyFunctionType *FN);
@@ -665,9 +691,11 @@ void coerceParameterListToType(ParameterList *P, AnyFunctionType *FN);
 bool typeCheckBinding(Pattern *&P, Expr *&Init, DeclContext *DC,
                       Type patternType,
                       PatternBindingDecl *PBD = nullptr,
-                      unsigned patternNumber = 0);
+                      unsigned patternNumber = 0,
+                      TypeCheckExprOptions options = {});
 bool typeCheckPatternBinding(PatternBindingDecl *PBD, unsigned patternNumber,
-                             Type patternType = Type());
+                             Type patternType = Type(),
+                             TypeCheckExprOptions options = {});
 
 /// Type-check a for-each loop's pattern binding and sequence together.
 ///
@@ -1023,7 +1051,7 @@ diagnosePotentialOpaqueTypeUnavailability(SourceRange ReferenceRange,
                                           const UnavailabilityReason &Reason);
 
 /// Type check a 'distributed actor' declaration.
-void checkDistributedActor(ClassDecl *decl);
+void checkDistributedActor(SourceFile *SF, NominalTypeDecl *decl);
 
 void checkConcurrencyAvailability(SourceRange ReferenceRange,
                                   const DeclContext *ReferenceDC);
@@ -1157,7 +1185,8 @@ UnresolvedMemberExpr *getUnresolvedMemberChainBase(Expr *expr);
 /// are verified against any candidates.
 bool typeSupportsBuilderOp(Type builderType, DeclContext *dc, Identifier fnName,
                            ArrayRef<Identifier> argLabels = {},
-                           SmallVectorImpl<ValueDecl *> *allResults = nullptr);
+                           SmallVectorImpl<ValueDecl *> *allResults = nullptr,
+                           bool checkAvailability = false);
 
 /// Forces all changes specified by the module's access notes file to be
 /// applied to this declaration. It is safe to call this function more than
@@ -1257,6 +1286,10 @@ Expr *buildPropertyWrapperInitCall(
     const VarDecl *var, Type backingStorageType, Expr *value,
     PropertyWrapperInitKind initKind,
     llvm::function_ref<void(ApplyExpr *)> callback = [](ApplyExpr *) {});
+
+/// Check if this var is the \c wrappedValue property belonging to
+/// a property wrapper type declaration.
+bool isWrappedValueOfPropWrapper(VarDecl *var);
 
 /// Whether an overriding declaration requires the 'override' keyword.
 enum class OverrideRequiresKeyword {

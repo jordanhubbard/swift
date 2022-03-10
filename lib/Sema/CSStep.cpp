@@ -345,6 +345,19 @@ StepResult ComponentStep::take(bool prevFailed) {
   auto *disjunction = CS.selectDisjunction();
   auto bestBindings = CS.determineBestBindings();
 
+  if (CS.shouldAttemptFixes()) {
+    if ((bestBindings &&
+         (bestBindings->forClosureResult() ||
+          bestBindings->forGenericParameter()) &&
+         bestBindings->isHole()) &&
+        !disjunction) {
+      if (auto *conjunction = CS.selectConjunction()) {
+        return suspend(
+            std::make_unique<ConjunctionStep>(CS, conjunction, Solutions));
+      }
+    }
+  }
+
   if (bestBindings &&
       (!disjunction || bestBindings->favoredOverDisjunction(disjunction))) {
     // Produce a type variable step.
@@ -802,6 +815,18 @@ bool ConjunctionStep::attempt(const ConjunctionElement &element) {
   // Make sure that element is solved in isolation
   // by dropping all scoring information.
   CS.CurrentScore = Score();
+
+  // Reset the scope counter to avoid "too complex" failures
+  // when closure has a lot of elements in the body.
+  CS.CountScopes = 0;
+
+  // If timer is enabled, let's reset it so that each element
+  // (expression) gets a fresh time slice to get solved. This
+  // is important for closures with large number of statements
+  // in them.
+  if (CS.Timer) {
+    CS.Timer.emplace(element.getLocator(), CS);
+  }
 
   auto success = element.attempt(CS);
 

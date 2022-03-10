@@ -796,6 +796,7 @@ Parser::parseTypeIdentifier(bool isParsingQualifiedDeclBaseType) {
 ///
 ///   type-composition:
 ///     'some'? type-simple
+///     'any'? type-simple
 ///     type-composition '&' type-simple
 ParserResult<TypeRepr>
 Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
@@ -804,18 +805,26 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
   // This is only semantically allowed in certain contexts, but we parse it
   // generally for diagnostics and recovery.
   SourceLoc opaqueLoc;
+  SourceLoc anyLoc;
   if (Tok.isContextualKeyword("some")) {
     // Treat some as a keyword.
     TokReceiver->registerTokenKindChange(Tok.getLoc(), tok::contextual_keyword);
     opaqueLoc = consumeToken();
+  } else if (Tok.isContextualKeyword("any")) {
+    // Treat any as a keyword.
+    TokReceiver->registerTokenKindChange(Tok.getLoc(), tok::contextual_keyword);
+    anyLoc = consumeToken();
   } else {
     // This isn't a some type.
     SomeTypeContext.setTransparent();
   }
   
-  auto applyOpaque = [&](TypeRepr *type) -> TypeRepr* {
-    if (opaqueLoc.isValid()) {
+  auto applyOpaque = [&](TypeRepr *type) -> TypeRepr * {
+    if (opaqueLoc.isValid() &&
+        (anyLoc.isInvalid() || SourceMgr.isBeforeInBuffer(opaqueLoc, anyLoc))) {
       type = new (Context) OpaqueReturnTypeRepr(opaqueLoc, type);
+    } else if (anyLoc.isValid()) {
+      type = new (Context) ExistentialTypeRepr(anyLoc, type);
     }
     return type;
   };
@@ -866,16 +875,25 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
       consumeToken(); // consume '&'
     }
     
-    // Diagnose invalid `some` after an ampersand.
-    if (Tok.isContextualKeyword("some")) {
+    // Diagnose invalid `some` or `any` after an ampersand.
+    if (Tok.isContextualKeyword("some") ||
+        Tok.isContextualKeyword("any")) {
+      auto keyword = Tok.getText();
       auto badLoc = consumeToken();
 
-      diagnose(badLoc, diag::opaque_mid_composition)
-          .fixItRemove(badLoc)
-          .fixItInsert(FirstTypeLoc, "some ");
+      const bool isAnyKeyword = keyword.equals("any");
 
-      if (opaqueLoc.isInvalid())
+      diagnose(badLoc, diag::opaque_mid_composition, keyword)
+          .fixItRemove(badLoc)
+          .fixItInsert(FirstTypeLoc, keyword.str() + " ");
+
+      if (isAnyKeyword) {
+        if (anyLoc.isInvalid()) {
+          anyLoc = badLoc;
+        }
+      } else if (opaqueLoc.isInvalid()) {
         opaqueLoc = badLoc;
+      }
     }
 
     // Parse next type.
@@ -1441,8 +1459,11 @@ bool Parser::canParseType() {
   // Accept 'inout' at for better recovery.
   consumeIf(tok::kw_inout);
 
-  if (Tok.isContextualKeyword("some"))
+  if (Tok.isContextualKeyword("some")) {
     consumeToken();
+  } else if (Tok.isContextualKeyword("any")) {
+    consumeToken();
+  }
 
   switch (Tok.getKind()) {
   case tok::kw_Self:

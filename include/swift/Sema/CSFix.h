@@ -382,6 +382,10 @@ enum class FixKind : uint8_t {
 
   /// Produce an error for not getting a compile-time constant
   NotCompileTimeConst,
+
+  /// Ignore a type mismatch while trying to infer generic parameter type
+  /// from default expression.
+  IgnoreDefaultExprTypeMismatch,
 };
 
 class ConstraintFix {
@@ -2235,6 +2239,10 @@ public:
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
 
+  bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const override {
+    return diagnose(*commonFixes.front().first);
+  }
+
   static RemoveInvalidCall *create(ConstraintSystem &cs,
                                    ConstraintLocator *locator);
 
@@ -2308,6 +2316,10 @@ public:
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
 
+  bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const override {
+    return diagnose(*commonFixes.front().first);
+  }
+
   static SpecifyClosureParameterType *create(ConstraintSystem &cs,
                                              ConstraintLocator *locator);
 
@@ -2326,6 +2338,10 @@ public:
   }
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const override {
+    return diagnose(*commonFixes.front().first);
+  }
 
   static SpecifyClosureReturnType *create(ConstraintSystem &cs,
                                           ConstraintLocator *locator);
@@ -2463,6 +2479,10 @@ public:
   std::string getName() const override { return "specify key path root type"; }
 
   bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  bool diagnoseForAmbiguity(CommonFixesArray commonFixes) const override {
+    return diagnose(*commonFixes.front().first);
+  }
 
   static SpecifyKeyPathRootType *create(ConstraintSystem &cs,
                                         ConstraintLocator *locator);
@@ -2878,6 +2898,29 @@ public:
 
   static AllowSwiftToCPointerConversion *create(ConstraintSystem &cs,
                                                 ConstraintLocator *locator);
+};
+
+class IgnoreDefaultExprTypeMismatch : public AllowArgumentMismatch {
+protected:
+  IgnoreDefaultExprTypeMismatch(ConstraintSystem &cs, Type argType,
+                                Type paramType, ConstraintLocator *locator)
+      : AllowArgumentMismatch(cs, FixKind::IgnoreDefaultExprTypeMismatch,
+                              argType, paramType, locator) {}
+
+public:
+  std::string getName() const override {
+    return "allow default expression conversion mismatch";
+  }
+
+  bool diagnose(const Solution &solution, bool asNote = false) const override;
+
+  static IgnoreDefaultExprTypeMismatch *create(ConstraintSystem &cs,
+                                               Type argType, Type paramType,
+                                               ConstraintLocator *locator);
+
+  static bool classof(const ConstraintFix *fix) {
+    return fix->getKind() == FixKind::IgnoreDefaultExprTypeMismatch;
+  }
 };
 
 } // end namespace constraints

@@ -28,7 +28,7 @@
 #include "swift/AST/Type.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/SourceManager.h"
-#include "swift/IDE/CodeCompletion.h"
+#include "swift/IDE/CodeCompletionResult.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/Subsystems.h"
 #include "clang/AST/Attr.h"
@@ -98,7 +98,8 @@ void swift::ide::typeCheckContextAt(DeclContext *DC, SourceLoc Loc) {
             [](VarDecl *VD) { (void)VD->getInterfaceType(); });
         if (PBD->getInit(i)) {
           if (!PBD->isInitializerChecked(i))
-            typeCheckPatternBinding(PBD, i);
+            typeCheckPatternBinding(PBD, i,
+                                    /*LeaveClosureBodyUnchecked=*/true);
         }
       }
     } else if (auto *defaultArg = dyn_cast<DefaultArgumentInitializer>(DC)) {

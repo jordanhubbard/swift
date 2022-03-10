@@ -115,7 +115,7 @@ ProtocolConformanceRef::subst(Type origType,
   // unless we're specifically substituting opaque types.
   if (auto origArchetype = origType->getAs<ArchetypeType>()) {
     if (!options.contains(SubstFlags::SubstituteOpaqueArchetypes)
-        && isa<OpaqueTypeArchetypeType>(origArchetype->getRoot())) {
+        && isa<OpaqueTypeArchetypeType>(origArchetype)) {
       return *this;
     }
   }
@@ -199,9 +199,8 @@ switch (getKind()) {                                                         \
   case ProtocolConformanceKind::Inherited:                                   \
     return cast<InheritedProtocolConformance>(this)->Method Args;            \
   case ProtocolConformanceKind::Builtin:                                     \
-    static_assert(&ProtocolConformance::Method !=                            \
-                    &BuiltinProtocolConformance::Method,                     \
-                  "Must override BuiltinProtocolConformance::" #Method);     \
+    assert(&ProtocolConformance::Method != &BuiltinProtocolConformance::Method \
+           && "Must override BuiltinProtocolConformance::" #Method);         \
     return cast<BuiltinProtocolConformance>(this)->Method Args;              \
 }                                                                            \
 llvm_unreachable("bad ProtocolConformanceKind");
@@ -564,7 +563,8 @@ void NormalProtocolConformance::setSignatureConformances(
 
 #if !NDEBUG
   unsigned idx = 0;
-  for (const auto &req : getProtocol()->getRequirementSignature()) {
+  auto reqs = getProtocol()->getRequirementSignature().getRequirements();
+  for (const auto &req : reqs) {
     if (req.getKind() == RequirementKind::Conformance) {
       assert(!conformances[idx].isConcrete() ||
              !conformances[idx].getConcrete()->getType()->hasArchetype() &&
@@ -766,7 +766,8 @@ NormalProtocolConformance::getAssociatedConformance(Type assocType,
          "signature conformances not yet computed");
 
   unsigned conformanceIndex = 0;
-  for (const auto &reqt : getProtocol()->getRequirementSignature()) {
+  auto requirements = getProtocol()->getRequirementSignature().getRequirements();
+  for (const auto &reqt : requirements) {
     if (reqt.getKind() == RequirementKind::Conformance) {
       // Is this the conformance we're looking for?
       if (reqt.getFirstType()->isEqual(assocType) &&
@@ -819,7 +820,7 @@ void NormalProtocolConformance::finishSignatureConformances() {
     return;
 
   auto *proto = getProtocol();
-  auto reqSig = proto->getRequirementSignature();
+  auto reqSig = proto->getRequirementSignature().getRequirements();
   if (reqSig.empty())
     return;
 
@@ -1165,8 +1166,33 @@ ProtocolConformance::subst(TypeSubstitutionFn subs,
                                    const_cast<ProtocolConformance *>(this),
                                    subMap);
   }
+  case ProtocolConformanceKind::Builtin: {
+    auto origType = getType();
+    if (!origType->hasTypeParameter() &&
+        !origType->hasArchetype())
+      return const_cast<ProtocolConformance *>(this);
+
+    auto substType = origType.subst(subs, conformances, options);
+
+    // We do an exact pointer equality check because subst() can
+    // change sugar.
+    if (substType.getPointer() == origType.getPointer())
+      return const_cast<ProtocolConformance *>(this);
+
+    SmallVector<Requirement, 2> requirements;
+    for (auto req : getConditionalRequirements()) {
+      requirements.push_back(*req.subst(subs, conformances, options));
+    }
+
+    auto kind = cast<BuiltinProtocolConformance>(this)
+        ->getBuiltinConformanceKind();
+
+    return substType->getASTContext()
+        .getBuiltinConformance(substType,
+                               getProtocol(), getGenericSignature(),
+                               requirements, kind);
+  }
   case ProtocolConformanceKind::Self:
-  case ProtocolConformanceKind::Builtin:
     return const_cast<ProtocolConformance*>(this);
   case ProtocolConformanceKind::Inherited: {
     // Substitute the base.
@@ -1289,11 +1315,12 @@ bool NominalTypeDecl::lookupConformance(
            conformances);
 }
 
-SmallVector<ProtocolDecl *, 2> NominalTypeDecl::getAllProtocols() const {
+SmallVector<ProtocolDecl *, 2>
+NominalTypeDecl::getAllProtocols(bool sorted) const {
   prepareConformanceTable();
   SmallVector<ProtocolDecl *, 2> result;
-  ConformanceTable->getAllProtocols(const_cast<NominalTypeDecl *>(this),
-                                    result);
+  ConformanceTable->getAllProtocols(const_cast<NominalTypeDecl *>(this), result,
+                                    sorted);
   return result;
 }
 

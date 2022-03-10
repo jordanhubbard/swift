@@ -4,6 +4,7 @@
 // REQUIRES: concurrency
 import Foundation
 import ObjCConcurrency
+// expected-remark@-1{{add '@preconcurrency' to suppress 'Sendable'-related warnings from module 'ObjCConcurrency'}}
 
 if #available(SwiftStdlib 5.5, *) {
 
@@ -44,6 +45,9 @@ func testSlowServer(slowServer: SlowServer) async throws {
 
   let _: Int = await slowServer.bestName("hello")
   let _: Int = await slowServer.customize("hello")
+
+  slowServer.unavailableMethod() // expected-warning{{instance method 'unavailableMethod' is unavailable from asynchronous contexts}}
+  slowServer.unavailableMethodWithMessage() // expected-warning{{instance method 'unavailableMethodWithMessage' is unavailable from asynchronous contexts; Blarpy!}}
 
   let _: String = await slowServer.dance("slide")
   let _: String = await slowServer.__leap(17)
@@ -93,7 +97,7 @@ func testSlowServerOldSchool(slowServer: SlowServer) {
 }
 
 func testSendable(fn: () -> Void) {
-  doSomethingConcurrently(fn) // okay, due to implicit @_predatesConcurrency
+  doSomethingConcurrently(fn) // okay, due to implicit @preconcurrency
   doSomethingConcurrentlyButUnsafe(fn) // okay, @Sendable not part of the type
 
   var x = 17
@@ -126,22 +130,22 @@ func testSendableAttrs(
 
   doSomethingConcurrently {
     print(sendableClass)               // no-error
-    print(nonSendableClass)            // expected-warning{{cannot use parameter 'nonSendableClass' with a non-sendable type 'NonSendableClass' from concurrently-executed code}}
+    print(nonSendableClass)            // expected-warning{{capture of 'nonSendableClass' with non-sendable type 'NonSendableClass' in a `@Sendable` closure}}
 
     print(sendableEnum)                // no-error
-    print(nonSendableEnum)             // expected-warning{{cannot use parameter 'nonSendableEnum' with a non-sendable type 'NonSendableEnum' from concurrently-executed code}}
+    print(nonSendableEnum)             // expected-warning{{capture of 'nonSendableEnum' with non-sendable type 'NonSendableEnum' in a `@Sendable` closure}}
 
     print(sendableOptions)             // no-error
-    print(nonSendableOptions)          // expected-warning{{cannot use parameter 'nonSendableOptions' with a non-sendable type 'NonSendableOptions' from concurrently-executed code}}
+    print(nonSendableOptions)          // expected-warning{{capture of 'nonSendableOptions' with non-sendable type 'NonSendableOptions' in a `@Sendable` closure}}
 
     print(sendableError)               // no-error
     print(nonSendableError)            // no-error--we don't respect `@_nonSendable` on `ns_error_domain` types because all errors are Sendable
 
     print(sendableStringEnum)          // no-error
-    print(nonSendableStringEnum)       // expected-warning{{cannot use parameter 'nonSendableStringEnum' with a non-sendable type 'NonSendableStringEnum' from concurrently-executed code}}
+    print(nonSendableStringEnum)       // expected-warning{{capture of 'nonSendableStringEnum' with non-sendable type 'NonSendableStringEnum' in a `@Sendable` closure}}
 
     print(sendableStringStruct)        // no-error
-    print(nonSendableStringStruct)     // expected-warning{{cannot use parameter 'nonSendableStringStruct' with a non-sendable type 'NonSendableStringStruct' from concurrently-executed code}}
+    print(nonSendableStringStruct)     // expected-warning{{capture of 'nonSendableStringStruct' with non-sendable type 'NonSendableStringStruct' in a `@Sendable` closure}}
   }
 }
 
@@ -214,6 +218,81 @@ func testMirrored(instance: ClassWithAsync) async {
       print(c)
     }
   }
+}
+
+@MainActor class MyView: NXView {
+  func f() {
+    Task {
+      await self.g()
+    }
+  }
+
+  func g() async { }
+}
+
+
+@MainActor func mainActorFn() {}
+@SomeGlobalActor func sgActorFn() {}
+
+// Check inferred isolation for overridden decls from ObjC.
+// Note that even if the override is not present, it
+// can have an affect. -- rdar://87217618 / SR-15694
+@MainActor
+class FooFrame: PictureFrame {
+  init() {
+    super.init(size: 0)
+  }
+
+  override init(size n: Int) {
+    super.init(size: n)
+  }
+
+  override func rotate() {
+    mainActorFn()
+  }
+}
+
+class BarFrame: PictureFrame {
+  init() {
+    super.init(size: 0)
+  }
+
+  override init(size n: Int) {
+    super.init(size: n)
+  }
+
+  override func rotate() {
+    mainActorFn()
+  }
+}
+
+@SomeGlobalActor
+class BazFrame: NotIsolatedPictureFrame {
+  init() {
+    super.init(size: 0)
+  }
+
+  override init(size n: Int) {
+    super.init(size: n)
+  }
+
+  override func rotate() {
+    sgActorFn()
+  }
+}
+
+@SomeGlobalActor
+class BazFrameIso: PictureFrame { // expected-error {{global actor 'SomeGlobalActor'-isolated class 'BazFrameIso' has different actor isolation from main actor-isolated superclass 'PictureFrame'}}
+}
+
+func check() async {
+  _ = await BarFrame()
+  _ = await FooFrame()
+  _ = await BazFrame()
+
+  _ = await BarFrame(size: 0)
+  _ = await FooFrame(size: 0)
+  _ = await BazFrame(size: 0)
 }
 
 } // SwiftStdlib 5.5

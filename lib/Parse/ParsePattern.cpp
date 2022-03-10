@@ -165,7 +165,8 @@ bool Parser::startsParameterName(bool isClosure) {
   if (nextTok.canBeArgumentLabel()) {
     // If the first name wasn't "isolated", we're done.
     if (!Tok.isContextualKeyword("isolated") &&
-        !Tok.isContextualKeyword("some"))
+        !Tok.isContextualKeyword("some") &&
+        !Tok.isContextualKeyword("any"))
       return true;
 
     // "isolated" can be an argument label, but it's also a contextual keyword,
@@ -925,6 +926,7 @@ bool Parser::isEffectsSpecifier(const Token &T) {
   //       'parseEffectsSpecifiers()'.
 
   if (T.isContextualKeyword("async") ||
+      (T.isContextualKeyword("await") && !T.isAtStartOfLine()) ||
       T.isContextualKeyword("reasync"))
     return true;
 
@@ -980,6 +982,13 @@ ParserStatus Parser::parseEffectsSpecifiers(SourceLoc existingArrowLoc,
           *reasync = isReasync;
         asyncLoc = Tok.getLoc();
       }
+      consumeToken();
+      continue;
+    }
+    // diagnose 'await'
+    if (Tok.isContextualKeyword("await") && !Tok.isAtStartOfLine()) {
+      diagnose(Tok, diag::await_in_function_type)
+        .fixItReplace(Tok.getLoc(), "async");
       consumeToken();
       continue;
     }

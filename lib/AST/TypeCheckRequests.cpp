@@ -18,6 +18,7 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/AST/RequirementSignature.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeLoc.h"
@@ -250,6 +251,31 @@ void ExistentialConformsToSelfRequest::cacheResult(bool value) const {
 }
 
 //----------------------------------------------------------------------------//
+// existentialRequiresAny computation.
+//----------------------------------------------------------------------------//
+
+void ExistentialRequiresAnyRequest::diagnoseCycle(DiagnosticEngine &diags) const {
+  auto decl = std::get<0>(getStorage());
+  diags.diagnose(decl, diag::circular_protocol_def, decl->getName());
+}
+
+void ExistentialRequiresAnyRequest::noteCycleStep(DiagnosticEngine &diags) const {
+  auto requirement = std::get<0>(getStorage());
+  diags.diagnose(requirement, diag::kind_declname_declared_here,
+                 DescriptiveDeclKind::Protocol, requirement->getName());
+}
+
+Optional<bool> ExistentialRequiresAnyRequest::getCachedResult() const {
+  auto decl = std::get<0>(getStorage());
+  return decl->getCachedExistentialRequiresAny();
+}
+
+void ExistentialRequiresAnyRequest::cacheResult(bool value) const {
+  auto decl = std::get<0>(getStorage());
+  decl->setCachedExistentialRequiresAny(value);
+}
+
+//----------------------------------------------------------------------------//
 // isFinal computation.
 //----------------------------------------------------------------------------//
 
@@ -296,15 +322,16 @@ void IsDynamicRequest::cacheResult(bool value) const {
 // RequirementSignatureRequest computation.
 //----------------------------------------------------------------------------//
 
-Optional<ArrayRef<Requirement>> RequirementSignatureRequest::getCachedResult() const {
+Optional<RequirementSignature>
+RequirementSignatureRequest::getCachedResult() const {
   auto proto = std::get<0>(getStorage());
   if (proto->isRequirementSignatureComputed())
-    return proto->getCachedRequirementSignature();
+    return *proto->RequirementSig;
 
   return None;
 }
 
-void RequirementSignatureRequest::cacheResult(ArrayRef<Requirement> value) const {
+void RequirementSignatureRequest::cacheResult(RequirementSignature value) const {
   auto proto = std::get<0>(getStorage());
   proto->setRequirementSignature(value);
 }
@@ -331,6 +358,9 @@ SourceLoc WhereClauseOwner::getLoc() const {
   if (auto attr = source.dyn_cast<SpecializeAttr *>())
     return attr->getLocation();
 
+  if (auto attr = source.dyn_cast<DifferentiableAttr *>())
+    return attr->getLocation();
+
   return source.get<GenericParamList *>()->getWhereLoc();
 }
 
@@ -340,6 +370,8 @@ void swift::simple_display(llvm::raw_ostream &out,
     simple_display(out, owner.dc->getAsDecl());
   } else if (owner.source.is<SpecializeAttr *>()) {
     out << "@_specialize";
+  } else if (owner.source.is<DifferentiableAttr *>()) {
+    out << "@_differentiable";
   } else {
     out << "(SIL generic parameter list)";
   }
@@ -529,6 +561,9 @@ void swift::simple_display(llvm::raw_ostream &out,
     break;
   case FragileFunctionKind::PropertyInitializer:
     out << "propertyInitializer";
+    break;
+  case FragileFunctionKind::BackDeploy:
+    out << "backDeploy";
     break;
   case FragileFunctionKind::None:
     out << "none";
@@ -795,6 +830,17 @@ void UnderlyingTypeRequest::diagnoseCycle(DiagnosticEngine &diags) const {
 }
 
 //----------------------------------------------------------------------------//
+// StructuralTypeRequest computation.
+//----------------------------------------------------------------------------//
+
+void StructuralTypeRequest::diagnoseCycle(DiagnosticEngine &diags) const {
+  auto aliasDecl = std::get<0>(getStorage());
+  diags.diagnose(aliasDecl, diag::recursive_decl_reference,
+                 aliasDecl->getDescriptiveKind(),
+                 aliasDecl->getName());
+}
+
+//----------------------------------------------------------------------------//
 // EnumRawValuesRequest computation.
 //----------------------------------------------------------------------------//
 
@@ -1030,11 +1076,11 @@ void swift::simple_display(llvm::raw_ostream &out,
   case ImplicitMemberAction::ResolveDistributedActor:
     out << "resolve DistributedActor";
     break;
-  case ImplicitMemberAction::ResolveDistributedActorIdentity:
+  case ImplicitMemberAction::ResolveDistributedActorID:
     out << "resolve DistributedActor.id";
     break;
-  case ImplicitMemberAction::ResolveDistributedActorTransport:
-    out << "resolve DistributedActor.actorTransport";
+  case ImplicitMemberAction::ResolveDistributedActorSystem:
+    out << "resolve DistributedActor.actorSystem";
     break;
   }
 }
@@ -1158,6 +1204,27 @@ Optional<Expr *> DefaultArgumentExprRequest::getCachedResult() const {
 void DefaultArgumentExprRequest::cacheResult(Expr *expr) const {
   auto *param = std::get<0>(getStorage());
   param->setDefaultExpr(expr, /*isTypeChecked*/ true);
+}
+
+//----------------------------------------------------------------------------//
+// DefaultArgumentTypeRequest computation.
+//----------------------------------------------------------------------------//
+
+Optional<Type> DefaultArgumentTypeRequest::getCachedResult() const {
+  auto *param = std::get<0>(getStorage());
+  auto *defaultInfo = param->DefaultValueAndFlags.getPointer();
+  if (!defaultInfo)
+    return None;
+
+  if (!defaultInfo->InitContextAndIsTypeChecked.getInt())
+    return None;
+
+  return defaultInfo->ExprType;
+}
+
+void DefaultArgumentTypeRequest::cacheResult(Type type) const {
+  auto *param = std::get<0>(getStorage());
+  param->setDefaultExprType(type);
 }
 
 //----------------------------------------------------------------------------//
@@ -1322,7 +1389,7 @@ Optional<BraceStmt *> TypeCheckFunctionBodyRequest::getCachedResult() const {
     return nullptr;
 
   case BodyKind::TypeChecked:
-    return afd->Body;
+    return afd->BodyAndFP.getBody();
 
   case BodyKind::Synthesize:
   case BodyKind::Parsed:
@@ -1463,7 +1530,6 @@ void CustomAttrTypeRequest::cacheResult(Type value) const {
 bool ActorIsolation::requiresSubstitution() const {
   switch (kind) {
   case ActorInstance:
-  case DistributedActorInstance:
   case Independent:
   case Unspecified:
     return false;
@@ -1478,7 +1544,6 @@ bool ActorIsolation::requiresSubstitution() const {
 ActorIsolation ActorIsolation::subst(SubstitutionMap subs) const {
   switch (kind) {
   case ActorInstance:
-  case DistributedActorInstance:
   case Independent:
   case Unspecified:
     return *this;
@@ -1486,7 +1551,8 @@ ActorIsolation ActorIsolation::subst(SubstitutionMap subs) const {
   case GlobalActor:
   case GlobalActorUnsafe:
     return forGlobalActor(
-        getGlobalActor().subst(subs), kind == GlobalActorUnsafe);
+        getGlobalActor().subst(subs), kind == GlobalActorUnsafe)
+              .withPreconcurrency(preconcurrency());
   }
   llvm_unreachable("unhandled actor isolation kind!");
 }
@@ -1496,10 +1562,6 @@ void swift::simple_display(
   switch (state) {
     case ActorIsolation::ActorInstance:
       out << "actor-isolated to instance of " << state.getActor()->getName();
-      break;
-
-    case ActorIsolation::DistributedActorInstance:
-      out << "distributed-actor-isolated to instance of " << state.getActor()->getName();
       break;
 
     case ActorIsolation::Independent:

@@ -1169,10 +1169,9 @@ public:
   struct ParsedAccessors;
   ParserStatus parseGetSet(ParseDeclOptions Flags,
                            GenericParamList *GenericParams,
-                           ParameterList *Indices,
+                           ParameterList *Indices, TypeRepr *ResultType,
                            ParsedAccessors &accessors,
-                           AbstractStorageDecl *storage,
-                           SourceLoc StaticLoc);
+                           AbstractStorageDecl *storage, SourceLoc StaticLoc);
   ParserResult<VarDecl> parseDeclVarGetSet(PatternBindingEntry &entry,
                                            ParseDeclOptions Flags,
                                            SourceLoc StaticLoc,
@@ -1195,9 +1194,14 @@ public:
                                        ParseDeclOptions Flags,
                                        DeclAttributes &Attributes,
                                        bool HasFuncKeyword = true);
-  BraceStmt *parseAbstractFunctionBodyImpl(AbstractFunctionDecl *AFD);
+  BodyAndFingerprint
+  parseAbstractFunctionBodyImpl(AbstractFunctionDecl *AFD);
   void parseAbstractFunctionBody(AbstractFunctionDecl *AFD);
-  BraceStmt *parseAbstractFunctionBodyDelayed(AbstractFunctionDecl *AFD);
+  BodyAndFingerprint
+  parseAbstractFunctionBodyDelayed(AbstractFunctionDecl *AFD);
+
+  ParserStatus parsePrimaryAssociatedTypes(
+      SmallVectorImpl<AssociatedTypeDecl *> &AssocTypes);
   ParserResult<ProtocolDecl> parseDeclProtocol(ParseDeclOptions Flags,
                                                DeclAttributes &Attributes);
 
@@ -1579,6 +1583,7 @@ public:
   ParserResult<Expr> parseExprSelector();
   ParserResult<Expr> parseExprSuper();
   ParserResult<Expr> parseExprStringLiteral();
+  ParserResult<Expr> parseExprRegexLiteral();
 
   StringRef copyAndStripUnderscores(StringRef text);
 
@@ -1844,6 +1849,16 @@ public:
                     bool &DiscardAttribute, SourceRange &attrRange,
                     SourceLoc AtLoc, SourceLoc Loc,
                     llvm::function_ref<void(AvailableAttr *)> addAttribute);
+
+  using PlatformAndVersion = std::pair<PlatformKind, llvm::VersionTuple>;
+
+  /// Parse a platform and version tuple (e.g. "macOS 12.0") and append it to the
+  /// given vector. Wildcards ('*') parse successfully but are ignored. Assumes
+  /// that the tuples are part of a comma separated list ending with a trailing
+  /// ')'.
+  ParserStatus parsePlatformVersionInList(StringRef AttrName,
+      llvm::SmallVector<PlatformAndVersion, 4> &PlatformAndVersions);
+
   //===--------------------------------------------------------------------===//
   // Code completion second pass.
 

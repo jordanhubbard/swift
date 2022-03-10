@@ -590,6 +590,10 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
           .diagnose(Loc, diag::cannot_find_in_scope, Name,
                     Name.isOperator())
           .highlight(UDRE->getSourceRange());
+      if (!Context.LangOpts.DisableExperimentalClangImporterDiagnostics) {
+        Context.getClangModuleLoader()->diagnoseTopLevelValue(
+            Name.getFullName());
+      }
     };
 
     if (!isConfused) {
@@ -663,7 +667,11 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
     if (UDRE->isImplicit()) {
       return TypeExpr::createImplicitForDecl(
           UDRE->getNameLoc(), D, LookupDC,
-          LookupDC->mapTypeIntoContext(D->getInterfaceType()));
+          // It might happen that LookupDC is null if this is checking
+          // synthesized code, in that case, don't map the type into context,
+          // but return as is -- the synthesis should ensure the type is correct.
+          LookupDC ? LookupDC->mapTypeIntoContext(D->getInterfaceType())
+                   : D->getInterfaceType());
     } else {
       return TypeExpr::createForDecl(UDRE->getNameLoc(), D, LookupDC);
     }
@@ -749,10 +757,27 @@ Expr *TypeChecker::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
                                            /*Implicit=*/true);
     }
 
+    auto isInClosureContext = [&](ValueDecl *decl) -> bool {
+      auto *DC = decl->getDeclContext();
+      do {
+        if (dyn_cast<ClosureExpr>(DC))
+          return true;
+      } while ((DC = DC->getParent()));
+
+      return false;
+    };
+
     llvm::SmallVector<ValueDecl *, 4> outerAlternatives;
     (void)findNonMembers(Lookup.outerResults(), UDRE->getRefKind(),
                          /*breakOnMember=*/false, outerAlternatives,
-                         /*isValid=*/[](ValueDecl *choice) -> bool {
+                         /*isValid=*/[&](ValueDecl *choice) -> bool {
+                           // Values that are defined in a closure
+                           // that hasn't been type-checked yet,
+                           // cannot be outer candidates.
+                           if (isInClosureContext(choice)) {
+                             return choice->hasInterfaceType() &&
+                                    !choice->isInvalid();
+                           }
                            return !choice->isInvalid();
                          });
 
@@ -892,6 +917,8 @@ namespace {
     /// Indicates whether pre-check is allowed to insert
     /// implicit `ErrorExpr` in place of invalid references.
     bool UseErrorExprs;
+
+    bool LeaveClosureBodiesUnchecked;
 
     /// A stack of expressions being walked, used to determine where to
     /// insert RebindSelfInConstructorExpr nodes.
@@ -1080,9 +1107,11 @@ namespace {
 
   public:
     PreCheckExpression(DeclContext *dc, Expr *parent,
-                       bool replaceInvalidRefsWithErrors)
-        : Ctx(dc->getASTContext()), DC(dc), ParentExpr(parent),
-          UseErrorExprs(replaceInvalidRefsWithErrors) {}
+                       bool replaceInvalidRefsWithErrors,
+                       bool leaveClosureBodiesUnchecked)
+        : Ctx(dc->getASTContext()), DC(dc),
+          ParentExpr(parent), UseErrorExprs(replaceInvalidRefsWithErrors),
+          LeaveClosureBodiesUnchecked(leaveClosureBodiesUnchecked) {}
 
     ASTContext &getASTContext() const { return Ctx; }
 
@@ -1415,11 +1444,12 @@ namespace {
 
     std::pair<bool, Pattern *> walkToPatternPre(Pattern *pattern) override {
       // With multi-statement closure inference enabled, constraint generation
-      // is responsible for pattern verification and type-checking, so there
-      // is no need to walk into patterns in that mode.
-      bool shouldWalkIntoPatterns =
-          !Ctx.TypeCheckerOpts.EnableMultiStatementClosureInference;
-      return {shouldWalkIntoPatterns, pattern};
+      // is responsible for pattern verification and type-checking in the body
+      // of the closure, so there is no need to walk into patterns.
+      bool walkIntoPatterns =
+          !(isa<ClosureExpr>(DC) &&
+            Ctx.TypeCheckerOpts.EnableMultiStatementClosureInference);
+      return {walkIntoPatterns, pattern};
     }
   };
 } // end anonymous namespace
@@ -1428,8 +1458,13 @@ namespace {
 /// true when we want the body to be considered part of this larger expression.
 bool PreCheckExpression::walkToClosureExprPre(ClosureExpr *closure) {
   // If we won't be checking the body of the closure, don't walk into it here.
-  if (!shouldTypeCheckInEnclosingExpression(closure))
-    return false;
+  if (!closure->hasSingleExpressionBody()) {
+    if (LeaveClosureBodiesUnchecked)
+      return false;
+
+    if (!Ctx.TypeCheckerOpts.EnableMultiStatementClosureInference)
+      return false;
+  }
 
   // Update the current DeclContext to be the closure we're about to
   // recurse into.
@@ -2079,14 +2114,52 @@ Expr *PreCheckExpression::simplifyTypeConstructionWithLiteralArg(Expr *E) {
              : nullptr;
 }
 
+bool ConstraintSystem::preCheckTarget(SolutionApplicationTarget &target,
+                                      bool replaceInvalidRefsWithErrors,
+                                      bool leaveClosureBodiesUnchecked) {
+  auto *DC = target.getDeclContext();
+
+  bool hadErrors = false;
+
+  if (auto *expr = target.getAsExpr()) {
+    hadErrors |= preCheckExpression(expr, DC, replaceInvalidRefsWithErrors,
+                                    leaveClosureBodiesUnchecked);
+    // Even if the pre-check fails, expression still has to be re-set.
+    target.setExpr(expr);
+  }
+
+  if (target.isForEachStmt()) {
+    auto &info = target.getForEachStmtInfo();
+
+    if (info.whereExpr)
+      hadErrors |= preCheckExpression(info.whereExpr, DC,
+                                      /*replaceInvalidRefsWithErrors=*/true,
+                                      /*leaveClosureBodiesUnchecked=*/false);
+
+    // Update sequence and where expressions to pre-checked versions.
+    if (!hadErrors) {
+      info.stmt->setSequence(target.getAsExpr());
+
+      if (info.whereExpr)
+        info.stmt->setWhere(info.whereExpr);
+    }
+  }
+
+  return hadErrors;
+}
+
 /// Pre-check the expression, validating any types that occur in the
 /// expression and folding sequence expressions.
 bool ConstraintSystem::preCheckExpression(Expr *&expr, DeclContext *dc,
-                                          bool replaceInvalidRefsWithErrors) {
+                                          bool replaceInvalidRefsWithErrors,
+                                          bool leaveClosureBodiesUnchecked) {
   auto &ctx = dc->getASTContext();
   FrontendStatsTracer StatsTracer(ctx.Stats, "precheck-expr", expr);
 
-  PreCheckExpression preCheck(dc, expr, replaceInvalidRefsWithErrors);
+  PreCheckExpression preCheck(dc, expr,
+                              replaceInvalidRefsWithErrors,
+                              leaveClosureBodiesUnchecked);
+
   // Perform the pre-check.
   if (auto result = expr->walk(preCheck)) {
     expr = result;

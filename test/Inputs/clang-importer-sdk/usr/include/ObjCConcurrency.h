@@ -4,6 +4,7 @@
 #pragma clang assume_nonnull begin
 
 #define MAIN_ACTOR __attribute__((__swift_attr__("@MainActor")))
+#define UI_ACTOR __attribute__((swift_attr("@UIActor")))
 
 #ifdef __SWIFT_ATTR_SUPPORTS_SENDABLE_DECLS
   #define SENDABLE __attribute__((__swift_attr__("@Sendable")))
@@ -35,11 +36,13 @@ typedef NSString *Flavor NS_EXTENSIBLE_STRING_ENUM;
 -(void)allOperationsWithCompletionHandler:(void (^)(NSArray<NSString *> *))completion;
 @end
 
-typedef void (^CompletionHandler)(NSString * _Nullable, NSString * _Nullable_result, NSError * _Nullable);
+typedef void (^CompletionHandler)(NSString * _Nullable, NSString * _Nullable_result, NSError * _Nullable) SENDABLE;
+typedef void (^NonsendableCompletionHandler)(NSString * _Nullable, NSString * _Nullable_result, NSError * _Nullable);
 
 @interface SlowServer : NSObject <ServiceProvider>
 -(void)doSomethingSlow:(NSString *)operation completionHandler:(void (^)(NSInteger))handler;
 -(void)doSomethingDangerous:(NSString *)operation completionHandler:(void (^ _Nullable)(NSString *_Nullable, NSError * _Nullable))handler;
+-(void)doSomethingReckless:(NSString *)operation completionHandler:(void (^ _Nullable NONSENDABLE)(NSString *_Nullable, NSError * _Nullable))handler;
 -(void)checkAvailabilityWithCompletionHandler:(void (^)(BOOL isAvailable))completionHandler;
 -(void)anotherExampleWithCompletionBlock:(void (^)(NSString *))block;
 -(void)finalExampleWithReplyTo:(void (^)(NSString *))block;
@@ -48,6 +51,8 @@ typedef void (^CompletionHandler)(NSString * _Nullable, NSString * _Nullable_res
 -(BOOL)findAnswerFailinglyWithError:(NSError * _Nullable * _Nullable)error completion:(void (^)(NSString *_Nullable, NSError * _Nullable))handler __attribute__((swift_name("findAnswerFailingly(completionHandler:)")));
 -(void)findQAndAWithCompletionHandler:(void (^)(NSString *_Nullable_result, NSString *_Nullable answer, NSError * _Nullable))handler;
 -(void)findQuestionableAnswersWithCompletionHandler:(CompletionHandler)handler;
+-(void)findAnswerableQuestionsWithCompletionHandler:(NonsendableCompletionHandler)handler;
+-(void)findUnanswerableQuestionsWithCompletionHandler:(NONSENDABLE NonsendableCompletionHandler)handler;
 -(void)doSomethingFun:(NSString *)operation then:(void (^)())completionHandler;
 -(void)getFortuneAsynchronouslyWithCompletionHandler:(void (^)(NSString *_Nullable, NSError * _Nullable))handler;
 -(void)getMagicNumberAsynchronouslyWithSeed:(NSInteger)seed completionHandler:(void (^)(NSInteger, NSError * _Nullable))handler;
@@ -65,6 +70,9 @@ typedef void (^CompletionHandler)(NSString * _Nullable, NSString * _Nullable_res
 -(void)poorlyNamed:(NSString *)operation completionHandler:(void (^)(NSInteger))handler __attribute__((swift_async_name("bestName(_:)")));
 
 -(void)customizedWithString:(NSString *)operation completionHandler:(void (^)(NSInteger))handler __attribute__((swift_name("customize(with:completionHandler:)"))) __attribute__((swift_async_name("customize(_:)")));
+
+-(void)unavailableMethod __attribute__((__swift_attr__("@_unavailableFromAsync")));
+-(void)unavailableMethodWithMessage __attribute__((__swift_attr__("@_unavailableFromAsync(message: \"Blarpy!\")")));
 
 -(void)dance:(NSString *)step andThen:(void (^)(NSString *))doSomething __attribute__((swift_async(not_swift_private,2)));
 -(void)leap:(NSInteger)height andThen:(void (^)(NSString *))doSomething __attribute__((swift_async(swift_private,2)));
@@ -239,6 +247,17 @@ typedef NS_ERROR_ENUM(unsigned, NonSendableErrorCode, NonSendableErrorDomain) {
   NonSendableErrorCodeFoo, NonSendableErrorCodeBar
 } NONSENDABLE;
 // expected-warning@-3 {{cannot make error code type 'NonSendableErrorCode' non-sendable because Swift errors are always sendable}}
+
+UI_ACTOR
+@interface PictureFrame : NSObject
+- (instancetype)initWithSize:(NSInteger)frame NS_DESIGNATED_INITIALIZER;
+- (void)rotate;
+@end
+
+@interface NotIsolatedPictureFrame : NSObject
+- (instancetype)initWithSize:(NSInteger)frame NS_DESIGNATED_INITIALIZER;
+- (void)rotate;
+@end
 
 typedef NSString *SendableStringEnum NS_STRING_ENUM;
 typedef NSString *NonSendableStringEnum NS_STRING_ENUM NONSENDABLE;
