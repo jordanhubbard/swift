@@ -60,7 +60,7 @@ func is_archetype<T : B>(b: B, _: T) -> Bool {
   // CHECK:   integer_literal {{.*}} -1
   // CHECK:   destroy_value [[CASTED_ARG]]
   // CHECK: [[NO]]([[ORIGINAL_VALUE:%.*]] : @owned $B):
-  // CHCEK:   destroy_value [[CASTED_ARG]]
+  // CHECK:   destroy_value [[ORIGINAL_VALUE]]
   // CHECK:   integer_literal {{.*}} 0
   return b is T
 }
@@ -77,11 +77,11 @@ protocol P {}
 struct S : P {}
 
 // CHECK: sil hidden [ossa] @$s5casts32downcast_existential_conditional{{[_0-9a-zA-Z]*}}F
-// CHECK: bb0([[IN:%.*]] : $*P):
-// CHECK:   [[COPY:%.*]] = alloc_stack $P
+// CHECK: bb0([[IN:%.*]] : $*any P):
+// CHECK:   [[COPY:%.*]] = alloc_stack $any P
 // CHECK:   copy_addr [[IN]] to [initialization] [[COPY]]
 // CHECK:   [[TMP:%.*]] = alloc_stack $S
-// CHECK:   checked_cast_addr_br take_always P in [[COPY]] : $*P to S in [[TMP]] : $*S, bb1, bb2
+// CHECK:   checked_cast_addr_br take_always any P in [[COPY]] : $*any P to S in [[TMP]] : $*S, bb1, bb2
 //   Success block.
 // CHECK: bb1:
 // CHECK:   [[T0:%.*]] = load [trivial] [[TMP]] : $*S

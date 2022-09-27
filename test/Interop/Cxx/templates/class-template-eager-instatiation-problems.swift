@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-cxx-interop)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop)
 //
 // REQUIRES: executable_test
 
@@ -23,7 +23,7 @@ TemplatesTestSuite.test("sfinae-example") {
   // This will fail since we are currently not instantiating function templates.
   // In C++ the first sfinaeGetInt should fail to instantiate, therefore get
   // ignored, and only the second sfinaeGetInt is used.
-  // TODO(SR-12541): Fix this
+  // TODO: Fix this (https://github.com/apple/swift/issues/54985):
   // let magicNumber = MagicNumber()
   // var brokenMagicWrapper = BrokenMagicWrapper()
   // expectEqual(42, brokenMagicWrapper.sfinaeGetInt(magicNumber, 0))

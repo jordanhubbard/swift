@@ -27,25 +27,25 @@ struct NoNameVoidGetter {
 };
 
 struct LongNameAllLower {
-  mutable int value = 42;
+  int value = 42;
   int getfoo() const { return value; }
-  void setfoo(int v) const { value = v; }
+  void setfoo(int v) { value = v; }
 };
 
 struct LongNameAllUpper {
-  mutable int value = 42;
+  int value = 42;
   int getFOO() const { return value; }
-  void setFOO(int v) const { value = v; }
+  void setFOO(int v) { value = v; }
 };
 
 struct UpperCaseMix {
-    mutable int value = 42;
+    int value = 42;
     int getFoo() const { return value; }
     void SetFoo(int v) { value = v; }
 };
 
 struct UpperCaseGetterSetter {
-    mutable int value = 42;
+    int value = 42;
     int GetFoo() const { return value; }
     void SetFoo(int v) { value = v; }
 };
@@ -132,24 +132,26 @@ struct ConstSetter {
 };
 
 struct MultipleArgsSetter {
-  int getX();
+  int getX() const;
   void setX(int a, int b);
 };
 
-struct NonTrivial {
+struct __attribute__((swift_attr("import_unsafe"))) NonTrivial {
   int value = 42;
   ~NonTrivial() {}
 };
 
 struct PtrGetterSetter {
   int value = 42;
-  int *getX() { return &value; }
+  int *getX() __attribute__((swift_attr("import_unsafe"))) { return &value; }
   void setX(int *v) { value = *v; }
 };
 
 struct RefGetterSetter {
   int value = 42;
-  const int &getX() { return value; }
+  const int &getX() __attribute__((swift_attr("import_unsafe"))) {
+    return value;
+  }
   void setX(const int &v) { value = v; }
 };
 
@@ -189,6 +191,24 @@ class PrivatePropertyWithSameName {
 public:
   int getValue() const;
   void setValue(int i);
+};
+
+struct SnakeCaseGetterSetter {
+  int value = 42;
+  int get_foo() const { return value; };
+  void set_foo(int v) { value = v; };
+};
+
+struct SnakeCaseUTF8Str {
+  int value = 42;
+  int get_utf8_string() const { return value; };
+  void set_utf8_string(int v) { value = v; };
+};
+
+struct SnakeCaseTrailing {
+  int value = 42;
+  int get_x_() const { return value; };
+  void set_x_(int v) { value = v; } ;
 };
 
 #endif // SWIFT_IMPLICIT_COMPUTED_PROPERTIES_H

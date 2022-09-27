@@ -1201,29 +1201,6 @@ bb0(%0 : $Builtin.RawPointer):
 
 sil @overwrite_int : $@convention(thin) (@inout Int, Int) -> ()
 
-// CHECK-LABEL: sil @test_address_block_args
-// CHECK: bb2({{.*}}):
-// CHECK: apply
-// CHECK: [[L:%.*]] = load
-// CHECK: return [[L]]
-sil @test_address_block_args : $@convention(thin) (Int) -> Int {
-bb0(%0 : $Int):
-  %4 = alloc_stack $Int
-  store %0 to %4 : $*Int
-  cond_br undef, bb1(%4 : $*Int), bb2(%4 : $*Int)
-
-bb1(%a1 : $*Int):
-  br bb2(%a1 : $*Int)
-
-bb2(%a : $*Int):
-  %l1 = load %a : $*Int
-  %60 = function_ref @overwrite_int : $@convention(thin) (@inout Int, Int) -> ()
-  %61 = apply %60(%4, %l1) : $@convention(thin) (@inout Int, Int) -> ()
-  %r = load %a : $*Int
-  dealloc_stack %4 : $*Int
-  return %r : $Int
-} 
-
 // Make sure that the store is forwarded to the load, ie. the load is
 // eliminated. That's correct as the stored value can't be changed by the
 // callee as it's passed with @in_guaranteed.
@@ -1270,3 +1247,22 @@ bb0:
   dealloc_stack_ref %1 : $AX
   return %5 : $Int32
 }
+
+sil @read_emptytuple : $@convention(thin) (@in_guaranteed ()) -> ()
+
+// CHECK-LABEL: sil @emptytuple_promotion :
+// CHECK: store
+// CHECK-LABEL: } // end sil function 'emptytuple_promotion'
+sil @emptytuple_promotion : $@convention(thin) () -> () {
+bb0:
+  %stk2 = alloc_stack $()
+  store undef to %stk2 : $*()
+  br bb1
+
+bb1:
+  %ld = load %stk2 : $*()
+  dealloc_stack %stk2 : $*()
+  %r = tuple ()
+  return %r : $()
+}
+

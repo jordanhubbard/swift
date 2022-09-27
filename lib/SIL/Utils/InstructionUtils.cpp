@@ -240,7 +240,7 @@ SILValue swift::stripBorrow(SILValue V) {
 // All instructions handled here must propagate their first operand into their
 // single result.
 //
-// This is guaranteed to handle all function-type converstions: ThinToThick,
+// This is guaranteed to handle all function-type conversions: ThinToThick,
 // ConvertFunction, and ConvertEscapeToNoEscapeInst.
 SingleValueInstruction *swift::getSingleValueCopyOrCast(SILInstruction *I) {
   if (auto *convert = dyn_cast<ConversionInst>(I))
@@ -324,10 +324,8 @@ bool swift::isInstrumentation(SILInstruction *Instruction) {
   if (isSanitizerInstrumentation(Instruction))
     return true;
 
-  if (BuiltinInst *bi = dyn_cast<BuiltinInst>(Instruction)) {
-    if (bi->getBuiltinKind() == BuiltinValueKind::IntInstrprofIncrement)
-      return true;
-  }
+  if (isa<IncrementProfilerCounterInst>(Instruction))
+    return true;
 
   return false;
 }
@@ -412,8 +410,6 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
 #undef LOADABLE_REF_STORAGE_HELPER
   case SILInstructionKind::ConvertFunctionInst:
   case SILInstructionKind::ConvertEscapeToNoEscapeInst:
-  case SILInstructionKind::ThinFunctionToPointerInst:
-  case SILInstructionKind::PointerToThinFunctionInst:
   case SILInstructionKind::RefToBridgeObjectInst:
   case SILInstructionKind::BridgeObjectToRefInst:
   case SILInstructionKind::BridgeObjectToWordInst:
@@ -426,6 +422,8 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::MoveValueInst:
   case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::CopyableToMoveOnlyWrapperValueInst:
+  case SILInstructionKind::MoveOnlyWrapperToCopyableValueInst:
   case SILInstructionKind::UncheckedOwnershipConversionInst:
   case SILInstructionKind::LoadInst:
   case SILInstructionKind::LoadBorrowInst:
@@ -482,11 +480,12 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::LinearFunctionInst:
   case SILInstructionKind::LinearFunctionExtractInst:
   case SILInstructionKind::DifferentiabilityWitnessFunctionInst:
+  case SILInstructionKind::IncrementProfilerCounterInst:
   case SILInstructionKind::EndCOWMutationInst:
     return RuntimeEffect::NoEffect;
 
   case SILInstructionKind::DebugValueInst:
-    // Ignore runtime calls of debug_vlaue
+    // Ignore runtime calls of debug_value
     return RuntimeEffect::NoEffect;
 
   case SILInstructionKind::GetAsyncContinuationInst:
@@ -569,7 +568,6 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     //return RuntimeEffect::NoEffect;
   }
 
-  case SILInstructionKind::UnconditionalCheckedCastValueInst:
   case SILInstructionKind::UnconditionalCheckedCastInst:
     impactType = inst->getOperand(0)->getType();
     return RuntimeEffect::Casting | metadataEffect(impactType) |
@@ -584,10 +582,6 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
     impactType = inst->getOperand(0)->getType();
     return RuntimeEffect::Casting | metadataEffect(impactType) |
       metadataEffect(cast<CheckedCastBranchInst>(inst)->getTargetLoweredType());
-  case SILInstructionKind::CheckedCastValueBranchInst:
-    impactType = inst->getOperand(0)->getType();
-    return RuntimeEffect::Casting | metadataEffect(impactType) |
-      metadataEffect(cast<CheckedCastValueBranchInst>(inst)->getTargetLoweredType());
 
   case SILInstructionKind::AllocStackInst:
   case SILInstructionKind::ProjectBoxInst:
@@ -601,6 +595,8 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
   case SILInstructionKind::AllocGlobalInst: {
     SILType glTy = cast<AllocGlobalInst>(inst)->getReferencedGlobal()->
                       getLoweredType();
+    if (glTy.isLoadable(*inst->getFunction()))
+      return RuntimeEffect::NoEffect;
     if (glTy.hasOpaqueArchetype()) {
       impactType = glTy;
       return RuntimeEffect::Allocating | RuntimeEffect::MetaData;
@@ -633,7 +629,16 @@ RuntimeEffect swift::getRuntimeEffect(SILInstruction *inst, SILType &impactType)
       return RuntimeEffect::MetaData | RuntimeEffect::RefCounting;
     return RuntimeEffect::MetaData;
   }
-  // Equialent to a copy_addr [init]
+  case SILInstructionKind::ExplicitCopyAddrInst: {
+    auto *ca = cast<ExplicitCopyAddrInst>(inst);
+    impactType = ca->getSrc()->getType();
+    if (!ca->isInitializationOfDest())
+      return RuntimeEffect::MetaData | RuntimeEffect::Releasing;
+    if (!ca->isTakeOfSrc())
+      return RuntimeEffect::MetaData | RuntimeEffect::RefCounting;
+    return RuntimeEffect::MetaData;
+  }
+  // Equivalent to a copy_addr [init]
   case SILInstructionKind::MarkUnresolvedMoveAddrInst: {
     return RuntimeEffect::MetaData | RuntimeEffect::RefCounting;
   }

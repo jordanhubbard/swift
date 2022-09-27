@@ -24,7 +24,7 @@ template <class R, class T, class U> R templateParameterReturnType(T a, U b) {
 // Same here:
 template <class T> void cannotInferTemplate() {}
 
-struct HasVariadicMemeber {
+struct HasVariadicMember {
   void test1(...) {}
   void test2(int, ...) {}
 };
@@ -44,13 +44,29 @@ decltype(auto) testAuto(T arg) {
   return arg;
 }
 
+template <typename T>
+struct ClassTemplate {
+  T t;
+};
+
+template <typename T>
+void takesPointerToDependent(ClassTemplate<T> *ct) {
+  ct->t++;
+}
+
+template <typename T>
+T usedInDeclType(T) {}
+
+template <typename T>
+void takesDeclTypePointer(decltype(usedInDeclType<T>()) *) {}
+
 // TODO: Add tests for Decltype, UnaryTransform, and TemplateSpecialization with
 // a dependent type once those are supported.
 
 // TODO: Add test for DeducedTemplateSpecializationType once we support class templates.
 
-// TODO(SR-13809): We don't yet support dependent types but we still shouldn't
-// crash when importing one.
+// TODO: We don't yet support dependent types but we still shouldn't
+// crash when importing one (https://github.com/apple/swift/issues/56206).
 template <class T> struct Dep { using TT = T; };
 
 template <class T> void useDependentType(typename Dep<T>::TT) {}

@@ -39,6 +39,8 @@ include(StdlibOptions)
 # End of user-configurable options.
 #
 
+set(SWIFT_STDLIB_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+
 # Remove llvm-project/llvm/include directory from -I search part when building
 # the stdlib. We have our own fork of LLVM includes (Support, ADT) in
 # stdlib/include/llvm and we don't want to silently use headers from LLVM.
@@ -174,8 +176,8 @@ function(swift_create_stdlib_targets name variant define_all_alias)
 endfunction()
 
 if("${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}" STREQUAL "singlethreaded"
-   AND NOT SWIFT_STDLIB_SINGLE_THREADED_RUNTIME)
-  message(SEND_ERROR "Cannot enable the single-threaded global executor without enabling SWIFT_STDLIB_SINGLE_THREADED_RUNTIME")
+   AND NOT SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY)
+  message(SEND_ERROR "Cannot enable the single-threaded global executor without enabling SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY")
 endif()
 
 swift_create_stdlib_targets("swift-stdlib" "" TRUE)

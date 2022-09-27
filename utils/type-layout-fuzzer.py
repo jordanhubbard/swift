@@ -1,11 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # This script outputs a Swift source with randomly-generated type definitions,
 # which can be used for ABI or layout algorithm fuzzing.
 
 # TODO: generate types with generics, existentials, compositions
-
-from __future__ import print_function
 
 import random
 import sys
@@ -133,7 +131,7 @@ def defineRandomNominalType(name, depth=0):
         print("}")
         print()
 
-    def clas():
+    def clazz():
         defineRandomClass(name, depth)
 
     def enum():
@@ -147,7 +145,7 @@ def defineRandomNominalType(name, depth=0):
         print("}")
         print()
 
-    kinds = [struct, clas, enum]
+    kinds = [struct, clazz, enum]
     return random.choice(kinds)()
 
 

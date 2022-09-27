@@ -12,6 +12,10 @@
 
 import SILBridging
 
+// Need to export "Basic" to make `Basic.assert` available in the Optimizer module.
+// Otherwise The Optimizer would fall back to Swift's assert implementation.
+@_exported import Basic
+
 //===----------------------------------------------------------------------===//
 //                              Lists
 //===----------------------------------------------------------------------===//
@@ -85,8 +89,8 @@ public struct ReverseList<NodeType: ListNode> :
 /// full object) in collection descriptions.
 ///
 /// This is useful to make collections, e.g. of BasicBlocks or Functions, readable.
-public protocol HasName {
-  var name: String { get }
+public protocol HasShortDescription {
+  var shortDescription: String { get }
 }
 
 private struct CustomMirrorChild : CustomStringConvertible, CustomReflectable {
@@ -104,8 +108,8 @@ extension FormattedLikeArray {
   /// Display a Sequence in an array like format, e.g. [a, b, c]
   public var description: String {
     "[" + map {
-      if let named = $0 as? HasName {
-        return named.name
+      if let named = $0 as? HasShortDescription {
+        return named.shortDescription
       }
       return String(describing: $0)
     }.joined(separator: ", ") + "]"
@@ -120,14 +124,28 @@ extension FormattedLikeArray {
     }
     let c: [Mirror.Child] = map {
       let val: Any
-      if let named = $0 as? HasName {
-        val = CustomMirrorChild(description: named.name)
+      if let named = $0 as? HasShortDescription {
+        val = CustomMirrorChild(description: named.shortDescription)
       } else {
         val = $0
       }
       return (label: nil, value: val)
     }
     return Mirror(self, children: c, displayStyle: .collection)
+  }
+}
+
+/// RandomAccessCollection which bridges to some C++ array.
+///
+/// It fixes the default reflection for bridged random access collections, which usually have a
+/// `bridged` stored property.
+/// Conforming to this protocol displays the "real" children  not just `bridged`.
+public protocol BridgedRandomAccessCollection : RandomAccessCollection, CustomReflectable {
+}
+
+extension BridgedRandomAccessCollection {
+  public var customMirror: Mirror {
+    Mirror(self, children: self.map { (label: nil, value: $0 as Any) })
   }
 }
 

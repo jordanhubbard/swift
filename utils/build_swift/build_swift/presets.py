@@ -12,14 +12,10 @@ Swift preset parsing and handling functionality.
 """
 
 
-from __future__ import absolute_import, unicode_literals
-
+import configparser
 import functools
 import io
 from collections import OrderedDict, namedtuple
-
-from six import StringIO
-from six.moves import configparser
 
 from . import class_utils
 
@@ -120,7 +116,7 @@ class PresetError(Exception):
 
 
 class DuplicatePresetError(PresetError):
-    """Raised when an existing preset would be overriden.
+    """Raised when an existing preset would be overridden.
     """
 
     def __init__(self, preset_name):
@@ -310,17 +306,12 @@ class PresetParser(object):
     @_catch_duplicate_option_error
     @_catch_duplicate_section_error
     def read_string(self, string):
-        """Reads and parses a string containing preset definintions.
+        """Reads and parses a string containing preset definitions.
         """
 
-        fp = StringIO(string)
+        fp = io.StringIO(string)
 
-        # ConfigParser changes drastically from Python 2 to 3
-        if hasattr(self._parser, 'read_file'):
-            self._parser.read_file(fp)
-        else:
-            self._parser.readfp(fp)
-
+        self._parser.read_file(fp)
         self._parse_raw_presets()
 
     # -------------------------------------------------------------------------
@@ -361,9 +352,9 @@ class PresetParser(object):
     def _interpolate_preset_vars(self, preset, vars):
         interpolated_options = []
         for (name, value) in preset.options:
-            # If the option is a key-value pair, e.g. 
+            # If the option is a key-value pair, e.g.
             # install-destdir=%(install_dir)s
-            # interpolate the value. If it is a raw option, e.g. 
+            # interpolate the value. If it is a raw option, e.g.
             # %(some_flag)s
             # is a raw option without a value, expand the name.
             if value:

@@ -32,6 +32,12 @@ static StringRef getRuntimeLibPath() {
   return sys::path::parent_path(SWIFTLIB_DIR);
 }
 
+static SmallString<128> getSwiftExecutablePath() {
+  SmallString<128> path = sys::path::parent_path(getRuntimeLibPath());
+  sys::path::append(path, "bin", "swift-frontend");
+  return path;
+}
+
 namespace {
 
 struct Token {
@@ -124,7 +130,8 @@ public:
     // This is avoiding destroying \p SourceKit::Context because another
     // thread may be active trying to use it to post notifications.
     // FIXME: Use shared_ptr ownership to avoid such issues.
-    Ctx = new SourceKit::Context(getRuntimeLibPath(),
+    Ctx = new SourceKit::Context(getSwiftExecutablePath(),
+                                 getRuntimeLibPath(),
                                  /*diagnosticDocumentationPath*/ "",
                                  SourceKit::createSwiftLangSupport,
                                  /*dispatchOnMain=*/false);
@@ -313,7 +320,7 @@ void EditTest::doubleOpenWithDelay(std::chrono::microseconds delay,
   close(DocName);
 }
 
-// This test is failing occassionally in CI: rdar://45644449
+// This test is failing occasionally in CI: rdar://45644449
 TEST_F(EditTest, DISABLED_DiagsAfterCloseAndReopen) {
   // Attempt to open the same file twice in a row. This tests (subject to
   // timing) cases where:

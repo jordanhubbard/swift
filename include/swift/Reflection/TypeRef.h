@@ -563,39 +563,48 @@ public:
   }
 };
 
-class ParameterizedProtocolTypeRef final : public TypeRef {
+class ConstrainedExistentialTypeRef final : public TypeRef {
   const ProtocolCompositionTypeRef *Base;
-  std::vector<const TypeRef *> Args;
+  std::vector<TypeRefRequirement> Requirements;
 
   static TypeRefID Profile(const ProtocolCompositionTypeRef *Protocol,
-                           std::vector<const TypeRef *> Args) {
+                           std::vector<TypeRefRequirement> Requirements) {
     TypeRefID ID;
     ID.addPointer(Protocol);
-    for (auto Arg : Args) {
-      ID.addPointer(Arg);
+    for (auto reqt : Requirements) {
+      ID.addPointer(reqt.getFirstType());
+      if (reqt.getKind() != RequirementKind::Layout)
+        ID.addPointer(reqt.getSecondType());
+      else
+        ID.addInteger(
+            unsigned(0)); // FIXME: Layout constraints aren't implemented yet
+      ID.addInteger(unsigned(reqt.getKind()));
     }
     return ID;
   }
 
 public:
-  ParameterizedProtocolTypeRef(const ProtocolCompositionTypeRef *Protocol,
-                               std::vector<const TypeRef *> Args)
-      : TypeRef(TypeRefKind::ParameterizedProtocol), Base(Protocol),
-        Args(Args) {}
+  ConstrainedExistentialTypeRef(const ProtocolCompositionTypeRef *Protocol,
+                                std::vector<TypeRefRequirement> Requirements)
+      : TypeRef(TypeRefKind::ConstrainedExistential), Base(Protocol),
+        Requirements(Requirements) {}
 
   template <typename Allocator>
-  static const ParameterizedProtocolTypeRef *
+  static const ConstrainedExistentialTypeRef *
   create(Allocator &A, const ProtocolCompositionTypeRef *Protocol,
-         std::vector<const TypeRef *> Args) {
-    FIND_OR_CREATE_TYPEREF(A, ParameterizedProtocolTypeRef, Protocol, Args);
+         std::vector<TypeRefRequirement> Requirements) {
+    FIND_OR_CREATE_TYPEREF(A, ConstrainedExistentialTypeRef, Protocol,
+                           Requirements);
   }
 
   const ProtocolCompositionTypeRef *getBase() const { return Base; }
 
-  const std::vector<const TypeRef *> &getArgs() const { return Args; }
+  const std::vector<TypeRefRequirement> &getRequirements() const {
+    return Requirements;
+  }
 
   static bool classof(const TypeRef *TR) {
-    return TR->getKind() == TypeRefKind::ParameterizedProtocol;
+    return TR->getKind() == TypeRefKind::ConstrainedExistential;
   }
 };
 
@@ -738,6 +747,37 @@ public:
 
   static bool classof(const TypeRef *TR) {
     return TR->getKind() == TypeRefKind::DependentMember;
+  }
+};
+
+/// A representation of a dynamically-constructed generic signature.
+///
+/// \note This class is not a \c TypeRef.
+class GenericSignatureRef final {
+  std::vector<const GenericTypeParameterTypeRef *> Params;
+  std::vector<TypeRefRequirement> Requirements;
+
+public:
+  GenericSignatureRef(
+      llvm::ArrayRef<const GenericTypeParameterTypeRef *> Params,
+      llvm::ArrayRef<TypeRefRequirement> Requirements)
+      : Params(Params.begin(), Params.end()),
+        Requirements(Requirements.begin(), Requirements.end()) {}
+
+  template <typename Allocator>
+  static const GenericSignatureRef *
+  create(Allocator &A,
+         llvm::ArrayRef<const GenericTypeParameterTypeRef *> Params,
+         llvm::ArrayRef<TypeRefRequirement> Requirements) {
+    return A.makeGenericSignatureRef(Params, Requirements);
+  }
+
+  const llvm::ArrayRef<const GenericTypeParameterTypeRef *> getParams() const {
+    return Params;
+  }
+
+  const llvm::ArrayRef<TypeRefRequirement> getRequirements() const {
+    return Requirements;
   }
 };
 

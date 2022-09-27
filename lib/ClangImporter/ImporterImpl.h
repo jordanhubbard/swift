@@ -33,6 +33,9 @@
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "clang/AST/ASTContext.h"
+#include "clang/AST/Decl.h"
+#include "clang/Lex/MacroInfo.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/AST/DeclVisitor.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Basic/IdentifierTable.h"
@@ -50,6 +53,7 @@
 #include <functional>
 #include <set>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace llvm {
@@ -60,12 +64,8 @@ class SmallBitVector;
 
 namespace clang {
 class APValue;
-class Decl;
 class DeclarationName;
-class EnumDecl;
-class MacroInfo;
 class MangleContext;
-class NamedDecl;
 class ObjCInterfaceDecl;
 class ObjCMethodDecl;
 class ObjCPropertyDecl;
@@ -187,6 +187,48 @@ enum class ImportTypeKind {
   Enum
 };
 
+/// Flags which are extracted from an imported declaration to influence how its
+/// type is imported. Typically used via \c ImportTypeAttrs to form an option
+/// set.
+///
+/// \warning Do not use this as a random grab bag of flags to \c importType() .
+/// This information is intended to be extracted and applied all at once.
+enum class ImportTypeAttr : uint8_t {
+  /// Type should be imported as though declaration was marked with
+  /// \c __attribute__((noescape)) .
+  NoEscape = 1 << 0,
+
+  /// Type should be imported as though declaration was marked with
+  /// \c __attribute__((swift_attr("@MainActor"))) .
+  MainActor = 1 << 1,
+
+  /// Type should be imported as though declaration was marked with
+  /// \c __attribute__((swift_attr("@Sendable"))) .
+  Sendable = 1 << 2,
+
+  /// Type is in a declaration where it would be imported as Sendable by
+  /// default. This comes directly from the parameters to
+  /// \c getImportTypeAttrs() and merely affects diagnostics.
+  DefaultsToSendable = 1 << 3
+};
+
+/// Attributes which were set on the declaration and affect how its type is
+/// imported.
+///
+/// \seeAlso ImportTypeAttr
+using ImportTypeAttrs = OptionSet<ImportTypeAttr>;
+
+/// Extracts the \c ImportTypeAttrs from a declaration.
+///
+/// \param D The declaration to extract attributes from.
+/// \param isParam Is the declaration a function parameter? If so, additional
+///        attributes will be imported.
+/// \param sendableByDefault If the sendability of the declaration is not
+///        specified, should the \c \@Sendable attribute be added implicitly?
+///        Used for e.g. completion handlers.
+ImportTypeAttrs getImportTypeAttrs(const clang::Decl *D, bool isParam = false,
+                                   bool sendableByDefault = false);
+
 struct ImportDiagnostic {
   ImportDiagnosticTarget target;
   Diagnostic diag;
@@ -275,7 +317,7 @@ public:
   bool isPlatformRelevant(StringRef platform) const;
 
   /// Returns true when the given declaration with the given deprecation
-  /// should be inlucded in the cutoff of imported deprecated APIs marked
+  /// should be included in the cutoff of imported deprecated APIs marked
   /// unavailable.
   bool treatDeprecatedAsUnavailable(const clang::Decl *clangDecl,
                                     const llvm::VersionTuple &version,
@@ -574,16 +616,24 @@ public:
 
   /// Keep track of cxx function names, params etc in order to
   /// allow for de-duping functions that differ strictly on "constness".
-  llvm::DenseMap<llvm::StringRef,
+  llvm::DenseMap<const clang::DeclContext *, llvm::DenseMap<llvm::StringRef,
                  std::pair<
                      llvm::DenseSet<clang::FunctionDecl *>,
-                     llvm::DenseSet<clang::FunctionDecl *>>>
+                     llvm::DenseSet<clang::FunctionDecl *>>>>
       cxxMethods;
+
+  // Keep track of the decls that were already cloned for this specific class.
+  llvm::DenseMap<std::pair<ValueDecl *, DeclContext *>, ValueDecl *>
+      clonedBaseMembers;
 
   // Cache for already-specialized function templates and any thunks they may
   // have.
   llvm::DenseMap<clang::FunctionDecl *, ValueDecl *>
       specializedFunctionTemplates;
+
+  /// Stores qualified names of C++ template specializations that were too deep
+  /// to import into Swift.
+  llvm::StringSet<> tooDeepTemplateSpecializations;
 
   /// Keeps track of the Clang functions that have been turned into
   /// properties.
@@ -720,7 +770,7 @@ public:
   /// Tracks macro definitions from the bridging header.
   std::vector<clang::IdentifierInfo *> BridgeHeaderMacros;
   /// Tracks included headers from the bridging header.
-  llvm::DenseSet<const clang::FileEntry *> BridgeHeaderFiles;
+  llvm::DenseSet<clang::FileEntryRef> BridgeHeaderFiles;
 
   void addBridgeHeaderTopLevelDecls(clang::Decl *D);
   bool shouldIgnoreBridgeHeaderTopLevelDecl(clang::Decl *D);
@@ -894,7 +944,7 @@ public:
 
   void addImportDiagnostic(
       ImportDiagnosticTarget target, Diagnostic &&diag,
-      const clang::SourceLocation &loc = clang::SourceLocation());
+      clang::SourceLocation loc);
 
   /// Import the given Clang identifier into Swift.
   ///
@@ -953,8 +1003,8 @@ public:
   void importAttributes(const clang::NamedDecl *ClangDecl, Decl *MappedDecl,
                         const clang::ObjCContainerDecl *NewContext = nullptr);
 
-  Type applyParamAttributes(const clang::ParmVarDecl *param, Type type,
-                            bool sendableByDefault);
+  Type applyImportTypeAttrs(ImportTypeAttrs attrs, Type type,
+                 llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn);
 
   /// If we already imported a given decl, return the corresponding Swift decl.
   /// Otherwise, return nullptr.
@@ -1060,53 +1110,11 @@ public:
   DeclContext *importDeclContextOf(const clang::Decl *D,
                                    EffectiveClangContext context);
 
-  /// Create a new named constant with the given value.
-  ///
-  /// \param name The name of the constant.
-  /// \param dc The declaration context into which the name will be introduced.
-  /// \param type The type of the named constant.
-  /// \param value The value of the named constant.
-  /// \param convertKind How to convert the constant to the given type.
-  /// \param isStatic Whether the constant should be a static member of \p dc.
-  ValueDecl *createConstant(Identifier name, DeclContext *dc,
-                            Type type, const clang::APValue &value,
-                            ConstantConvertKind convertKind,
-                            bool isStatic,
-                            ClangNode ClangN);
-
-  /// Create a new named constant with the given value.
-  ///
-  /// \param name The name of the constant.
-  /// \param dc The declaration context into which the name will be introduced.
-  /// \param type The type of the named constant.
-  /// \param value The value of the named constant.
-  /// \param convertKind How to convert the constant to the given type.
-  /// \param isStatic Whether the constant should be a static member of \p dc.
-  ValueDecl *createConstant(Identifier name, DeclContext *dc,
-                            Type type, StringRef value,
-                            ConstantConvertKind convertKind,
-                            bool isStatic,
-                            ClangNode ClangN);
-
-  /// Create a new named constant using the given expression.
-  ///
-  /// \param name The name of the constant.
-  /// \param dc The declaration context into which the name will be introduced.
-  /// \param type The type of the named constant.
-  /// \param valueExpr An expression to use as the value of the constant.
-  /// \param convertKind How to convert the constant to the given type.
-  /// \param isStatic Whether the constant should be a static member of \p dc.
-  ValueDecl *createConstant(Identifier name, DeclContext *dc,
-                            Type type, Expr *valueExpr,
-                            ConstantConvertKind convertKind,
-                            bool isStatic,
-                            ClangNode ClangN);
-
   /// Determine whether the given declaration is considered
   /// 'unavailable' in Swift.
   bool isUnavailableInSwift(const clang::Decl *decl) {
     return importer::isUnavailableInSwift(
-        decl, platformAvailability, SwiftContext.LangOpts.EnableObjCInterop);
+        decl, &platformAvailability, SwiftContext.LangOpts.EnableObjCInterop);
   }
 
   /// Add "Unavailable" annotation to the swift declaration.
@@ -1117,6 +1125,18 @@ public:
   ValueDecl *createUnavailableDecl(Identifier name, DeclContext *dc,
                                    Type type, StringRef UnavailableMessage,
                                    bool isStatic, ClangNode ClangN);
+
+  /// Add a synthesized typealias to the given nominal type.
+  void addSynthesizedTypealias(NominalTypeDecl *nominal, Identifier name,
+                               Type underlyingType);
+
+  void addSynthesizedProtocolAttrs(
+      NominalTypeDecl *nominal,
+      ArrayRef<KnownProtocolKind> synthesizedProtocolAttrs,
+      bool isUnchecked = false);
+
+  void makeComputed(AbstractStorageDecl *storage, AccessorDecl *getter,
+                    AccessorDecl *setter);
 
   /// Retrieve the standard library module.
   ModuleDecl *getStdlibModule();
@@ -1213,6 +1233,11 @@ public:
   ///   but in parameter position they are known to always be passed at +0.
   ///   See also the \p topLevelBridgeability parameter.
   ///
+  /// \param addImportDiagnosticFn A function that can be called to add import
+  ///   diagnostics to the declaration being imported. This can be any lambda or
+  ///   callable object, but it's designed to be compatible with
+  ///   \c ImportDiagnosticAdder .
+  ///
   /// \param allowNSUIntegerAsInt If true, NSUInteger will be imported as Int
   ///   in certain contexts. If false, it will always be imported as UInt.
   ///
@@ -1229,6 +1254,10 @@ public:
   ///   funny going on, we either have to use a less lossy version of the type
   ///   (ObjCBool rather than Bool) or refuse to import it at all (a block with
   ///   the \c ns_returns_retained attribute).
+  ///
+  /// \param attrs Attributes extracted from the declaration containing the type
+  ///   that should be applied to it. This should usually generated by applying
+  ///   \c getImportTypeAttrs() to the declaration.
   ///
   /// \param optional If the imported type was a pointer-like type in C, this
   ///   optionality is applied to the resulting Swift type.
@@ -1247,7 +1276,9 @@ public:
   ///          field will be null.
   ImportedType
   importType(clang::QualType type, ImportTypeKind kind,
+             llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn,
              bool allowNSUIntegerAsInt, Bridgeability topLevelBridgeability,
+             ImportTypeAttrs attrs,
              OptionalTypeKind optional = OTK_ImplicitlyUnwrappedOptional,
              bool resugarNSErrorPointer = true,
              Optional<unsigned> completionHandlerErrorParamIndex = None);
@@ -1262,8 +1293,10 @@ public:
   /// \returns The imported type, or null if this type could not be
   ///   represented in Swift.
   Type importTypeIgnoreIUO(
-      clang::QualType type, ImportTypeKind kind, bool allowNSUIntegerAsInt,
-      Bridgeability topLevelBridgeability,
+      clang::QualType type, ImportTypeKind kind,
+      llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn,
+      bool allowNSUIntegerAsInt, Bridgeability topLevelBridgeability,
+      ImportTypeAttrs attrs,
       OptionalTypeKind optional = OTK_ImplicitlyUnwrappedOptional,
       bool resugarNSErrorPointer = true);
 
@@ -1331,6 +1364,51 @@ public:
       bool allowNSUIntegerAsInt, ArrayRef<Identifier> argNames,
       ArrayRef<GenericTypeParamDecl *> genericParams, Type resultType);
 
+  struct ImportParameterTypeResult {
+    /// The imported parameter Swift type.
+    swift::Type swiftTy;
+    /// If the parameter is or not inout.
+    bool isInOut;
+    /// If the parameter is implicitly unwrapped or not.
+    bool isParamTypeImplicitlyUnwrapped;
+  };
+
+  /// Import a parameter type
+  ///
+  /// \param param The underlaying parameter declaraction.
+  /// \param optionalityOfParam The kind of optionality for the parameter
+  ///        being imported.
+  /// \param allowNSUIntegerAsInt If true, NSUInteger will be import as Int
+  ///        in certain contexts. If false, it will always be import as UInt.
+  /// \param isNSDictionarySubscriptGetter If true, the parameter is being
+  ///        imported as part of an NSDictionary subscript getter. If false,
+  ///        the parameter belongs to some other kind of method/function.
+  /// \param paramIsError If true, the parameter being imported is an NSError
+  ///        parameter. If false, the parameter is not an error parameter.
+  /// \param paramIsCompletionHandler If true, the parameter being imported is
+  ///        a completion handler. If false, the parameter is not a completion
+  ///        handler.
+  /// \param completionHandlerErrorParamIndex If it contains a value, the value
+  ///        indicates the index of the completion handler whose error
+  ///        parameter is used to indicate throwing. If None, the function does
+  ///        not have such parameter.
+  /// \param genericParams For C++ functions, an array of the generic type
+  ///        parameters of the function. For the rest of cases, an empty array
+  ///        can be provided.
+  /// \param addImportDiagnosticFn A function that can be called to add import
+  ///        diagnostics to the declaration being imported. This can be any
+  ///        lambda or callable object, but it's designed to be compatible
+  ///        with \c ImportDiagnosticAdder .
+  ///
+  /// \returns The imported parameter result on success, or None on failure.
+  Optional<ImportParameterTypeResult> importParameterType(
+      const clang::ParmVarDecl *param, OptionalTypeKind optionalityOfParam,
+      bool allowNSUIntegerAsInt, bool isNSDictionarySubscriptGetter,
+      bool paramIsError, bool paramIsCompletionHandler,
+      Optional<unsigned> completionHandlerErrorParamIndex,
+      ArrayRef<GenericTypeParamDecl *> genericParams,
+      llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn);
+
   ImportedType importPropertyType(const clang::ObjCPropertyDecl *clangDecl,
                                   bool isFromSystemModule);
 
@@ -1343,7 +1421,7 @@ public:
 
   /// Attempt to infer a default argument for a parameter with the
   /// given Clang \c type, \c baseName, and optionality.
-  static DefaultArgumentKind
+  static ArgumentAttrs
   inferDefaultArgument(clang::QualType type, OptionalTypeKind clangOptionality,
                        DeclBaseName baseName, StringRef argumentLabel,
                        bool isFirstParameter, bool isLastParameter,
@@ -1535,8 +1613,15 @@ public:
     llvm_unreachable("unimplemented for ClangImporter");
   }
 
-  void loadAssociatedTypes(const ProtocolDecl *decl, uint64_t contextData,
-                           SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override {
+  void loadAssociatedTypes(
+      const ProtocolDecl *decl, uint64_t contextData,
+      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override {
+    llvm_unreachable("unimplemented for ClangImporter");
+  }
+
+  void loadPrimaryAssociatedTypes(
+      const ProtocolDecl *decl, uint64_t contextData,
+      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override {
     llvm_unreachable("unimplemented for ClangImporter");
   }
 
@@ -1681,6 +1766,22 @@ public:
   }
 };
 
+class ImportDiagnosticAdder {
+  ClangImporter::Implementation &impl;
+  ImportDiagnosticTarget target;
+  const clang::SourceLocation loc;
+
+public:
+  ImportDiagnosticAdder(
+      ClangImporter::Implementation &impl, ImportDiagnosticTarget target,
+      clang::SourceLocation loc)
+      : impl(impl), target(target), loc(loc) {}
+
+  void operator () (Diagnostic &&diag) {
+    impl.addImportDiagnostic(target, std::move(diag), loc);
+  }
+};
+
 namespace importer {
 
 /// Whether this is a forward declaration of a type. We ignore forward
@@ -1693,10 +1794,6 @@ bool shouldSuppressDeclImport(const clang::Decl *decl);
 /// Identifies certain UIKit constants that used to have overlay equivalents,
 /// but are now renamed using the swift_name attribute.
 bool isSpecialUIKitStructZeroProperty(const clang::NamedDecl *decl);
-
-/// \returns true if this operator should be made a static function
-/// even if imported as a non-static member function.
-bool isImportedAsStatic(clang::OverloadedOperatorKind op);
 
 /// \returns true if \p a has the same underlying type as \p b after removing
 /// any pointer/reference specifiers. Note that this does not currently look through
@@ -1772,6 +1869,9 @@ public:
 /// actor.
 bool isMainActorAttr(const clang::SwiftAttrAttr *swiftAttr);
 
+/// Determines whether the given swift_attr controls mutability
+bool isMutabilityAttr(const clang::SwiftAttrAttr *swiftAttr);
+
 /// Apply an attribute to a function type.
 static inline Type applyToFunctionType(
     Type type, llvm::function_ref<ASTExtInfo(ASTExtInfo)> transform) {
@@ -1789,6 +1889,42 @@ static inline Type applyToFunctionType(
   }
 
   return type;
+}
+
+inline Optional<const clang::EnumDecl *> findAnonymousEnumForTypedef(
+    const ASTContext &ctx,
+    const clang::TypedefType *typedefType) {
+  auto *typedefDecl = typedefType->getDecl();
+  auto *lookupTable = ctx.getClangModuleLoader()->findLookupTable(typedefDecl->getOwningModule());
+
+  auto foundDecls = lookupTable->lookup(
+      SerializedSwiftName(typedefDecl->getName()), EffectiveClangContext());
+
+  auto found = llvm::find_if(foundDecls, [](SwiftLookupTable::SingleEntry decl) {
+    return decl.is<clang::NamedDecl *>() &&
+        isa<clang::EnumDecl>(decl.get<clang::NamedDecl *>());
+  });
+
+  if (found != foundDecls.end())
+    return cast<clang::EnumDecl>(found->get<clang::NamedDecl *>());
+
+  return None;
+}
+
+inline bool requiresCPlusPlus(const clang::Module *module) {
+  // The libc++ modulemap doesn't currently declare the requirement.
+  if (module->getTopLevelModuleName() == "std")
+    return true;
+
+  // Modulemaps often declare the requirement for the top-level module only.
+  if (auto parent = module->Parent) {
+    if (requiresCPlusPlus(parent))
+      return true;
+  }
+
+  return llvm::any_of(module->Requirements, [](clang::Module::Requirement req) {
+    return req.first == "cplusplus";
+  });
 }
 
 }

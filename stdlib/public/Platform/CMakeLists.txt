@@ -142,8 +142,7 @@ foreach(sdk ${SWIFT_SDKS})
         SOURCE "${glibc_modulemap_source}"
         OUTPUT "${glibc_modulemap_out}"
         FLAGS
-            "-DCMAKE_SDK=${sdk}"
-            "-DGLIBC_INCLUDE_PATH=${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}")
+            "-DCMAKE_SDK=${sdk}")
 
     list(APPEND glibc_modulemap_target_list ${glibc_modulemap_target})
 
@@ -176,14 +175,10 @@ foreach(sdk ${SWIFT_SDKS})
        NOT (${sdk} STREQUAL ANDROID AND NOT "${SWIFT_ANDROID_NATIVE_SYSROOT}" STREQUAL ""))
       set(glibc_sysroot_relative_modulemap_out "${module_dir}/sysroot-relative-modulemaps/glibc.modulemap")
 
-      string(REPLACE "${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_ARCH_${arch}_PATH}"
-        "" absolute_libc_include_path "${SWIFT_SDK_${sdk}_ARCH_${arch}_LIBC_INCLUDE_DIRECTORY}")
-
       handle_gyb_source_single(glibc_modulemap_native_target
         SOURCE "${glibc_modulemap_source}"
         OUTPUT "${glibc_sysroot_relative_modulemap_out}"
-        FLAGS "-DCMAKE_SDK=${sdk}"
-              "-DGLIBC_INCLUDE_PATH=${absolute_libc_include_path}")
+        FLAGS "-DCMAKE_SDK=${sdk}")
 
       list(APPEND glibc_modulemap_target_list ${glibc_modulemap_native_target})
       set(glibc_modulemap_out ${glibc_sysroot_relative_modulemap_out})
@@ -192,7 +187,7 @@ foreach(sdk ${SWIFT_SDKS})
     # FIXME: When SDK is a cross-compile target (SDK != Host), the generated
     #        modulemap will be relative to the Host, with hardcoded paths.
     #        It is not relocatable to the target platform itself.
-    #        This affects any cross-comipled targets that use glibc.modulemap.
+    #        This affects any cross-compiled targets that use glibc.modulemap.
 
     swift_install_in_component(FILES "${glibc_modulemap_out}"
                                DESTINATION "lib/swift/${arch_subdir}"

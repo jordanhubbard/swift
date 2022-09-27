@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 # This is a simple script that takes in an scurve file produced by
 # csvcolumn_to_scurve and produces a png graph of the scurve.
@@ -73,7 +73,7 @@ def main():
     ax.set_xlim(0.0, 1.0)
     y_min = args.y_axis_min or 1.0 - y_limit
     y_max = args.y_axis_max or 1.0 + y_limit
-    assert(y_min <= y_max)
+    assert y_min <= y_max
     ax.set_ylim(y_min, y_max)
     ax.grid(True)
     ax.xaxis.set_ticks(np.arange(0.0, 1.0, 0.05))

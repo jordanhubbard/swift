@@ -19,6 +19,7 @@
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/InstructionUtils.h"
+#include "swift/SIL/NodeBits.h"
 #include "swift/SIL/PatternMatch.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILBuilder.h"
@@ -1032,7 +1033,8 @@ SILInstruction *SILCombiner::visitIndexAddrInst(IndexAddrInst *IA) {
 
   auto *newIndex = Builder.createIntegerLiteral(IA->getLoc(),
                                     IA->getIndex()->getType(), index + index2);
-  return Builder.createIndexAddr(IA->getLoc(), base2, newIndex);
+  return Builder.createIndexAddr(IA->getLoc(), base2, newIndex,
+    IA->needsStackProtection() || cast<IndexAddrInst>(base)->needsStackProtection());
 }
 
 /// Walks over all fields of an aggregate and checks if a reference count
@@ -1224,7 +1226,7 @@ SILInstruction *SILCombiner::visitCopyValueInst(CopyValueInst *cvi) {
   // transformations around function types that result in given a copy_value a
   // thin_to_thick_function argument). In such a case, just RAUW with the
   // copy_value's operand since it is a no-op.
-  if (cvi->getOperand().getOwnershipKind() == OwnershipKind::None) {
+  if (cvi->getOperand()->getOwnershipKind() == OwnershipKind::None) {
     replaceInstUsesWith(*cvi, cvi->getOperand());
     return eraseInstFromFunction(*cvi);
   }
@@ -1240,7 +1242,7 @@ SILInstruction *SILCombiner::visitDestroyValueInst(DestroyValueInst *dvi) {
   //
   // As an example, consider transformations around function types that result
   // in a thin_to_thick_function being passed to a destroy_value.
-  if (dvi->getOperand().getOwnershipKind() == OwnershipKind::None) {
+  if (dvi->getOperand()->getOwnershipKind() == OwnershipKind::None) {
     eraseInstFromFunction(*dvi);
     return nullptr;
   }
@@ -1526,7 +1528,7 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
   }
   InitEnumDataAddrInst *DataAddrInst = nullptr;
   InjectEnumAddrInst *EnumAddrIns = nullptr;
-  llvm::SmallPtrSet<SILInstruction *, 32> WriteSet;
+  InstructionSetWithSize WriteSet(IEAI->getFunction());
   for (auto UsersIt : ASO->getUses()) {
     SILInstruction *CurrUser = UsersIt->getUser();
     if (CurrUser->isDeallocatingStack()) {
@@ -1592,7 +1594,7 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
           // don't care about what comes before init enum in the basic block
           break;
         }
-        if (WriteSet.count(Ins) != 0) {
+        if (WriteSet.contains(Ins) != 0) {
           return nullptr;
         }
       }
@@ -2034,7 +2036,7 @@ SILInstruction *SILCombiner::visitCondBranchInst(CondBranchInst *CBI) {
     //    lifetime of that argument.
     SILValue selectEnumOperand = SEI->getEnumOperand();
     SILValue switchEnumOperand = selectEnumOperand;
-    if (selectEnumOperand.getOwnershipKind() != OwnershipKind::None) {
+    if (selectEnumOperand->getOwnershipKind() != OwnershipKind::None) {
       switchEnumOperand =
           makeCopiedValueAvailable(selectEnumOperand, Builder.getInsertionBB());
     }
@@ -2259,7 +2261,6 @@ visitAllocRefDynamicInst(AllocRefDynamicInst *ARDI) {
     if (!use || use->getUser() != ARDI)
       return nullptr;
 
-    auto silTy = AI->getType();
     auto storageTy = AI->getType().getASTType();
     // getContiguousArrayStorageType<SomeClass> =>
     //   ContiguousArrayStorage<AnyObject>
@@ -2348,7 +2349,7 @@ SILInstruction *SILCombiner::visitMarkDependenceInst(MarkDependenceInst *mdi) {
   {
     SILType baseType = base->getType();
     if (baseType.isObject()) {
-      if ((hasOwnership() && base.getOwnershipKind() == OwnershipKind::None) ||
+      if ((hasOwnership() && base->getOwnershipKind() == OwnershipKind::None) ||
           baseType.isTrivial(*mdi->getFunction())) {
         SILValue value = mdi->getValue();
         replaceInstUsesWith(*mdi, value);
@@ -2421,4 +2422,42 @@ SILCombiner::legacyVisitGlobalValueInst(GlobalValueInst *globalValue) {
     eraseInstFromFunction(*inst);
   }
   return nullptr;
+
+}
+
+// Simplify `differentiable_function_extract` of `differentiable_function`.
+//
+// Before:
+// %diff_func = differentiable_function(%orig, %jvp, %vjp)
+// %orig' = differentiable_function_extract [original] %diff_func
+// %jvp'  = differentiable_function_extract [jvp]      %diff_func
+// %vjp'  = differentiable_function_extract [vjp]      %diff_func
+//
+// After:
+// %orig' = %orig
+// %jvp' = %jvp
+// %vjp' = %vjp
+SILInstruction *
+SILCombiner::visitDifferentiableFunctionExtractInst(DifferentiableFunctionExtractInst *DFEI) {
+  auto *DFI = dyn_cast<DifferentiableFunctionInst>(DFEI->getOperand());
+  if (!DFI)
+    return nullptr;
+
+  if (!DFI->hasExtractee(DFEI->getExtractee()))
+    return nullptr;
+
+  SILValue newValue = DFI->getExtractee(DFEI->getExtractee());
+
+  // If the type of the `differentiable_function` operand does not precisely
+  // match the type of the original `differentiable_function_extract`,
+  // create a `convert_function`.
+  if (newValue->getType() != DFEI->getType()) {
+    std::tie(newValue, std::ignore) =
+      castValueToABICompatibleType(&Builder, DFEI->getLoc(),
+                                   newValue,
+                                   newValue->getType(), DFEI->getType(), {});
+  }
+
+  replaceInstUsesWith(*DFEI, newValue);
+  return eraseInstFromFunction(*DFEI);
 }

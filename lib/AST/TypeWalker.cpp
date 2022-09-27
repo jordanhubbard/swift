@@ -114,6 +114,7 @@ class Traversal : public TypeVisitor<Traversal, bool>
         return true;
 
       switch (req.getKind()) {
+      case RequirementKind::SameCount:
       case RequirementKind::SameType:
       case RequirementKind::Conformance:
       case RequirementKind::Superclass:
@@ -232,6 +233,10 @@ class Traversal : public TypeVisitor<Traversal, bool>
   
   bool visitSILBlockStorageType(SILBlockStorageType *ty) {
     return doIt(ty->getCaptureType());
+  }
+
+  bool visitSILMoveOnlyWrappedType(SILMoveOnlyWrappedType *ty) {
+    return doIt(ty->getInnerType());
   }
 
   bool visitSILBoxType(SILBoxType *ty) {

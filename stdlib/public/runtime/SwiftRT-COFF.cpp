@@ -11,7 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "ImageInspectionCommon.h"
-#include "../SwiftShims/MetadataSections.h"
+#include "swift/shims/MetadataSections.h"
 
 #include <cstdint>
 #include <new>
@@ -65,7 +65,7 @@ static void swift_image_constructor() {
   { reinterpret_cast<uintptr_t>(&__start_##name) + sizeof(__start_##name),     \
     reinterpret_cast<uintptr_t>(&__stop_##name) - reinterpret_cast<uintptr_t>(&__start_##name) - sizeof(__start_##name) }
 
-  new (&sections) swift::MetadataSections {
+  ::new (&sections) swift::MetadataSections {
       swift::CurrentSectionMetadataVersion,
       { __ImageBase },
 

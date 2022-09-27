@@ -14,21 +14,26 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "swift/Runtime/Concurrency.h"
+
+#include "../CompatibilityOverride/CompatibilityOverride.h"
+#include "Debug.h"
+#include "TaskPrivate.h"
+
 #include "swift/ABI/AsyncLet.h"
 #include "swift/ABI/Metadata.h"
 #include "swift/ABI/Task.h"
 #include "swift/ABI/TaskOptions.h"
-#include "swift/Runtime/Mutex.h"
+#include "swift/Runtime/Heap.h"
 #include "swift/Runtime/HeapObject.h"
+#include "swift/Threading/Mutex.h"
 #include "llvm/ADT/PointerIntPair.h"
-#include "TaskPrivate.h"
-#include "Debug.h"
 
 #if !defined(_WIN32) && !defined(__wasi__) && __has_include(<dlfcn.h>)
 #include <dlfcn.h>
 #endif
+
+#include <new>
 
 using namespace swift;
 
@@ -136,7 +141,7 @@ static AsyncLetImpl *asImpl(const AsyncLet *alet) {
 
 void swift::asyncLet_addImpl(AsyncTask *task, AsyncLet *asyncLet,
                              bool didAllocateInParentTask) {
-  AsyncLetImpl *impl = new (asyncLet) AsyncLetImpl(task);
+  AsyncLetImpl *impl = ::new (asyncLet) AsyncLetImpl(task);
   impl->setDidAllocateFromParentTask(didAllocateInParentTask);
 
   auto record = impl->getTaskRecord();
@@ -162,7 +167,13 @@ void swift::swift_asyncLet_start(AsyncLet *alet,
                                  void *closureEntryPoint,
                                  HeapObject *closureContext) {
   auto flags = TaskCreateFlags();
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  // In the task to thread model, we don't want tasks to start running on
+  // separate threads - they will run in the context of the parent
+  flags.setEnqueueJob(false);
+#else
   flags.setEnqueueJob(true);
+#endif
 
   AsyncLetTaskOptionRecord asyncLetOptionRecord(alet);
   asyncLetOptionRecord.Parent = options;
@@ -186,7 +197,14 @@ void swift::swift_asyncLet_begin(AsyncLet *alet,
                        resultBuffer);
 
   auto flags = TaskCreateFlags();
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  // In the task to thread model, we don't want tasks to start running on
+  // separate threads - they will run in the context of the parent
+  flags.setEnqueueJob(false);
+#else
   flags.setEnqueueJob(true);
+#endif
+
 
   AsyncLetWithBufferTaskOptionRecord asyncLetOptionRecord(alet, resultBuffer);
   asyncLetOptionRecord.Parent = options;

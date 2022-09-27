@@ -21,6 +21,15 @@
 namespace swift {
 namespace ide {
 
+enum class CustomAttributeKind : uint8_t {
+  /// A type that can be used as a property wrapper.
+  PropertyWrapper = 1 << 0,
+  /// A type that can be used as a result builder.
+  ResultBuilder = 1 << 1,
+  /// A type that can be used as a global actor.
+  GlobalActor = 1 << 2,
+};
+
 /// The expected contextual type(s) for code-completion.
 class ExpectedTypeContext {
   /// Possible types of the code completion expression.
@@ -36,6 +45,11 @@ class ExpectedTypeContext {
   /// only a hint.
   bool IsImplicitSingleExpressionReturn = false;
   bool PreferNonVoid = false;
+
+  /// If not empty, \c PossibleTypes are ignored and types that have an
+  /// attribute kind that is contained in this list will be reported as
+  /// 'Convertible'. All other types are related as 'Invalid'.
+  OptionSet<CustomAttributeKind> ExpectedCustomAttributeKinds;
 
 public:
   ExpectedTypeContext() = default;
@@ -82,6 +96,15 @@ public:
   void setPreferNonVoid(bool PreferNonVoid) {
     this->PreferNonVoid = PreferNonVoid;
   }
+
+  OptionSet<CustomAttributeKind> getExpectedCustomAttributeKinds() const {
+    return ExpectedCustomAttributeKinds;
+  }
+
+  void setExpectedCustomAttributeKinds(
+      OptionSet<CustomAttributeKind> ExpectedAttributeKinds) {
+    this->ExpectedCustomAttributeKinds = ExpectedAttributeKinds;
+  }
 };
 
 /// Describes the relationship between the type of the completion results and
@@ -100,13 +123,10 @@ enum class CodeCompletionResultTypeRelation : uint8_t {
   /// The result's type is invalid at the expected position.
   Invalid,
 
-  /// The result's type is convertible to the type of the expected.
+  /// The result's type is convertible or identical to the type of the expected.
   Convertible,
 
-  /// The result's type is identical to the type of the expected.
-  Identical,
-
-  MAX_VALUE = Identical
+  MAX_VALUE = Convertible
 };
 
 class USRBasedType;
@@ -145,23 +165,14 @@ public:
     /// convertible.
     llvm::SmallVector<const USRBasedType *, 1> Types;
 
-    /// Whether a match against this type should be considered convertible
-    /// instead of identical. This is used to model optional conversions.
-    /// If we have
-    ///   let x: Int? = #^COMPLETE^#
-    /// we add both 'Int?' and 'Int' as contextual types to the
-    /// USRBasedTypeContext, but an identical match against 'Int' should only
-    /// be considered convertible.
-    bool IsConvertible;
-
   public:
     /// Compute the type relation of \p ResultType to this conextual type.
     CodeCompletionResultTypeRelation
     typeRelation(const USRBasedType *ResultType,
                  const USRBasedType *VoidType) const;
 
-    ContextualType(ArrayRef<const USRBasedType *> Types, bool IsConvertible)
-        : Types(Types.begin(), Types.end()), IsConvertible(IsConvertible) {
+    ContextualType(ArrayRef<const USRBasedType *> Types)
+        : Types(Types.begin(), Types.end()) {
       assert(!Types.empty() && "USRBasedTypeContext::ContextualType should "
                                "contain at least one type");
     }
@@ -173,6 +184,9 @@ private:
   const USRBasedTypeArena &Arena;
 
   SmallVector<ContextualType, 4> ContextualTypes;
+
+  /// See \c ExpectedTypeContext::ExpectedAttributeKinds.
+  OptionSet<CustomAttributeKind> ExpectedCustomAttributeKinds;
 
 public:
   /// Create a USR-based equivalent of the \p TypeContext.
@@ -203,10 +217,15 @@ class USRBasedType {
   /// declared in the same module that the type was defined.
   ArrayRef<const USRBasedType *> Supertypes;
 
+  /// The kinds of attributes this type can be used as.
+  OptionSet<CustomAttributeKind> CustomAttributeKinds;
+
   /// Memberwise initializer. \p USR and \p Supertypes need to be allocated in
   /// the same arena as this \c USRBasedType.
-  USRBasedType(StringRef USR, ArrayRef<const USRBasedType *> Supertypes)
-      : USR(USR), Supertypes(Supertypes) {}
+  USRBasedType(StringRef USR, ArrayRef<const USRBasedType *> Supertypes,
+               OptionSet<CustomAttributeKind> CustomAttributeKinds)
+      : USR(USR), Supertypes(Supertypes),
+        CustomAttributeKinds(CustomAttributeKinds) {}
 
   /// Implementation of \c typeRelation. \p VisistedTypes keeps track which
   /// types have already been visited.
@@ -225,12 +244,17 @@ public:
 
   /// Construct as \c USRBasedType from a USR and its supertypes. This method
   /// takes care of copying \p USR and \p Supertypes to \p Arena.
-  static const USRBasedType *fromUSR(StringRef USR,
-                                     ArrayRef<const USRBasedType *> Supertypes,
-                                     USRBasedTypeArena &Arena);
+  static const USRBasedType *
+  fromUSR(StringRef USR, ArrayRef<const USRBasedType *> Supertypes,
+          OptionSet<CustomAttributeKind> CustomAttributeKinds,
+          USRBasedTypeArena &Arena);
 
   StringRef getUSR() const { return USR; }
   ArrayRef<const USRBasedType *> getSupertypes() const { return Supertypes; }
+
+  OptionSet<CustomAttributeKind> getCustomAttributeKinds() const {
+    return CustomAttributeKinds;
+  }
 
   /// Compute the relation of \c ResultType when to this contextual type.
   CodeCompletionResultTypeRelation

@@ -172,8 +172,7 @@ struct StaticFuncs {
 }
 
 struct StaticFuncsGeneric<U> {
-  // FIXME: Nested generics are very broken
-  // static func chameleon<T>() -> T {}
+  static func chameleon<T>() -> T {}
 }
 
 func chameleon<T>() -> T {}
@@ -182,10 +181,10 @@ func testStatic(_ sf: StaticFuncs, sfi: StaticFuncsGeneric<Int>) {
   var x: Int16
   x = StaticFuncs.chameleon()
   x = sf.chameleon2()
-  // FIXME: Nested generics are very broken
-  // x = sfi.chameleon()
-  // typealias SFI = StaticFuncsGeneric<Int>
-  // x = SFI.chameleon()
+
+  x = sfi.chameleon() // expected-error {{static member 'chameleon' cannot be used on instance of type 'StaticFuncsGeneric<Int>'}}
+  typealias SFI = StaticFuncsGeneric<Int>
+  x = SFI.chameleon()
   _ = x
 }
 
@@ -310,9 +309,10 @@ class DeducePropertyParams {
   let badSet: Set = ["Hello"]
 }
 
-// SR-69
-struct A {}
-func foo() {
+// https://github.com/apple/swift/issues/42691
+do {
+    struct A {}
+
     for i in min(1,2) { // expected-error{{for-in loop requires 'Int' to conform to 'Sequence'}}
     }
     let j = min(Int(3), Float(2.5)) // expected-error{{conflicting arguments to generic parameter 'T' ('Int' vs. 'Float')}}

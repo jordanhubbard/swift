@@ -1,13 +1,27 @@
-// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-cxx-interop)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop)
+// RUN: %target-run-simple-swift(-D USE_CXXSTDLIB_SPELLING -I %S/Inputs -Xfrontend -enable-experimental-cxx-interop)
 //
 // REQUIRES: executable_test
 //
-// Enable this everywhere once we have a solution for modularizing libstdc++: rdar://87654514
-// REQUIRES: OS=macosx
+// Enable this everywhere once we have a solution for modularizing other C++ stdlibs: rdar://87654514
+// REQUIRES: OS=macosx || OS=linux-gnu
 
 import StdlibUnittest
 import StdString
+#if os(Linux)
+#if USE_CXXSTDLIB_SPELLING
+import CxxStdlib
+#else
+import std
+#endif
+// FIXME: import CxxStdlib.string once libstdc++ is split into submodules.
+#else
+#if USE_CXXSTDLIB_SPELLING
+import CxxStdlib.string
+#else
 import std.string
+#endif
+#endif
 
 var StdStringTestSuite = TestSuite("StdString")
 

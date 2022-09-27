@@ -7,8 +7,6 @@
 # See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 
 
-from __future__ import absolute_import, unicode_literals
-
 import unittest
 
 from build_swift import cache_utils
@@ -49,7 +47,7 @@ class TestCache(unittest.TestCase):
             def func():
                 return None
 
-        assert(mock_lru_cache.called)
+        assert mock_lru_cache.called
 
     def test_call_with_no_args(self):
         # Increments the counter once per unique call.

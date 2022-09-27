@@ -16,26 +16,17 @@ import Basic
 
 public typealias DiagID = BridgedDiagID
 
-extension BridgedDiagnosticArgument {
-  init(stringRef val: BridgedStringRef) {
-    self.init(kind: .stringRef, value: .init(stringRefValue: val))
-  }
-  init(int val: Int) {
-    self.init(kind: .int, value: .init(intValue: val))
-  }
-}
-
 public protocol DiagnosticArgument {
-  func _withBridgedDiagnosticArgument(_ fn: (BridgedDiagnosticArgument) -> Void)
+  func _withBridgedDiagnosticArgument(_ fn: (swift.DiagnosticArgument) -> Void)
 }
 extension String: DiagnosticArgument {
-  public func _withBridgedDiagnosticArgument(_ fn: (BridgedDiagnosticArgument) -> Void) {
-    withBridgedStringRef { fn(BridgedDiagnosticArgument(stringRef: $0)) }
+  public func _withBridgedDiagnosticArgument(_ fn: (swift.DiagnosticArgument) -> Void) {
+    _withStringRef { fn(swift.DiagnosticArgument($0)) }
   }
 }
 extension Int: DiagnosticArgument {
-  public func _withBridgedDiagnosticArgument(_ fn: (BridgedDiagnosticArgument) -> Void) {
-    fn(BridgedDiagnosticArgument(int: self))
+  public func _withBridgedDiagnosticArgument(_ fn: (swift.DiagnosticArgument) -> Void) {
+    fn(swift.DiagnosticArgument(Int32(self)))
   }
 }
 
@@ -50,21 +41,21 @@ public struct DiagnosticFixIt {
     self.text = text
   }
 
-  func withBridgedDiagnosticFixIt(_ fn: (BridgedDiagnosticFixIt) -> Void) {
-    text.withBridgedStringRef { bridgedTextRef in
-      let bridgedDiagnosticFixIt = BridgedDiagnosticFixIt(
-        start: start.bridged,
-        byteLength: byteLength,
-        text: bridgedTextRef)
+  func withBridgedDiagnosticFixIt(_ fn: (swift.DiagnosticInfo.FixIt) -> Void) {
+    text._withStringRef { bridgedTextRef in
+      let bridgedDiagnosticFixIt = swift.DiagnosticInfo.FixIt(
+        swift.CharSourceRange(start.bridged, UInt32(byteLength)),
+        bridgedTextRef,
+        llvm.ArrayRef<swift.DiagnosticArgument>())
       fn(bridgedDiagnosticFixIt)
     }
   }
 }
 
 public struct DiagnosticEngine {
-  private let bridged: BridgedDiagnosticEngine
+  private let bridged: swift.DiagnosticEngine
 
-  public init(bridged: BridgedDiagnosticEngine) {
+  public init(bridged: swift.DiagnosticEngine) {
     self.bridged = bridged
   }
 
@@ -74,15 +65,15 @@ public struct DiagnosticEngine {
                        highlight: CharSourceRange? = nil,
                        fixIts: [DiagnosticFixIt] = []) {
 
-    let bridgedSourceLoc: BridgedSourceLoc = position.bridged
-    let bridgedHighlightRange: BridgedCharSourceRange = highlight.bridged
-    var bridgedArgs: [BridgedDiagnosticArgument] = []
-    var bridgedFixIts: [BridgedDiagnosticFixIt] = []
+    let bridgedSourceLoc: swift.SourceLoc = position.bridged
+    let bridgedHighlightRange: swift.CharSourceRange = highlight.bridged
+    var bridgedArgs: [swift.DiagnosticArgument] = []
+    var bridgedFixIts: [swift.DiagnosticInfo.FixIt] = []
 
     // Build a higher-order function to wrap every 'withBridgedXXX { ... }'
     // calls, so we don't escape anything from the closure. 'bridgedArgs' and
     // 'bridgedFixIts' are temporary storage to store bridged values. So they
-    // should not be used after the closue is executed.
+    // should not be used after the closure is executed.
  
     var closure: () -> Void = {
       bridgedArgs.withBridgedArrayRef { bridgedArgsRef in

@@ -13,6 +13,8 @@
 #ifndef SWIFT_PRINTASCLANG_DECLANDTYPEPRINTER_H
 #define SWIFT_PRINTASCLANG_DECLANDTYPEPRINTER_H
 
+#include "OutputLanguageMode.h"
+
 #include "swift/AST/Type.h"
 // for OptionalTypeKind
 #include "swift/ClangImporter/ClangImporter.h"
@@ -22,6 +24,10 @@ namespace clang {
 } // end namespace clang
 
 namespace swift {
+
+class PrimitiveTypeMapping;
+class ValueDecl;
+class SwiftToClangInteropContext;
 
 /// Responsible for printing a Swift Decl or Type in Objective-C, to be
 /// included in a Swift module's ObjC compatibility header.
@@ -35,21 +41,14 @@ private:
 
   ModuleDecl &M;
   raw_ostream &os;
+  raw_ostream &prologueOS;
+  raw_ostream &outOfLineDefinitionsOS;
   const DelayedMemberSet &delayedMembers;
+  PrimitiveTypeMapping &typeMapping;
+  SwiftToClangInteropContext &interopContext;
   AccessLevel minRequiredAccess;
-
-  struct CTypeInfo {
-    StringRef name;
-    bool canBeNullable;
-  };
-
-  /// A map from {Module, TypeName} pairs to {C name, C nullability} pairs.
-  ///
-  /// This is populated on first use with a list of known Swift types that are
-  /// translated directly by the ObjC printer instead of structurally, allowing
-  /// it to do things like map 'Int' to 'NSInteger' and 'Float' to 'float'.
-  /// In some sense it's the reverse of the ClangImporter's MappedTypes.def.
-  llvm::DenseMap<std::pair<Identifier, Identifier>, CTypeInfo> specialNames;
+  bool requiresExposedAttribute;
+  OutputLanguageMode outputLang;
 
   /// The name 'CFTypeRef'.
   ///
@@ -59,9 +58,21 @@ private:
   Implementation getImpl();
 
 public:
-  DeclAndTypePrinter(ModuleDecl &mod, raw_ostream &out,
-                     DelayedMemberSet &delayed, AccessLevel access)
-    : M(mod), os(out), delayedMembers(delayed), minRequiredAccess(access) {}
+  DeclAndTypePrinter(ModuleDecl &mod, raw_ostream &out, raw_ostream &prologueOS,
+                     raw_ostream &outOfLineDefinitionsOS,
+                     DelayedMemberSet &delayed,
+                     PrimitiveTypeMapping &typeMapping,
+                     SwiftToClangInteropContext &interopContext,
+                     AccessLevel access, bool requiresExposedAttribute,
+                     OutputLanguageMode outputLang)
+      : M(mod), os(out), prologueOS(prologueOS),
+        outOfLineDefinitionsOS(outOfLineDefinitionsOS), delayedMembers(delayed),
+        typeMapping(typeMapping), interopContext(interopContext),
+        minRequiredAccess(access),
+        requiresExposedAttribute(requiresExposedAttribute),
+        outputLang(outputLang) {}
+
+  SwiftToClangInteropContext &getInteropContext() { return interopContext; }
 
   /// Returns true if \p VD should be included in a compatibility header for
   /// the options the printer was constructed with.
@@ -90,6 +101,9 @@ public:
   /// Returns the name of an <os/object.h> type minus the leading "OS_",
   /// or an empty string if \p decl is not an <os/object.h> type.
   static StringRef maybeGetOSObjectBaseName(const clang::NamedDecl *decl);
+
+  static std::pair<Type, OptionalTypeKind>
+  getObjectTypeAndOptionality(const ValueDecl *D, Type ty);
 };
 
 } // end namespace swift

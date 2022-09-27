@@ -41,7 +41,7 @@ DeclContext *ConformanceLookupTable::ConformanceSource::getDeclContext() const {
     return getImpliedSource()->Source.getDeclContext();
 
   case ConformanceEntryKind::Synthesized:
-    return getSynthesizedDecl();
+    return getSynthesizedDeclContext();
   }
 
   llvm_unreachable("Unhandled ConformanceEntryKind in switch.");
@@ -240,6 +240,14 @@ void ConformanceLookupTable::inheritConformances(ClassDecl *classDecl,
   llvm::SmallPtrSet<ProtocolDecl *, 4> protocols;
   auto addInheritedConformance = [&](ConformanceEntry *entry) {
     auto protocol = entry->getProtocol();
+
+    // Don't add unavailable conformances.
+    if (auto dc = entry->Source.getDeclContext()) {
+      if (auto ext = dyn_cast<ExtensionDecl>(dc)) {
+        if (AvailableAttr::isUnavailable(ext))
+          return;
+      }
+    }
 
     // Don't add redundant conformances here. This is merely an
     // optimization; resolveConformances() would zap the duplicates
@@ -612,20 +620,14 @@ ConformanceLookupTable::Ordering ConformanceLookupTable::compareConformances(
     // If the explicit protocol for the left-hand side is implied by
     // the explicit protocol for the right-hand side, the left-hand
     // side supersedes the right-hand side.
-    for (auto rhsProtocol : rhsExplicitProtocol->getAllProtocols()) {
-      if (rhsProtocol == lhsExplicitProtocol) {
-        return Ordering::Before;
-      }
-    }
+    if (rhsExplicitProtocol->inheritsFrom(lhsExplicitProtocol))
+      return Ordering::Before;
 
     // If the explicit protocol for the right-hand side is implied by
     // the explicit protocol for the left-hand side, the right-hand
     // side supersedes the left-hand side.
-    for (auto lhsProtocol : lhsExplicitProtocol->getAllProtocols()) {
-      if (lhsProtocol == rhsExplicitProtocol) {
-        return Ordering::After;
-      }
-    }
+    if (lhsExplicitProtocol->inheritsFrom(rhsExplicitProtocol))
+      return Ordering::After;
   }
 
   // Prefer the least conditional implier, which we approximate by seeing if one
@@ -812,7 +814,9 @@ DeclContext *ConformanceLookupTable::getConformingContext(
         if (superclassTy->is<ErrorType>())
           return nullptr;
         auto inheritedConformance = module->lookupConformance(
-            superclassTy, protocol);
+            superclassTy, protocol, /*allowMissing=*/false);
+        if (inheritedConformance.hasUnavailableConformance())
+          inheritedConformance = ProtocolConformanceRef::forInvalid();
         if (inheritedConformance)
           return superclassDecl;
       } while ((superclassDecl = superclassDecl->getSuperclassDecl()));
@@ -870,13 +874,18 @@ ConformanceLookupTable::getConformance(NominalTypeDecl *nominal,
     entry->Conformance =
         ctx.getInheritedConformance(type, inheritedConformance.getConcrete());
   } else {
-    // Create or find the normal conformance.
-    Type conformingType = conformingDC->getDeclaredInterfaceType();
+    // Protocols don't have conformance lookup tables. Self-conformance is
+    // handled directly in lookupConformance().
+    assert(!isa<ProtocolDecl>(conformingNominal));
+    assert(!isa<ProtocolDecl>(conformingDC->getSelfNominalTypeDecl()));
+    Type conformingType = conformingDC->getSelfInterfaceType();
+
     SourceLoc conformanceLoc
       = conformingNominal == conformingDC
           ? conformingNominal->getLoc()
           : cast<ExtensionDecl>(conformingDC)->getLoc();
 
+    // Create or find the normal conformance.
     auto normalConf =
         ctx.getConformance(conformingType, protocol, conformanceLoc,
                            conformingDC, ProtocolConformanceState::Incomplete,
@@ -927,10 +936,11 @@ ConformanceLookupTable::getConformance(NominalTypeDecl *nominal,
   return entry->Conformance.get<ProtocolConformance *>();
 }
 
-void ConformanceLookupTable::addSynthesizedConformance(NominalTypeDecl *nominal,
-                                                       ProtocolDecl *protocol) {
+void ConformanceLookupTable::addSynthesizedConformance(
+    NominalTypeDecl *nominal, ProtocolDecl *protocol,
+    DeclContext *conformanceDC) {
   addProtocol(protocol, nominal->getLoc(),
-              ConformanceSource::forSynthesized(nominal));
+              ConformanceSource::forSynthesized(conformanceDC));
 }
 
 void ConformanceLookupTable::registerProtocolConformance(
@@ -956,7 +966,7 @@ void ConformanceLookupTable::registerProtocolConformance(
   auto inherited = dyn_cast<InheritedProtocolConformance>(conformance);
   ConformanceSource source
     = inherited   ? ConformanceSource::forInherited(cast<ClassDecl>(nominal)) :
-      synthesized ? ConformanceSource::forSynthesized(nominal) :
+      synthesized ? ConformanceSource::forSynthesized(dc) :
                     ConformanceSource::forExplicit(dc);
 
   ASTContext &ctx = nominal->getASTContext();

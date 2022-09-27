@@ -79,6 +79,10 @@ protected:
     IsLet : 1
   );
 
+  SWIFT_INLINE_BITFIELD(AnyPattern, Pattern, 1,
+                        /// True if this is an "async let _"  pattern.
+                        IsAsyncLet : 1);
+
   } Bits;
 
   Pattern(PatternKind kind) {
@@ -256,9 +260,6 @@ public:
 ///
 /// The fully general form of this is something like:
 ///    label: (pattern) = initexpr
-///
-/// The Init and DefArgKind fields are only used in argument lists for
-/// functions.  They are not parsed as part of normal pattern grammar.
 class TuplePatternElt {
   Identifier Label;
   SourceLoc LabelLoc;
@@ -273,10 +274,6 @@ public:
 
   Identifier getLabel() const { return Label; }
   SourceLoc getLabelLoc() const { return LabelLoc; }
-  void setLabel(Identifier I, SourceLoc Loc) {
-    Label = I;
-    LabelLoc = Loc;
-  }
 
   Pattern *getPattern() { return ThePattern; }
   const Pattern *getPattern() const {
@@ -371,8 +368,10 @@ class AnyPattern : public Pattern {
   SourceLoc Loc;
 
 public:
-  explicit AnyPattern(SourceLoc Loc)
-      : Pattern(PatternKind::Any), Loc(Loc) { }
+  explicit AnyPattern(SourceLoc Loc, bool IsAsyncLet = false)
+      : Pattern(PatternKind::Any), Loc(Loc) {
+    Bits.AnyPattern.IsAsyncLet = static_cast<uint64_t>(IsAsyncLet);
+  }
 
   static AnyPattern *createImplicit(ASTContext &Context) {
     auto *AP = new (Context) AnyPattern(SourceLoc());
@@ -382,6 +381,16 @@ public:
 
   SourceLoc getLoc() const { return Loc; }
   SourceRange getSourceRange() const { return Loc; }
+
+  /// True if this is an "async let _ pattern since `async let _` could be a 
+  /// subPattern of a \c TypedPattern represented as \c AnyPattern e.g. 
+  /// "async let _: Type = <expr>" or simply just an \c AnyPattern in 
+  /// "async let _ = <expr>" case.
+  bool isAsyncLet() const { return bool(Bits.AnyPattern.IsAsyncLet); }
+  
+  void setIsAsyncLet() {
+    Bits.AnyPattern.IsAsyncLet = static_cast<uint64_t>(true);
+  }
 
   static bool classof(const Pattern *P) {
     return P->getKind() == PatternKind::Any;

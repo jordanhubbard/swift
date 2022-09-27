@@ -11,10 +11,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "ModuleFileSharedCore.h"
-#include "ModuleFileCoreTableInfo.h"
 #include "BCReadingExtras.h"
 #include "DeserializationErrors.h"
+#include "ModuleFileCoreTableInfo.h"
 #include "swift/Basic/LangOptions.h"
+#include "swift/Parse/ParseVersion.h"
 #include "swift/Strings.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/OnDiskHashTable.h"
@@ -172,12 +173,15 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
 static ValidationInfo validateControlBlock(
     llvm::BitstreamCursor &cursor, SmallVectorImpl<uint64_t> &scratch,
     std::pair<uint16_t, uint16_t> expectedVersion, bool requiresOSSAModules,
+    bool requiresRevisionMatch,
+    StringRef requiredSDK,
     ExtendedValidationInfo *extendedInfo,
     PathObfuscator &pathRecoverer) {
   // The control block is malformed until we've at least read a major version
   // number.
   ValidationInfo result;
   bool versionSeen = false;
+  bool revisionSeen = false;
 
   while (!cursor.AtEndOfStream()) {
     Expected<llvm::BitstreamEntry> maybeEntry = cursor.advance();
@@ -279,9 +283,9 @@ static ValidationInfo validateControlBlock(
       }
       case 4:
         if (scratch[3] != 0) {
-          result.compatibilityVersion =
-            version::Version(blobData.substr(scratch[2]+1, scratch[3]),
-                             SourceLoc(), nullptr);
+          result.compatibilityVersion = *VersionParser::parseVersionString(
+              blobData.substr(scratch[2] + 1, scratch[3]), SourceLoc(),
+              nullptr);
         }
         LLVM_FALLTHROUGH;
       case 3:
@@ -305,9 +309,35 @@ static ValidationInfo validateControlBlock(
       break;
     case control_block::SDK_NAME: {
       result.sdkName = blobData;
+
+      // Enable this check for tagged compiler or when the
+      // env var is set (for testing).
+      static const char* forceDebugPreSDKRestriction =
+        ::getenv("SWIFT_DEBUG_FORCE_SWIFTMODULE_PER_SDK");
+      if (!version::isCurrentCompilerTagged() &&
+          !forceDebugPreSDKRestriction) {
+        break;
+      }
+
+      // The loaded module was built with a compatible SDK if either:
+      // * it was the same SDK
+      // * or one who's name is a prefix of the clients' SDK name. This expects
+      // that a module built with macOS11 can be used with the macOS11.secret SDK.
+      // This is generally the case as SDKs with suffixes are a superset of the
+      // short SDK name equivalent. While this is accepted, this is still not a
+      // recommended configuration and may lead to unreadable swiftmodules.
+      StringRef moduleSDK = blobData;
+      if (!moduleSDK.empty() && !requiredSDK.empty() &&
+          !requiredSDK.startswith(moduleSDK)) {
+        result.status = Status::SDKMismatch;
+        return result;
+      }
+
       break;
     }
     case control_block::REVISION: {
+      revisionSeen = true;
+
       // Tagged compilers should only load modules if they were
       // produced by the exact same compiler tag.
 
@@ -325,14 +355,18 @@ static ValidationInfo validateControlBlock(
         ::getenv("SWIFT_DEBUG_FORCE_SWIFTMODULE_REVISION");
 
       bool isCompilerTagged = forcedDebugRevision ||
-        !version::Version::getCurrentCompilerVersion().empty();
+        version::isCurrentCompilerTagged();
 
       StringRef moduleRevision = blobData;
       if (isCompilerTagged) {
         StringRef compilerRevision = forcedDebugRevision ?
-          forcedDebugRevision : version::getSwiftRevision();
-        if (moduleRevision != compilerRevision)
+          forcedDebugRevision : version::getCurrentCompilerTag();
+        if (moduleRevision != compilerRevision) {
           result.status = Status::RevisionIncompatible;
+
+          // We can't trust this module format at this point.
+          return result;
+        }
       }
       break;
     }
@@ -348,6 +382,13 @@ static ValidationInfo validateControlBlock(
       break;
     }
   }
+
+  // Last resort check in cases where the format is broken enough that
+  // we didn't read the REVISION block, report such a case as incompatible.
+  if (requiresRevisionMatch &&
+      !revisionSeen &&
+      result.status == Status::Valid)
+    result.status = Status::RevisionIncompatible;
 
   return result;
 }
@@ -428,7 +469,7 @@ bool serialization::isSerializedAST(StringRef data) {
 }
 
 ValidationInfo serialization::validateSerializedAST(
-    StringRef data, bool requiresOSSAModules,
+    StringRef data, bool requiresOSSAModules, StringRef requiredSDK,
     ExtendedValidationInfo *extendedInfo,
     SmallVectorImpl<SerializationOptions::FileDependency> *dependencies) {
   ValidationInfo result;
@@ -471,7 +512,9 @@ ValidationInfo serialization::validateSerializedAST(
       result = validateControlBlock(
           cursor, scratch,
           {SWIFTMODULE_VERSION_MAJOR, SWIFTMODULE_VERSION_MINOR},
-          requiresOSSAModules, extendedInfo, localObfuscator);
+          requiresOSSAModules, /*requiresRevisionMatch=*/true,
+          requiredSDK,
+          extendedInfo, localObfuscator);
       if (result.status == Status::Malformed)
         return result;
     } else if (dependencies &&
@@ -522,6 +565,8 @@ void ModuleFileSharedCore::fatal(llvm::Error error) const {
   llvm::raw_svector_ostream out(errorStr);
 
   out << "*** DESERIALIZATION FAILURE ***\n";
+  out << "*** If any module named here was modified in the SDK, please delete the ***\n";
+  out << "*** new swiftmodule files from the SDK and keep only swiftinterfaces.   ***\n";
   outputDiagnosticInfo(out);
   out << "\n";
   if (error) {
@@ -540,6 +585,8 @@ void ModuleFileSharedCore::outputDiagnosticInfo(llvm::raw_ostream &os) const {
       << "'";
   if (Bits.IsAllowModuleWithCompilerErrorsEnabled)
     os << " (built with -experimental-allow-module-with-compiler-errors)";
+  if (ModuleInputBuffer)
+    os << " at '" << ModuleInputBuffer->getBufferIdentifier() << "'";
 }
 
 ModuleFileSharedCore::~ModuleFileSharedCore() { }
@@ -797,6 +844,10 @@ bool ModuleFileSharedCore::readIndexBlock(llvm::BitstreamCursor &cursor) {
         assert(blobData.empty());
         allocateBuffer(GenericSignatures, scratch);
         break;
+      case index_block::GENERIC_ENVIRONMENT_OFFSETS:
+        assert(blobData.empty());
+        allocateBuffer(GenericEnvironments, scratch);
+        break;
       case index_block::SUBSTITUTION_MAP_OFFSETS:
         assert(blobData.empty());
         allocateBuffer(SubstitutionMaps, scratch);
@@ -979,8 +1030,8 @@ bool ModuleFileSharedCore::readModuleDocIfPresent(PathObfuscator &pathRecoverer)
 
       info = validateControlBlock(
           docCursor, scratch, {SWIFTDOC_VERSION_MAJOR, SWIFTDOC_VERSION_MINOR},
-          RequiresOSSAModules,
-          /*extendedInfo*/ nullptr, pathRecoverer);
+          RequiresOSSAModules, /*requiresRevisionMatch*/false,
+          /*requiredSDK*/StringRef(), /*extendedInfo*/nullptr, pathRecoverer);
       if (info.status != Status::Valid)
         return false;
       // Check that the swiftdoc is actually for this module.
@@ -1123,9 +1174,8 @@ bool ModuleFileSharedCore::readModuleSourceInfoIfPresent(PathObfuscator &pathRec
       info = validateControlBlock(
           infoCursor, scratch,
           {SWIFTSOURCEINFO_VERSION_MAJOR, SWIFTSOURCEINFO_VERSION_MINOR},
-          RequiresOSSAModules,
-          /*extendedInfo*/ nullptr,
-          pathRecoverer);
+          RequiresOSSAModules, /*requiresRevisionMatch*/false,
+          /*requiredSDK*/StringRef(), /*extendedInfo*/nullptr, pathRecoverer);
       if (info.status != Status::Valid)
         return false;
       // Check that the swiftsourceinfo is actually for this module.
@@ -1199,7 +1249,7 @@ ModuleFileSharedCore::ModuleFileSharedCore(
     std::unique_ptr<llvm::MemoryBuffer> moduleInputBuffer,
     std::unique_ptr<llvm::MemoryBuffer> moduleDocInputBuffer,
     std::unique_ptr<llvm::MemoryBuffer> moduleSourceInfoInputBuffer,
-    bool isFramework, bool requiresOSSAModules,
+    bool isFramework, bool requiresOSSAModules, StringRef requiredSDK,
     serialization::ValidationInfo &info, PathObfuscator &pathRecoverer)
     : ModuleInputBuffer(std::move(moduleInputBuffer)),
       ModuleDocInputBuffer(std::move(moduleDocInputBuffer)),
@@ -1251,7 +1301,8 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       info = validateControlBlock(
           cursor, scratch,
           {SWIFTMODULE_VERSION_MAJOR, SWIFTMODULE_VERSION_MINOR},
-          RequiresOSSAModules, &extInfo, pathRecoverer);
+          RequiresOSSAModules, /*requiresRevisionMatch=*/true, requiredSDK,
+          &extInfo, pathRecoverer);
       if (info.status != Status::Valid) {
         error(info.status);
         return;

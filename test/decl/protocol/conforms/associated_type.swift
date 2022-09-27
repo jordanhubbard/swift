@@ -12,7 +12,7 @@ struct X : P { // expected-error{{type 'X' does not conform to protocol 'P'}}
   typealias AssocA = Int // expected-note{{possibly intended match 'X.AssocA' (aka 'Int') does not conform to 'AnyObject'}}
 }
 
-// SR-5166
+// https://github.com/apple/swift/issues/47742
 protocol FooType {
     associatedtype BarType
 
@@ -37,7 +37,7 @@ class Foo: FooType {
 protocol P1 {
   associatedtype A
 
-  func f(_: A) // expected-note {{protocol requires function 'f' with type '(@escaping SendableX1b.A) -> ()' (aka '(@escaping @Sendable (Int) -> Int) -> ()'); do you want to add a stub?}}
+  func f(_: A) // expected-note {{expected sendability to match requirement here}}
 }
 
 struct X1a : P1 {
@@ -61,10 +61,10 @@ struct X1b : P1 {
 //        instead of adjusting types before adding them to the constraint
 //        graph, we should introduce a new constraint kind that allows only a
 //        witness's adjustments.
-struct SendableX1b : P1 { // expected-error {{type 'SendableX1b' does not conform to protocol 'P1'}}
+struct SendableX1b : P1 {
   typealias A = @Sendable (Int) -> Int
 
-  func f(_: (Int) -> Int) { } // expected-note {{candidate has non-matching type '((Int) -> Int) -> ()'}}
+  func f(_: (Int) -> Int) { } // expected-warning {{sendability of function types in instance method 'f' does not match requirement in protocol 'P1'}}
 }
 
 struct X1c : P1 {
@@ -78,8 +78,8 @@ struct X1d : P1 {
 }
 
 protocol P2 {
-  func f(_: (Int) -> Int) // expected-note 3 {{protocol requires function 'f' with type '((Int) -> Int) -> ()'; do you want to add a stub?}}
-  func g(_: @escaping (Int) -> Int) // expected-note 2 {{protocol requires function 'g' with type '(@escaping (Int) -> Int) -> ()'; do you want to add a stub?}}
+  func f(_: (Int) -> Int) // expected-note{{expected sendability to match requirement here}} expected-note 2{{protocol requires function 'f' with type '((Int) -> Int) -> ()'; do you want to add a stub?}}
+  func g(_: @escaping (Int) -> Int) // expected-note 2 {{expected sendability to match requirement here}}
   func h(_: @Sendable (Int) -> Int) // expected-note 2 {{protocol requires function 'h' with type '(@Sendable (Int) -> Int) -> ()'; do you want to add a stub?}}
   func i(_: @escaping @Sendable (Int) -> Int)
 }
@@ -98,75 +98,75 @@ struct X2b : P2 { // expected-error{{type 'X2b' does not conform to protocol 'P2
   func i(_: @escaping (Int) -> Int) { }
 }
 
-struct X2c : P2 { // expected-error{{type 'X2c' does not conform to protocol 'P2'}}
-  func f(_: @Sendable (Int) -> Int) { } // expected-note{{candidate has non-matching type '(@Sendable (Int) -> Int) -> ()'}}
-  func g(_: @Sendable (Int) -> Int) { } // expected-note{{candidate has non-matching type '(@Sendable (Int) -> Int) -> ()'}}
+struct X2c : P2 {
+  func f(_: @Sendable (Int) -> Int) { } // expected-warning{{sendability of function types in instance method 'f' does not match requirement in protocol 'P2'}}
+  func g(_: @Sendable (Int) -> Int) { } // expected-warning{{sendability of function types in instance method 'g' does not match requirement in protocol 'P2'}}
   func h(_: @Sendable (Int) -> Int) { }
   func i(_: @Sendable (Int) -> Int) { }
 }
 
 struct X2d : P2 { // expected-error{{type 'X2d' does not conform to protocol 'P2'}}
   func f(_: @escaping @Sendable (Int) -> Int) { } // expected-note{{candidate has non-matching type '(@escaping @Sendable (Int) -> Int) -> ()'}}
-  func g(_: @escaping @Sendable (Int) -> Int) { } // expected-note{{candidate has non-matching type '(@escaping @Sendable (Int) -> Int) -> ()'}}
+  func g(_: @escaping @Sendable (Int) -> Int) { } // expected-warning{{sendability of function types in instance method 'g' does not match requirement in protocol 'P2'}}
   func h(_: @escaping @Sendable (Int) -> Int) { } // expected-note{{candidate has non-matching type '(@escaping @Sendable (Int) -> Int) -> ()'}}
   func i(_: @escaping @Sendable (Int) -> Int) { }
 }
 
 
-// SR-12707
+// https://github.com/apple/swift/issues/55151
 
-class SR_12707_C<T> {}
+class GenClass<T> {}
 
 // Regular type witnesses
-protocol SR_12707_P1 {
+protocol P3a {
   associatedtype A
-  associatedtype B: SR_12707_C<(A, Self)> // expected-note {{'B' declared here}}
+  associatedtype B: GenClass<(A, Self)> // expected-note {{'B' declared here}}
 }
-struct SR_12707_Conform_P1: SR_12707_P1 {
+struct S3a: P3a {
   typealias A = Never
-  typealias B = SR_12707_C<(A, SR_12707_Conform_P1)>
+  typealias B = GenClass<(A, S3a)>
 }
 
 // Type witness in protocol extension
-protocol SR_12707_P2: SR_12707_P1 {}
-extension SR_12707_P2 {
-  typealias B = SR_12707_C<(A, Self)> // expected-warning {{typealias overriding associated type 'B' from protocol 'SR_12707_P1' is better expressed as same-type constraint on the protocol}}
+protocol P3b: P3a {}
+extension P3b {
+  typealias B = GenClass<(A, Self)> // expected-warning {{typealias overriding associated type 'B' from protocol 'P3a' is better expressed as same-type constraint on the protocol}}
 }
-struct SR_12707_Conform_P2: SR_12707_P2 {
+struct S3b: P3b {
   typealias A = Never
 }
 
 // FIXME: resolveTypeWitnessViaLookup must not happen independently in the
 // general case.
-protocol SR_12707_FIXME_P3 {
-  associatedtype A: SR_12707_C<B> // expected-note {{protocol requires nested type 'A'; do you want to add it?}}
+protocol P4 {
+  associatedtype A: GenClass<B> // expected-note {{protocol requires nested type 'A'; do you want to add it?}}
   associatedtype B
 }
-struct SR_12707_FIXME_Conform_P3: SR_12707_FIXME_P3 { // expected-error {{type 'SR_12707_FIXME_Conform_P3' does not conform to protocol 'SR_12707_FIXME_P3'}}
-  typealias A = SR_12707_C<B> // expected-note {{possibly intended match 'SR_12707_FIXME_Conform_P3.A' (aka 'SR_12707_C<Never>') does not inherit from 'SR_12707_C<SR_12707_FIXME_Conform_P3.B>'}}
+struct S4: P4 { // expected-error {{type 'S4' does not conform to protocol 'P4'}}
+  typealias A = GenClass<B> // expected-note {{possibly intended match 'S4.A' (aka 'GenClass<Never>') does not inherit from 'GenClass<S4.B>'}}
   typealias B = Never
 }
 
 // FIXME: Associated type inference via value witnesses should consider
 // tentative witnesses when checking a candidate.
-protocol SR_12707_FIXME_P4 {
+protocol P5 {
   associatedtype X = Never
 
-  associatedtype A: SR_12707_C<X> // expected-note {{unable to infer associated type 'A' for protocol 'SR_12707_FIXME_P4'}}
+  associatedtype A: GenClass<X> // expected-note {{unable to infer associated type 'A' for protocol 'P5'}}
   func foo(arg: A)
 }
-struct SR_12707_FIXME_Conform_P4: SR_12707_FIXME_P4 { // expected-error {{type 'SR_12707_FIXME_Conform_P4' does not conform to protocol 'SR_12707_FIXME_P4'}}
-  func foo(arg: SR_12707_C<Never>) {} // expected-note {{candidate would match and infer 'A' = 'SR_12707_C<Never>' if 'SR_12707_C<Never>' inherited from 'SR_12707_C<SR_12707_FIXME_Conform_P4.X>'}}
+struct S5: P5 { // expected-error {{type 'S5' does not conform to protocol 'P5'}}
+  func foo(arg: GenClass<Never>) {} // expected-note {{candidate would match and infer 'A' = 'GenClass<Never>' if 'GenClass<Never>' inherited from 'GenClass<S5.X>'}}
 }
 
 // Abstract type witnesses.
-protocol SR_12707_P5a {
+protocol P6a {
   associatedtype X = Never
 
-  associatedtype A: SR_12707_C<X>
-  associatedtype B: SR_12707_C<X>
+  associatedtype A: GenClass<X>
+  associatedtype B: GenClass<X>
 }
-protocol SR_12707_P5b: SR_12707_P5a where B == SR_12707_C<X> {
-  associatedtype C: SR_12707_C<Self> = SR_12707_C<Self>
+protocol P6b: P6a where B == GenClass<X> {
+  associatedtype C: GenClass<Self> = GenClass<Self>
 }
-struct SR_12707_Conform_P5<A: SR_12707_C<Never>>: SR_12707_P5b {}
+struct S6<A: GenClass<Never>>: P6b {}

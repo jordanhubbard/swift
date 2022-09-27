@@ -634,7 +634,8 @@ final class TestRunner {
       let index: (Int) -> String =
         { q == 2 ? "" : q <= 20 ?  base20[$0] : String($0) }
       let tail = (1..<q).map { prefix + index($0) } + ["MAX"]
-      return [withUnit("MIN")] + tail.map(c.delta ? withDelta : withUnit)
+      // QMIN identifies the quantile format, distinct from formats using "MIN"
+      return [withUnit("QMIN")] + tail.map(c.delta ? withDelta : withUnit)
     }
     return (
       ["#", "TEST", "SAMPLES"] +
@@ -664,8 +665,7 @@ final class TestRunner {
           (c.logMemory ? [r.meta?.maxRSS].compactMap { $0 } : []) +
           (c.logMeta ? r.meta.map {
             [$0.pages, $0.ics, $0.yields] } ?? [] : [])
-        return values.map {
-          (c.delta && $0 == 0) ? "" : String($0) } // drop 0s in deltas
+        return values.map { String($0) }
       }
       let benchmarkStats = (
         [index, t.name] + (results.map(values) ?? ["Unsupported"])

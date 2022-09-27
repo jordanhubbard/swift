@@ -6,7 +6,37 @@ class MyLabel {
 }
 
 class Controller {
+  
   fileprivate let label = MyLabel()
+  fileprivate var secondLabel: MyLabel? = MyLabel()
+  public var thirdLabel: MyLabel? = MyLabel()
+  
+  subscript(string: String) -> String {
+    get {
+      ""
+    }
+    set {
+      
+    }
+  }
+  
+  subscript(int int: Int, str str: String, otherInt: Int) -> Int {
+    get {
+      0
+    }
+    set {
+      
+    }
+  }
+  
+  subscript() -> Int {
+    0
+  }
+  
+}
+
+struct S {
+  var a: Int
 }
 
 struct Container<V> {
@@ -37,12 +67,26 @@ public class GenericController<U> {
   fileprivate let label = MyLabel()
 }
 
-public func generic_class_constrainted_keypath<U, V>(_ c: V) where V : GenericController<U> {
+public func generic_class_constrained_keypath<U, V>(_ c: V) where V : GenericController<U> {
   let kp = \V.label
   print(kp)
   print(c[keyPath: kp].text)
 }
 
-// CHECK: Swift.KeyPath<main.GenericController<Swift.Int>, main.MyLabel>
+// CHECK: GenericController<Int>.label
 // CHECK: label
-generic_class_constrainted_keypath(GenericController(5))
+generic_class_constrained_keypath(GenericController(5))
+
+// CHECK: {{\\Controller\.secondLabel!\.text|\\Controller\.<computed 0x.* \(Optional<MyLabel>\)>!\.<computed 0x.* \(String\)>}}
+print(\Controller.secondLabel!.text)
+
+// CHECK: {{\\Controller\.subscript\(_: String\)|\\Controller\.<computed 0x.* \(String\)>}}
+print(\Controller["abc"])
+// CHECK: \S.a
+print(\S.a)
+// CHECK: {{\\Controller\.subscript\(int: Int, str: String, _: Int\)|\\Controller\.<computed 0x.* \(Int\)>}}
+print(\Controller[int: 0, str: "", 0])
+// CHECK: {{\\Controller\.thirdLabel|\\Controller\.<computed 0x.* \(Optional<MyLabel>\)>}}
+print(\Controller.thirdLabel)
+// CHECK: {{\\Controller\.subscript\(\)|\\Controller\.<computed 0x.* \(Int\)>}}
+print(\Controller.[])

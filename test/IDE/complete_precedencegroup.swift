@@ -19,6 +19,9 @@
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=ASSIGNMENT_1 | %FileCheck %s -check-prefix=ASSIGNMENT
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=ASSIGNMENT_2 | %FileCheck %s -check-prefix=ASSIGNMENT
 
+// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=GLOBAL_EXPR | %FileCheck %s -check-prefix=PRECEDENCE_GROUP_NEGATIVE
+// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=GLOBAL_TYPE | %FileCheck %s -check-prefix=PRECEDENCE_GROUP_NEGATIVE
+
 infix operator +++: #^PRECEDENCE_GROUP_1^#
 
 precedencegroup MyPrecedence1 {
@@ -82,6 +85,13 @@ precedencegroup MyPrecedence12 {
 
 infix operator ---: #^PRECEDENCE_GROUP_CURRFILE^#
 
+func testExpr() {
+  _ = #^GLOBAL_EXPR^#
+}
+func testType() {
+  let _: #^GLOBAL_TYPE^#
+}
+
 // ATTRIBUTE_LIST: Begin completions, 4 items
 // ATTRIBUTE_LIST: Keyword/None: associativity; name=associativity
 // ATTRIBUTE_LIST: Keyword/None: higherThan;    name=higherThan
@@ -101,7 +111,7 @@ infix operator ---: #^PRECEDENCE_GROUP_CURRFILE^#
 // PRECEDENCE_GROUP-DAG: Decl[PrecedenceGroup]/OtherModule[Swift]/IsSystem: AssignmentPrecedence; name=AssignmentPrecedence
 // PRECEDENCE_GROUP-DAG: Decl[PrecedenceGroup]/OtherModule[Swift]/IsSystem: ComparisonPrecedence; name=ComparisonPrecedence
 
-/* FIXME: SR-8898 We only see precedence groups that are earlier in life! */
+/* FIXME: (https://github.com/apple/swift/issues/51404) We only see precedence groups that are earlier in life! */
 // PRECEDENCE_GROUP_CURRFILE-DAG: Begin completions
 // PRECEDENCE_GROUP_CURRFILE-DAG: Decl[PrecedenceGroup]/CurrModule: MyPrecedence{{[0-9]+}};
 // PRECEDENCE_GROUP_CURRFILE-DAG: Decl[PrecedenceGroup]/CurrModule: MyPrecedence{{[0-9]+}};
@@ -117,3 +127,7 @@ infix operator ---: #^PRECEDENCE_GROUP_CURRFILE^#
 // PRECEDENCE_GROUP_CURRFILE-DAG: Decl[PrecedenceGroup]/CurrModule: MyPrecedence{{[0-9]+}};
 
 // PRECEDENCE_GROUP_MULTIFILE: Decl[PrecedenceGroup]/CurrModule: PrecedenceGroupOtherFile; name=PrecedenceGroupOtherFile
+
+// PRECEDENCE_GROUP_NEGATIVE: Begin completions
+// PRECEDENCE_GROUP_NEGATIVE-NOT: Decl[PrecedenceGroup]
+// PRECEDENCE_GROUP_NEGATIVE: End completions

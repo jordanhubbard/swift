@@ -88,6 +88,8 @@ namespace sil_index_block {
     SIL_FUNC_OFFSETS,
     SIL_VTABLE_NAMES,
     SIL_VTABLE_OFFSETS,
+    SIL_MOVEONLYDEINIT_NAMES,
+    SIL_MOVEONLYDEINIT_OFFSETS,
     SIL_GLOBALVAR_NAMES,
     SIL_GLOBALVAR_OFFSETS,
     SIL_WITNESS_TABLE_NAMES,
@@ -154,6 +156,8 @@ namespace sil_block {
     SIL_INST_LINEAR_FUNCTION,
     SIL_INST_DIFFERENTIABLE_FUNCTION_EXTRACT,
     SIL_INST_LINEAR_FUNCTION_EXTRACT,
+    SIL_INST_INCREMENT_PROFILER_COUNTER,
+    SIL_MOVEONLY_DEINIT,
   };
 
   using SILInstNoOperandLayout = BCRecordLayout<
@@ -173,6 +177,13 @@ namespace sil_block {
     SILVTableEntryKindField,  // Kind
     BCFixed<1>, // NonOverridden
     BCArray<ValueIDField> // SILDeclRef
+  >;
+
+  using MoveOnlyDeinitLayout = BCRecordLayout<
+    SIL_MOVEONLY_DEINIT,
+    DeclIDField,          // Class Decl
+    DeclIDField,          // SILFunction name
+    BCFixed<1>            // IsSerialized.
   >;
   
   using PropertyLayout = BCRecordLayout<
@@ -284,8 +295,10 @@ namespace sil_block {
                      BCFixed<1>,  // is distributed
                      TypeIDField, // SILFunctionType
                      DeclIDField,  // SILFunction name or 0 (replaced function)
+                     DeclIDField,  // SILFunction name or 0 (used ad-hoc requirement witness function)
                      GenericSignatureIDField,
                      DeclIDField, // ClangNode owner
+                     ModuleIDField, // Parent ModuleDecl *
                      BCArray<IdentifierIDField> // Semantics Attribute
                      // followed by specialize and argument effects attributes
                      // followed by generic param list, if any
@@ -299,12 +312,14 @@ namespace sil_block {
                      DeclIDField, // Target SILFunction name or 0.
                      DeclIDField,  // SPIGroup or 0.
                      DeclIDField, // SPIGroup Module name id.
-                     BC_AVAIL_TUPLE // Availability
+                     BC_AVAIL_TUPLE, // Availability
+                     BCArray<IdentifierIDField> // type erased params
                      >;
 
   using SILArgEffectsAttrLayout =
       BCRecordLayout<SIL_ARG_EFFECTS_ATTR,
                      IdentifierIDField, // argument effects string
+                     BCVBR<8>,          // argumentIndex
                      BCFixed<1>         // isDerived
                      >;
 
@@ -330,7 +345,7 @@ namespace sil_block {
   using SILOneTypeOneOperandLayout = BCRecordLayout<
     SIL_ONE_TYPE_ONE_OPERAND,
     SILInstOpCodeField,
-    BCFixed<1>,          // Optional attribute
+    BCFixed<2>,          // Optional attribute
     TypeIDField,
     SILTypeCategoryField,
     TypeIDField,
@@ -504,6 +519,14 @@ namespace sil_block {
     SILTypeCategoryField,
     ValueIDField,
     BCFixed<1> // extractee
+  >;
+
+  using SILInstIncrementProfilerCounterLayout = BCRecordLayout<
+    SIL_INST_INCREMENT_PROFILER_COUNTER,
+    IdentifierIDField,       // PGO func name
+    IdentifierIDField,       // PGO func hash
+    BCVBR<8>,                // counter index
+    BCVBR<8>                 // num counters
   >;
 }
 

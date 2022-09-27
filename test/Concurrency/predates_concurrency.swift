@@ -126,3 +126,56 @@ func aFailedExperiment(@_unsafeSendable _ body: @escaping () -> Void) { }
 
 func anothingFailedExperiment(@_unsafeMainActor _ body: @escaping () -> Void) { }
 // expected-warning@-1{{'_unsafeMainActor' attribute has been removed in favor of @preconcurrency}}
+
+// ---------------------------------------------------------------------------
+// Random bugs
+// ---------------------------------------------------------------------------
+
+public enum StringPlacement : Sendable {
+  public typealias StringPosition = @Sendable (_: [String]) -> Int
+
+  @preconcurrency
+  public static func position(before string: String) -> StringPosition {
+    return { _ in 0 }
+  }
+
+  @preconcurrency
+  public static func position(after string: String) -> StringPosition {
+    return { _ in 0 }
+  }
+}
+
+func testStringPlacement() {
+  let fn1 = StringPlacement.position(before: "Test")
+  let _: Int = fn1   // expected-error{{cannot convert value of type '([String]) -> Int' to specified type 'Int'}}
+
+  let fn2 = StringPlacement.position(before:)
+  let _: Int = fn2 // expected-error{{cannot convert value of type '(String) -> ([String]) -> Int' to specified type 'Int'}}
+}
+
+// @preconcurrency in an outer closure
+// (https://github.com/apple/swift/issues/59910)
+struct Scheduled<T> { }
+
+@preconcurrency
+func doPreconcurrency(_: @Sendable () -> Void) { }
+
+class EventLoop {
+  @discardableResult
+  @preconcurrency
+  func scheduleTask<T>(deadline: Int, _ task: @escaping @Sendable () throws -> T) -> Scheduled<T> { fatalError("") }
+}
+
+class C {
+  var ev: EventLoop? = nil
+
+  func test(i: Int) {
+    func doNext() {
+      doPreconcurrency {
+        self.ev?.scheduleTask(deadline: i, doNext)
+        return
+      }
+    }
+  }
+}
+

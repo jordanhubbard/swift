@@ -21,7 +21,7 @@ if #available(OSX 10.51, *) && #available(OSX 10.52, *) { // expected-error {{ex
 }
 
 
-if #available { // expected-error {{expected availability condition}} expected-error {{closure expression is unused}} expected-error {{top-level statement cannot begin with a closure expression}} expected-note {{did you mean to use a 'do' statement?}} {{15-15=do }}
+if #available { // expected-error {{expected availability condition}}
 }
 
 if #available( { // expected-error {{expected platform name}} expected-error {{expected ')'}} expected-note {{to match this opening '('}}
@@ -44,6 +44,18 @@ if #available(iDishwasherOS 10.51) { // expected-warning {{unrecognized platform
 }
 
 if #available(iDishwasherOS 10.51, *) { // expected-warning {{unrecognized platform name 'iDishwasherOS'}}
+}
+
+if #available(macos 10.51, *) { // expected-warning {{unrecognized platform name 'macos'; did you mean 'macOS'?}} {{15-20=macOS}}
+}
+
+if #available(mscos 10.51, *) { // expected-warning {{unrecognized platform name 'mscos'; did you mean 'macOS'?}} {{15-20=macOS}}
+}
+
+if #available(macoss 10.51, *) { // expected-warning {{unrecognized platform name 'macoss'; did you mean 'macOS'?}} {{15-21=macOS}}
+}
+
+if #available(mac 10.51, *) { // expected-warning {{unrecognized platform name 'mac'; did you mean 'macOS'?}} {{15-18=macOS}}
 }
 
 if #available(OSX 10.51, OSX 10.52, *) {  // expected-error {{version for 'macOS' already specified}}

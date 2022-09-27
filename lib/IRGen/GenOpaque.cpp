@@ -291,7 +291,7 @@ getOrCreateValueWitnessTablePtrTy(IRGenModule &IGM, llvm::PointerType *&cache,
 }
 
 llvm::StructType *IRGenModule::getValueWitnessTableTy() {
-  return cast<llvm::StructType>(getValueWitnessTablePtrTy()->getElementType());
+  return cast<llvm::StructType>(getValueWitnessTablePtrTy()->getPointerElementType());
 }
 llvm::PointerType *IRGenModule::getValueWitnessTablePtrTy() {
   return getOrCreateValueWitnessTablePtrTy(*this, ValueWitnessTablePtrTy,
@@ -300,7 +300,7 @@ llvm::PointerType *IRGenModule::getValueWitnessTablePtrTy() {
 
 llvm::StructType *IRGenModule::getEnumValueWitnessTableTy() {
   return cast<llvm::StructType>(getEnumValueWitnessTablePtrTy()
-           ->getElementType());
+           ->getPointerElementType());
 }
 llvm::PointerType *IRGenModule::getEnumValueWitnessTablePtrTy() {
   return getOrCreateValueWitnessTablePtrTy(*this, EnumValueWitnessTablePtrTy,
@@ -548,7 +548,7 @@ StackAddress IRGenFunction::emitDynamicAlloca(llvm::Type *eltTy,
     } else {
       byteCount = Builder.CreateMul(arraySize, IGM.getSize(Size(eltSize)));
     }
-    // The task allocator wants size increments in the mulitple of
+    // The task allocator wants size increments in the multiple of
     // MaximumAlignment.
     byteCount = alignUpToMaximumAlignment(IGM.SizeTy, byteCount);
     auto address = emitTaskAlloc(byteCount, align);
@@ -1269,8 +1269,13 @@ irgen::emitGetEnumTagSinglePayloadGenericCall(IRGenFunction &IGF,
   auto getExtraInhabitantTagFn =
     getOrCreateGetExtraInhabitantTagFunction(IGF.IGM, payloadType,
                                              payloadTI, emitter);
-  getExtraInhabitantTagFn =
-    IGF.IGM.getConstantSignedCFunctionPointer(getExtraInhabitantTagFn);      
+  // Sign the getExtraInhabitantTag function with the C function pointer schema.
+  if (auto schema = IGF.IGM.getOptions().PointerAuth.FunctionPointers) {
+    if (schema.hasOtherDiscrimination())
+      schema = IGF.IGM.getOptions().PointerAuth.GetExtraInhabitantTagFunction;
+    getExtraInhabitantTagFn = IGF.IGM.getConstantSignedPointer(
+        getExtraInhabitantTagFn, schema, PointerAuthEntity(), nullptr);
+  }
 
   // We assume this is never a reabstracted type.
   auto type = payloadType.getASTType();
@@ -1344,8 +1349,14 @@ irgen::emitStoreEnumTagSinglePayloadGenericCall(IRGenFunction &IGF,
   auto storeExtraInhabitantTagFn =
     getOrCreateStoreExtraInhabitantTagFunction(IGF.IGM, payloadType,
                                                payloadTI, emitter);
-  storeExtraInhabitantTagFn =
-    IGF.IGM.getConstantSignedCFunctionPointer(storeExtraInhabitantTagFn);      
+
+  // Sign the getExtraInhabitantTag function with the C function pointer schema.
+  if (auto schema = IGF.IGM.getOptions().PointerAuth.FunctionPointers) {
+    if (schema.hasOtherDiscrimination())
+      schema = IGF.IGM.getOptions().PointerAuth.StoreExtraInhabitantTagFunction;
+    storeExtraInhabitantTagFn = IGF.IGM.getConstantSignedPointer(
+        storeExtraInhabitantTagFn, schema, PointerAuthEntity(), nullptr);
+  }
 
   // We assume this is never a reabstracted type.
   auto type = payloadType.getASTType();

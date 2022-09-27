@@ -17,7 +17,7 @@
 :: - REPO_SCHEME: Optional. The scheme name to checkout.
 
 :: REQUIRED PERMISSIONS
-:: Practically, it is easier to be in the Adminstrators group to run the
+:: Practically, it is easier to be in the Administrators group to run the
 :: script, but it should be possible to execute as a normal user.
 :: The user will need permission to write files into the Windows SDK and the
 :: VisualC++ folder.
@@ -28,8 +28,8 @@ setlocal enableextensions enabledelayedexpansion
 
 PATH=%PATH%;%PYTHON_HOME%
 
-set icu_version_major=64
-set icu_version_minor=2
+set icu_version_major=69
+set icu_version_minor=1
 set icu_version=%icu_version_major%_%icu_version_minor%
 set icu_version_dashed=%icu_version_major%-%icu_version_minor%
 
@@ -64,10 +64,14 @@ set CUSTOM_CLANG_MODULE_CACHE=%build_root%\tmp\org.llvm.clang.9999
 md %build_root%\tmp\org.swift.package-manager
 set SWIFTPM_MODULECACHE_OVERRIDE=%build_root%\tmp\org.swift.package-manager
 
+set RunTest=1
+if "%1"=="-notest" set RunTest=0
+
 call :clone_repositories %exitOnError%
-call :download_icu %exitOnError%
+:: TODO: Disabled until we need Foundation in this build script.
+:: call :download_icu %exitOnError%
 :: TODO: Disabled until we need LLBuild/SwiftPM in this build script.
-:: call :download_sqlite3
+:: call :download_sqlite3 %exitOnError%
 
 call :build_llvm %exitOnError%
 path %PATH%;%install_directory%\bin
@@ -79,12 +83,15 @@ call :build_swift %exitOnError%
 
 call :build_lldb %exitOnError%
 
-path %PATH%;C:\Program Files\Git\usr\bin
+path %PATH%;%SystemDrive%\Program Files\Git\usr\bin
 call :build_libdispatch %exitOnError%
 
-path %source_root%\icu-%icu_version%\bin64;%install_directory%\bin;%build_root%\swift\bin;%build_root%\swift\libdispatch-prefix\bin;%PATH%
-call :test_swift %exitOnError%
-call :test_libdispatch %exitOnError%
+path %install_directory%\bin;%build_root%\swift\bin;%build_root%\swift\libdispatch-prefix\bin;%PATH%
+
+if %RunTest%==1 (
+  call :test_swift %exitOnError%
+  call :test_libdispatch %exitOnError%
+)
 
 goto :end
 endlocal
@@ -98,7 +105,7 @@ setlocal enableextensions enabledelayedexpansion
 if defined REPO_SCHEME SET "scheme_arg=--scheme %REPO_SCHEME%"
 
 git -C "%source_root%\swift" config --local core.autocrlf input
-git -C "%source_root%\swift" config --local core.symlink true
+git -C "%source_root%\swift" config --local core.symlinks true
 git -C "%source_root%\swift" checkout-index --force --all
 
 :: Always skip Swift, since it is checked out by Jenkins
@@ -115,7 +122,6 @@ git -C "%source_root%\swift" checkout-index --force --all
 @set "skip_repositories_arg=%skip_repositories_arg% --skip-repository swift-integration-tests"
 @set "skip_repositories_arg=%skip_repositories_arg% --skip-repository swiftpm"
 @set "skip_repositories_arg=%skip_repositories_arg% --skip-repository swift-stress-tester"
-@set "skip_repositories_arg=%skip_repositories_arg% --skip-repository swift-syntax"
 @set "skip_repositories_arg=%skip_repositories_arg% --skip-repository swift-tools-support-core"
 @set "skip_repositories_arg=%skip_repositories_arg% --skip-repository swift-xcode-playground-support"
 @set "skip_repositories_arg=%skip_repositories_arg% --skip-repository tensorflow-swift-apis"
@@ -128,15 +134,14 @@ endlocal
 
 
 :download_icu
-:: Downloads ICU, which will be used as a dependency for the Swift Standard
-:: Library and Foundation.
+:: Downloads ICU, which will be used as a dependency for Foundation.
 setlocal enableextensions enabledelayedexpansion
 
-set file_name=icu4c-%icu_version%-Win64-MSVC2017.zip
+set file_name=icu4c-%icu_version%-Win64-MSVC2019.zip
 curl -L -O "https://github.com/unicode-org/icu/releases/download/release-%icu_version_dashed%/%file_name%" %exitOnError%
 :: unzip warns about the paths in the zip using slashes, which raises the
 :: errorLevel to 1. We cannot use exitOnError, and have to ignore errors.
-"C:\Program Files\Git\usr\bin\unzip.exe" -o %file_name% -d "%source_root%\icu-%icu_version%"
+"%SystemDrive%\Program Files\Git\usr\bin\unzip.exe" -o %file_name% -d "%source_root%\icu-%icu_version%"
 exit /b 0
 
 goto :eof
@@ -148,9 +153,9 @@ endlocal
 :: Swift Package Manager.
 setlocal enableextensions enabledelayedexpansion
 
-set file_name=sqlite-amalgamation-3270200.zip
-curl -L -O "https://www.sqlite.org/2019/%file_name%" %exitOnError%
-"C:\Program Files\Git\usr\bin\unzip.exe" -o %file_name% %exitOnError%
+set file_name=sqlite-amalgamation-3360000.zip
+curl -L -O "https://www.sqlite.org/2021/%file_name%" %exitOnError%
+"%SystemDrive%\Program Files\Git\usr\bin\unzip.exe" -o %file_name% %exitOnError%
 
 goto :eof
 endlocal
@@ -164,8 +169,8 @@ setlocal enableextensions enabledelayedexpansion
 
 copy /y "%source_root%\swift\stdlib\public\Platform\ucrt.modulemap" "%UniversalCRTSdkDir%\Include\%UCRTVersion%\ucrt\module.modulemap" %exitOnError%
 copy /y "%source_root%\swift\stdlib\public\Platform\winsdk.modulemap" "%UniversalCRTSdkDir%\Include\%UCRTVersion%\um\module.modulemap" %exitOnError%
-copy /y "%source_root%\swift\stdlib\public\Platform\visualc.modulemap" "%VCToolsInstallDir%\include\module.modulemap" %exitOnError%
-copy /y "%source_root%\swift\stdlib\public\Platform\visualc.apinotes" "%VCToolsInstallDir%\include\visualc.apinotes" %exitOnError%
+copy /y "%source_root%\swift\stdlib\public\Platform\vcruntime.modulemap" "%VCToolsInstallDir%\include\module.modulemap" %exitOnError%
+copy /y "%source_root%\swift\stdlib\public\Platform\vcruntime.apinotes" "%VCToolsInstallDir%\include\vcruntime.apinotes" %exitOnError%
 
 goto :eof
 endlocal
@@ -276,6 +281,7 @@ cmake^
     -DCMAKE_EXE_LINKER_FLAGS:STRING=/INCREMENTAL:NO^
     -DCMAKE_SHARED_LINKER_FLAGS:STRING=/INCREMENTAL:NO^
     -DSWIFT_LIT_ARGS="--time-tests"^
+    -DSWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE:PATH=%source_root%\swift-syntax^
     -S "%source_root%\swift" %exitOnError%
 
 cmake --build "%build_root%\swift" %exitOnError%

@@ -189,9 +189,6 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   }
 
   // Add flags for C++ interop.
-  if (inputArgs.hasArg(options::OPT_enable_experimental_cxx_interop)) {
-    arguments.push_back("-enable-cxx-interop");
-  }
   if (const Arg *arg =
           inputArgs.getLastArg(options::OPT_experimental_cxx_stdlib)) {
     arguments.push_back("-Xcc");
@@ -235,12 +232,16 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
                        options::OPT_enable_actor_data_race_checks,
                        options::OPT_disable_actor_data_race_checks);
   inputArgs.AddLastArg(arguments, options::OPT_warn_concurrency);
+  inputArgs.AddLastArg(arguments, options::OPT_strict_concurrency);
+  inputArgs.AddAllArgs(arguments, options::OPT_enable_experimental_feature);
+  inputArgs.AddAllArgs(arguments, options::OPT_enable_upcoming_feature);
   inputArgs.AddLastArg(arguments, options::OPT_warn_implicit_overrides);
   inputArgs.AddLastArg(arguments, options::OPT_typo_correction_limit);
   inputArgs.AddLastArg(arguments, options::OPT_enable_app_extension);
   inputArgs.AddLastArg(arguments, options::OPT_enable_library_evolution);
   inputArgs.AddLastArg(arguments, options::OPT_require_explicit_availability);
   inputArgs.AddLastArg(arguments, options::OPT_require_explicit_availability_target);
+  inputArgs.AddLastArg(arguments, options::OPT_require_explicit_availability_EQ);
   inputArgs.AddLastArg(arguments, options::OPT_require_explicit_sendable);
   inputArgs.AddLastArg(arguments, options::OPT_check_api_availability_only);
   inputArgs.AddLastArg(arguments, options::OPT_enable_testing);
@@ -298,13 +299,16 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
                        options::OPT_verify_incremental_dependencies);
   inputArgs.AddLastArg(arguments, options::OPT_access_notes_path);
   inputArgs.AddLastArg(arguments, options::OPT_library_level);
+  inputArgs.AddLastArg(arguments, options::OPT_enable_bare_slash_regex);
+  inputArgs.AddLastArg(arguments, options::OPT_enable_experimental_cxx_interop);
 
   // Pass on any build config options
   inputArgs.AddAllArgs(arguments, options::OPT_D);
 
   // Pass on file paths that should be remapped in debug info.
-  inputArgs.AddAllArgs(arguments, options::OPT_debug_prefix_map);
-  inputArgs.AddAllArgs(arguments, options::OPT_coverage_prefix_map);
+  inputArgs.AddAllArgs(arguments, options::OPT_debug_prefix_map,
+                                  options::OPT_coverage_prefix_map,
+                                  options::OPT_file_prefix_map);
 
   std::string globalRemapping = getGlobalDebugPathRemapping();
   if (!globalRemapping.empty()) {
@@ -315,7 +319,7 @@ void ToolChain::addCommonFrontendArgs(const OutputInfo &OI,
   // Pass through the values passed to -Xfrontend.
   inputArgs.AddAllArgValues(arguments, options::OPT_Xfrontend);
 
-  // Pass on module names whose symbols should be embeded in tbd.
+  // Pass on module names whose symbols should be embedded in tbd.
   inputArgs.AddAllArgs(arguments, options::OPT_embed_tbd_for_module);
 
   if (auto *A = inputArgs.getLastArg(options::OPT_working_directory)) {
@@ -570,6 +574,8 @@ ToolChain::constructInvocation(const CompileJobAction &job,
     context.Args.AddLastArg(Arguments, options::OPT_index_store_path);
     if (!context.Args.hasArg(options::OPT_index_ignore_system_modules))
       Arguments.push_back("-index-system-modules");
+    context.Args.AddLastArg(Arguments, options::OPT_index_ignore_clang_modules);
+    context.Args.AddLastArg(Arguments, options::OPT_index_include_locals);
   }
 
   if (context.Args.hasArg(options::OPT_debug_info_store_invocation) ||
@@ -611,6 +617,7 @@ ToolChain::constructInvocation(const CompileJobAction &job,
     context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
   }
   context.Args.AddLastArg(Arguments, options::OPT_include_spi_symbols);
+  context.Args.AddLastArg(Arguments, options::OPT_emit_extension_block_symbols);
   context.Args.AddLastArg(Arguments, options::OPT_symbol_graph_minimum_access_level);
 
   return II;
@@ -675,8 +682,7 @@ const char *ToolChain::JobContext::computeFrontendModeForCompile() const {
   case file_types::TY_Dependencies:
   case file_types::TY_SwiftModuleDocFile:
   case file_types::TY_SerializedDiagnostics:
-  case file_types::TY_ObjCHeader:
-  case file_types::TY_CXXHeader:
+  case file_types::TY_ClangHeader:
   case file_types::TY_Image:
   case file_types::TY_SwiftDeps:
   case file_types::TY_ExternalSwiftDeps:
@@ -692,6 +698,7 @@ const char *ToolChain::JobContext::computeFrontendModeForCompile() const {
   case file_types::TY_SwiftOverlayFile:
   case file_types::TY_IndexUnitOutputPath:
   case file_types::TY_SwiftABIDescriptor:
+  case file_types::TY_ConstValues:
     llvm_unreachable("Output type can never be primary output.");
   case file_types::TY_INVALID:
     llvm_unreachable("Invalid type ID");
@@ -815,7 +822,7 @@ void ToolChain::JobContext::addFrontendSupplementaryOutputArguments(
                    file_types::TY_SerializedDiagnostics,
                    "-serialize-diagnostics-path");
 
-  if (addOutputsOfType(arguments, Output, Args, file_types::ID::TY_ObjCHeader,
+  if (addOutputsOfType(arguments, Output, Args, file_types::ID::TY_ClangHeader,
                        "-emit-objc-header-path")) {
     assert(OI.CompilerMode == OutputInfo::Mode::SingleCompile &&
            "The Swift tool should only emit an Obj-C header in single compile"
@@ -936,8 +943,7 @@ ToolChain::constructInvocation(const BackendJobAction &job,
     case file_types::TY_Dependencies:
     case file_types::TY_SwiftModuleDocFile:
     case file_types::TY_SerializedDiagnostics:
-    case file_types::TY_ObjCHeader:
-    case file_types::TY_CXXHeader:
+    case file_types::TY_ClangHeader:
     case file_types::TY_Image:
     case file_types::TY_SwiftDeps:
     case file_types::TY_ExternalSwiftDeps:
@@ -953,6 +959,7 @@ ToolChain::constructInvocation(const BackendJobAction &job,
     case file_types::TY_SwiftOverlayFile:
     case file_types::TY_IndexUnitOutputPath:
     case file_types::TY_SwiftABIDescriptor:
+    case file_types::TY_ConstValues:
       llvm_unreachable("Output type can never be primary output.");
     case file_types::TY_INVALID:
       llvm_unreachable("Invalid type ID");
@@ -1100,13 +1107,14 @@ ToolChain::constructInvocation(const MergeModuleJobAction &job,
                    file_types::TY_SerializedDiagnostics,
                    "-serialize-diagnostics-path");
   addOutputsOfType(Arguments, context.Output, context.Args,
-                   file_types::TY_ObjCHeader, "-emit-objc-header-path");
+                   file_types::TY_ClangHeader, "-emit-objc-header-path");
   addOutputsOfType(Arguments, context.Output, context.Args, file_types::TY_TBD,
                    "-emit-tbd-path");
 
   context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph);
   context.Args.AddLastArg(Arguments, options::OPT_emit_symbol_graph_dir);
   context.Args.AddLastArg(Arguments, options::OPT_include_spi_symbols);
+  context.Args.AddLastArg(Arguments, options::OPT_emit_extension_block_symbols);
   context.Args.AddLastArg(Arguments, options::OPT_symbol_graph_minimum_access_level);
 
   context.Args.AddLastArg(Arguments, options::OPT_import_objc_header);
@@ -1309,7 +1317,7 @@ ToolChain::constructInvocation(const GeneratePCHJobAction &job,
                    file_types::TY_SerializedDiagnostics,
                    "-serialize-diagnostics-path");
 
-  addInputsOfType(Arguments, context.InputActions, file_types::TY_ObjCHeader);
+  addInputsOfType(Arguments, context.InputActions, file_types::TY_ClangHeader);
   context.Args.AddLastArg(Arguments, options::OPT_index_store_path);
 
   if (job.isPersistentPCH()) {

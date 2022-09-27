@@ -11,15 +11,18 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-module"
+
 #include "swift/SIL/SILModule.h"
 #include "Linker.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/Notifications.h"
 #include "swift/SIL/SILDebugScope.h"
+#include "swift/SIL/SILMoveOnlyDeinit.h"
 #include "swift/SIL/SILRemarkStreamer.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SIL/SILVisitor.h"
@@ -90,9 +93,11 @@ class SILModule::SerializationCallback final
 };
 
 SILModule::SILModule(llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
-                     Lowering::TypeConverter &TC, const SILOptions &Options)
-    : Stage(SILStage::Raw), indexTrieRoot(new IndexTrieNode()),
-      Options(Options), serialized(false),
+                     Lowering::TypeConverter &TC, const SILOptions &Options,
+                     const IRGenOptions *irgenOptions)
+    : Stage(SILStage::Raw), loweredAddresses(!Options.EnableSILOpaqueValues),
+      indexTrieRoot(new IndexTrieNode()), Options(Options),
+      irgenOptions(irgenOptions), serialized(false),
       regDeserializationNotificationHandlerForNonTransparentFuncOME(false),
       regDeserializationNotificationHandlerForAllFuncOME(false),
       prespecializedFunctionDeclsImported(false), SerializeSILAction(),
@@ -129,6 +134,9 @@ SILModule::~SILModule() {
   for (auto vt : vtables)
     vt->~SILVTable();
 
+  for (auto deinit : moveOnlyDeinits)
+    deinit->~SILMoveOnlyDeinit();
+
   // Drop everything functions in this module reference.
   //
   // This is necessary since the functions may reference each other.  We don't
@@ -138,6 +146,7 @@ SILModule::~SILModule() {
   for (SILFunction &F : *this) {
     F.dropAllReferences();
     F.dropDynamicallyReplacedFunction();
+    F.dropReferencedAdHocRequirementWitnessFunction();
     F.clearSpecializeAttrs();
   }
 
@@ -158,14 +167,20 @@ void SILModule::checkForLeaks() const {
   int instsInModule = std::distance(scheduledForDeletion.begin(),
                                     scheduledForDeletion.end());
   for (const SILFunction &F : *this) {
-    for (const SILBasicBlock &block : F) {
-      instsInModule += std::distance(block.begin(), block.end());
-    }
+    const SILFunction *sn = &F;
+    do {
+      for (const SILBasicBlock &block : *sn) {
+        instsInModule += std::distance(block.begin(), block.end());
+      }
+    } while ((sn = sn->snapshots) != nullptr);
   }
   for (const SILFunction &F : zombieFunctions) {
-    for (const SILBasicBlock &block : F) {
-      instsInModule += std::distance(block.begin(), block.end());
-    }
+    const SILFunction *sn = &F;
+    do {
+      for (const SILBasicBlock &block : F) {
+        instsInModule += std::distance(block.begin(), block.end());
+      }
+    } while ((sn = sn->snapshots) != nullptr);
   }
   for (const SILGlobalVariable &global : getSILGlobals()) {
       instsInModule += std::distance(global.StaticInitializerBlock.begin(),
@@ -177,7 +192,7 @@ void SILModule::checkForLeaks() const {
                        
   if (numAllocated != instsInModule) {
     llvm::errs() << "Leaking instructions!\n";
-    llvm::errs() << "Alloated instructions: " << numAllocated << '\n';
+    llvm::errs() << "Allocated instructions: " << numAllocated << '\n';
     llvm::errs() << "Instructions in module: " << instsInModule << '\n';
     llvm_unreachable("leaking instructions");
   }
@@ -202,8 +217,10 @@ void SILModule::checkForLeaksAfterDestruction() {
 
 std::unique_ptr<SILModule> SILModule::createEmptyModule(
     llvm::PointerUnion<FileUnit *, ModuleDecl *> context,
-    Lowering::TypeConverter &TC, const SILOptions &Options) {
-  return std::unique_ptr<SILModule>(new SILModule(context, TC, Options));
+    Lowering::TypeConverter &TC, const SILOptions &Options,
+    const IRGenOptions *irgenOptions) {
+  return std::unique_ptr<SILModule>(new SILModule(context, TC, Options,
+                                                  irgenOptions));
 }
 
 ASTContext &SILModule::getASTContext() const {
@@ -429,13 +446,14 @@ void SILModule::invalidateSILLoaderCaches() {
 
 SILFunction *SILModule::removeFromZombieList(StringRef Name) {
   if (auto *Zombie = ZombieFunctionTable.lookup(Name)) {
+    assert(Zombie->snapshotID == 0 && "zombie cannot be a snapthot function");
     ZombieFunctionTable.erase(Name);
     zombieFunctions.remove(Zombie);
 
     // The owner of the function's Name is the ZombieFunctionTable key, which is
     // freed by erase().
     // Make sure nobody accesses the name string after it is freed.
-    Zombie->Name = StringRef();
+    Zombie->setName(StringRef());
     return Zombie;
   }
   return nullptr;
@@ -444,6 +462,7 @@ SILFunction *SILModule::removeFromZombieList(StringRef Name) {
 /// Erase a function from the module.
 void SILModule::eraseFunction(SILFunction *F) {
   assert(!F->isZombie() && "zombie function is in list of alive functions");
+  assert(F->snapshotID == 0 && "cannot erase a snapshot function");
 
   llvm::StringMapEntry<SILFunction*> *entry =
       &*ZombieFunctionTable.insert(std::make_pair(F->getName(), nullptr)).first;
@@ -454,7 +473,7 @@ void SILModule::eraseFunction(SILFunction *F) {
   // the function from the table we need to use the allocated name string from
   // the ZombieFunctionTable.
   FunctionTable.erase(F->getName());
-  F->Name = zombieName;
+  F->setName(zombieName);
 
   // The function is dead, but we need it later (at IRGen) for debug info
   // or vtable stub generation. So we move it into the zombie list.
@@ -467,6 +486,7 @@ void SILModule::eraseFunction(SILFunction *F) {
   // (References are not needed anymore.)
   F->clear();
   F->dropDynamicallyReplacedFunction();
+  F->dropReferencedAdHocRequirementWitnessFunction();
   // Drop references for any _specialize(target:) functions.
   F->clearSpecializeAttrs();
 }
@@ -503,6 +523,29 @@ SILVTable *SILModule::lookUpVTable(const ClassDecl *C,
   // If we succeeded, map C -> VTbl in the table and return VTbl.
   VTableMap[C] = Vtbl;
   return Vtbl;
+}
+
+SILMoveOnlyDeinit *SILModule::lookUpMoveOnlyDeinit(const NominalTypeDecl *C,
+                                                   bool deserializeLazily) {
+  if (!C)
+    return nullptr;
+
+  // First try to look up R from the lookup table.
+  auto iter = MoveOnlyDeinitMap.find(C);
+  if (iter != MoveOnlyDeinitMap.end())
+    return iter->second;
+
+  if (!deserializeLazily)
+    return nullptr;
+
+  // If that fails, try to deserialize it. If that fails, return nullptr.
+  auto *tbl = getSILLoader()->lookupMoveOnlyDeinit(C);
+  if (!tbl)
+    return nullptr;
+
+  // If we succeeded, map C -> VTbl in the table and return VTbl.
+  MoveOnlyDeinitMap[C] = tbl;
+  return tbl;
 }
 
 SerializedSILLoader *SILModule::getSILLoader() {
@@ -613,6 +656,20 @@ lookUpFunctionInVTable(ClassDecl *Class, SILDeclRef Member) {
   return nullptr;
 }
 
+SILFunction *
+SILModule::lookUpMoveOnlyDeinitFunction(const NominalTypeDecl *nomDecl) {
+  assert(nomDecl->isMoveOnly());
+
+  auto *tbl = lookUpMoveOnlyDeinit(nomDecl);
+
+  // Bail, if the lookup of VTable fails.
+  if (!tbl) {
+    return nullptr;
+  }
+
+  return tbl->getImplementation();
+}
+
 SILDifferentiabilityWitness *
 SILModule::lookUpDifferentiabilityWitness(StringRef name) {
   auto it = DifferentiabilityWitnessMap.find(name);
@@ -663,6 +720,48 @@ SILValue SILModule::getRootOpenedArchetypeDef(CanOpenedArchetypeType archetype,
 
 bool SILModule::hasUnresolvedOpenedArchetypeDefinitions() {
   return numUnresolvedOpenedArchetypes != 0;
+}
+
+/// Get a unique index for a struct or class field in layout order.
+unsigned SILModule::getFieldIndex(NominalTypeDecl *decl, VarDecl *field) {
+
+  auto iter = fieldIndices.find({decl, field});
+  if (iter != fieldIndices.end())
+    return iter->second;
+
+  unsigned index = 0;
+  if (auto *classDecl = dyn_cast<ClassDecl>(decl)) {
+    for (auto *superDecl = classDecl->getSuperclassDecl(); superDecl != nullptr;
+         superDecl = superDecl->getSuperclassDecl()) {
+      index += superDecl->getStoredProperties().size();
+    }
+  }
+  for (VarDecl *property : decl->getStoredProperties()) {
+    if (field == property) {
+      fieldIndices[{decl, field}] = index;
+      return index;
+    }
+    ++index;
+  }
+  llvm_unreachable("The field decl for a struct_extract, struct_element_addr, "
+                   "or ref_element_addr must be an accessible stored "
+                   "property of the operand type");
+}
+
+unsigned SILModule::getCaseIndex(EnumElementDecl *enumElement) {
+  auto iter = enumCaseIndices.find(enumElement);
+  if (iter != enumCaseIndices.end())
+    return iter->second;
+
+  unsigned idx = 0;
+  for (EnumElementDecl *e : enumElement->getParentEnum()->getAllElements()) {
+    if (e == enumElement) {
+      enumCaseIndices[enumElement] = idx;
+      return idx;
+    }
+    ++idx;
+  }
+  llvm_unreachable("enum element not found in enum decl");
 }
 
 void SILModule::notifyAddedInstruction(SILInstruction *inst) {
@@ -748,12 +847,6 @@ shouldSerializeEntitiesAssociatedWithDeclContext(const DeclContext *DC) const {
 bool SILModule::isOptimizedOnoneSupportModule() const {
   return getOptions().shouldOptimize() &&
          getSwiftModule()->isOnoneSupportModule();
-}
-
-void SILModule::addPublicCMOSymbol(StringRef symbol) {
-  if (!publicCMOSymbols)
-    publicCMOSymbols = std::make_shared<TBDSymbolSet>();
-  publicCMOSymbols->insert(symbol.str());
 }
 
 void SILModule::setSerializeSILAction(SILModule::ActionCallback Action) {

@@ -103,7 +103,8 @@ CodeCompletionCache::~CodeCompletionCache() {}
 ///
 /// This should be incremented any time we commit a change to the format of the
 /// cached results. This isn't expected to change very often.
-static constexpr uint32_t onDiskCompletionCacheVersion = 6; // Store completion item result types in the cache
+static constexpr uint32_t onDiskCompletionCacheVersion =
+    10; // Store if decl has an async alternative
 
 /// Deserializes CodeCompletionResults from \p in and stores them in \p V.
 /// \see writeCacheModule.
@@ -193,8 +194,9 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
       auto supertypeIndex = read32le(p);
       supertypes.push_back(getType(supertypeIndex));
     }
-    const USRBasedType *res =
-        USRBasedType::fromUSR(usr, supertypes, V.USRTypeArena);
+    auto customAttributeKinds = OptionSet<CustomAttributeKind, uint8_t>(*p++);
+    const USRBasedType *res = USRBasedType::fromUSR(
+        usr, supertypes, customAttributeKinds, V.USRTypeArena);
     knownTypes[index] = res;
     return res;
   };
@@ -233,11 +235,14 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
     auto diagSeverity =
         static_cast<CodeCompletionDiagnosticSeverity>(*cursor++);
     auto isSystem = static_cast<bool>(*cursor++);
+    auto isAsync = static_cast<bool>(*cursor++);
+    auto hasAsyncAlternative = static_cast<bool>(*cursor++);
     auto chunkIndex = read32le(cursor);
     auto moduleIndex = read32le(cursor);
     auto briefDocIndex = read32le(cursor);
     auto diagMessageIndex = read32le(cursor);
     auto filterNameIndex = read32le(cursor);
+    auto nameForDiagnosticsIndex = read32le(cursor);
 
     auto assocUSRCount = read32le(cursor);
     SmallVector<NullTerminatedStringRef, 4> assocUSRs;
@@ -257,13 +262,15 @@ static bool readCachedModule(llvm::MemoryBuffer *in,
     auto briefDocComment = getString(briefDocIndex);
     auto diagMessage = getString(diagMessageIndex);
     auto filterName = getString(filterNameIndex);
+    auto nameForDiagnostics = getString(nameForDiagnosticsIndex);
 
     ContextFreeCodeCompletionResult *result =
         new (*V.Allocator) ContextFreeCodeCompletionResult(
-            kind, associatedKind, opKind, isSystem, string, moduleName,
-            briefDocComment, makeArrayRef(assocUSRs).copy(*V.Allocator),
+            kind, associatedKind, opKind, isSystem, isAsync,
+            hasAsyncAlternative, string, moduleName, briefDocComment,
+            makeArrayRef(assocUSRs).copy(*V.Allocator),
             CodeCompletionResultType(resultTypes), notRecommended, diagSeverity,
-            diagMessage, filterName);
+            diagMessage, filterName, nameForDiagnostics);
 
     V.Results.push_back(result);
   }
@@ -381,6 +388,9 @@ static void writeCachedModule(llvm::raw_ostream &out,
     for (auto supertypeIndex : supertypeIndicies) {
       LE.write(static_cast<uint32_t>(supertypeIndex));
     }
+    OptionSet<CustomAttributeKind, uint8_t> customAttributeKinds =
+        type->getCustomAttributeKinds();
+    LE.write(static_cast<uint8_t>(customAttributeKinds.toRaw()));
     knownTypes[type] = size;
     return static_cast<uint32_t>(size);
   };
@@ -416,12 +426,15 @@ static void writeCachedModule(llvm::raw_ostream &out,
       LE.write(static_cast<uint8_t>(R->getNotRecommendedReason()));
       LE.write(static_cast<uint8_t>(R->getDiagnosticSeverity()));
       LE.write(static_cast<uint8_t>(R->isSystem()));
+      LE.write(static_cast<uint8_t>(R->isAsync()));
+      LE.write(static_cast<uint8_t>(R->hasAsyncAlternative()));
       LE.write(
           static_cast<uint32_t>(addCompletionString(R->getCompletionString())));
       LE.write(addString(R->getModuleName()));      // index into strings
       LE.write(addString(R->getBriefDocComment())); // index into strings
       LE.write(addString(R->getDiagnosticMessage())); // index into strings
       LE.write(addString(R->getFilterName())); // index into strings
+      LE.write(addString(R->getNameForDiagnostics())); // index into strings
 
       LE.write(static_cast<uint32_t>(R->getAssociatedUSRs().size()));
       for (unsigned i = 0; i < R->getAssociatedUSRs().size(); ++i) {
@@ -471,6 +484,12 @@ static std::string getName(StringRef cacheDirectory,
       << (K.AddInitsInToplevel ? "-inits" : "")
       << (K.AddCallWithNoDefaultArgs ? "-nodefaults" : "")
       << (K.Annotated ? "-annotated" : "");
+  if (K.SpiGroups.size() > 0) {
+    OSS << "-spi";
+    for (auto SpiGroup : K.SpiGroups) {
+      OSS << "-" << SpiGroup;
+    }
+  }
 
   // name[-access-path-components]
   for (StringRef component : K.AccessPath)
@@ -535,9 +554,16 @@ OnDiskCodeCompletionCache::getFromFile(StringRef filename) {
     return None;
 
   // Make up a key for readCachedModule.
-  CodeCompletionCache::Key K{filename.str(), "<module-name>", {},
-                             false,          false,           false,
-                             false,          false,           false};
+  CodeCompletionCache::Key K{/*ModuleFilename=*/filename.str(),
+                             /*ModuleName=*/"<module-name>",
+                             /*AccessPath=*/{},
+                             /*ResultsHaveLeadingDot=*/false,
+                             /*ForTestableLookup=*/false,
+                             /*ForPrivateImportLookup=*/false,
+                             /*SpiGroups=*/{},
+                             /*AddInitsInToplevel=*/false,
+                             /*AddCallWithNoDefaultArgs=*/false,
+                             /*Annotated=*/false};
 
   // Read the cached results.
   auto V = CodeCompletionCache::createValue();

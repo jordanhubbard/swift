@@ -11,8 +11,15 @@
 //===----------------------------------------------------------------------===//
 
 #include "DeclAndTypePrinter.h"
+#include "ClangSyntaxPrinter.h"
+#include "PrimitiveTypeMapping.h"
+#include "PrintClangClassType.h"
+#include "PrintClangFunction.h"
+#include "PrintClangValueType.h"
+#include "SwiftToClangInteropContext.h"
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/ClangSwiftTypeCorrespondence.h"
 #include "swift/AST/Comment.h"
@@ -26,6 +33,8 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeVisitor.h"
 #include "swift/IDE/CommentConversion.h"
+#include "swift/IRGen/IRABIDetailsProvider.h"
+#include "swift/IRGen/Linking.h"
 #include "swift/Parse/Lexer.h"
 #include "swift/Parse/Parser.h"
 
@@ -35,6 +44,7 @@
 #include "clang/AST/DeclObjC.h"
 #include "clang/Basic/CharInfo.h"
 #include "clang/Basic/SourceManager.h"
+#include "SwiftToClangInteropContext.h"
 
 using namespace swift;
 using namespace swift::objc_translation;
@@ -53,25 +63,24 @@ static bool isAnyObjectOrAny(Type type) {
   return type->isAnyObject() || type->isAny();
 }
 
-/// Returns true if \p name matches a keyword in any Clang language mode.
-static bool isClangKeyword(Identifier name) {
-  static const llvm::DenseSet<StringRef> keywords = []{
-    llvm::DenseSet<StringRef> set;
-    // FIXME: clang::IdentifierInfo /nearly/ has the API we need to do this
-    // in a more principled way, but not quite.
-#define KEYWORD(SPELLING, FLAGS) \
-    set.insert(#SPELLING);
-#define CXX_KEYWORD_OPERATOR(SPELLING, TOK) \
-    set.insert(#SPELLING);
-#include "clang/Basic/TokenKinds.def"
-    return set;
-  }();
+// For a given Decl and Type, if the type is not an optional return
+// the type and OTK_None as the optionality. If the type is
+// optional, return the underlying object type, and an optionality
+// that is based on the type but overridden by the return value of
+// isImplicitlyUnwrappedOptional().
+std::pair<Type, OptionalTypeKind>
+DeclAndTypePrinter::getObjectTypeAndOptionality(const ValueDecl *D, Type ty) {
+  OptionalTypeKind kind;
+  if (auto objTy = ty->getReferenceStorageReferent()->getOptionalObjectType()) {
+    kind = OTK_Optional;
+    if (D->isImplicitlyUnwrappedOptional())
+      kind = OTK_ImplicitlyUnwrappedOptional;
 
-  if (name.empty())
-    return false;
-  return keywords.contains(name.str());
+    return {objTy, kind};
+  }
+
+  return {ty, OTK_None};
 }
-
 
 namespace {
   /// Whether the type being printed is in function param position.
@@ -92,18 +101,16 @@ static bool looksLikeInitMethod(ObjCSelector selector) {
 }
 
 class DeclAndTypePrinter::Implementation
-  : private DeclVisitor<DeclAndTypePrinter::Implementation>,
-    private TypeVisitor<DeclAndTypePrinter::Implementation, void,
-                        Optional<OptionalTypeKind>>
-{
+    : private DeclVisitor<DeclAndTypePrinter::Implementation>,
+      private TypeVisitor<DeclAndTypePrinter::Implementation, void,
+                          Optional<OptionalTypeKind>>,
+      private ClangSyntaxPrinter {
   using PrinterImpl = Implementation;
   friend ASTVisitor;
   friend TypeVisitor;
 
-  // The output stream is accessible through 'owningPrinter',
-  // but it makes the code simpler to have it here too.
-  raw_ostream &os;
   DeclAndTypePrinter &owningPrinter;
+  OutputLanguageMode outputLang;
 
   SmallVector<const FunctionType *, 4> openFunctionTypes;
 
@@ -111,9 +118,15 @@ class DeclAndTypePrinter::Implementation
     return owningPrinter.M.getASTContext();
   }
 
+  // Returns an implementation that prints to the module's prologue.
+  Implementation getModuleProloguePrinter() {
+    return Implementation(owningPrinter.prologueOS, owningPrinter, outputLang);
+  }
+
 public:
-  explicit Implementation(raw_ostream &out, DeclAndTypePrinter &owner)
-    : os(out), owningPrinter(owner) {}
+  explicit Implementation(raw_ostream &out, DeclAndTypePrinter &owner,
+                          OutputLanguageMode outputLang)
+      : ClangSyntaxPrinter(out), owningPrinter(owner), outputLang(outputLang) {}
 
   void print(const Decl *D) {
     PrettyStackTraceDecl trace("printing", D);
@@ -272,17 +285,7 @@ private:
   // isImplicitlyUnwrappedOptional().
   static std::pair<Type, OptionalTypeKind>
   getObjectTypeAndOptionality(const ValueDecl *D, Type ty) {
-    OptionalTypeKind kind;
-    if (auto objTy =
-            ty->getReferenceStorageReferent()->getOptionalObjectType()) {
-      kind = OTK_Optional;
-      if (D->isImplicitlyUnwrappedOptional())
-        kind = OTK_ImplicitlyUnwrappedOptional;
-
-      return {objTy, kind};
-    }
-
-    return {ty, OTK_None};
+    return DeclAndTypePrinter::getObjectTypeAndOptionality(D, ty);
   }
 
   // Ignore other declarations.
@@ -291,9 +294,19 @@ private:
   void visitClassDecl(ClassDecl *CD) {
     printDocumentationComment(CD);
 
+    if (outputLang == OutputLanguageMode::Cxx) {
+      // FIXME: Non objc class.
+      // FIXME: Print availability.
+      // FIXME: forward decl should be handled by ModuleWriter.
+      ClangValueTypePrinter::forwardDeclType(os, CD);
+      ClangClassTypePrinter(os).printClassTypeDecl(
+          CD, [&]() { printMembers(CD->getMembers()); });
+      return;
+    }
+
     // This is just for testing, so we check explicitly for the attribute instead
-    // of asking if the class is weak imported. If the class has availablility,
-    // we'll print a SWIFT_AVAIALBLE() which implies __attribute__((weak_imported))
+    // of asking if the class is weak imported. If the class has availability,
+    // we'll print a SWIFT_AVAILABLE() which implies __attribute__((weak_imported))
     // already.
     if (CD->getAttrs().hasAttribute<WeakLinkedAttr>())
       os << "SWIFT_WEAK_IMPORT\n";
@@ -328,6 +341,26 @@ private:
     os << "\n";
     printMembers(CD->getMembers());
     os << "@end\n";
+  }
+
+  void visitStructDecl(StructDecl *SD) {
+    if (outputLang != OutputLanguageMode::Cxx)
+      return;
+    // FIXME: Print struct's doc comment.
+    // FIXME: Print struct's availability.
+    ClangValueTypePrinter printer(os, owningPrinter.prologueOS,
+                                  owningPrinter.interopContext);
+    printer.printValueTypeDecl(SD, /*bodyPrinter=*/[&]() {
+      printMembers(SD->getMembers());
+      for (const auto *ed :
+           owningPrinter.interopContext.getExtensionsForNominalType(SD)) {
+        auto sign = ed->getGenericSignature();
+        // FIXME: support requirements.
+        if (!sign.getRequirements().empty())
+          continue;
+        printMembers(ed->getMembers());
+      }
+    });
   }
 
   void visitExtensionDecl(ExtensionDecl *ED) {
@@ -368,8 +401,372 @@ private:
     os << "@end\n";
   }
 
+  void visitEnumDeclCxx(EnumDecl *ED) {
+    assert(owningPrinter.outputLang == OutputLanguageMode::Cxx);
+
+    // FIXME: Print enum's availability
+    ClangValueTypePrinter valueTypePrinter(os, owningPrinter.prologueOS,
+                                           owningPrinter.interopContext);
+    ClangSyntaxPrinter syntaxPrinter(os);
+    DeclAndTypeClangFunctionPrinter clangFuncPrinter(
+        os, owningPrinter.prologueOS, owningPrinter.typeMapping,
+        owningPrinter.interopContext, owningPrinter);
+
+    auto &outOfLineOS = owningPrinter.outOfLineDefinitionsOS;
+    ClangSyntaxPrinter outOfLineSyntaxPrinter(outOfLineOS);
+    DeclAndTypeClangFunctionPrinter outOfLineFuncPrinter(
+        owningPrinter.outOfLineDefinitionsOS, owningPrinter.prologueOS,
+        owningPrinter.typeMapping, owningPrinter.interopContext, owningPrinter);
+    ClangValueTypePrinter outOfLineValTyPrinter(
+        owningPrinter.outOfLineDefinitionsOS, owningPrinter.prologueOS,
+        owningPrinter.interopContext);
+
+    auto elementTagMapping =
+        owningPrinter.interopContext.getIrABIDetails().getEnumTagMapping(ED);
+    // Sort cases based on their assigned tag indices
+    llvm::stable_sort(elementTagMapping, [](const auto &p1, const auto &p2) {
+      return p1.second.tag < p2.second.tag;
+    });
+
+    auto printIsFunction = [&](StringRef caseName, EnumDecl *ED) {
+      std::string declName, defName, name;
+      llvm::raw_string_ostream declOS(declName), defOS(defName), nameOS(name);
+      ClangSyntaxPrinter(nameOS).printIdentifier(caseName);
+      name[0] = std::toupper(name[0]);
+
+      os << "  inline bool is" << name << "() const;\n";
+
+      outOfLineSyntaxPrinter
+          .printNominalTypeOutsideMemberDeclTemplateSpecifiers(ED);
+      outOfLineOS << "  inline bool ";
+      outOfLineSyntaxPrinter.printNominalTypeQualifier(
+          ED, /*moduleContext=*/ED->getModuleContext());
+      outOfLineOS << "is" << name << "() const {\n";
+      outOfLineOS << "    return *this == ";
+      outOfLineSyntaxPrinter.printNominalTypeQualifier(
+          ED, /*moduleContext=*/ED->getModuleContext());
+      outOfLineSyntaxPrinter.printIdentifier(caseName);
+      outOfLineOS << ";\n";
+      outOfLineOS << "  }\n";
+    };
+
+    auto printGetFunction = [&](EnumElementDecl *elementDecl) {
+      auto associatedValueList = elementDecl->getParameterList();
+      // TODO: add tuple type support
+      if (!elementDecl->hasAssociatedValues() ||
+          associatedValueList->size() > 1) {
+        return;
+      }
+      auto paramType = associatedValueList->front()->getInterfaceType();
+
+      std::string declName, defName, name;
+      llvm::raw_string_ostream declOS(declName), defOS(defName), nameOS(name);
+      ClangSyntaxPrinter(nameOS).printIdentifier(elementDecl->getNameStr());
+      name[0] = std::toupper(name[0]);
+
+      clangFuncPrinter.printCustomCxxFunction(
+          {paramType},
+          [&](auto &types) {
+            // Printing function name and return type
+            os << "  inline " << types[paramType] << " get" << name;
+            outOfLineSyntaxPrinter
+                .printNominalTypeOutsideMemberDeclTemplateSpecifiers(ED);
+            outOfLineOS << "  inline " << types[paramType] << ' ';
+            outOfLineSyntaxPrinter.printNominalTypeQualifier(
+                ED, /*moduleContext=*/ED->getModuleContext());
+            outOfLineOS << "get" << name;
+          },
+          [&](auto &types) {}, true,
+          [&](auto &types) {
+            // Printing function body
+            outOfLineOS << "    if (!is" << name << "()) abort();\n";
+            outOfLineOS << "    alignas(";
+            outOfLineSyntaxPrinter.printBaseName(elementDecl->getParentEnum());
+            outOfLineOS << ") unsigned char buffer[sizeof(";
+            outOfLineSyntaxPrinter.printBaseName(elementDecl->getParentEnum());
+            outOfLineOS << ")];\n";
+            outOfLineOS << "    auto *thisCopy = new(buffer) ";
+            outOfLineSyntaxPrinter.printBaseName(elementDecl->getParentEnum());
+            outOfLineOS << "(*this);\n";
+            outOfLineOS << "    char * _Nonnull payloadFromDestruction = "
+                           "thisCopy->_destructiveProjectEnumData();\n";
+            if (const auto *gtpt = paramType->getAs<GenericTypeParamType>()) {
+              DeclAndTypeClangFunctionPrinter::printGenericReturnSequence(
+                  outOfLineOS, gtpt, [](StringRef) {},
+                  /*initializeWithTake=*/StringRef("payloadFromDestruction"));
+              return;
+            }
+            // FIXME: unify non-generic return with regular function emission
+            // return path.
+            Type objectType;
+            OptionalTypeKind optKind;
+            std::tie(objectType, optKind) = getObjectTypeAndOptionality(
+                paramType->getNominalOrBoundGenericNominal(), paramType);
+            auto objectTypeDecl = objectType->getNominalOrBoundGenericNominal();
+
+            if (auto knownCxxType =
+                    owningPrinter.typeMapping.getKnownCxxTypeInfo(
+                        objectTypeDecl)) {
+              outOfLineOS << "    " << types[paramType] << " result;\n";
+              outOfLineOS << "    "
+                             "memcpy(&result, payloadFromDestruction, "
+                             "sizeof(result));\n";
+              outOfLineOS << "    return result;\n  ";
+            } else {
+              outOfLineOS << "    return swift::";
+              outOfLineOS << cxx_synthesis::getCxxImplNamespaceName();
+              outOfLineOS << "::implClassFor<";
+              outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                  objectTypeDecl->getModuleContext(),
+                  elementDecl->getParentEnum()->getModuleContext());
+              outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+              outOfLineOS << ">::type";
+              outOfLineOS << "::returnNewValue([&](char * _Nonnull result) {\n";
+              outOfLineOS << "      swift::"
+                          << cxx_synthesis::getCxxImplNamespaceName();
+              outOfLineOS << "::implClassFor<";
+              outOfLineSyntaxPrinter.printModuleNamespaceQualifiersIfNeeded(
+                  objectTypeDecl->getModuleContext(),
+                  elementDecl->getParentEnum()->getModuleContext());
+              outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+              outOfLineOS << ">::type";
+              outOfLineOS
+                  << "::initializeWithTake(result, payloadFromDestruction);\n";
+              outOfLineOS << "    });\n  ";
+            }
+          },
+          ED->getModuleContext(), outOfLineOS);
+    };
+
+    auto printStruct = [&](StringRef caseName, EnumElementDecl *elementDecl,
+                           Optional<IRABIDetailsProvider::EnumElementInfo>
+                               elementInfo) {
+      os << "  inline const static struct {  "
+         << "// impl struct for case " << caseName << '\n';
+      os << "    inline constexpr operator cases() const {\n";
+      os << "      return cases::";
+      syntaxPrinter.printIdentifier(caseName);
+      os << ";\n";
+      os << "    }\n";
+
+      if (elementDecl != nullptr) {
+        assert(elementInfo.hasValue());
+
+        Type paramType, objectType;
+        NominalTypeDecl *objectTypeDecl = nullptr;
+        OptionalTypeKind optKind;
+
+        // TODO: support tuple type
+        if (elementDecl->hasAssociatedValues() &&
+            elementDecl->getParameterList()->size() == 1) {
+          paramType = elementDecl->getParameterList()->front()->getType();
+          std::tie(objectType, optKind) = getObjectTypeAndOptionality(
+              paramType->getNominalOrBoundGenericNominal(), paramType);
+          objectTypeDecl = objectType->getNominalOrBoundGenericNominal();
+        }
+
+        SmallVector<Type> neededTypes;
+        if (paramType) {
+          neededTypes.push_back(paramType);
+        }
+
+        // FIXME: support generic constructor.
+        if (!ED->isGeneric())
+          clangFuncPrinter.printCustomCxxFunction(
+              neededTypes,
+              [&](auto &types) {
+                // Printing function name and return type
+                os << "    inline ";
+                syntaxPrinter.printBaseName(elementDecl->getParentEnum());
+                os << " operator()";
+
+                outOfLineOS << "  inline ";
+                outOfLineSyntaxPrinter.printBaseName(
+                    elementDecl->getParentEnum());
+                outOfLineOS << ' ';
+                outOfLineSyntaxPrinter.printBaseName(
+                    elementDecl->getParentEnum());
+                outOfLineOS << "::_impl_" << elementDecl->getNameStr()
+                            << "::operator()";
+              },
+              [&](auto &types) {
+                // Printing parameters
+                if (!paramType) {
+                  return;
+                }
+                assert(objectTypeDecl != nullptr);
+                if (owningPrinter.typeMapping.getKnownCxxTypeInfo(
+                        objectTypeDecl)) {
+                  os << types[paramType] << " val";
+                  outOfLineOS << types[paramType] << " val";
+                } else {
+                  os << "const " << types[paramType] << " &val";
+                  outOfLineOS << "const " << types[paramType] << " &val";
+                }
+              },
+              true,
+              [&](auto &types) {
+                // Printing function body
+                outOfLineOS << "    auto result = ";
+                outOfLineSyntaxPrinter.printBaseName(
+                    elementDecl->getParentEnum());
+                outOfLineOS << "::_make();\n";
+
+                if (paramType) {
+                  assert(objectTypeDecl != nullptr);
+
+                  if (owningPrinter.typeMapping.getKnownCxxTypeInfo(
+                          objectTypeDecl)) {
+                    outOfLineOS
+                        << "    memcpy(result._getOpaquePointer(), &val, "
+                           "sizeof(val));\n";
+                  } else {
+                    outOfLineOS << "    alignas(";
+                    outOfLineSyntaxPrinter
+                        .printModuleNamespaceQualifiersIfNeeded(
+                            objectTypeDecl->getModuleContext(),
+                            ED->getModuleContext());
+                    outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                    outOfLineOS << ") unsigned char buffer[sizeof(";
+                    outOfLineSyntaxPrinter
+                        .printModuleNamespaceQualifiersIfNeeded(
+                            objectTypeDecl->getModuleContext(),
+                            ED->getModuleContext());
+                    outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                    outOfLineOS << ")];\n";
+                    outOfLineOS << "    auto *valCopy = new(buffer) ";
+                    outOfLineSyntaxPrinter
+                        .printModuleNamespaceQualifiersIfNeeded(
+                            objectTypeDecl->getModuleContext(),
+                            ED->getModuleContext());
+                    outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                    outOfLineOS << "(val);\n";
+                    outOfLineOS << "    ";
+                    outOfLineOS << cxx_synthesis::getCxxSwiftNamespaceName()
+                                << "::";
+                    outOfLineOS << cxx_synthesis::getCxxImplNamespaceName();
+                    outOfLineOS << "::implClassFor<";
+                    outOfLineSyntaxPrinter
+                        .printModuleNamespaceQualifiersIfNeeded(
+                            objectTypeDecl->getModuleContext(),
+                            ED->getModuleContext());
+                    outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                    outOfLineOS << ">::type::initializeWithTake(result._"
+                                   "getOpaquePointer(), ";
+                    outOfLineOS << cxx_synthesis::getCxxSwiftNamespaceName()
+                                << "::";
+                    outOfLineOS << cxx_synthesis::getCxxImplNamespaceName();
+                    outOfLineOS << "::implClassFor<";
+                    outOfLineSyntaxPrinter
+                        .printModuleNamespaceQualifiersIfNeeded(
+                            objectTypeDecl->getModuleContext(),
+                            ED->getModuleContext());
+                    outOfLineSyntaxPrinter.printBaseName(objectTypeDecl);
+                    outOfLineOS << ">::type::getOpaquePointer(*valCopy)";
+                    outOfLineOS << ");\n";
+                  }
+                }
+
+                outOfLineOS << "    result._destructiveInjectEnumTag(";
+                if (ED->isResilient()) {
+                  outOfLineOS << cxx_synthesis::getCxxImplNamespaceName()
+                              << "::" << elementInfo->globalVariableName;
+                } else {
+                  outOfLineOS << elementInfo->tag;
+                }
+                outOfLineOS << ");\n";
+                outOfLineOS << "    return result;\n";
+                outOfLineOS << "  ";
+              },
+              ED->getModuleContext(), outOfLineOS);
+      }
+      os << "  } ";
+      syntaxPrinter.printIdentifier(caseName);
+      os << ";\n";
+    };
+
+    valueTypePrinter.printValueTypeDecl(ED, /*bodyPrinter=*/[&]() {
+      os << '\n';
+      os << "  enum class cases {";
+      llvm::interleave(
+          elementTagMapping, os,
+          [&](const auto &pair) {
+            os << "\n    ";
+            syntaxPrinter.printIdentifier(pair.first->getNameStr());
+          },
+          ",");
+      // TODO: allow custom name for this special case
+      auto resilientUnknownDefaultCaseName = "unknownDefault";
+      if (ED->isResilient()) {
+        os << (ED->getNumElements() > 0 ? ",\n    " : "\n    ")
+           << resilientUnknownDefaultCaseName;
+      }
+      os << "\n  };\n\n"; // enum class cases' closing bracket
+
+      os << "#pragma clang diagnostic push\n";
+      os << "#pragma clang diagnostic ignored \"-Wc++17-extensions\"  "
+         << "// allow use of inline static data member\n";
+      for (const auto &pair : elementTagMapping) {
+        // Printing struct
+        printStruct(pair.first->getNameStr(), pair.first, pair.second);
+        // Printing `is` function
+        printIsFunction(pair.first->getNameStr(), ED);
+        if (pair.first->hasAssociatedValues()) {
+          // Printing `get` function
+          printGetFunction(pair.first);
+        }
+        os << '\n';
+      }
+
+      if (ED->isResilient()) {
+        // Printing struct for unknownDefault
+        printStruct(resilientUnknownDefaultCaseName, /* elementDecl */ nullptr,
+                    /* elementInfo */ None);
+        // Printing isUnknownDefault
+        printIsFunction(resilientUnknownDefaultCaseName, ED);
+        os << '\n';
+      }
+      os << "#pragma clang diagnostic pop\n";
+
+      // Printing operator cases()
+      os << "  inline operator cases() const {\n";
+      if (ED->isResilient()) {
+        if (!elementTagMapping.empty()) {
+          os << "    auto tag = _getEnumTag();\n";
+        }
+        for (const auto &pair : elementTagMapping) {
+          os << "    if (tag == " << cxx_synthesis::getCxxImplNamespaceName();
+          os << "::" << pair.second.globalVariableName << ") return cases::";
+          syntaxPrinter.printIdentifier(pair.first->getNameStr());
+          os << ";\n";
+        }
+        os << "    return cases::" << resilientUnknownDefaultCaseName << ";\n";
+      } else { // non-resilient enum
+        os << "    switch (_getEnumTag()) {\n";
+        for (const auto &pair : elementTagMapping) {
+          os << "      case " << pair.second.tag << ": return cases::";
+          syntaxPrinter.printIdentifier(pair.first->getNameStr());
+          os << ";\n";
+        }
+        // TODO: change to Swift's fatalError when it's available in C++
+        os << "      default: abort();\n";
+        os << "    }\n"; // switch's closing bracket
+      }
+      os << "  }\n"; // operator cases()'s closing bracket
+      os << "\n";
+      
+      printMembers(ED->getMembers());
+    });
+  }
+
   void visitEnumDecl(EnumDecl *ED) {
     printDocumentationComment(ED);
+
+    if (outputLang == OutputLanguageMode::Cxx) {
+      visitEnumDeclCxx(ED);
+      return;
+    }
+
     os << "typedef ";
     StringRef customName = getNameForObjC(ED, CustomNamesOnly);
     if (customName.empty()) {
@@ -422,7 +819,7 @@ private:
       Type objTy;
       std::tie(objTy, kind) =
           getObjectTypeAndOptionality(param, param->getInterfaceType());
-      print(objTy, kind, Identifier(), IsFunctionParam);
+      print(objTy, kind, "", IsFunctionParam);
     }
     os << ")";
 
@@ -462,7 +859,7 @@ private:
   }
 
   Type getForeignResultType(AbstractFunctionDecl *AFD,
-                            FunctionType *methodTy,
+                            AnyFunctionType *methodTy,
                             Optional<ForeignAsyncConvention> asyncConvention,
                             Optional<ForeignErrorConvention> errorConvention) {
     // A foreign error convention can affect the result type as seen in
@@ -503,8 +900,85 @@ private:
 
   void printAbstractFunctionAsMethod(AbstractFunctionDecl *AFD,
                                      bool isClassMethod,
-                                     bool isNSUIntegerSubscript = false) {
+                                     bool isNSUIntegerSubscript = false,
+                                     const SubscriptDecl *SD = nullptr) {
     printDocumentationComment(AFD);
+
+    Optional<ForeignAsyncConvention> asyncConvention =
+        AFD->getForeignAsyncConvention();
+    Optional<ForeignErrorConvention> errorConvention =
+        AFD->getForeignErrorConvention();
+    Type rawMethodTy = AFD->getMethodInterfaceType();
+    auto methodTy = rawMethodTy->castTo<FunctionType>();
+    auto resultTy =
+        getForeignResultType(AFD, methodTy, asyncConvention, errorConvention);
+
+    if (outputLang == OutputLanguageMode::Cxx) {
+      auto *typeDeclContext = dyn_cast<NominalTypeDecl>(AFD->getParent());
+      if (!typeDeclContext) {
+        typeDeclContext =
+            cast<ExtensionDecl>(AFD->getParent())->getExtendedNominal();
+      }
+
+      std::string cFuncDecl;
+      llvm::raw_string_ostream cFuncPrologueOS(cFuncDecl);
+      auto funcABI = Implementation(cFuncPrologueOS, owningPrinter, outputLang)
+                         .printSwiftABIFunctionSignatureAsCxxFunction(
+                             AFD, methodTy,
+                             /*selfTypeDeclContext=*/typeDeclContext);
+      if (!funcABI)
+        return;
+      owningPrinter.prologueOS << cFuncPrologueOS.str();
+
+      DeclAndTypeClangFunctionPrinter declPrinter(
+          os, owningPrinter.prologueOS, owningPrinter.typeMapping,
+          owningPrinter.interopContext, owningPrinter);
+      if (auto *accessor = dyn_cast<AccessorDecl>(AFD)) {
+        if (SD)
+          declPrinter.printCxxSubscriptAccessorMethod(
+              typeDeclContext, accessor, funcABI->getSignature(),
+              funcABI->getSymbolName(), resultTy,
+              /*isDefinition=*/false);
+        else
+          declPrinter.printCxxPropertyAccessorMethod(
+              typeDeclContext, accessor, funcABI->getSignature(),
+              funcABI->getSymbolName(), resultTy,
+              /*isStatic=*/isClassMethod,
+              /*isDefinition=*/false);
+      } else {
+        declPrinter.printCxxMethod(typeDeclContext, AFD,
+                                   funcABI->getSignature(),
+                                   funcABI->getSymbolName(), resultTy,
+                                   /*isDefinition=*/false);
+      }
+
+      DeclAndTypeClangFunctionPrinter defPrinter(
+          owningPrinter.outOfLineDefinitionsOS, owningPrinter.prologueOS,
+          owningPrinter.typeMapping, owningPrinter.interopContext,
+          owningPrinter);
+
+      if (auto *accessor = dyn_cast<AccessorDecl>(AFD)) {
+        if (SD)
+          defPrinter.printCxxSubscriptAccessorMethod(
+              typeDeclContext, accessor, funcABI->getSignature(),
+              funcABI->getSymbolName(), resultTy, /*isDefinition=*/true);
+        else
+          defPrinter.printCxxPropertyAccessorMethod(
+              typeDeclContext, accessor, funcABI->getSignature(),
+              funcABI->getSymbolName(), resultTy,
+              /*isStatic=*/isClassMethod,
+              /*isDefinition=*/true);
+      } else {
+        defPrinter.printCxxMethod(typeDeclContext, AFD, funcABI->getSignature(),
+                                  funcABI->getSymbolName(), resultTy,
+                                  /*isDefinition=*/true);
+      }
+
+      // FIXME: SWIFT_WARN_UNUSED_RESULT
+      // FIXME: availability
+      return;
+    }
+
     if (isClassMethod)
       os << "+ (";
     else
@@ -517,15 +991,6 @@ private:
             dyn_cast_or_null<clang::ObjCMethodDecl>(clangBase->getClangDecl());
       }
     }
-
-    Optional<ForeignAsyncConvention> asyncConvention
-      = AFD->getForeignAsyncConvention();
-    Optional<ForeignErrorConvention> errorConvention
-      = AFD->getForeignErrorConvention();
-    Type rawMethodTy = AFD->getMethodInterfaceType();
-    auto methodTy = rawMethodTy->castTo<FunctionType>();
-    auto resultTy = getForeignResultType(
-        AFD, methodTy, asyncConvention, errorConvention);
 
     // Constructors and methods returning DynamicSelf return
     // instancetype.
@@ -716,7 +1181,56 @@ private:
     }
   }
 
-  void printAbstractFunctionAsFunction(FuncDecl *FD) {
+  /// Print the core function declaration for a given function with the given
+  /// name.
+  void printFunctionDeclAsCFunctionDecl(FuncDecl *FD, StringRef name,
+                                        Type resultTy) {
+    // The result type may be a partial function type we need to close
+    // up later.
+    PrintMultiPartType multiPart(*this);
+
+    OptionalTypeKind kind;
+    Type objTy;
+    std::tie(objTy, kind) = getObjectTypeAndOptionality(FD, resultTy);
+    visitPart(objTy, kind);
+
+    os << ' ' << name << '(';
+
+    auto params = FD->getParameters();
+    if (params->size()) {
+      size_t index = 1;
+      interleaveComma(*params, os, [&](const ParamDecl *param) {
+        OptionalTypeKind kind;
+        Type objTy;
+        std::tie(objTy, kind) =
+            getObjectTypeAndOptionality(param, param->getInterfaceType());
+        StringRef paramName =
+            param->getName().empty() ? "" : param->getName().str();
+        print(objTy, kind, paramName, IsFunctionParam);
+        ++index;
+      });
+    } else {
+      os << "void";
+    }
+
+    os << ')';
+
+    // Finish the result type.
+    multiPart.finish();
+  }
+
+  /// Print C or C++ trailing attributes for a function declaration.
+  void printFunctionClangAttributes(FuncDecl *FD, AnyFunctionType *funcTy) {
+    if (funcTy->getResult()->isUninhabited()) {
+      os << " SWIFT_NORETURN";
+    } else if (!funcTy->getResult()->isVoid() &&
+               !FD->getAttrs().hasAttribute<DiscardableResultAttr>()) {
+      os << " SWIFT_WARN_UNUSED_RESULT";
+    }
+  }
+
+  // Print out the function signature for a @_cdecl function.
+  void printAbstractFunctionAsCFunction(FuncDecl *FD) {
     printDocumentationComment(FD);
     Optional<ForeignAsyncConvention> asyncConvention
       = FD->getForeignAsyncConvention();
@@ -728,52 +1242,146 @@ private:
     auto resultTy = getForeignResultType(
         FD, funcTy, asyncConvention, errorConvention);
 
+    assert(FD->getAttrs().hasAttribute<CDeclAttr>() && "not a cdecl function");
     os << "SWIFT_EXTERN ";
-
-    // The result type may be a partial function type we need to close
-    // up later.
-    PrintMultiPartType multiPart(*this);
-
-    OptionalTypeKind kind;
-    Type objTy;
-    std::tie(objTy, kind) = getObjectTypeAndOptionality(FD, resultTy);
-    visitPart(objTy, kind);
-
-    assert(FD->getAttrs().hasAttribute<CDeclAttr>()
-           && "not a cdecl function");
-
-    os << ' ' << FD->getAttrs().getAttribute<CDeclAttr>()->Name << '(';
-
-    auto params = FD->getParameters();
-    if (params->size()) {
-      interleave(*params,
-                 [&](const ParamDecl *param) {
-                   OptionalTypeKind kind;
-                   Type objTy;
-                   std::tie(objTy, kind) = getObjectTypeAndOptionality(
-                       param, param->getInterfaceType());
-                   print(objTy, kind, param->getName(), IsFunctionParam);
-                 },
-                 [&] { os << ", "; });
-    } else {
-      os << "void";
-    }
-
-    os << ')';
-
-    // Finish the result type.
-    multiPart.finish();
-
-    if (funcTy->getResult()->isUninhabited()) {
-      os << " SWIFT_NORETURN";
-    } else if (!funcTy->getResult()->isVoid() &&
-               !FD->getAttrs().hasAttribute<DiscardableResultAttr>()) {
-      os << " SWIFT_WARN_UNUSED_RESULT";
-    }
-
+    printFunctionDeclAsCFunctionDecl(
+        FD, FD->getAttrs().getAttribute<CDeclAttr>()->Name, resultTy);
+    printFunctionClangAttributes(FD, funcTy);
     printAvailability(FD);
-
     os << ";\n";
+  }
+
+  struct FunctionSwiftABIInformation {
+    FunctionSwiftABIInformation(AbstractFunctionDecl *FD,
+                                LoweredFunctionSignature signature)
+        : signature(signature) {
+      isCDecl = FD->getAttrs().hasAttribute<CDeclAttr>();
+      if (!isCDecl) {
+        auto mangledName = SILDeclRef(FD).mangle();
+        symbolName = FD->getASTContext().AllocateCopy(mangledName);
+      } else {
+        symbolName = FD->getAttrs().getAttribute<CDeclAttr>()->Name;
+      }
+    }
+
+    StringRef getSymbolName() const { return symbolName; }
+
+    bool useCCallingConvention() const { return isCDecl; }
+
+    bool useMangledSymbolName() const { return !isCDecl; }
+
+    const LoweredFunctionSignature &getSignature() const { return signature; }
+
+  private:
+    bool isCDecl;
+    StringRef symbolName;
+    LoweredFunctionSignature signature;
+  };
+
+  // Print out the extern C Swift ABI function signature.
+  Optional<FunctionSwiftABIInformation>
+  printSwiftABIFunctionSignatureAsCxxFunction(
+      AbstractFunctionDecl *FD, Optional<FunctionType *> givenFuncType = None,
+      Optional<NominalTypeDecl *> selfTypeDeclContext = None) {
+    assert(outputLang == OutputLanguageMode::Cxx);
+    Optional<ForeignAsyncConvention> asyncConvention =
+        FD->getForeignAsyncConvention();
+    Optional<ForeignErrorConvention> errorConvention =
+        FD->getForeignErrorConvention();
+    // FIXME (Alex): Make type adjustments for C++.
+    AnyFunctionType *funcTy;
+    if (givenFuncType || FD->getInterfaceType()->is<FunctionType>()) {
+      funcTy = givenFuncType ? *givenFuncType
+                             : FD->getInterfaceType()->castTo<FunctionType>();
+    } else {
+      funcTy = FD->getInterfaceType()->castTo<GenericFunctionType>();
+    }
+
+    auto resultTy =
+        getForeignResultType(FD, funcTy, asyncConvention, errorConvention);
+
+    std::string cRepresentationString;
+    llvm::raw_string_ostream cRepresentationOS(cRepresentationString);
+
+    auto signature = owningPrinter.interopContext.getIrABIDetails()
+                         .getFunctionLoweredSignature(FD);
+    // FIXME: Add a note saying that this func is unsupported.
+    if (!signature)
+      return None;
+    FunctionSwiftABIInformation funcABI(FD, *signature);
+
+    cRepresentationOS << "SWIFT_EXTERN ";
+
+    DeclAndTypeClangFunctionPrinter funcPrinter(
+        cRepresentationOS, owningPrinter.prologueOS, owningPrinter.typeMapping,
+        owningPrinter.interopContext, owningPrinter);
+
+    auto representation = funcPrinter.printFunctionSignature(
+        FD, funcABI.getSignature(), funcABI.getSymbolName(), resultTy,
+        DeclAndTypeClangFunctionPrinter::FunctionSignatureKind::CFunctionProto);
+    if (representation.isUnsupported()) {
+      // FIXME: Emit remark about unemitted declaration.
+      return None;
+    }
+
+    os << cRepresentationOS.str();
+    // Swift functions can't throw exceptions, we can only
+    // throw them from C++ when emitting C++ inline thunks for the Swift
+    // functions.
+    // FIXME: Support throwing exceptions for Swift errors.
+    if (!funcTy->isThrowing())
+      os << " SWIFT_NOEXCEPT";
+    if (!funcABI.useCCallingConvention())
+      os << " SWIFT_CALL";
+    printAvailability(FD);
+    os << ';';
+    if (funcABI.useMangledSymbolName()) {
+      // add a comment with a demangled function name.
+      os << " // ";
+      FD->getName().print(os);
+    }
+    os << "\n";
+    return funcABI;
+  }
+
+  // Print out the C++ inline function thunk that
+  // represents the Swift function in C++.
+  void printAbstractFunctionAsCxxFunctionThunk(
+      FuncDecl *FD, const FunctionSwiftABIInformation &funcABI) {
+    assert(outputLang == OutputLanguageMode::Cxx);
+    printDocumentationComment(FD);
+
+    Optional<ForeignAsyncConvention> asyncConvention =
+        FD->getForeignAsyncConvention();
+    Optional<ForeignErrorConvention> errorConvention =
+        FD->getForeignErrorConvention();
+    auto funcTy = FD->getInterfaceType()->castTo<AnyFunctionType>();
+    auto resultTy =
+        getForeignResultType(FD, funcTy, asyncConvention, errorConvention);
+
+    DeclAndTypeClangFunctionPrinter funcPrinter(
+        os, owningPrinter.prologueOS, owningPrinter.typeMapping,
+        owningPrinter.interopContext, owningPrinter);
+    DeclAndTypeClangFunctionPrinter::FunctionSignatureModifiers modifiers;
+    modifiers.isInline = true;
+    auto result = funcPrinter.printFunctionSignature(
+        FD, funcABI.getSignature(), cxx_translation::getNameForCxx(FD),
+        resultTy,
+        DeclAndTypeClangFunctionPrinter::FunctionSignatureKind::CxxInlineThunk,
+        modifiers);
+    assert(
+        !result.isUnsupported()); // The C signature should be unsupported too.
+    // FIXME: Support throwing exceptions for Swift errors.
+    if (!funcTy->isThrowing())
+      os << " noexcept";
+    printFunctionClangAttributes(FD, funcTy);
+    printAvailability(FD);
+    os << " {\n";
+    funcPrinter.printCxxThunkBody(
+        FD, funcABI.getSignature(), funcABI.getSymbolName(),
+        FD->getModuleContext(), resultTy, FD->getParameters(),
+        funcTy->isThrowing(), funcTy);
+    os << "}\n";
   }
 
   enum class PrintLeadingSpace : bool {
@@ -979,10 +1587,36 @@ private:
   }
 
   void visitFuncDecl(FuncDecl *FD) {
+    if (outputLang == OutputLanguageMode::Cxx) {
+      // Don't expose async functions or @_alwaysEmitIntoClient functions
+      // because they're currently unsupported
+      if (FD->hasAsync() ||
+          FD->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>()) {
+        return;
+      }
+
+      // FIXME: Support static methods.
+      if (FD->getDeclContext()->isTypeContext() && FD->isStatic())
+        return;
+      if (FD->getDeclContext()->isTypeContext())
+        return printAbstractFunctionAsMethod(FD, FD->isStatic());
+
+      // Emit the underlying C signature that matches the Swift ABI
+      // in the generated C++ implementation prologue for the module.
+      std::string cFuncDecl;
+      llvm::raw_string_ostream cFuncPrologueOS(cFuncDecl);
+      auto funcABI = Implementation(cFuncPrologueOS, owningPrinter, outputLang)
+                         .printSwiftABIFunctionSignatureAsCxxFunction(FD);
+      if (!funcABI)
+        return;
+      owningPrinter.prologueOS << cFuncPrologueOS.str();
+      printAbstractFunctionAsCxxFunctionThunk(FD, *funcABI);
+      return;
+    }
     if (FD->getDeclContext()->isTypeContext())
       printAbstractFunctionAsMethod(FD, FD->isStatic());
     else
-      printAbstractFunctionAsFunction(FD);
+      printAbstractFunctionAsCFunction(FD);
   }
 
   void visitConstructorDecl(ConstructorDecl *CD) {
@@ -1010,6 +1644,9 @@ private:
   /// Returns whether \p ty is the C type \c CFTypeRef, or some typealias
   /// thereof.
   bool isCFTypeRef(Type ty) {
+    if (auto existential = dyn_cast<ExistentialType>(ty.getPointer()))
+      ty = existential->getConstraintType();
+
     const TypeAliasDecl *TAD = nullptr;
     while (auto aliasTy = dyn_cast<TypeAliasType>(ty.getPointer())) {
       TAD = aliasTy->getDecl();
@@ -1049,6 +1686,16 @@ private:
   void visitVarDecl(VarDecl *VD) {
     assert(VD->getDeclContext()->isTypeContext() &&
            "cannot handle global variables right now");
+
+    if (outputLang == OutputLanguageMode::Cxx) {
+      // FIXME: Documentation.
+      // FIXME: availability.
+      auto *getter = VD->getOpaqueAccessor(AccessorKind::Get);
+      printAbstractFunctionAsMethod(getter, /*isStatic=*/VD->isStatic());
+      if (auto *setter = VD->getOpaqueAccessor(AccessorKind::Set))
+        printAbstractFunctionAsMethod(setter, /*isStatic=*/VD->isStatic());
+      return;
+    }
 
     printDocumentationComment(VD);
 
@@ -1177,7 +1824,7 @@ private:
       OptionalTypeKind kind;
       Type objTy;
       std::tie(objTy, kind) = getObjectTypeAndOptionality(VD, ty);
-      print(objTy, kind, objCName);
+      print(objTy, kind, objCName.str().str());
     }
 
     printSwift3ObjCDeprecatedInference(VD);
@@ -1207,6 +1854,14 @@ private:
   }
 
   void visitSubscriptDecl(SubscriptDecl *SD) {
+    if (outputLang == OutputLanguageMode::Cxx) {
+      if (!SD->isInstanceMember())
+        return;
+      auto *getter = SD->getOpaqueAccessor(AccessorKind::Get);
+      printAbstractFunctionAsMethod(getter, false,
+                                    /*isNSUIntegerSubscript=*/false, SD);
+      return;
+    }
     assert(SD->isInstanceMember() && "static subscripts not supported");
 
     bool isNSUIntegerSubscript = false;
@@ -1231,55 +1886,6 @@ private:
     TypeVisitor::visit(ty, optionalKind);
   }
 
-  /// Where nullability information should be printed.
-  enum class NullabilityPrintKind {
-    Before,
-    After,
-    ContextSensitive,
-  };
-
-  void printNullability(Optional<OptionalTypeKind> kind,
-                        NullabilityPrintKind printKind
-                          = NullabilityPrintKind::After) {
-    if (!kind)
-      return;
-
-    switch (printKind) {
-    case NullabilityPrintKind::ContextSensitive:
-      switch (*kind) {
-      case OTK_None:
-        os << "nonnull";
-        break;
-      case OTK_Optional:
-        os << "nullable";
-        break;
-      case OTK_ImplicitlyUnwrappedOptional:
-        os << "null_unspecified";
-        break;
-      }
-      break;
-    case NullabilityPrintKind::After:
-      os << ' ';
-      LLVM_FALLTHROUGH;
-    case NullabilityPrintKind::Before:
-      switch (*kind) {
-      case OTK_None:
-        os << "_Nonnull";
-        break;
-      case OTK_Optional:
-        os << "_Nullable";
-        break;
-      case OTK_ImplicitlyUnwrappedOptional:
-        os << "_Null_unspecified";
-        break;
-      }
-      break;
-    }
-
-    if (printKind != NullabilityPrintKind::After)
-      os << ' ';
-  }
-
   /// Determine whether this generic Swift nominal type maps to a
   /// generic Objective-C class.
   static bool hasGenericObjCType(const NominalTypeDecl *nominal) {
@@ -1302,11 +1908,14 @@ public:
   /// Otherwise returns null.
   const ClassDecl *getObjCBridgedClass(const NominalTypeDecl *nominal) {
     // Print known types as their unbridged type.
-    if (getKnownTypeInfo(nominal))
+    if (owningPrinter.typeMapping.getKnownObjCTypeInfo(nominal))
       return nullptr;
 
     // Print imported bridgeable decls as their unbridged type.
     if (nominal->hasClangNode())
+      return nullptr;
+
+    if (isa<ProtocolDecl>(nominal))
       return nullptr;
 
     auto &ctx = nominal->getASTContext();
@@ -1407,102 +2016,6 @@ private:
   }
 
   /// If \p typeDecl is one of the standard library types used to map in Clang
-  /// primitives and basic types, return the info in \c specialNames containing
-  /// the Clang name and whether it can be nullable in C.
-  Optional<CTypeInfo> getKnownTypeInfo(const TypeDecl *typeDecl) {
-    auto &specialNames = owningPrinter.specialNames;
-    if (specialNames.empty()) {
-      ASTContext &ctx = getASTContext();
-#define MAP(SWIFT_NAME, CLANG_REPR, NEEDS_NULLABILITY)                       \
-      specialNames[{ctx.StdlibModuleName, ctx.getIdentifier(#SWIFT_NAME)}] = \
-        { CLANG_REPR, NEEDS_NULLABILITY }
-
-      MAP(CBool, "bool", false);
-
-      MAP(CChar, "char", false);
-      MAP(CWideChar, "wchar_t", false);
-      MAP(CChar16, "char16_t", false);
-      MAP(CChar32, "char32_t", false);
-
-      MAP(CSignedChar, "signed char", false);
-      MAP(CShort, "short", false);
-      MAP(CInt, "int", false);
-      MAP(CLong, "long", false);
-      MAP(CLongLong, "long long", false);
-
-      MAP(CUnsignedChar, "unsigned char", false);
-      MAP(CUnsignedShort, "unsigned short", false);
-      MAP(CUnsignedInt, "unsigned int", false);
-      MAP(CUnsignedLong, "unsigned long", false);
-      MAP(CUnsignedLongLong, "unsigned long long", false);
-
-      MAP(CFloat, "float", false);
-      MAP(CDouble, "double", false);
-
-      MAP(Int8, "int8_t", false);
-      MAP(Int16, "int16_t", false);
-      MAP(Int32, "int32_t", false);
-      MAP(Int64, "int64_t", false);
-      MAP(UInt8, "uint8_t", false);
-      MAP(UInt16, "uint16_t", false);
-      MAP(UInt32, "uint32_t", false);
-      MAP(UInt64, "uint64_t", false);
-
-      MAP(Float, "float", false);
-      MAP(Double, "double", false);
-      MAP(Float32, "float", false);
-      MAP(Float64, "double", false);
-
-      MAP(Int, "NSInteger", false);
-      MAP(UInt, "NSUInteger", false);
-      MAP(Bool, "BOOL", false);
-
-      MAP(OpaquePointer, "void *", true);
-      MAP(UnsafeRawPointer, "void const *", true);
-      MAP(UnsafeMutableRawPointer, "void *", true);
-
-      Identifier ID_ObjectiveC = ctx.Id_ObjectiveC;
-      specialNames[{ID_ObjectiveC, ctx.getIdentifier("ObjCBool")}]
-        = { "BOOL", false};
-      specialNames[{ID_ObjectiveC, ctx.getIdentifier("Selector")}]
-        = { "SEL", true };
-      specialNames[{ID_ObjectiveC,
-                    ctx.getIdentifier(
-                      ctx.getSwiftName(KnownFoundationEntity::NSZone))}]
-        = { "struct _NSZone *", true };
-
-      specialNames[{ctx.Id_Darwin, ctx.getIdentifier("DarwinBoolean")}]
-        = { "Boolean", false};
-
-      specialNames[{ctx.Id_CoreGraphics, ctx.Id_CGFloat}]
-        = { "CGFloat", false };
-
-      specialNames[{ctx.Id_CoreFoundation, ctx.Id_CGFloat}]
-        = { "CGFloat", false };
-
-      // Use typedefs we set up for SIMD vector types.
-#define MAP_SIMD_TYPE(BASENAME, _, __) \
-      specialNames[{ctx.Id_simd, ctx.getIdentifier(#BASENAME "2")}] \
-        = { "swift_" #BASENAME "2", false };                        \
-      specialNames[{ctx.Id_simd, ctx.getIdentifier(#BASENAME "3")}] \
-        = { "swift_" #BASENAME "3", false };                        \
-      specialNames[{ctx.Id_simd, ctx.getIdentifier(#BASENAME "4")}] \
-        = { "swift_" #BASENAME "4", false };
-#include "swift/ClangImporter/SIMDMappedTypes.def"
-      static_assert(SWIFT_MAX_IMPORTED_SIMD_ELEMENTS == 4,
-                    "must add or remove special name mappings if max number of "
-                    "SIMD elements is changed");
-    }
-
-    Identifier moduleName = typeDecl->getModuleContext()->getName();
-    Identifier name = typeDecl->getName();
-    auto iter = specialNames.find({moduleName, name});
-    if (iter == specialNames.end())
-      return None;
-    return iter->second;
-  }
-
-  /// If \p typeDecl is one of the standard library types used to map in Clang
   /// primitives and basic types, print out the appropriate spelling and
   /// return true.
   ///
@@ -1510,7 +2023,8 @@ private:
   /// for interfacing with C and Objective-C.
   bool printIfKnownSimpleType(const TypeDecl *typeDecl,
                               Optional<OptionalTypeKind> optionalKind) {
-    Optional<CTypeInfo> knownTypeInfo = getKnownTypeInfo(typeDecl);
+    auto knownTypeInfo =
+        owningPrinter.typeMapping.getKnownObjCTypeInfo(typeDecl);
     if (!knownTypeInfo)
       return false;
     os << knownTypeInfo->name;
@@ -1814,10 +2328,7 @@ private:
       os << (isMetatype ? "Class" : "id");
     }
 
-    SmallVector<ProtocolDecl *, 2> protos;
-    for (auto proto : layout.getProtocols())
-      protos.push_back(proto->getDecl());
-    printProtocols(protos);
+    printProtocols(layout.getProtocols());
 
     if (layout.explicitSuperclass && !isMetatype)
       os << " *";
@@ -1837,8 +2348,7 @@ private:
 
   void visitExistentialType(ExistentialType *ET,
                             Optional<OptionalTypeKind> optionalKind) {
-    visitExistentialType(ET, optionalKind,
-        /*isMetatype=*/ET->getConstraintType()->is<AnyMetatypeType>());
+    visitPart(ET->getConstraintType(), optionalKind);
   }
 
   void visitExistentialMetatypeType(ExistentialMetatypeType *MT,
@@ -1922,23 +2432,24 @@ private:
   void finishFunctionType(const FunctionType *FT) {
     os << ")(";
     if (!FT->getParams().empty()) {
-      interleave(FT->getParams(),
-                 [this](const AnyFunctionType::Param &param) {
-                   switch (param.getValueOwnership()) {
-                   case ValueOwnership::Default:
-                   case ValueOwnership::Shared:
-                     break;
-                   case ValueOwnership::Owned:
-                     os << "SWIFT_RELEASES_ARGUMENT ";
-                     break;
-                   case ValueOwnership::InOut:
-                     llvm_unreachable("bad specifier");
-                   }
+      interleave(
+          FT->getParams(),
+          [this](const AnyFunctionType::Param &param) {
+            switch (param.getValueOwnership()) {
+            case ValueOwnership::Default:
+            case ValueOwnership::Shared:
+              break;
+            case ValueOwnership::Owned:
+              os << "SWIFT_RELEASES_ARGUMENT ";
+              break;
+            case ValueOwnership::InOut:
+              llvm_unreachable("bad specifier");
+            }
 
-                   print(param.getParameterType(), OTK_None, param.getLabel(),
-                         IsFunctionParam);
-                 },
-                 [this] { os << ", "; });
+            print(param.getParameterType(), OTK_None,
+                  param.getLabel().str().str(), IsFunctionParam);
+          },
+          [this] { os << ", "; });
     } else {
       os << "void";
     }
@@ -2013,7 +2524,7 @@ private:
   /// visitPart().
 public:
   void print(Type ty, Optional<OptionalTypeKind> optionalKind,
-             Identifier name = Identifier(),
+             StringRef name = "",
              IsFunctionParam_t isFuncParam = IsNotFunctionParam) {
     PrettyStackTraceType trace(getASTContext(), "printing", ty);
 
@@ -2027,20 +2538,81 @@ public:
     visitPart(ty, optionalKind);
     if (!name.empty()) {
       os << ' ' << name;
-      if (isClangKeyword(name)) {
+      if (isClangKeyword(name))
         os << '_';
-      }
     }
   }
 };
 
 auto DeclAndTypePrinter::getImpl() -> Implementation {
-  return Implementation(os, *this);
+  return Implementation(os, *this, outputLang);
+}
+
+static bool isAsyncAlternativeOfOtherDecl(const ValueDecl *VD) {
+  auto AFD = dyn_cast<AbstractFunctionDecl>(VD);
+  if (!AFD || !AFD->isAsyncContext() || !AFD->getObjCSelector())
+    return false;
+
+  auto type = AFD->getDeclContext()->getSelfNominalTypeDecl();
+  if (!type)
+    return false;
+  auto others = type->lookupDirect(AFD->getObjCSelector(),
+                                   AFD->isInstanceMember());
+
+  for (auto other : others)
+    if (other->getAsyncAlternative() == AFD)
+      return true;
+
+  return false;
+}
+
+static bool hasExposeAttr(const ValueDecl *VD, bool isExtension = false) {
+  if (isa<NominalTypeDecl>(VD) && VD->getModuleContext()->isStdlibModule()) {
+    if (VD == VD->getASTContext().getStringDecl() && !isExtension)
+      return true;
+    if (VD == VD->getASTContext().getArrayDecl())
+      return true;
+    if (VD == VD->getASTContext().getOptionalDecl() && !isExtension)
+      return true;
+    return false;
+  }
+  // Clang decls don't need to be explicitly exposed.
+  if (VD->hasClangNode())
+    return true;
+  if (VD->getAttrs().hasAttribute<ExposeAttr>())
+    return true;
+  if (const auto *NMT = dyn_cast<NominalTypeDecl>(VD->getDeclContext()))
+    return hasExposeAttr(NMT);
+  if (const auto *ED = dyn_cast<ExtensionDecl>(VD->getDeclContext())) {
+    // FIXME: Do not expose 'index' methods as the overloads are conflicting.
+    // this should either be prohibited in the stdlib module, or the overloads
+    // should be renamed automatically or using the expose attribute.
+    if (ED->getExtendedNominal() == VD->getASTContext().getArrayDecl()) {
+      if (isa<AbstractFunctionDecl>(VD) &&
+          !cast<AbstractFunctionDecl>(VD)
+               ->getName()
+               .getBaseName()
+               .isSpecial() &&
+          cast<AbstractFunctionDecl>(VD)
+              ->getName()
+              .getBaseName()
+              .getIdentifier()
+              .str()
+              .contains_insensitive("index"))
+        return false;
+    }
+    return hasExposeAttr(ED->getExtendedNominal(), /*isExtension=*/true);
+  }
+  return false;
 }
 
 bool DeclAndTypePrinter::shouldInclude(const ValueDecl *VD) {
-  return !VD->isInvalid() && isVisibleToObjC(VD, minRequiredAccess) &&
-         !VD->getAttrs().hasAttribute<ImplementationOnlyAttr>();
+  return !VD->isInvalid() && (!requiresExposedAttribute || hasExposeAttr(VD)) &&
+         (outputLang == OutputLanguageMode::Cxx
+              ? cxx_translation::isVisibleToCxx(VD, minRequiredAccess)
+              : isVisibleToObjC(VD, minRequiredAccess)) &&
+         !VD->getAttrs().hasAttribute<ImplementationOnlyAttr>() &&
+         !isAsyncAlternativeOfOtherDecl(VD);
 }
 
 void DeclAndTypePrinter::print(const Decl *D) {

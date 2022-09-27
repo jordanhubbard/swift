@@ -1,9 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import sys
 
 (_, old, new) = sys.argv
-assert(len(old) == len(new))
+assert len(old) == len(new)
 
 if sys.version_info[0] < 3:
     data = sys.stdin.read()

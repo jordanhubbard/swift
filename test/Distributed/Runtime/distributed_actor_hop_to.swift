@@ -1,6 +1,7 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-swift-frontend-emit-module -emit-module-path %t/FakeDistributedActorSystems.swiftmodule -module-name FakeDistributedActorSystems -disable-availability-checking %S/../Inputs/FakeDistributedActorSystems.swift
 // RUN: %target-build-swift -module-name main -Xfrontend -enable-experimental-distributed -Xfrontend -disable-availability-checking -j2 -parse-as-library -I %t %s %S/../Inputs/FakeDistributedActorSystems.swift -o %t/a.out
+// RUN: %target-codesign %t/a.out
 // RUN: %target-run %t/a.out | %FileCheck %s --color
 
 // REQUIRES: executable_test
@@ -12,10 +13,10 @@
 // UNSUPPORTED: back_deployment_runtime
 
 // FIXME(distributed): Distributed actors currently have some issues on windows, isRemote always returns false. rdar://82593574
-// UNSUPPORTED: windows
+// UNSUPPORTED: OS=windows-msvc
 
 
-import _Distributed
+import Distributed
 import FakeDistributedActorSystems
 
 typealias DefaultDistributedActorSystem = FakeRoundtripActorSystem
@@ -24,14 +25,14 @@ protocol LifecycleWatch: DistributedActor where ActorSystem == FakeRoundtripActo
 }
 
 extension LifecycleWatch {
-  func watch() async throws {
+  func watch<T: Codable>(x: Int, _ y: T) async throws {
     // nothing here
-    print("executed: \(#function)")
+    print("executed: \(#function) - x = \(x), y = \(y)")
   }
 
-  distributed func test() async throws {
+  distributed func test<T: Codable>(x: Int, _ y: T) async throws {
     print("executed: \(#function)")
-    try await self.watch()
+    try await self.watch(x: x, y)
     print("done executed: \(#function)")
   }
 }
@@ -41,12 +42,12 @@ distributed actor Worker: LifecycleWatch {
 
 @main struct Main {
   static func main() async {
-    let worker: any LifecycleWatch = Worker(system: DefaultDistributedActorSystem())
-    try! await worker.test()
+    let worker: any LifecycleWatch = Worker(actorSystem: DefaultDistributedActorSystem())
+    try! await worker.test(x: 42, "on protocol")
 
-    // CHECK: executed: test()
-    // CHECK: executed: watch()
-    // CHECK: done executed: test()
+    // CHECK: executed: test(x:_:)
+    // CHECK: executed: watch(x:_:) - x = 42, y = on protocol
+    // CHECK: done executed: test(x:_:)
 
     print("OK") // CHECK: OK
   }

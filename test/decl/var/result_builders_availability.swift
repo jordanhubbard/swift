@@ -88,12 +88,37 @@ tuplify(true) { x in
 @available(*, unavailable)
 func unavailableFunc(_ x: Bool) -> Bool {} // expected-note {{'unavailableFunc' has been explicitly marked unavailable here}}
 
-// SR-13260: Availability checking not working in the where clause of a for
-// loop.
+// https://github.com/apple/swift/issues/55700
+// Availability checking not working in the 'where' clause of a 'for' loop
 tuplify(true) { b in
   for x in [b] where unavailableFunc(x) { // expected-error {{'unavailableFunc' is unavailable}}
     ""
     Option.best // expected-error{{'best' is only available in macOS 10.15.4 or newer}}
     // expected-note@-1{{add 'if #available' version check}}
+  }
+}
+
+@resultBuilder
+struct PairwiseBuilder {
+  @available(SwiftStdlib 5.6, *)
+  static func buildPartialBlock(first: Int) -> Int { fatalError() }
+  @available(SwiftStdlib 5.6, *)
+  static func buildPartialBlock(accumulated: Int, next: Int) -> Int { fatalError() }
+}
+
+@available(SwiftStdlib 5.5, *)
+func caller1_PairwiseBuilder() {
+  // expected-error @+1 {{result builder 'PairwiseBuilder' does not implement any 'buildBlock' or a combination of 'buildPartialBlock(first:)' and 'buildPartialBlock(accumulated:next:)' with sufficient availability for this call site}}
+  @PairwiseBuilder var x: Int {
+    1
+    1
+    1
+  }
+  if #available(SwiftStdlib 5.6, *) {
+    @PairwiseBuilder var y: Int {
+      1
+      1
+      1
+    }
   }
 }

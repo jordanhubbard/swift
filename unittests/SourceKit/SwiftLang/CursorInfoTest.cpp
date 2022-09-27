@@ -27,7 +27,13 @@ static StringRef getRuntimeLibPath() {
   return sys::path::parent_path(SWIFTLIB_DIR);
 }
 
-static void *createCancallationToken() {
+static SmallString<128> getSwiftExecutablePath() {
+  SmallString<128> path = sys::path::parent_path(getRuntimeLibPath());
+  sys::path::append(path, "bin", "swift-frontend");
+  return path;
+}
+
+static void *createCancellationToken() {
   static std::atomic<size_t> handle(1000);
   return reinterpret_cast<void *>(
       handle.fetch_add(1, std::memory_order_relaxed));
@@ -125,7 +131,8 @@ public:
   }
 
   CursorInfoTest()
-      : Ctx(*new SourceKit::Context(getRuntimeLibPath(),
+      : Ctx(*new SourceKit::Context(getSwiftExecutablePath(),
+                                    getRuntimeLibPath(),
                                     /*diagnosticDocumentationPath*/ "",
                                     SourceKit::createSwiftLangSupport,
                                     /*dispatchOnMain=*/false)) {
@@ -464,7 +471,7 @@ TEST_F(CursorInfoTest, CursorInfoCancelsPreviousRequest) {
 
   bool expired = FirstCursorInfoSema.wait(30 * 1000);
   if (expired)
-    llvm::report_fatal_error("Did not receive a resonse for the first request");
+    llvm::report_fatal_error("Did not receive a response for the first request");
 }
 
 TEST_F(CursorInfoTest, CursorInfoCancellation) {
@@ -483,7 +490,7 @@ TEST_F(CursorInfoTest, CursorInfoCancellation) {
 
   open(SlowDocName, SlowContents, llvm::makeArrayRef(Args));
 
-  SourceKitCancellationToken CancellationToken = createCancallationToken();
+  SourceKitCancellationToken CancellationToken = createCancellationToken();
 
   // Schedule a cursor info request that takes long to execute. This should be
   // cancelled as the next cursor info (which is faster) gets requested.
@@ -501,5 +508,5 @@ TEST_F(CursorInfoTest, CursorInfoCancellation) {
 
   bool expired = CursorInfoSema.wait(30 * 1000);
   if (expired)
-    llvm::report_fatal_error("Did not receive a resonse for the first request");
+    llvm::report_fatal_error("Did not receive a response for the first request");
 }

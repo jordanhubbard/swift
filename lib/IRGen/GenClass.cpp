@@ -148,6 +148,7 @@ namespace {
         HeaderSize = CurSize;
         break;
       case ReferenceCounting::None:
+      case ReferenceCounting::Custom:
         break;
       case ReferenceCounting::Block:
       case ReferenceCounting::Unknown:
@@ -229,11 +230,14 @@ namespace {
         auto superclassDecl = superclassType.getClassOrBoundGenericClass();
         assert(superclassType && superclassDecl);
 
-        if (IGM.hasResilientMetadata(superclassDecl, ResilienceExpansion::Maximal))
+        if (IGM.hasResilientMetadata(superclassDecl,
+                                     ResilienceExpansion::Maximal,
+                                     rootClass))
           Options |= ClassMetadataFlags::ClassHasResilientAncestry;
 
         // If the superclass has resilient storage, don't walk its fields.
-        if (IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal)) {
+        if (IGM.isResilient(superclassDecl, ResilienceExpansion::Maximal,
+                            rootClass)) {
           Options |= ClassMetadataFlags::ClassHasResilientMembers;
 
           // If the superclass is generic, we have to assume that its layout
@@ -263,10 +267,11 @@ namespace {
       if (classHasIncompleteLayout(IGM, theClass))
         Options |= ClassMetadataFlags::ClassHasMissingMembers;
 
-      if (IGM.hasResilientMetadata(theClass, ResilienceExpansion::Maximal))
+      if (IGM.hasResilientMetadata(theClass, ResilienceExpansion::Maximal,
+                                   rootClass))
         Options |= ClassMetadataFlags::ClassHasResilientAncestry;
 
-      if (IGM.isResilient(theClass, ResilienceExpansion::Maximal)) {
+      if (IGM.isResilient(theClass, ResilienceExpansion::Maximal, rootClass)) {
         Options |= ClassMetadataFlags::ClassHasResilientMembers;
         return;
       }
@@ -448,7 +453,7 @@ ClassTypeInfo::createLayoutWithTailElems(IRGenModule &IGM,
                                                         os.str());
   builder.setAsBodyOfStruct(ResultTy);
 
-  // Create the StructLayout, which is transfered to the caller (the caller is
+  // Create the StructLayout, which is transferred to the caller (the caller is
   // responsible for deleting it).
   return new StructLayout(builder, classType.getClassOrBoundGenericClass(),
                           ResultTy, builder.getElements());
@@ -591,7 +596,7 @@ OwnedAddress irgen::projectPhysicalClassMemberAddress(IRGenFunction &IGF,
     auto element = fieldInfo.second;
     Address memberAddr = element.project(IGF, baseAddr, None);
     // We may need to bitcast the address if the field is of a generic type.
-    if (memberAddr.getType()->getElementType() != fieldTI.getStorageType())
+    if (memberAddr.getType()->getPointerElementType() != fieldTI.getStorageType())
       memberAddr = IGF.Builder.CreateBitCast(memberAddr,
                                      fieldTI.getStorageType()->getPointerTo());
     return OwnedAddress(memberAddr, base);
@@ -2242,7 +2247,9 @@ namespace {
       case llvm::Triple::Wasm:
         var->setSection(".data");
         break;
+      case llvm::Triple::DXContainer:
       case llvm::Triple::GOFF:
+      case llvm::Triple::SPIRV:
       case llvm::Triple::UnknownObjectFormat:
         llvm_unreachable("Don't know how to emit private global constants for "
                          "the selected object format.");
@@ -2566,7 +2573,7 @@ ClassDecl *irgen::getRootClassForMetaclass(IRGenModule &IGM, ClassDecl *C) {
   if (C->hasClangNode()) return C;
   
   // FIXME: If the root class specifies its own runtime ObjC base class,
-  // assume that that base class ultimately inherits NSObject.
+  // assume that base class ultimately inherits NSObject.
   if (C->getAttrs().hasAttribute<SwiftNativeObjCRuntimeBaseAttr>())
     return IGM.getObjCRuntimeBaseClass(
              IGM.Context.getSwiftId(KnownFoundationEntity::NSObject),

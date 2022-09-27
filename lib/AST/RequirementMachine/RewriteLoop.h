@@ -219,11 +219,11 @@ struct RewriteStep {
 
   /// The size of the left whisker, which is the position within the term where
   /// the rule is being applied. In A.(X => Y).B, this is |A|=1.
-  unsigned StartOffset : 16;
+  unsigned StartOffset : 13;
 
   /// The size of the right whisker, which is the length of the remaining suffix
   /// after the rule is applied. In A.(X => Y).B, this is |B|=1.
-  unsigned EndOffset : 16;
+  unsigned EndOffset : 13;
 
   /// If Kind is Rule, the index of the rule in the rewrite system.
   ///
@@ -235,11 +235,11 @@ struct RewriteStep {
   /// If Kind is Relation, the relation index returned from
   /// RewriteSystem::recordRelation().
   ///
-  /// If Kind is DecomposeConcrete, the type difference ID returend from
+  /// If Kind is DecomposeConcrete, the type difference ID returned from
   /// RewriteSystem::recordTypeDifference().
   ///
   /// If Kind is LeftConcreteProjection or RightConcreteProjection, the
-  /// type difference returend from RewriteSystem::recordTypeDifference()
+  /// type difference returned from RewriteSystem::recordTypeDifference()
   /// in the most significant 16 bits, together with the substitution index
   /// in the least significant 16 bits. See getConcreteProjectionArg(),
   /// getTypeDifference() and getSubstitutionIndex().
@@ -407,7 +407,13 @@ public:
 
   RewritePath splitCycleAtRule(unsigned ruleID) const;
 
+  bool replaceRulesWithPaths(llvm::function_ref<const RewritePath *(unsigned)> fn);
+
   bool replaceRuleWithPath(unsigned ruleID, const RewritePath &path);
+
+  SmallVector<unsigned, 1>
+  findRulesAppearingOnceInEmptyContext(const MutableTerm &term,
+                                       const RewriteSystem &system) const;
 
   void invert();
 
@@ -418,7 +424,7 @@ public:
 
   bool computeLeftCanonicalForm(const RewriteSystem &system);
 
-  void computeNormalForm(const RewriteSystem &system);
+  bool computeNormalForm(const RewriteSystem &system);
 
   void dump(llvm::raw_ostream &out,
             MutableTerm term,
@@ -427,15 +433,6 @@ public:
   void dumpLong(llvm::raw_ostream &out,
                 MutableTerm term,
                 const RewriteSystem &system) const;
-};
-
-/// Information about protocol conformance rules appearing in a rewrite loop.
-///
-/// This is the return value of RewriteLoop::findProtocolConformanceRules().
-struct ProtocolConformanceRules {
-  SmallVector<unsigned, 2> RulesInEmptyContext;
-  SmallVector<std::pair<MutableTerm, unsigned>, 2> RulesInContext;
-  bool SawIdentityConformance = false;
 };
 
 /// A loop (3-cell) that rewrites the basepoint back to the basepoint.
@@ -453,6 +450,9 @@ private:
 
   /// Cached value for getDecomposeCount().
   unsigned DecomposeCount : 15;
+
+  /// Cached value for hasConcreteTypeAliasRule().
+  unsigned HasConcreteTypeAliasRule : 1;
 
   /// A useful loop contains at least one rule in empty context, even if that
   /// rule appears multiple times or also in non-empty context. The only loops
@@ -475,6 +475,7 @@ public:
     : Basepoint(basepoint), Path(path) {
     ProjectionCount = 0;
     DecomposeCount = 0;
+    HasConcreteTypeAliasRule = 0;
     Useful = 0;
     Deleted = 0;
 
@@ -506,10 +507,7 @@ public:
 
   unsigned getDecomposeCount(const RewriteSystem &system) const;
 
-  void findProtocolConformanceRules(
-      llvm::SmallDenseMap<const ProtocolDecl *,
-                          ProtocolConformanceRules, 2> &result,
-      const RewriteSystem &system) const;
+  bool hasConcreteTypeAliasRule(const RewriteSystem &system) const;
 
   void computeNormalForm(const RewriteSystem &system);
 

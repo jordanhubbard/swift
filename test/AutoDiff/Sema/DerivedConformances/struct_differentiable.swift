@@ -271,7 +271,7 @@ public struct TF_269: TF_269_Layer {
 // Test errors.
 
 // Test manually customizing vector space types.
-// Thees should fail. Synthesis is semantically unsupported if vector space
+// These should fail. Synthesis is semantically unsupported if vector space
 // types are customized.
 // expected-error @+1 {{type 'VectorSpaceTypeAlias' does not conform to protocol 'Differentiable'}}
 struct VectorSpaceTypeAlias: AdditiveArithmetic, Differentiable {
@@ -361,9 +361,10 @@ where T: AdditiveArithmetic {}
 extension NoMemberwiseInitializerExtended: Differentiable
 where T: Differentiable & AdditiveArithmetic {}
 
-// SR-12793: Test interaction with `@differentiable` and `@derivative` type-checking.
+// https://github.com/apple/swift/issues/55238
+// Test interaction with `@differentiable` and `@derivative` type-checking.
 
-struct SR_12793: Differentiable {
+struct S_55238: Differentiable {
   var x: Float
 
   @differentiable(reverse)
@@ -408,7 +409,9 @@ struct WrappedProperties: Differentiable {
 
   @Wrapper var float: Generic<Float>
   @ClassWrapper var float2: Generic<Float>
-  // SR-13071: Test `@differentiable` wrapped property.
+
+  // https://github.com/apple/swift/issues/55517
+  // Test `@differentiable` wrapped property.
   @differentiable(reverse) @Wrapper var float3: Generic<Float>
 
   @noDerivative @ImmutableWrapper var nondiff: Generic<Int>

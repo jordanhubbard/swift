@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-cxx-interop)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop)
 //
 // REQUIRES: executable_test
 
@@ -149,6 +149,26 @@ OperatorsTestSuite.test("greater equal (>=)") {
   let result = lhs >= rhs
 
   expectEqual(true, result)
+}
+
+OperatorsTestSuite.test("slash equal (/=)") {
+  var lhs = LoadableIntWrapper(value: 8)
+  let rhs = LoadableIntWrapper(value: 2)
+
+  let result = lhs /= rhs
+
+  expectEqual(lhs.value, 4)
+  expectEqual(result.value, 4)
+}
+
+OperatorsTestSuite.test("star equal (*=)") {
+  var lhs = LoadableIntWrapper(value: 8)
+  let rhs = LoadableIntWrapper(value: 2)
+
+  let result = lhs *= rhs
+
+  expectEqual(lhs.value, 16)
+  expectEqual(result.value, 16)
 }
 
 OperatorsTestSuite.test("amp amp (&&)") {

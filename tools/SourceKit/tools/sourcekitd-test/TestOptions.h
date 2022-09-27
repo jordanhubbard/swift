@@ -63,7 +63,7 @@ enum class SourceKitRequest {
   Statistics,
   SyntaxTree,
   EnableCompileNotifications,
-  CollectExpresstionType,
+  CollectExpressionType,
   CollectVariableType,
   GlobalConfiguration,
   DependencyUpdated,
@@ -126,6 +126,7 @@ struct TestOptions {
   bool timeRequest = false;
   bool measureInstructions = false;
   bool DisableImplicitConcurrencyModuleImport = false;
+  bool DisableImplicitStringProcessingModuleImport = false;
   llvm::Optional<unsigned> CompletionCheckDependencyInterval;
   unsigned repeatRequest = 1;
   struct VFSFile {

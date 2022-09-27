@@ -133,9 +133,9 @@ Projection::Projection(SingleValueInstruction *I) : Value() {
   }
   case SILInstructionKind::UncheckedTakeEnumDataAddrInst: {
     auto *UTEDAI = cast<UncheckedTakeEnumDataAddrInst>(I);
-    Value = ValueTy(ProjectionKind::Enum, UTEDAI->getElementNo());
+    Value = ValueTy(ProjectionKind::Enum, UTEDAI->getCaseIndex());
     assert(getKind() == ProjectionKind::Enum);
-    assert(getIndex() == int(UTEDAI->getElementNo()));
+    assert(getIndex() == int(UTEDAI->getCaseIndex()));
     break;
   }
   case SILInstructionKind::IndexAddrInst: {
@@ -272,7 +272,9 @@ Projection::createAddressProjection(SILBuilder &B, SILLocation Loc,
         SILType::getBuiltinIntegerType(64, B.getModule().getASTContext());
     auto IntLiteralIndex =
         B.createIntegerLiteral(Loc, IntLiteralTy, getIndex());
-    return B.createIndexAddr(Loc, Base, IntLiteralIndex);
+    return B.createIndexAddr(Loc, Base, IntLiteralIndex,
+        // TODO: do we need to be conservative here?
+        /*needsStackProtection=*/ true);
   }
   case ProjectionKind::Enum:
     return B.createUncheckedTakeEnumDataAddr(Loc, Base,
@@ -389,7 +391,11 @@ Optional<ProjectionPath> ProjectionPath::getProjectionPath(SILValue Start,
       Projection AP(Iter);
       if (!AP.isValid())
         break;
-      P.Path.push_back(AP);
+      // We _must_ ignore zero-indexing projections so that alias analysis
+      // recognizes an "alias" between two addresses where one has such an
+      // `index_addr 0` instruction and the other doesn't.
+      if (AP.getKind() != ProjectionKind::Index || AP.getIndex() != 0)
+        P.Path.push_back(AP);
     }
     Iter = cast<SingleValueInstruction>(*Iter).getOperand(0);
   }

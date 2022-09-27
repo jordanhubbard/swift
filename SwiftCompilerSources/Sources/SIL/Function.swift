@@ -13,16 +13,25 @@
 import Basic
 import SILBridging
 
-final public class Function : CustomStringConvertible, HasName {
+final public class Function : CustomStringConvertible, HasShortDescription, Hashable {
   public private(set) var effects = FunctionEffects()
 
-  public var name: String {
-    return SILFunction_getName(bridged).string
+  public var name: StringRef {
+    return StringRef(bridged: SILFunction_getName(bridged))
   }
 
   final public var description: String {
-    return SILFunction_debugDescription(bridged).takeString()
+    let stdString = SILFunction_debugDescription(bridged)
+    return String(_cxxString: stdString)
   }
+
+  public var shortDescription: String { name.string }
+
+  public func hash(into hasher: inout Hasher) {
+    hasher.combine(ObjectIdentifier(self))
+  }
+
+  public var hasOwnership: Bool { SILFunction_hasOwnership(bridged) != 0 }
 
   public var entryBlock: BasicBlock {
     SILFunction_firstBlock(bridged).block!
@@ -34,6 +43,11 @@ final public class Function : CustomStringConvertible, HasName {
 
   public var arguments: LazyMapSequence<ArgumentArray, FunctionArgument> {
     entryBlock.arguments.lazy.map { $0 as! FunctionArgument }
+  }
+
+  /// All instructions of all blocks.
+  public var instructions: LazySequence<FlattenSequence<LazyMapSequence<List<BasicBlock>, List<Instruction>>>> {
+    blocks.lazy.flatMap { $0.instructions }
   }
 
   public var numIndirectResultArguments: Int {
@@ -53,11 +67,44 @@ final public class Function : CustomStringConvertible, HasName {
   public var argumentTypes: ArgumentTypeArray { ArgumentTypeArray(function: self) }
   public var resultType: Type { SILFunction_getSILResultType(bridged).type }
 
+  public var returnInstruction: ReturnInst? {
+    for block in blocks.reversed() {
+      if let retInst = block.terminator as? ReturnInst { return retInst }
+    }
+    return nil
+  }
+
+  /// True, if the linkage of the function indicates that it is visible outside the current
+  /// compilation unit and therefore not all of its uses are known.
+  ///
+  /// For example, `public` linkage.
+  public var isPossiblyUsedExternally: Bool {
+    return SILFunction_isPossiblyUsedExternally(bridged) != 0
+  }
+
+  /// True, if the linkage of the function indicates that it has a definition outside the
+  /// current compilation unit.
+  ///
+  /// For example, `public_external` linkage.
+  public var isAvailableExternally: Bool {
+    return SILFunction_isAvailableExternally(bridged) != 0
+  }
+
+  public func hasSemanticsAttribute(_ attr: StaticString) -> Bool {
+    attr.withUTF8Buffer { (buffer: UnsafeBufferPointer<UInt8>) in
+      SILFunction_hasSemanticsAttr(bridged, llvm.StringRef(buffer.baseAddress!, buffer.count)) != 0
+    }
+  }
+
   /// True, if the function runs with a swift 5.1 runtime.
   /// Note that this is function specific, because inlinable functions are de-serialized
   /// in a client module, which might be compiled with a different deployment target.
   public var isSwift51RuntimeAvailable: Bool {
     SILFunction_isSwift51RuntimeAvailable(bridged) != 0
+  }
+
+  public var needsStackProtection: Bool {
+    SILFunction_needsStackProtection(bridged) != 0
   }
 
   // Only to be called by PassContext
@@ -86,27 +133,36 @@ final public class Function : CustomStringConvertible, HasName {
       },
       // writeFn
       { (f: BridgedFunction, os: BridgedOStream, idx: Int) in
-        let s = f.function.effects.argumentEffects[idx].description
-        s.withBridgedStringRef { OStream_write(os, $0) }
+        let s: String
+        if idx >= 0 {
+          s = f.function.effects.argumentEffects[idx].bodyDescription
+        } else {
+          s = f.function.effects.argumentEffectsDescription
+        }
+        s._withStringRef { OStream_write(os, $0) }
       },
       // parseFn:
-      { (f: BridgedFunction, str: BridgedStringRef, fromSIL: Int, isDerived: Int, paramNames: BridgedArrayRef) -> BridgedParsingError in
+      { (f: BridgedFunction, str: llvm.StringRef, fromSIL: Int, argumentIndex: Int, isDerived: Int, paramNames: BridgedArrayRef) -> BridgedParsingError in
         do {
           var parser = StringParser(str.string)
-          let effect: ArgumentEffect
-          if fromSIL != 0 {
-            effect = try parser.parseEffectFromSIL(for: f.function, isDerived: isDerived != 0)
+
+          if fromSIL != 0 && argumentIndex < 0 {
+            try parser.parseEffectsFromSIL(to: &f.function.effects)
           } else {
-            let paramToIdx = paramNames.withElements(ofType: BridgedStringRef.self) {
-                (buffer: UnsafeBufferPointer<BridgedStringRef>) -> Dictionary<String, Int> in
-              let keyValPairs = buffer.enumerated().lazy.map { ($0.1.string, $0.0) }
-              return Dictionary(uniqueKeysWithValues: keyValPairs)
+            let effect: ArgumentEffect
+            if fromSIL != 0 {
+              effect = try parser.parseEffectFromSIL(argumentIndex: argumentIndex, isDerived: isDerived != 0)
+            } else {
+              let paramToIdx = paramNames.withElements(ofType: llvm.StringRef.self) {
+                  (buffer: UnsafeBufferPointer<llvm.StringRef>) -> Dictionary<String, Int> in
+                let keyValPairs = buffer.enumerated().lazy.map { ($0.1.string, $0.0) }
+                return Dictionary(uniqueKeysWithValues: keyValPairs)
+              }
+              effect = try parser.parseEffectFromSource(for: f.function, params: paramToIdx)
             }
-            effect = try parser.parseEffectFromSource(for: f.function, params: paramToIdx)
+            f.function.effects.argumentEffects.append(effect)
           }
           if !parser.isEmpty() { try parser.throwError("syntax error") }
-
-          f.function.effects.argumentEffects.append(effect)
         } catch let error as ParsingError {
           return BridgedParsingError(message: error.message.utf8Start, position: error.position)
         } catch {
@@ -132,20 +188,14 @@ final public class Function : CustomStringConvertible, HasName {
                           resultArgDelta: destResultArgs - srcResultArgs)
         return 1
       },
-      // getEffectFlags
-      {  (f: BridgedFunction, idx: Int) -> Int in
+      // getEffectInfo
+      {  (f: BridgedFunction, idx: Int) -> BridgedEffectInfo in
         let argEffects = f.function.effects.argumentEffects
-        if idx >= argEffects.count { return 0 }
+        if idx >= argEffects.count {
+          return BridgedEffectInfo(argumentIndex: -1, isDerived: false)
+        }
         let effect = argEffects[idx]
-        var flags = 0
-        switch effect.kind {
-          case .notEscaping, .escaping:
-            flags |= Int(EffectsFlagEscape)
-        }
-        if effect.isDerived {
-          flags |= Int(EffectsFlagDerived)
-        }
-        return flags
+        return BridgedEffectInfo(argumentIndex: effect.argumentIndex, isDerived: effect.isDerived)
       }
     )
   }

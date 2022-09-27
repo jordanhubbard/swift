@@ -11,12 +11,15 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "definite-init"
+
 #include "DIMemoryUseCollector.h"
 #include "swift/AST/Expr.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
+#include "swift/SIL/SILInstruction.h"
+#include "swift/SILOptimizer/Utils/DistributedActor.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -166,6 +169,25 @@ SILInstruction *DIMemoryObjectInfo::getFunctionEntryPoint() const {
   return &*getFunction().begin()->begin();
 }
 
+static SingleValueInstruction *
+getUninitializedValue(MarkUninitializedInst *MemoryInst) {
+  SILValue inst = MemoryInst;
+  if (auto *bbi = MemoryInst->getSingleUserOfType<BeginBorrowInst>()) {
+    inst = bbi;
+  }
+
+  if (SingleValueInstruction *svi =
+          inst->getSingleUserOfType<ProjectBoxInst>()) {
+    return svi;
+  }
+
+  return MemoryInst;
+}
+
+SingleValueInstruction *DIMemoryObjectInfo::getUninitializedValue() const {
+  return ::getUninitializedValue(MemoryInst);
+}
+
 /// Given a symbolic element number, return the type of the element.
 static SILType getElementTypeRec(TypeExpansionContext context,
                                  SILModule &Module, SILType T, unsigned EltNo,
@@ -223,6 +245,33 @@ SILType DIMemoryObjectInfo::getElementType(unsigned EltNo) const {
                            Module, MemorySILType, EltNo, isNonDelegatingInit());
 }
 
+/// During tear-down of a distributed actor, we must invoke its
+/// \p actorSystem.resignID method, passing in the \p id from the
+/// instance. Thus, this function inspects the VarDecl about to be destroyed
+/// and if it matches the \p id, the \p resignIdentity call is emitted.
+///
+/// NOTE (id-before-actorSystem): it is crucial that the \p id is
+/// deinitialized before the \p actorSystem is deinitialized, because
+/// resigning the identity requires a call into the \p actorSystem.
+/// Since deinitialization consistently happens in-order, according to the
+/// listing returned by \p NominalTypeDecl::getStoredProperties
+/// it is important the the VarDecl for the \p id is synthesized before
+/// the \p actorSystem so that we get the right ordering in DI and deinits.
+///
+/// \param nomDecl a distributed actor decl
+/// \param var a VarDecl that is a member of the \p nomDecl
+static void tryToResignIdentity(SILLocation loc, SILBuilder &B,
+                                NominalTypeDecl* nomDecl, VarDecl *var,
+                                SILValue idRef, SILValue actorInst) {
+  assert(nomDecl->isDistributedActor());
+
+  if (var != nomDecl->getDistributedActorIDProperty())
+    return;
+
+  emitResignIdentityCall(B, loc, cast<ClassDecl>(nomDecl),
+                         actorInst, idRef);
+}
+
 /// Given a tuple element number (in the flattened sense) return a pointer to a
 /// leaf element of the specified number, so we can insert destroys for it.
 SILValue DIMemoryObjectInfo::emitElementAddressForDestroy(
@@ -262,6 +311,7 @@ SILValue DIMemoryObjectInfo::emitElementAddressForDestroy(
     // lifetimes for each of the tuple members.
     if (IsSelf) {
       if (auto *NTD = PointeeType.getNominalOrBoundGenericNominal()) {
+        const bool IsDistributedActor = NTD->isDistributedActor();
         bool HasStoredProperties = false;
         for (auto *VD : NTD->getStoredProperties()) {
           if (!HasStoredProperties) {
@@ -284,15 +334,20 @@ SILValue DIMemoryObjectInfo::emitElementAddressForDestroy(
             } else {
               assert(isa<ClassDecl>(NTD));
               SILValue Original, Borrowed;
-              if (Ptr.getOwnershipKind() != OwnershipKind::Guaranteed) {
+              if (Ptr->getOwnershipKind() != OwnershipKind::Guaranteed) {
                 Original = Ptr;
                 Borrowed = Ptr = B.createBeginBorrow(Loc, Ptr);
                 EndScopeList.emplace_back(Borrowed, EndScopeKind::Borrow);
               }
+              SILValue Self = Ptr;
               Ptr = B.createRefElementAddr(Loc, Ptr, VD);
               Ptr = B.createBeginAccess(
                   Loc, Ptr, SILAccessKind::Deinit, SILAccessEnforcement::Static,
                   false /*noNestedConflict*/, false /*fromBuiltin*/);
+
+              if (IsDistributedActor)
+                tryToResignIdentity(Loc, B, NTD, VD, Ptr, Self);
+
               EndScopeList.emplace_back(Ptr, EndScopeKind::Access);
             }
 
@@ -442,6 +497,31 @@ bool DIMemoryObjectInfo::isElementLetProperty(unsigned Element) const {
   return false;
 }
 
+SingleValueInstruction *DIMemoryObjectInfo::findUninitializedSelfValue() const {
+  // If the object is 'self', return its uninitialized value.
+  if (isAnyInitSelf())
+    return getUninitializedValue();
+
+  // Otherwise we need to scan entry block to find mark_uninitialized
+  // instruction that belongs to `self`.
+
+  auto *BB = getFunction().getEntryBlock();
+  if (!BB)
+    return nullptr;
+
+  for (auto &I : *BB) {
+    SILInstruction *Inst = &I;
+    if (auto *MUI = dyn_cast<MarkUninitializedInst>(Inst)) {
+      // If instruction is not a local variable, it could only
+      // be some kind of `self` (root, delegating, derived etc.)
+      // see \c MarkUninitializedInst::Kind for more details.
+      if (!MUI->isVar())
+        return ::getUninitializedValue(MUI);
+    }
+  }
+  return nullptr;
+}
+
 ConstructorDecl *DIMemoryObjectInfo::getActorInitSelf() const {
   // is it 'self'?
   if (!MemoryInst->isVar())
@@ -523,6 +603,10 @@ private:
   /// When walking the use list, if we index into an enum slice, keep track
   /// of this.
   bool InEnumSubElement = false;
+
+  /// If true, then encountered uses correspond to a VarDecl marked
+  /// as \p @_compilerInitialized
+  bool InCompilerInitializedField = false;
 
 public:
   ElementUseCollector(const DIMemoryObjectInfo &TheMemory,
@@ -665,6 +749,16 @@ static SILValue getAccessedPointer(SILValue Pointer) {
   return Pointer;
 }
 
+static DIUseKind verifyCompilerInitialized(SILValue pointer,
+                                           SILInstruction *write,
+                                           DIUseKind origKind) {
+  // if the write is _not_ auto-generated, it's a bad store.
+  if (!write->getLoc().isAutoGenerated())
+    return DIUseKind::BadExplicitStore;
+
+  return origKind;
+}
+
 void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
   assert(Pointer->getType().isAddress() &&
          "Walked through the pointer to the value?");
@@ -694,6 +788,12 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
 
     // Ignore end_access.
     if (isa<EndAccessInst>(User)) {
+      continue;
+    }
+
+    // Look through mark_must_check. To us, it is not interesting.
+    if (auto *mmi = dyn_cast<MarkMustCheckInst>(User)) {
+      collectUses(mmi, BaseEltNo);
       continue;
     }
 
@@ -732,6 +832,11 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
         Kind = DIUseKind::InitOrAssign;
       else
         Kind = DIUseKind::Initialization;
+
+      // If it's a non-synthesized write to a @_compilerInitialized field,
+      // indicate that in the Kind.
+      if (LLVM_UNLIKELY(InCompilerInitializedField))
+        Kind = verifyCompilerInitialized(Pointer, User, Kind);
 
       addElementUses(BaseEltNo, PointeeType, User, Kind);
       continue;
@@ -1158,6 +1263,7 @@ void ElementUseCollector::collectClassSelfUses(SILValue ClassPointer) {
       Uses.append(beginAccess->getUses().begin(), beginAccess->getUses().end());
       continue;
     }
+
     if (isa<EndAccessInst>(User))
       continue;
 
@@ -1403,9 +1509,15 @@ void ElementUseCollector::collectClassSelfUses(
       if (EltNumbering.count(REAI->getField()) != 0) {
         assert(EltNumbering.count(REAI->getField()) &&
                "ref_element_addr not a local field?");
+
+        // Remember whether the field is marked '@_compilerInitialized'
+        const bool hasCompInit =
+          REAI->getField()->getAttrs().hasAttribute<CompilerInitializedAttr>();
+        llvm::SaveAndRestore<bool> X1(InCompilerInitializedField, hasCompInit);
+
         // Recursively collect uses of the fields.  Note that fields of the class
         // could be tuples, so they may be tracked as independent elements.
-        llvm::SaveAndRestore<bool> X(IsSelfOfNonDelegatingInitializer, false);
+        llvm::SaveAndRestore<bool> X2(IsSelfOfNonDelegatingInitializer, false);
         collectUses(REAI, EltNumbering[REAI->getField()]);
         continue;
       }
@@ -1430,9 +1542,9 @@ void ElementUseCollector::collectClassSelfUses(
 
     // Look through begin_borrow, upcast, unchecked_ref_cast
     // and copy_value.
-    if (isa<BeginBorrowInst>(User) || isa<BeginAccessInst>(User)
-        || isa<UpcastInst>(User) || isa<UncheckedRefCastInst>(User)
-        || isa<CopyValueInst>(User)) {
+    if (isa<BeginBorrowInst>(User) || isa<BeginAccessInst>(User) ||
+        isa<UpcastInst>(User) || isa<UncheckedRefCastInst>(User) ||
+        isa<CopyValueInst>(User) || isa<MarkMustCheckInst>(User)) {
       auto value = cast<SingleValueInstruction>(User);
       std::copy(value->use_begin(), value->use_end(),
                 std::back_inserter(Worklist));
@@ -1523,6 +1635,12 @@ collectDelegatingInitUses(const DIMemoryObjectInfo &TheMemory,
     // Look through begin_access
     if (auto *BAI = dyn_cast<BeginAccessInst>(User)) {
       collectDelegatingInitUses(TheMemory, UseInfo, BAI);
+      continue;
+    }
+
+    // Look through mark_must_check.
+    if (auto *MMCI = dyn_cast<MarkMustCheckInst>(User)) {
+      collectDelegatingInitUses(TheMemory, UseInfo, MMCI);
       continue;
     }
 

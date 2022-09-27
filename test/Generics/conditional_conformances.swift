@@ -1,5 +1,5 @@
-// RUN: %target-typecheck-verify-swift
-// RUN: %target-typecheck-verify-swift -debug-generic-signatures > %t.dump 2>&1
+// RUN: %target-typecheck-verify-swift -warn-redundant-requirements
+// RUN: %target-typecheck-verify-swift -debug-generic-signatures -warn-redundant-requirements > %t.dump 2>&1
 // RUN: %FileCheck %s < %t.dump
 
 protocol P1 {}
@@ -49,12 +49,14 @@ struct RedundantSame<T: P1> {}
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=RedundantSame
 // CHECK-NEXT: (normal_conformance type=RedundantSame<T> protocol=P2)
 extension RedundantSame: P2 where T: P1 {}
+// expected-warning@-1 {{redundant conformance constraint 'T' : 'P1'}}
 
 struct RedundantSuper<T: P4> {}
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=RedundantSuper
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=RedundantSuper
 // CHECK-NEXT: (normal_conformance type=RedundantSuper<T> protocol=P2)
 extension RedundantSuper: P2 where T: P1 {}
+// expected-warning@-1 {{redundant conformance constraint 'T' : 'P1'}}
 
 struct OverlappingSub<T: P1> {}
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=OverlappingSub
@@ -187,6 +189,7 @@ struct ClassLessSpecific<T: C3> {}
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=ClassLessSpecific
 // CHECK-NEXT: (normal_conformance type=ClassLessSpecific<T> protocol=P2)
 extension ClassLessSpecific: P2 where T: C1 {}
+// expected-warning@-1 {{redundant superclass constraint 'T' : 'C1'}}
 
 
 // Inherited conformances:
@@ -229,10 +232,12 @@ func inheritequal_bad<U>(_: U) {
 
 struct InheritLess<T> {}
 extension InheritLess: P2 where T: P1 {}
-extension InheritLess: P5 {} // expected-error{{type 'T' does not conform to protocol 'P1'}}
-// expected-error@-1{{'P5' requires that 'T' conform to 'P1'}}
-// expected-note@-2{{requirement specified as 'T' : 'P1'}}
-// expected-note@-3{{requirement from conditional conformance of 'InheritLess<T>' to 'P2'}}
+extension InheritLess: P5 {}
+// expected-error@-1 {{type 'InheritLess<T>' does not conform to protocol 'P5'}}
+// expected-error@-2 {{type 'T' does not conform to protocol 'P1'}}
+// expected-error@-3 {{'P5' requires that 'T' conform to 'P1'}}
+// expected-note@-4 {{requirement specified as 'T' : 'P1'}}
+// expected-note@-5 {{requirement from conditional conformance of 'InheritLess<T>' to 'P2'}}
 
 
 struct InheritMore<T> {}
@@ -330,6 +335,8 @@ struct RedundancyOrderDependenceGood<T: P1, U> {}
 // CHECK-NEXT: (normal_conformance type=RedundancyOrderDependenceGood<T, U> protocol=P2
 // CHECK-NEXT:   same_type: T U)
 extension RedundancyOrderDependenceGood: P2 where U: P1, T == U {}
+// expected-warning@-1 {{redundant conformance constraint 'U' : 'P1'}}
+
 struct RedundancyOrderDependenceBad<T, U: P1> {}
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=RedundancyOrderDependenceBad
 // CHECK-LABEL: ExtensionDecl line={{.*}} base=RedundancyOrderDependenceBad
@@ -371,15 +378,15 @@ func passesConditionallyNotF7(x21: X2<X1>) {
   takesF7(x21) // expected-error{{global function 'takesF7' requires that 'X1.A' (aka 'X0') conform to 'P7'}}
 }
 
-
-public struct SR6990<T, U> {}
-extension SR6990: Sequence where T == Int {
+// https://github.com/apple/swift/issues/49538
+public struct S_49538<T, U> {}
+extension S_49538: Sequence where T == Int {
     public typealias Element = Float
     public typealias Iterator = IndexingIterator<[Float]>
     public func makeIterator() -> Iterator { fatalError() }
 }
 
-// SR-8324
+// https://github.com/apple/swift/issues/50852
 protocol ElementProtocol {
   associatedtype BaseElement: BaseElementProtocol = Self
 }
@@ -396,7 +403,8 @@ extension Array: NestedArrayProtocol where Element: ElementProtocol, Element: Ar
   // typealias BaseElement = Element.BaseElement
 }
 
-// SR-8337
+// https://github.com/apple/swift/issues/50865
+
 struct Foo<Bar> {}
 
 protocol P {
@@ -419,13 +427,13 @@ extension BinaryInteger {
   }
 }
 
-// SR-10992
+// https://github.com/apple/swift/issues/53382
 
-protocol SR_10992_P {}
-struct SR_10992_S<T> {}
-extension SR_10992_S: SR_10992_P where T: SR_10992_P {} // expected-note {{requirement from conditional conformance of 'SR_10992_S<String>' to 'SR_10992_P'}}
+protocol P_53382 {}
+struct S_53382<T> {}
+extension S_53382: P_53382 where T: P_53382 {} // expected-note {{requirement from conditional conformance of 'S_53382<String>' to 'P_53382'}}
 	
-func sr_10992_foo(_ fn: (SR_10992_S<String>) -> Void) {}
-func sr_10992_bar(_ fn: (SR_10992_P) -> Void) {
-  sr_10992_foo(fn) // expected-error {{global function 'sr_10992_foo' requires that 'String' conform to 'SR_10992_P'}}
+func f1_53382(_ fn: (S_53382<String>) -> Void) {}
+func f2_53382(_ fn: (P_53382) -> Void) {
+  f1_53382(fn) // expected-error {{global function 'f1_53382' requires that 'String' conform to 'P_53382'}}
 }

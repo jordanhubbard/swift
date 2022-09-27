@@ -78,7 +78,7 @@ struct TupleBuilderWithoutIf { // expected-note 3{{struct 'TupleBuilderWithoutIf
   static func buildDo<T>(_ value: T) -> T { return value }
 }
 
-func tuplify<T>(_ cond: Bool, @TupleBuilder body: (Bool) -> T) {
+func tuplify<T>(_ cond: Bool, @TupleBuilder body: (Bool) -> T) { // expected-note {{in call to function 'tuplify(_:body:)'}}
   print(body(cond))
 }
 
@@ -232,7 +232,8 @@ func test_56221372() -> some P {
   })
 }
 
-struct SR11440 {
+// https://github.com/apple/swift/issues/53841
+struct S_53841 {
   typealias ReturnsTuple<T> = () -> (T, T)
   subscript<T, U>(@TupleBuilder x: ReturnsTuple<T>) -> (ReturnsTuple<U>) -> Void { //expected-note {{in call to 'subscript(_:)'}}
     return { _ in }
@@ -261,8 +262,9 @@ struct SR11440 {
 
 func acceptInt(_: Int, _: () -> Void) { }
 
-// SR-11350 crash due to improper recontextualization.
-func erroneousSR11350(x: Int) {
+// https://github.com/apple/swift/issues/53751
+// Crash due to improper recontextualization.
+func erroneous_53751(x: Int) {
   tuplify(true) { b in
     17
     x + 25
@@ -304,21 +306,6 @@ struct MyTuplifiedStruct {
     } else {
            return 42
     }
-  }
-}
-
-func test_invalid_return_type_in_body() {
-  tuplify(true) { _ -> (Void, Int) in
-    tuplify(false) { condition in
-      if condition {
-        return 42 // expected-error {{cannot use explicit 'return' statement in the body of result builder 'TupleBuilder'}}
-        // expected-note@-1 {{remove 'return' statements to apply the result builder}} {{9-16=}}
-      } else {
-        1
-      }
-    }
-
-    42
   }
 }
 
@@ -481,7 +468,7 @@ struct TestConstraintGenerationErrors {
   func buildTupleClosure() {
     tuplify(true) { _ in
       let a = nothing // expected-error {{cannot find 'nothing' in scope}}
-      String(nothing)
+      String(nothing) // expected-error {{cannot find 'nothing' in scope}}
     }
   }
 }
@@ -522,7 +509,7 @@ enum E3 {
 }
 
 func testCaseMutabilityMismatches(e: E3) {
-    tuplify(true) { c in
+   tuplify(true) { c in // expected-error {{generic parameter 'T' could not be inferred}}
     "testSwitch"
     switch e {
     case .a(let x, var y),
@@ -816,7 +803,7 @@ func test_missing_member_in_optional_context() {
   }
 }
 
-func test_redeclations() {
+func test_redeclarations() {
   tuplify(true) { c in
     let foo = 0 // expected-note {{'foo' previously declared here}}
     let foo = foo // expected-error {{invalid redeclaration of 'foo'}}
@@ -824,5 +811,86 @@ func test_redeclations() {
 
   tuplify(true) { c in
     let (foo, foo) = (5, 6) // expected-error {{invalid redeclaration of 'foo'}} expected-note {{'foo' previously declared here}}
+  }
+}
+
+func test_rdar89742267() {
+  @resultBuilder
+  struct Builder {
+    static func buildBlock<T>(_ t: T) -> T { t }
+    static func buildEither<T>(first: T) -> T { first }
+    static func buildEither<T>(second: T) -> T { second }
+  }
+
+  struct S {}
+
+  enum Hey {
+    case listen
+  }
+
+  struct MyView {
+    var entry: Hey
+
+    @Builder var body: S {
+      switch entry {
+      case .listen: S()
+      case nil: S() // expected-warning {{type 'Hey' is not optional, value can never be nil; this is an error in Swift 6}}
+      default: S()
+      }
+    }
+  }
+}
+
+// https://github.com/apple/swift/issues/59390
+func test_invalid_result_is_diagnosed() {
+  @resultBuilder
+  struct MyBuilder {
+    static func buildBlock<T1>(_ t1: T1) -> T1 {
+      return t1
+    }
+  }
+
+  struct S<T> {} // expected-note {{arguments to generic parameter 'T' ('Int' and 'String') are expected to be equal}}
+
+  @MyBuilder
+  func test() -> S<String> { // expected-error {{cannot convert result builder result type 'S<Int>' to return type 'S<String>}}
+    S<Int>()
+  }
+}
+
+func test_associated_values_dont_block_solver_when_unresolved() {
+  @resultBuilder
+  struct Builder {
+    static func buildBlock<T>(_ t: T) -> T { t }
+    static func buildEither<T>(first: T) -> T { first }
+    static func buildEither<T>(second: T) -> T { second }
+  }
+
+  struct Value {
+    enum Kind {
+      case a(String)
+      case b
+    }
+
+    var kind: Kind
+  }
+
+  struct Container {
+    var prop: Value? = nil
+  }
+
+  struct TestWithAny {
+    var container: Container
+
+    @Builder var body: String {
+      let v = container.prop.kind // expected-error {{value of optional type 'Value?' must be unwrapped to refer to member 'kind' of wrapped base type 'Value'}}
+      // expected-note@-1 {{chain the optional using '?' to access member 'kind' only for non-'nil' base values}}
+      // expected-note@-2 {{force-unwrap using '!' to abort execution if the optional value contains 'nil'}}
+
+      switch v.kind { // expected-error {{value of type 'Value.Kind' has no member 'kind'}}
+      case .a(_): "a"
+      case .b: "b"
+      }
+    }
   }
 }

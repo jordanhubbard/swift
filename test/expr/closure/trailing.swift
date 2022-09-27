@@ -39,7 +39,8 @@ func notPostfix() {
 }
 
 func notLiterals() {
-  struct SR3671 { // <https://bugs.swift.org/browse/SR-3671>
+  // https://github.com/apple/swift/issues/46256
+  struct S {
     var v: Int = 1 { // expected-error {{variable with getter/setter cannot have an initial value}}
       get {
         return self.v
@@ -133,7 +134,7 @@ let someInt = 0
 let intArray = [someInt]
 limitXY(someInt, toGamut: intArray) {}  // expected-error{{extra trailing closure passed in call}}
 
-// <rdar://problem/23036383> QoI: Invalid trailing closures in stmt-conditions produce lowsy diagnostics
+// <rdar://problem/23036383> QoI: Invalid trailing closures in stmt-conditions produce lousy diagnostics
 func retBool(x: () -> Int) -> Bool {}
 func maybeInt(_: () -> Int) -> Int? {}
 func twoClosureArgs(_:()->Void, _:()->Void) -> Bool {}
@@ -218,10 +219,12 @@ func r23036383(foo: Foo23036383?, obj: Foo23036383) {
   if let _ = (foo?.map {$0+1}.map({$0+1})).map({$0+1}) {} // OK
 }
 
+// https://github.com/apple/swift/issues/51245
+
 func id<T>(fn: () -> T) -> T { return fn() }
 func any<T>(fn: () -> T) -> Any { return fn() }
 
-func testSR8736() {
+func test_51245() {
   if !id { true } { return } // expected-warning {{trailing closure in this context is confusable with the body of the statement; pass as a parenthesized argument to silence this warning}}
   
   if id { true } == true { return } // expected-warning {{trailing closure in this context is confusable with the body of the statement; pass as a parenthesized argument to silence this warning}}
@@ -474,4 +477,14 @@ func rdar85343171() {
 
   // Okay, as trailing closure is nested in argument list.
   if foo(bar {}) {}
+}
+
+// rdar://92521618 - Spurious warning on trailing closure nested within a
+// closure initializer.
+
+func rdar92521618() {
+  func foo(_ fn: () -> Void) -> Int? { 0 }
+
+  if let _ = { foo {} }() {}
+  guard let _ = { foo {} }() else { return }
 }

@@ -8,70 +8,72 @@
 #include <string>
 namespace swift {
 struct CXXMethodBridging {
-  enum class Kind { unkown, getter, setter, subscript };
+  enum class Kind { unknown, getter, setter, subscript };
 
-  enum class NameKind { unkown, snake, lower, camel, title };
+  enum class NameKind { unknown, snake, lower, camel, title };
 
   CXXMethodBridging(const clang::CXXMethodDecl *method) : method(method) {}
 
   Kind classify() {
     if (nameIsBlacklist())
-      return Kind::unkown;
+      return Kind::unknown;
 
-    // this should be handled as snake case. See: rdar://89453010
+    // This should be handled as snake case. See: rdar://89453010
     // case. In the future we could
     //  import these too, though.
     auto nameKind = classifyNameKind();
     if (nameKind != NameKind::title && nameKind != NameKind::camel &&
-        nameKind != NameKind::lower)
-      return Kind::unkown;
+        nameKind != NameKind::lower && nameKind != NameKind::snake)
+      return Kind::unknown;
 
     if (getClangName().startswith_insensitive("set")) {
       // Setters only have one parameter.
       if (method->getNumParams() != 1)
-        return Kind::unkown;
+        return Kind::unknown;
 
       // rdar://89453106 (We need to handle imported properties that return a
       // reference)
       if (method->getParamDecl(0)->getType()->isReferenceType())
-        return Kind::unkown;
+        return Kind::unknown;
 
       return Kind::setter;
     }
 
     // Getters and subscripts cannot return void.
     if (method->getReturnType()->isVoidType())
-      return Kind::unkown;
+      return Kind::unknown;
 
     if (getClangName().startswith_insensitive("get")) {
       // Getters cannot take arguments.
       if (method->getNumParams() != 0)
-        return Kind::unkown;
+        return Kind::unknown;
 
       // rdar://89453106 (We need to handle imported properties that return a
       // reference)
       if (method->getReturnType()->isReferenceType())
-        return Kind::unkown;
+        return Kind::unknown;
 
       return Kind::getter;
     }
 
     // rdar://89453187 (Add subscripts clarification to CXXMethod Bridging to
     // clean up importDecl)
-    return Kind::unkown;
+    return Kind::unknown;
   }
 
   NameKind classifyNameKind() {
-    bool allLower = llvm::all_of(getClangName(), islower);
+    bool hasUpper = llvm::any_of(
+        getClangName(), [](unsigned char ch) { return std::isupper(ch); });
 
-    if (getClangName().empty())
-      return NameKind::unkown;
+    if (getClangName().empty()) {
+      return NameKind::unknown;
+    }
 
-    if (getClangName().contains('_'))
-      return allLower ? NameKind::snake : NameKind::unkown;
-
-    if (allLower)
+    if (getClangName().contains('_')) {
+      return hasUpper ? NameKind::unknown : NameKind::snake;
+    } else if (!hasUpper) {
       return NameKind::lower;
+    }
 
     return islower(getClangName().front()) ? NameKind::camel : NameKind::title;
   }
@@ -83,7 +85,7 @@ struct CXXMethodBridging {
     return method->getName();
   }
 
-  // this should be handled as snake case. See: rdar://89453010
+  // This should be handled as snake case. See: rdar://89453010
   std::string importNameAsCamelCaseName() {
     std::string output;
     auto kind = classify();
@@ -102,6 +104,24 @@ struct CXXMethodBridging {
 
     // The first character is always lowercase.
     output.front() = std::tolower(output.front());
+
+    if (classifyNameKind() == NameKind::snake) {
+      for (std::size_t i = 0; i < output.size(); i++) {
+        size_t next = i + 1;
+        if (output[i] == '_') {
+          // If the first or last element is an underscore, remove it.
+          if (i == 0 || next == output.size()) {
+            output.erase(i, 1);
+          } else if (next < output.size()) {
+            // If the current element is an underscore, capitalize the element
+            // next to it, and remove the extra element.
+            output[i] = std::toupper(output[next]);
+            output.erase(next, 1);
+          }
+        }
+      }
+      return output;
+    }
 
     // We already lowercased the first element, so start at one. Look at the
     // current element and the next one. To handle cases like UTF8String, start

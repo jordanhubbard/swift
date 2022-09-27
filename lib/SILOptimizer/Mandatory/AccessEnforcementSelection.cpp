@@ -31,7 +31,9 @@
 ///
 //===----------------------------------------------------------------------===//
 
+#include "swift/SIL/SILInstruction.h"
 #define DEBUG_TYPE "access-enforcement-selection"
+#include "swift/Basic/Defer.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILFunction.h"
@@ -98,12 +100,16 @@ raw_ostream &operator<<(raw_ostream &os, const AddressCapture &capture) {
 // For each non-escaping closure, record the indices of arguments that
 // require dynamic enforcement.
 class DynamicCaptures {
+  const ClosureFunctionOrder &closureOrder;
+
+  // This only maps functions that have at least one inout_aliasable argument.
   llvm::DenseMap<SILFunction *, SmallVector<unsigned, 4>> dynamicCaptureMap;
 
   DynamicCaptures(DynamicCaptures &) = delete;
 
 public:
-  DynamicCaptures() = default;
+  DynamicCaptures(const ClosureFunctionOrder &closureOrder):
+    closureOrder(closureOrder) {}
 
   void recordCapture(AddressCapture capture) {
     LLVM_DEBUG(llvm::dbgs() << "Dynamic Capture: " << capture);
@@ -121,6 +127,11 @@ public:
   }
 
   bool isDynamic(SILFunctionArgument *arg) const {
+    // If the current function is a local function that directly or indirectly
+    // refers to itself, then conservatively assume dynamic enforcement.
+    if (closureOrder.isHeadOfClosureCycle(arg->getFunction()))
+      return true;
+
     auto pos = dynamicCaptureMap.find(arg->getFunction());
     if (pos == dynamicCaptureMap.end())
       return false;
@@ -184,7 +195,8 @@ public:
 
 private:
   void analyzeUsesOfBox(SingleValueInstruction *source);
-  void analyzeProjection(ProjectBoxInst *projection);
+  // Used for project_box and mark_must_initialize.
+  void analyzeProjection(SingleValueInstruction *project);
 
   /// Note that the given instruction is a use of the box (or a use of
   /// a projection from it) in which the address escapes.
@@ -227,13 +239,13 @@ void SelectEnforcement::analyzeUsesOfBox(SingleValueInstruction *source) {
   for (auto use : source->getUses()) {
     auto user = use->getUser();
 
-    if (auto BBI = dyn_cast<BeginBorrowInst>(user)) {
-      analyzeUsesOfBox(BBI);
+    if (auto bbi = dyn_cast<BeginBorrowInst>(user)) {
+      analyzeUsesOfBox(bbi);
       continue;
     }
 
-    if (auto MUI = dyn_cast<MarkUninitializedInst>(user)) {
-      analyzeUsesOfBox(MUI);
+    if (auto mui = dyn_cast<MarkUninitializedInst>(user)) {
+      analyzeUsesOfBox(mui);
       continue;
     }
 
@@ -271,9 +283,15 @@ static void checkUsesOfAccess(BeginAccessInst *access) {
 #endif
 }
 
-void SelectEnforcement::analyzeProjection(ProjectBoxInst *projection) {
+void SelectEnforcement::analyzeProjection(SingleValueInstruction *projection) {
   for (auto *use : projection->getUses()) {
     auto user = use->getUser();
+
+    // Look through mark must check.
+    if (auto *mmi = dyn_cast<MarkMustCheckInst>(user)) {
+      analyzeProjection(mmi);
+      continue;
+    }
 
     // Collect accesses.
     if (auto *access = dyn_cast<BeginAccessInst>(user)) {
@@ -576,16 +594,15 @@ struct SourceAccess {
 ///
 /// TODO: Make this a "ClosureTransform". See the file-level comments above.
 class AccessEnforcementSelection : public SILModuleTransform {
-  // Reference back to the known dynamically enforced non-escaping closure
+  // Track the known dynamically enforced non-escaping closure
   // arguments in this module. Parent scopes are processed before the closures
   // they reference.
-  DynamicCaptures dynamicCaptures;
+  std::unique_ptr<DynamicCaptures> dynamicCaptures;
 
 #ifndef NDEBUG
   // Per-function book-keeping to verify that a box is processed before all of
   // its accesses and captures are seen.
   llvm::DenseSet<AllocBoxInst *> handledBoxes;
-  llvm::DenseSet<SILFunction *> visited;
 #endif
 
 public:
@@ -601,34 +618,24 @@ protected:
 
 void AccessEnforcementSelection::run() {
   auto *CSA = getAnalysis<ClosureScopeAnalysis>();
-  TopDownClosureFunctionOrder closureOrder(CSA);
-  closureOrder.visitFunctions(
-      [this](SILFunction *F) { this->processFunction(F); });
+  ClosureFunctionOrder closureOrder(CSA);
+  closureOrder.compute();
+
+  dynamicCaptures = std::make_unique<DynamicCaptures>(closureOrder);
+  SWIFT_DEFER { dynamicCaptures.reset(); };
+
+  for (SILFunction *function : closureOrder.getTopDownFunctions()) {
+    this->processFunction(function);
+  }
 }
 
-void AccessEnforcementSelection::processFunction(SILFunction *F) {
+void AccessEnforcementSelection::
+processFunction(SILFunction *F) {
   if (F->isExternalDeclaration())
     return;
 
   LLVM_DEBUG(llvm::dbgs() << "Access Enforcement Selection in " << F->getName()
                           << "\n");
-
-  // This ModuleTransform needs to analyze closures and their parent scopes in
-  // the same pass, and the parent needs to be analyzed before the closure.
-#ifndef NDEBUG
-  auto *CSA = getAnalysis<ClosureScopeAnalysis>();
-  if (isNonEscapingClosure(F->getLoweredFunctionType())) {
-    for (auto *scopeF : CSA->getClosureScopes(F)) {
-      LLVM_DEBUG(llvm::dbgs() << "  Parent scope: " << scopeF->getName()
-                              << "\n");
-      assert(visited.count(scopeF));
-      // Closures must be defined in the same module as their parent scope.
-      assert(scopeF->wasDeserializedCanonical()
-             == F->wasDeserializedCanonical());
-    }
-  }
-  visited.insert(F);
-#endif
 
   // Deserialized functions, which have been mandatory inlined, no longer meet
   // the structural requirements on access markers required by this pass.
@@ -646,7 +653,7 @@ void AccessEnforcementSelection::processFunction(SILFunction *F) {
       // may still have captures that require dynamic enforcement because the
       // box has escaped prior to the capture.
       if (auto box = dyn_cast<AllocBoxInst>(inst)) {
-        SelectEnforcement(dynamicCaptures, box).run();
+        SelectEnforcement(*dynamicCaptures, box).run();
         assert(handledBoxes.insert(box).second);
 
       } else if (auto access = dyn_cast<BeginAccessInst>(inst))
@@ -688,8 +695,12 @@ AccessEnforcementSelection::getAccessKindForBox(ProjectBoxInst *projection) {
 
 SourceAccess AccessEnforcementSelection::getSourceAccess(SILValue address) {
   // Recurse through MarkUninitializedInst.
-  if (auto *MUI = dyn_cast<MarkUninitializedInst>(address))
-    return getSourceAccess(MUI->getOperand());
+  if (auto *mui = dyn_cast<MarkUninitializedInst>(address))
+    return getSourceAccess(mui->getOperand());
+
+  // Recurse through mark must check.
+  if (auto *mmci = dyn_cast<MarkMustCheckInst>(address))
+    return getSourceAccess(mmci->getOperand());
 
   if (auto box = dyn_cast<ProjectBoxInst>(address))
     return getAccessKindForBox(box);
@@ -703,7 +714,7 @@ SourceAccess AccessEnforcementSelection::getSourceAccess(SILValue address) {
       return SourceAccess::getStaticAccess();
 
     case SILArgumentConvention::Indirect_InoutAliasable:
-      if (dynamicCaptures.isDynamic(arg))
+      if (dynamicCaptures->isDynamic(arg))
         return SourceAccess::getDynamicAccess();
 
       return SourceAccess::getStaticAccess();
@@ -754,7 +765,7 @@ void AccessEnforcementSelection::handleApply(ApplySite apply) {
       // there's no need to track it.
       break;
     case SourceAccess::DynamicAccess: {
-      dynamicCaptures.recordCapture(capture);
+      dynamicCaptures->recordCapture(capture);
       break;
     }
     case SourceAccess::BoxAccess:

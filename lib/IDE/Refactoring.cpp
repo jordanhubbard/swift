@@ -440,11 +440,6 @@ public:
         HandleLabels = Resolved.LabelType != LabelRangeType::None;
         break;
       }
-    } else if (Resolved.LabelType != LabelRangeType::None &&
-               !Config.IsNonProtocolType &&
-               // FIXME: Workaround for enum case labels until we support them
-               Config.Usage != NameUsage::Definition) {
-      return RegionType::Mismatch;
     }
 
     if (HandleLabels) {
@@ -874,10 +869,23 @@ static void analyzeRenameScope(ValueDecl *VD, Optional<RenameRefInfo> RefInfo,
   }
 
   auto *Scope = VD->getDeclContext();
-  // If the context is a top-level code decl, there may be other sibling
-  // decls that the renamed symbol is visible from
-  if (isa<TopLevelCodeDecl>(Scope))
+  // There may be sibling decls that the renamed symbol is visible from.
+  switch (Scope->getContextKind()) {
+  case DeclContextKind::GenericTypeDecl:
+  case DeclContextKind::ExtensionDecl:
+  case DeclContextKind::TopLevelCodeDecl:
+  case DeclContextKind::SubscriptDecl:
+  case DeclContextKind::EnumElementDecl:
+  case DeclContextKind::AbstractFunctionDecl:
     Scope = Scope->getParent();
+    break;
+  case DeclContextKind::AbstractClosureExpr:
+  case DeclContextKind::Initializer:
+  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::Module:
+  case DeclContextKind::FileUnit:
+    break;
+  }
 
   Scopes.push_back(Scope);
 }
@@ -2379,17 +2387,18 @@ isApplicable(const ResolvedRangeInfo &Info, DiagnosticEngine &Diag) {
     bool ConditionUseOnlyAllowedFunctions = false;
     StringRef ExpectName;
 
-    Expr *walkToExprPost(Expr *E) override {
+    PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
       if (E->getKind() != ExprKind::DeclRef)
-        return E;
+        return Action::Continue(E);
       auto D = dyn_cast<DeclRefExpr>(E)->getDecl();
       if (D->getKind() == DeclKind::Var || D->getKind() == DeclKind::Param)
         ParamsUseSameVars = checkName(dyn_cast<VarDecl>(D));
       if (D->getKind() == DeclKind::Func)
         ConditionUseOnlyAllowedFunctions = checkName(dyn_cast<FuncDecl>(D));
       if (allCheckPassed())
-        return E;
-      return nullptr;
+        return Action::Continue(E);
+
+      return Action::Stop();
     }
 
     bool allCheckPassed() {
@@ -2476,14 +2485,14 @@ bool RefactoringActionConvertToSwitchStmt::performChange() {
   public:
     std::string VarName;
 
-    Expr *walkToExprPost(Expr *E) override {
+    PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
       if (E->getKind() != ExprKind::DeclRef)
-        return E;
+        return Action::Continue(E);
       auto D = dyn_cast<DeclRefExpr>(E)->getDecl();
       if (D->getKind() != DeclKind::Var && D->getKind() != DeclKind::Param)
-        return E;
+        return Action::Continue(E);
       VarName = dyn_cast<VarDecl>(D)->getName().str().str();
-      return nullptr;
+      return Action::Stop();
     }
   };
 
@@ -2493,20 +2502,20 @@ bool RefactoringActionConvertToSwitchStmt::performChange() {
 
     SmallString<64> ConditionalPattern = SmallString<64>();
 
-    Expr *walkToExprPost(Expr *E) override {
+    PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
       auto *BE = dyn_cast<BinaryExpr>(E);
       if (!BE)
-        return E;
+        return Action::Continue(E);
       if (isFunctionNameAllowed(BE))
         appendPattern(BE->getLHS(), BE->getRHS());
-      return E;
+      return Action::Continue(E);
     }
 
-    std::pair<bool, Pattern*> walkToPatternPre(Pattern *P) override {
+    PreWalkResult<Pattern *> walkToPatternPre(Pattern *P) override {
       ConditionalPattern.append(Lexer::getCharSourceRangeFromSourceRange(SM, P->getSourceRange()).str());
       if (P->getKind() == PatternKind::OptionalSome)
         ConditionalPattern.append("?");
-      return { true, nullptr };
+      return Action::Stop();
     }
 
   private:
@@ -2514,14 +2523,24 @@ bool RefactoringActionConvertToSwitchStmt::performChange() {
     SourceManager &SM;
 
     bool isFunctionNameAllowed(BinaryExpr *E) {
-      auto FunctionBody = dyn_cast<DotSyntaxCallExpr>(E->getFn())->getFn();
-      auto FunctionDeclaration = dyn_cast<DeclRefExpr>(FunctionBody)->getDecl();
-      const auto FunctionName = dyn_cast<FuncDecl>(FunctionDeclaration)
-          ->getBaseIdentifier().str();
-      return FunctionName == "~="
-      || FunctionName == "=="
-      || FunctionName == "__derived_enum_equals"
-      || FunctionName == "__derived_struct_equals";
+      Expr *Fn = E->getFn();
+      if (auto DotSyntaxCall = dyn_cast_or_null<DotSyntaxCallExpr>(Fn)) {
+        Fn = DotSyntaxCall->getFn();
+      }
+      DeclRefExpr *DeclRef = dyn_cast_or_null<DeclRefExpr>(Fn);
+      if (!DeclRef) {
+        return false;
+      }
+      auto FunctionDeclaration = dyn_cast_or_null<FuncDecl>(DeclRef->getDecl());
+      if (!FunctionDeclaration) {
+        return false;
+      }
+      auto &ASTCtx = FunctionDeclaration->getASTContext();
+      const auto FunctionName = FunctionDeclaration->getBaseIdentifier();
+      return FunctionName == ASTCtx.Id_MatchOperator ||
+             FunctionName == ASTCtx.Id_EqualsOperator ||
+             FunctionName == ASTCtx.Id_derived_enum_equals ||
+             FunctionName == ASTCtx.Id_derived_struct_equals;
     }
 
     void appendPattern(Expr *LHS, Expr *RHS) {
@@ -3147,12 +3166,12 @@ bool RefactoringActionLocalizeString::performChange() {
 }
 
 struct MemberwiseParameter {
-  Identifier Name;
+  CharSourceRange NameRange;
   Type MemberType;
   Expr *DefaultExpr;
 
-  MemberwiseParameter(Identifier name, Type type, Expr *initialExpr)
-      : Name(name), MemberType(type), DefaultExpr(initialExpr) {}
+  MemberwiseParameter(CharSourceRange nameRange, Type type, Expr *initialExpr)
+      : NameRange(nameRange), MemberType(type), DefaultExpr(initialExpr) {}
 };
 
 static void generateMemberwiseInit(SourceEditConsumer &EditConsumer,
@@ -3160,13 +3179,11 @@ static void generateMemberwiseInit(SourceEditConsumer &EditConsumer,
                                    ArrayRef<MemberwiseParameter> memberVector,
                                    SourceLoc targetLocation) {
   
-  assert(!memberVector.empty());
-
   EditConsumer.accept(SM, targetLocation, "\ninternal init(");
   auto insertMember = [&SM](const MemberwiseParameter &memberData,
                             raw_ostream &OS, bool wantsSeparator) {
     {
-      OS << memberData.Name << ": ";
+      OS << SM.extractText(memberData.NameRange) << ": ";
       // Unconditionally print '@escaping' if we print out a function type -
       // the assignments we generate below will escape this parameter.
       if (isa<AnyFunctionType>(memberData.MemberType->getCanonicalType())) {
@@ -3175,15 +3192,18 @@ static void generateMemberwiseInit(SourceEditConsumer &EditConsumer,
       OS << memberData.MemberType.getString();
     }
 
+    bool HasAddedDefault = false;
     if (auto *expr = memberData.DefaultExpr) {
-      if (isa<NilLiteralExpr>(expr)) {
-        OS << " = nil";
-      } else if (expr->getSourceRange().isValid()) {
+      if (expr->getSourceRange().isValid()) {
         auto range =
           Lexer::getCharSourceRangeFromSourceRange(
             SM, expr->getSourceRange());
         OS << " = " << SM.extractText(range);
+        HasAddedDefault = true;
       }
+    }
+    if (!HasAddedDefault && memberData.MemberType->isOptional()) {
+      OS << " = nil";
     }
 
     if (wantsSeparator) {
@@ -3194,18 +3214,17 @@ static void generateMemberwiseInit(SourceEditConsumer &EditConsumer,
   // Process the initial list of members, inserting commas as appropriate.
   std::string Buffer;
   llvm::raw_string_ostream OS(Buffer);
-  for (const auto &memberData : memberVector.drop_back()) {
-    insertMember(memberData, OS, /*wantsSeparator*/ true);
+  for (const auto &memberData : llvm::enumerate(memberVector)) {
+    bool wantsSeparator = (memberData.index() != memberVector.size() - 1);
+    insertMember(memberData.value(), OS, wantsSeparator);
   }
-
-  // Process the last (or perhaps, only) member.
-  insertMember(memberVector.back(), OS, /*wantsSeparator*/ false);
 
   // Synthesize the body.
   OS << ") {\n";
   for (auto &member : memberVector) {
     // self.<property> = <property>
-    OS << "self." << member.Name << " = " << member.Name << "\n";
+    auto name = SM.extractText(member.NameRange);
+    OS << "self." << name << " = " << name << "\n";
   }
   OS << "}\n";
 
@@ -3234,30 +3253,41 @@ collectMembersForInit(const ResolvedCursorInfo &CursorInfo,
   if (!targetLocation.isValid())
     return SourceLoc();
 
-  for (auto varDecl : nominalDecl->getStoredProperties()) {
-    auto patternBinding = varDecl->getParentPatternBinding();
-    if (!patternBinding)
+  SourceManager &SM = nominalDecl->getASTContext().SourceMgr;
+
+  for (auto member : nominalDecl->getMembers()) {
+    auto varDecl = dyn_cast<VarDecl>(member);
+    if (!varDecl) {
       continue;
+    }
+    if (varDecl->getAttrs().hasAttribute<LazyAttr>()) {
+      // Exclude lazy members from the memberwise initializer. This is
+      // inconsistent with the implicitly synthesized memberwise initializer but
+      // we think it makes more sense because otherwise the lazy variable's
+      // initializer gets evaluated eagerly.
+      continue;
+    }
 
     if (!varDecl->isMemberwiseInitialized(/*preferDeclaredProperties=*/true)) {
       continue;
     }
 
+    auto patternBinding = varDecl->getParentPatternBinding();
+    if (!patternBinding)
+      continue;
+
     const auto i = patternBinding->getPatternEntryIndexForVarDecl(varDecl);
     Expr *defaultInit = nullptr;
     if (patternBinding->isExplicitlyInitialized(i) ||
         patternBinding->isDefaultInitializable()) {
-      defaultInit = varDecl->getParentInitializer();
+      defaultInit = patternBinding->getOriginalInit(i);
     }
 
-    memberVector.emplace_back(varDecl->getName(),
-                              varDecl->getType(), defaultInit);
+    auto NameRange =
+        Lexer::getCharSourceRangeFromSourceRange(SM, varDecl->getNameLoc());
+    memberVector.emplace_back(NameRange, varDecl->getType(), defaultInit);
   }
-  
-  if (memberVector.empty()) {
-    return SourceLoc();
-  }
-  
+
   return targetLocation;
 }
 
@@ -3278,6 +3308,18 @@ bool RefactoringActionMemberwiseInitLocalRefactoring::performChange() {
   generateMemberwiseInit(EditConsumer, SM, memberVector, targetLocation);
   
   return false;
+}
+
+/// If \p NTD is a protocol, return all the protocols it inherits from. If it's
+/// a type, return all the protocols it conforms to.
+static SmallVector<ProtocolDecl *, 2> getAllProtocols(NominalTypeDecl *NTD) {
+  if (auto Proto = dyn_cast<ProtocolDecl>(NTD)) {
+    return SmallVector<ProtocolDecl *, 2>(
+        Proto->getInheritedProtocols().begin(),
+        Proto->getInheritedProtocols().end());
+  } else {
+    return NTD->getAllProtocols();
+  }
 }
 
 class AddEquatableContext {
@@ -3337,19 +3379,23 @@ class AddEquatableContext {
   std::vector<VarDecl *> getUserAccessibleProperties();
 
 public:
+  AddEquatableContext(NominalTypeDecl *Decl)
+      : DC(Decl), Adopter(Decl->getDeclaredType()),
+        StartLoc(Decl->getBraces().Start),
+        ProtocolsLocations(Decl->getInherited()),
+        Protocols(getAllProtocols(Decl)),
+        ProtInsertStartLoc(Decl->getNameLoc()),
+        StoredProperties(Decl->getStoredProperties()),
+        Range(Decl->getMembers()){};
 
-  AddEquatableContext(NominalTypeDecl *Decl) : DC(Decl),
-  Adopter(Decl->getDeclaredType()), StartLoc(Decl->getBraces().Start),
-  ProtocolsLocations(Decl->getInherited()),
-  Protocols(Decl->getAllProtocols()), ProtInsertStartLoc(Decl->getNameLoc()),
-  StoredProperties(Decl->getStoredProperties()), Range(Decl->getMembers()) {};
-
-  AddEquatableContext(ExtensionDecl *Decl) : DC(Decl),
-  Adopter(Decl->getExtendedType()), StartLoc(Decl->getBraces().Start),
-  ProtocolsLocations(Decl->getInherited()),
-  Protocols(Decl->getExtendedNominal()->getAllProtocols()),
-  ProtInsertStartLoc(Decl->getExtendedTypeRepr()->getEndLoc()),
-  StoredProperties(Decl->getExtendedNominal()->getStoredProperties()), Range(Decl->getMembers()) {};
+  AddEquatableContext(ExtensionDecl *Decl)
+      : DC(Decl), Adopter(Decl->getExtendedType()),
+        StartLoc(Decl->getBraces().Start),
+        ProtocolsLocations(Decl->getInherited()),
+        Protocols(getAllProtocols(Decl->getExtendedNominal())),
+        ProtInsertStartLoc(Decl->getExtendedTypeRepr()->getEndLoc()),
+        StoredProperties(Decl->getExtendedNominal()->getStoredProperties()),
+        Range(Decl->getMembers()){};
 
   AddEquatableContext() : DC(nullptr), Adopter(), ProtocolsLocations(),
   Protocols(), StoredProperties(), Range(nullptr, nullptr) {};
@@ -3554,11 +3600,11 @@ class AddCodableContext {
 public:
   AddCodableContext(NominalTypeDecl *Decl)
       : DC(Decl), StartLoc(Decl->getBraces().Start),
-        Protocols(Decl->getAllProtocols()), Range(Decl->getMembers()){};
+        Protocols(getAllProtocols(Decl)), Range(Decl->getMembers()){};
 
   AddCodableContext(ExtensionDecl *Decl)
       : DC(Decl), StartLoc(Decl->getBraces().Start),
-        Protocols(Decl->getExtendedNominal()->getAllProtocols()),
+        Protocols(getAllProtocols(Decl->getExtendedNominal())),
         Range(Decl->getMembers()){};
 
   AddCodableContext() : DC(nullptr), Protocols(), Range(nullptr, nullptr){};
@@ -3593,13 +3639,13 @@ private:
 public:
   SynthesizedCodablePrinter(ASTPrinter &Printer) : Printer(Printer) {}
 
-  bool walkToDeclPre(Decl *D) override {
+  PreWalkAction walkToDeclPre(Decl *D) override {
     auto *VD = dyn_cast<ValueDecl>(D);
     if (!VD)
-      return false;
+      return Action::SkipChildren();
 
     if (!VD->isSynthesized()) {
-      return true;
+      return Action::Continue();
     }
     SmallString<32> Scratch;
     auto name = VD->getName().getString(Scratch);
@@ -3609,7 +3655,7 @@ public:
         isa<EnumDecl>(VD) || name == "init(from:)" || name == "encode(to:)";
     if (!shouldPrint) {
       // Some other synthesized decl that we don't want to print.
-      return false;
+      return Action::SkipChildren();
     }
 
     Printer.printNewline();
@@ -3629,7 +3675,7 @@ public:
       }
       Printer.printNewline();
       Printer << "}";
-      return false;
+      return Action::SkipChildren();
     }
 
     PrintOptions Options;
@@ -3643,7 +3689,7 @@ public:
     Printer.printNewline();
     D->print(Printer, Options);
 
-    return false;
+    return Action::SkipChildren();
   }
 };
 
@@ -3771,7 +3817,7 @@ static NumberLiteralExpr *getTrailingNumberLiteral(
 
     explicit FindLiteralNumber(Expr *parent) : parent(parent) { }
 
-    std::pair<bool, Expr *> walkToExprPre(Expr *expr) override {
+    PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
       if (auto *literal = dyn_cast<NumberLiteralExpr>(expr)) {
         // The sub-expression must have the same start loc with the outermost
         // expression, i.e. the cursor position.
@@ -3781,8 +3827,7 @@ static NumberLiteralExpr *getTrailingNumberLiteral(
           found = literal;
         }
       }
-
-      return { found == nullptr, expr };
+      return Action::SkipChildrenIf(found, expr);
     }
   };
 
@@ -5327,40 +5372,40 @@ private:
           : ErrParam(ErrParam) {}
       bool foundUnwrap() const { return FoundUnwrap; }
 
-      std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+      PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
         // Don't walk into ternary conditionals as they may have additional
         // conditions such as err != nil that make a force unwrap now valid.
         if (isa<IfExpr>(E))
-          return {false, E};
+          return Action::SkipChildren(E);
 
         auto *FVE = dyn_cast<ForceValueExpr>(E);
         if (!FVE)
-          return {true, E};
+          return Action::Continue(E);
 
         auto *DRE = dyn_cast<DeclRefExpr>(FVE->getSubExpr());
         if (!DRE)
-          return {true, E};
+          return Action::Continue(E);
 
         if (DRE->getDecl() != ErrParam)
-          return {true, E};
+          return Action::Continue(E);
 
         // If we find the node we're looking for, make a note of it, and abort
         // the walk.
         FoundUnwrap = true;
-        return {false, nullptr};
+        return Action::Stop();
       }
 
-      std::pair<bool, Stmt *> walkToStmtPre(Stmt *S) override {
+      PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
         // Don't walk into new explicit scopes, we only want to consider force
         // unwraps in the immediate conditional body.
         if (!S->isImplicit() && startsNewScope(S))
-          return {false, S};
-        return {true, S};
+          return Action::SkipChildren(S);
+        return Action::Continue(S);
       }
 
-      bool walkToDeclPre(Decl *D) override {
+      PreWalkAction walkToDeclPre(Decl *D) override {
         // Don't walk into new explicit DeclContexts.
-        return D->isImplicit() || !isa<DeclContext>(D);
+        return Action::VisitChildrenIf(D->isImplicit() || !isa<DeclContext>(D));
       }
     };
     for (auto Node : Nodes) {
@@ -7270,7 +7315,7 @@ private:
     if (auto Closure = dyn_cast<ClosureExpr>(E)) {
       return Closure;
     } else if (auto CaptureList = dyn_cast<CaptureListExpr>(E)) {
-      return CaptureList->getClosureBody();
+      return dyn_cast<ClosureExpr>(CaptureList->getClosureBody());
     } else {
       return nullptr;
     }

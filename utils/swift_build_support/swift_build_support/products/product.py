@@ -244,6 +244,9 @@ class Product(object):
         return self.args.cross_compile_hosts and \
             host_target in self.args.cross_compile_hosts
 
+    def has_cross_compile_hosts(self):
+        return self.args.cross_compile_hosts
+
     def generate_darwin_toolchain_file(self, platform, arch):
         shell.makedirs(self.build_dir)
         toolchain_file = os.path.join(self.build_dir, 'BuildScriptToolchain.cmake')
@@ -362,6 +365,9 @@ class Product(object):
             print("DRY_RUN! Writing Toolchain file to path: {}".format(toolchain_file))
 
         return toolchain_file
+
+    def get_openbsd_toolchain_file(self):
+        return os.getenv('OPENBSD_USE_TOOLCHAIN_FILE')
 
     def common_cross_c_flags(self, platform, arch):
         cross_flags = []

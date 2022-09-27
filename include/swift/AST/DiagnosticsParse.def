@@ -140,7 +140,13 @@ ERROR(lex_invalid_escape_delimiter,none,
 ERROR(lex_invalid_closing_delimiter,none,
       "too many '#' characters in closing delimiter", ())
 
-ERROR(lex_unterminated_regex,none,
+ERROR(lex_regex_literal_invalid_starting_char,none,
+      "regex literal may not start with %0; add backslash to escape",
+      (StringRef))
+ERROR(lex_regex_literal_invalid_ending_char,none,
+      "regex literal may not end with %0; use extended literal instead",
+      (StringRef))
+ERROR(lex_regex_literal_unterminated,none,
       "unterminated regex literal", ())
 
 ERROR(lex_invalid_unicode_scalar,none,
@@ -213,8 +219,6 @@ ERROR(number_cant_start_decl_name,none,
       (StringRef))
 ERROR(expected_identifier_after_case_comma, PointsToFirstBadToken,
       "expected identifier after comma in enum 'case' declaration", ())
-ERROR(decl_redefinition,none,
-      "definition conflicts with previous value", ())
 ERROR(let_cannot_be_computed_property,none,
       "'let' declarations cannot be computed properties", ())
 ERROR(let_cannot_be_observing_property,none,
@@ -227,8 +231,6 @@ ERROR(disallowed_var_multiple_getset,none,
 
 ERROR(disallowed_init,none,
       "initial value is not allowed here", ())
-ERROR(var_init_self_referential,none,
-      "variable used within its own initial value", ())
 
 ERROR(disallowed_enum_element,none,
       "enum 'case' is not allowed outside of an enum", ())
@@ -378,9 +380,6 @@ ERROR(expected_rbrace_actor,none,
       "expected '}' in actor", ())
 
 // Protocol
-ERROR(generic_arguments_protocol,PointsToFirstBadToken,
-      "protocols do not allow generic parameters; use associated types instead",
-      ())
 ERROR(expected_lbrace_protocol,PointsToFirstBadToken,
       "expected '{' in protocol type", ())
 ERROR(expected_rbrace_protocol,none,
@@ -421,6 +420,8 @@ ERROR(expected_lparen_initializer,PointsToFirstBadToken,
       "expected '(' for initializer parameters", ())
 ERROR(initializer_has_name,PointsToFirstBadToken,
       "initializers cannot have a name", ())
+ERROR(initializer_result_type,PointsToFirstBadToken,
+      "initializers cannot have a result type", ())
 
 // Destructor
 ERROR(destructor_decl_outside_class,none,
@@ -514,6 +515,9 @@ ERROR(silfunc_and_silarg_have_incompatible_sil_value_ownership,none,
       "SILFunction and SILArgument have mismatching ValueOwnershipKinds. "
       "Function type specifies: '@%0'. SIL argument specifies: '@%1'.",
       (StringRef, StringRef))
+ERROR(sil_arg_both_lexical_and_eagerMove,none,
+      "Function argument is annotated both @_eagerMove and @_noEagerMove, "
+      "but these are incompatible alternatives", ())
 ERROR(expected_sil_colon,none,
       "expected ':' before %0", (StringRef))
 ERROR(expected_sil_tuple_index,none,
@@ -527,6 +531,14 @@ ERROR(sil_invalid_attribute_for_instruction,none,
 ERROR(sil_invalid_attribute_for_expected,none,
       "Invalid attribute '%0' (expected '%1').", 
       (StringRef, StringRef))
+ERROR(expected_sil_profiler_counter_idx,none,
+      "expected profiler counter index", ())
+ERROR(expected_sil_profiler_counter_pgo_func_name,none,
+      "expected profiler counter PGO function name", ())
+ERROR(expected_sil_profiler_counter_total,none,
+      "expected profiler counter total", ())
+ERROR(expected_sil_profiler_counter_hash,none,
+      "expected profiler counter hash", ())
 
 // SIL Values
 ERROR(sil_value_redefinition,none,
@@ -657,6 +669,10 @@ ERROR(sil_markmustcheck_invalid_attribute,none,
       "Attribute '[%0]' can not be applied to mark_value_as_moveonly", (StringRef))
 ERROR(sil_markmustcheck_requires_attribute,none,
       "mark_must_check requires an attribute like 'noImplicitCopy'", ())
+ERROR(sil_moveonlytocopyable_invalid_attribute,none,
+      "Attribute '[%0]' can not be applied to moveonlywrapper_to_copyable", (StringRef))
+ERROR(sil_moveonlytocopyable_requires_attribute,none,
+      "moveonlywrapper_to_copyable requires either a [guaranteed] or [owned] attribute", ())
 
 // SIL Basic Blocks
 ERROR(expected_sil_block_name,none,
@@ -679,6 +695,8 @@ ERROR(expected_sil_function_type, none,
       "sil function expected to have SIL function type", ())
 ERROR(sil_dynamically_replaced_func_not_found,none,
       "dynamically replaced function not found %0", (Identifier))
+ERROR(sil_adhoc_requirement_witness_func_not_found,none,
+      "ad-hoc requirement witness function not found %0", (Identifier))
 ERROR(sil_specialize_target_func_not_found,none,
       "_specialize target function not found %0", (Identifier))
 ERROR(sil_availability_expected_version,none,
@@ -701,6 +719,14 @@ ERROR(sil_vtable_bad_entry_kind,none,
       "expected 'inherited' or 'override'", ())
 ERROR(sil_vtable_expect_rsquare,none,
       "expected ']' after vtable entry kind", ())
+
+// SIL MoveOnlyDeinit
+ERROR(expected_sil_moveonlydeinit_colon,none,
+      "expected ':' in a MoveOnlyDeinit entry", ())
+ERROR(sil_moveonlydeinit_func_not_found,none,
+      "sil function not found %0", (Identifier))
+ERROR(sil_moveonlydeinit_nominal_not_found,none,
+      "sil nominal decl not found %0", (Identifier))
 
 // SIL Global
 ERROR(sil_global_variable_not_found,none,
@@ -728,7 +754,7 @@ ERROR(sil_witness_protocol_conformance_not_found,none,
 ERROR(sil_diff_witness_expected_token,PointsToFirstBadToken,
       "expected '%0' in differentiability witness", (StringRef))
 ERROR(sil_diff_witness_unknown_kind,PointsToFirstBadToken,
-      "unknonwn differentiability kind '%0'; expected 'forward', 'reverse', "
+      "unknown differentiability kind '%0'; expected 'forward', 'reverse', "
       "'normal', or 'linear'", (StringRef))
 ERROR(sil_diff_witness_serialized_declaration,none,
       "differentiability witness declaration should not be serialized", ())
@@ -842,8 +868,6 @@ NOTE(subscript_array_element_fix_it_remove_space, none,
 // Tuple Types
 ERROR(expected_rparen_tuple_type_list,none,
       "expected ')' at end of tuple list", ())
-ERROR(multiple_ellipsis_in_tuple,none,
-      "only a single element can be variadic", ())
 ERROR(tuple_type_init,none,
       "default argument not permitted in a tuple type", ())
 ERROR(protocol_method_argument_init,none,
@@ -949,8 +973,6 @@ ERROR(expected_parameter_colon,PointsToFirstBadToken,
       "expected ':' following argument label and parameter name", ())
 ERROR(expected_assignment_instead_of_comparison_operator,none,
       "expected '=' instead of '==' to assign default value for parameter", ())
-ERROR(parameter_vararg_default,none,
-      "variadic parameter cannot have a default value", ())
 ERROR(parameter_specifier_as_attr_disallowed,none,
       "'%0' before a parameter name is not allowed, place it before the parameter type instead",
       (StringRef))
@@ -976,19 +998,8 @@ WARNING(parameter_unnamed_warn,none,
 ERROR(parameter_curry_syntax_removed,none,
       "cannot have more than one parameter list", ())
 
-ERROR(availability_cannot_be_mixed,none,
-      "#available and #unavailable cannot be in the same statement", ())
-
-ERROR(false_available_is_called_unavailable,none,
-      "#available cannot be used as an expression, did you mean to use '#unavailable'?", ())
-
 ERROR(initializer_as_typed_pattern,none,
       "unexpected initializer in pattern; did you mean to use '='?", ())
-
-ERROR(unlabeled_parameter_following_variadic_parameter,none,
-      "a parameter following a variadic parameter requires a label", ())
-ERROR(closure_unlabeled_parameter_following_variadic_parameter,none,
-      "no parameters may follow a variadic parameter in a closure", ())
 
 ERROR(enum_element_empty_arglist,none,
       "enum element with associated values must have at least one "
@@ -1059,7 +1070,7 @@ ERROR(expected_expr_throw,PointsToFirstBadToken,
 ERROR(expected_await_not_async,none,
       "found 'async' in expression; did you mean 'await'?", ())
 
-// Yield Statment
+// Yield Statement
 ERROR(expected_expr_yield,PointsToFirstBadToken,
       "expected expression in 'yield' statement", ())
 ERROR(unexpected_label_yield,none,
@@ -1086,12 +1097,14 @@ ERROR(conditional_var_initializer_required,none,
 ERROR(wrong_condition_case_location,none,
       "pattern matching binding is spelled with 'case %0', not '%0 case'",
       (StringRef))
+ERROR(conditional_var_valid_identifiers_only,none,
+      "unwrap condition requires a valid identifier", ())
 
 // If Statement
 ERROR(expected_condition_if,PointsToFirstBadToken,
       "expected expression, var, or let in 'if' condition", ())
 ERROR(missing_condition_after_if,none,
-      "missing condition in an 'if' statement", ())
+      "missing condition in 'if' statement", ())
 ERROR(expected_lbrace_after_if,PointsToFirstBadToken,
       "expected '{' after 'if' condition", ())
 ERROR(expected_lbrace_or_if_after_else,PointsToFirstBadToken,
@@ -1107,7 +1120,7 @@ NOTE(suggest_removing_else,none,
 ERROR(expected_condition_guard,PointsToFirstBadToken,
       "expected expression, var, let or case in 'guard' condition", ())
 ERROR(missing_condition_after_guard,none,
-      "missing condition in an 'guard' statement", ())
+      "missing condition in 'guard' statement", ())
 ERROR(expected_else_after_guard,PointsToFirstBadToken,
       "expected 'else' after 'guard' condition", ())
 ERROR(expected_lbrace_after_guard,PointsToFirstBadToken,
@@ -1117,7 +1130,7 @@ ERROR(expected_lbrace_after_guard,PointsToFirstBadToken,
 ERROR(expected_condition_while,PointsToFirstBadToken,
       "expected expression, var, or let in 'while' condition", ())
 ERROR(missing_condition_after_while,none,
-      "missing condition in a 'while' statement", ())
+      "missing condition in 'while' statement", ())
 ERROR(expected_lbrace_after_while,PointsToFirstBadToken,
       "expected '{' after 'while' condition", ())
 
@@ -1275,7 +1288,7 @@ ERROR(string_literal_no_atsign,none,
 ERROR(invalid_float_literal_missing_leading_zero,none,
       "'.%0' is not a valid floating point literal; it must be written '0.%0'",
       (StringRef))
-ERROR(availability_query_outside_if_stmt_guard, none,
+ERROR(special_condition_outside_if_stmt_guard, none,
       "%0 may only be used as condition of an 'if', 'guard'"
       " or 'while' statement", (StringRef))
 
@@ -1350,6 +1363,11 @@ ERROR(expected_type_after_as,none,
 // Extra tokens in string interpolation like in " >> \( $0 } ) << "
 ERROR(string_interpolation_extra,none,
       "extra tokens after interpolated string expression", ())
+
+// String interpolation isnt closed by a )
+// ie: `let west = "ye \("`
+ERROR(string_interpolation_unclosed, none,
+      "cannot find ')' to match opening '(' in string interpolation", ())
 
 // Interpolations with parameter labels or multiple values
 WARNING(string_interpolation_list_changing,none,
@@ -1497,14 +1515,16 @@ ERROR(attr_unsupported_on_target, none,
 // availability
 ERROR(attr_availability_platform,none,
       "expected platform name or '*' for '%0' attribute", (StringRef))
-ERROR(attr_availability_unavailable_deprecated,none,
-      "'%0' attribute cannot be both unconditionally 'unavailable' and "
-      "'deprecated'", (StringRef))
+ERROR(attr_availability_multiple_kinds ,none,
+      "'%0' attribute cannot be both '%1' and '%2'", (StringRef, StringRef, StringRef))
 
 WARNING(attr_availability_invalid_duplicate,none,
         "'%0' argument has already been specified", (StringRef))
 WARNING(attr_availability_unknown_platform,none,
-      "unknown platform '%0' for attribute '%1'", (StringRef, StringRef))
+       "unknown platform '%0' for attribute '%1'", (StringRef, StringRef))
+WARNING(attr_availability_suggest_platform,none,
+       "unknown platform '%0' for attribute '%1'; did you mean '%2'?",
+       (StringRef, StringRef, StringRef))
 ERROR(attr_availability_expected_platform,none,
       "expected platform in '%0' attribute", (StringRef))
 ERROR(attr_availability_invalid_renamed,none,
@@ -1572,6 +1592,10 @@ ERROR(originally_defined_in_need_nonempty_module_name,none,
       "original module name cannot be empty in @_originallyDefinedIn", ())
 
 // backDeploy
+ERROR(attr_back_deploy_expected_before_label,none,
+      "expected 'before:' in '@_backDeploy' attribute", ())
+ERROR(attr_back_deploy_expected_colon_after_before,none,
+      "expected ':' after 'before' in '@_backDeploy' attribute", ())
 ERROR(attr_back_deploy_missing_rparen,none,
       "expected ')' in '@_backDeploy' argument list", ())
 
@@ -1743,6 +1767,28 @@ WARNING(warn_attr_unsafe_removed,none,
         "'%0' attribute has been removed in favor of @preconcurrency",
         (StringRef))
 
+// _documentation
+ERROR(documentation_attr_expected_argument,none,
+      "@_documentation attribute expected 'visibility' or 'metadata' argument",
+      ())
+ERROR(documentation_attr_unknown_argument,none,
+      "unknown argument '%0', expected 'visibility' or 'metadata'",
+      (StringRef))
+ERROR(documentation_attr_expected_access_level,none,
+      "@_documentation attribute's 'visibility' argument expected an access level",
+      ())
+ERROR(documentation_attr_unknown_access_level,none,
+      "unknown visibility '%0', expected an access level keyword",
+      (StringRef))
+ERROR(documentation_attr_duplicate_visibility,none,
+      "cannot give more than one visibility to the same item", ())
+ERROR(documentation_attr_metadata_expected_text,none,
+      "@_documentation attribute's 'metadata' argument expected an identifier or "
+      "quoted string",
+      ())
+ERROR(documentation_attr_duplicate_metadata,none,
+      "cannot give more than one metadata argument to the same item", ())
+
 //------------------------------------------------------------------------------
 // MARK: Generics parsing diagnostics
 //------------------------------------------------------------------------------
@@ -1811,7 +1857,10 @@ ERROR(version_component_not_number,none,
 ERROR(compiler_version_too_many_components,none,
       "compiler version must not have more than five components", ())
 WARNING(unused_compiler_version_component,NoUsage,
-      "the second version component is not used for comparison", ())
+      "the second version component is not used for comparison in legacy "
+      "compiler versions%select{|; are you trying to encode a new Swift "
+      "compiler version for compatibility with legacy compilers?}0",
+      (bool))
 ERROR(empty_version_component,none,
       "found empty version component", ())
 ERROR(compiler_version_component_out_of_range,none,
@@ -1829,11 +1878,20 @@ WARNING(likely_simulator_platform_condition,none,
       "use 'targetEnvironment(simulator)' instead",
       ())
 
-ERROR(canimport_two_parameters, none, "canImport can take only two parameters", ())
-
-ERROR(canimport_label, none, "2nd parameter of canImport should be labeled as _version or _underlyingVersion", ())
-
-ERROR(canimport_version, none, "cannot parse module version: %0", (StringRef))
+ERROR(canimport_two_parameters,none,
+      "canImport can take only two parameters", ())
+ERROR(canimport_label,none,
+      "2nd parameter of canImport should be labeled as "
+      "_version or _underlyingVersion", ())
+ERROR(canimport_invalid_version,none,
+      "cannot parse module version '%0'",
+      (StringRef))
+ERROR(canimport_empty_version,none,
+      "%0 argument cannot be empty",
+      (StringRef))
+WARNING(canimport_version_too_many_components,none,
+        "trailing components of version '%0' are ignored",
+        (StringRef))
 
 //------------------------------------------------------------------------------
 // MARK: Availability query parsing diagnostics
@@ -1850,6 +1908,10 @@ ERROR(avail_query_expected_rparen,PointsToFirstBadToken,
 
 WARNING(avail_query_unrecognized_platform_name,
         PointsToFirstBadToken, "unrecognized platform name %0", (Identifier))
+WARNING(avail_query_suggest_platform_name,
+        PointsToFirstBadToken, "unrecognized platform name %0;"
+        " did you mean '%1'?",
+        (Identifier, StringRef))
 
 ERROR(avail_query_disallowed_operator, PointsToFirstBadToken,
       "'%0' cannot be used in an availability condition", (StringRef))
@@ -1882,14 +1944,28 @@ ERROR(pound_available_package_description_not_allowed, none,
 ERROR(availability_query_repeated_platform, none,
       "version for '%0' already specified", (StringRef))
 
+ERROR(availability_cannot_be_mixed,none,
+      "#available and #unavailable cannot be in the same statement", ())
+
+ERROR(false_available_is_called_unavailable,none,
+      "#available cannot be used as an expression, did you mean to use '#unavailable'?", ())
+
+//------------------------------------------------------------------------------
+// MARK: #_hasSymbol query parsing diagnostics
+//------------------------------------------------------------------------------
+
+ERROR(has_symbol_expected_lparen,PointsToFirstBadToken,
+      "expected '(' in #_hasSymbol directive", ())
+
+ERROR(has_symbol_expected_expr,PointsToFirstBadToken,
+      "expected expression in #_hasSymbol", ())
+
+ERROR(has_symbol_expected_rparen,PointsToFirstBadToken,
+      "expected ')' in #_hasSymbol condition", ())
+
 ERROR(attr_requires_concurrency, none,
       "'%0' %select{attribute|modifier}1 is only valid when experimental "
       "concurrency is enabled",
-      (StringRef, bool))
-
-ERROR(attr_requires_distributed, none,
-      "'%0' %select{attribute|modifier}1 is only valid when experimental "
-      "distributed support is enabled",
       (StringRef, bool))
 
 //------------------------------------------------------------------------------

@@ -19,11 +19,12 @@
 #ifndef SWIFT_SIL_SILDeclRef_H
 #define SWIFT_SIL_SILDeclRef_H
 
+#include "swift/AST/Availability.h"
 #include "swift/AST/ClangNode.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/TypeAlignments.h"
-#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/Support/PrettyStackTrace.h"
 
@@ -299,6 +300,11 @@ struct SILDeclRef {
   /// Retrieves the ASTContext from the underlying AST node being stored.
   ASTContext &getASTContext() const;
 
+  /// Retrieve the innermost declaration context corresponding to the underlying
+  /// node, which will either be the node itself (if it's also a declaration
+  /// context) or its parent context.
+  DeclContext *getInnermostDeclContext() const;
+
   llvm::Optional<AnyFunctionRef> getAnyFunctionRef() const;
 
   SILLocation getAsRegularLocation() const;
@@ -372,6 +378,8 @@ struct SILDeclRef {
   bool isNoinline() const;
   /// True if the function has __always inline attribute.
   bool isAlwaysInline() const;
+  /// True if the function has the @_backDeploy attribute.
+  bool isBackDeployed() const;
   
   /// Return the expected linkage of this declaration.
   SILLinkage getLinkage(ForDefinition_t forDefinition) const;
@@ -412,8 +420,7 @@ struct SILDeclRef {
                       defaultArgIndex,
                       pointer.get<AutoDiffDerivativeFunctionIdentifier *>());
   }
-  /// Returns the distributed entry point corresponding to the same
-  /// decl.
+  /// Returns the distributed entry point corresponding to the same decl.
   SILDeclRef asDistributed(bool distributed = true) const {
     return SILDeclRef(loc.getOpaqueValue(), kind,
                       /*foreign=*/false,
@@ -528,6 +535,9 @@ struct SILDeclRef {
   /// entry overridden by this method.
   static AbstractFunctionDecl *getOverriddenWitnessTableEntry(
                                                     AbstractFunctionDecl *func);
+
+  /// Returns the availability of the decl for computing linkage.
+  Optional<AvailabilityContext> getAvailabilityForLinkage() const;
 
   /// True if the referenced entity is some kind of thunk.
   bool isThunk() const;

@@ -13,12 +13,15 @@
 from .backdeployconcurrency import BackDeployConcurrency
 from .benchmarks import Benchmarks
 from .cmark import CMark
+from .curl import LibCurl
 from .earlyswiftdriver import EarlySwiftDriver
+from .earlyswiftsyntax import EarlySwiftSyntax
 from .foundation import Foundation
 from .indexstoredb import IndexStoreDB
 from .libcxx import LibCXX
 from .libdispatch import LibDispatch
 from .libicu import LibICU
+from .libxml2 import LibXML2
 from .llbuild import LLBuild
 from .lldb import LLDB
 from .llvm import LLVM
@@ -37,6 +40,7 @@ from .swiftpm import SwiftPM
 from .swiftsyntax import SwiftSyntax
 from .tsan_libdispatch import TSanLibDispatch
 from .xctest import XCTest
+from .zlib import Zlib
 
 __all__ = [
     'BackDeployConcurrency',
@@ -46,6 +50,9 @@ __all__ = [
     'LibCXX',
     'LibDispatch',
     'LibICU',
+    'LibXML2',
+    'Zlib',
+    'LibCurl',
     'LLBuild',
     'LLDB',
     'LLVM',
@@ -57,6 +64,7 @@ __all__ = [
     'SwiftPM',
     'SwiftDriver',
     'EarlySwiftDriver',
+    'EarlySwiftSyntax',
     'XCTest',
     'SwiftSyntax',
     'SKStressTester',

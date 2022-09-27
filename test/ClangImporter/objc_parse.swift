@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-sil -I %S/Inputs/custom-modules %s -verify
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk) -emit-sil -I %S/Inputs/custom-modules %s -verify -disable-experimental-clang-importer-diagnostics
 
 // REQUIRES: objc_interop
 
@@ -315,7 +315,7 @@ func ivars(_ hive: Hive) {
   hive.queen.description() // expected-error{{value of type 'Hive' has no member 'queen'}}
 }
 
-class NSObjectable : NSObjectProtocol {
+class NSObjectable : NSObjectProtocol { // expected-error {{cannot declare conformance to 'NSObjectProtocol' in Swift; 'NSObjectable' should inherit 'NSObject' instead}}
   @objc var description : String { return "" }
   @objc(conformsToProtocol:) func conforms(to _: Protocol) -> Bool { return false }
   @objc(isKindOfClass:) func isKind(of aClass: AnyClass) -> Bool { return false }
@@ -506,7 +506,7 @@ class IncompleteProtocolAdopter : Incomplete, IncompleteOptional { // expected-e
 
 func testNullarySelectorPieces(_ obj: AnyObject) {
   obj.foo(1, bar: 2, 3) // no-warning
-  obj.foo(1, 2, bar: 3) // expected-error{{cannot invoke 'foo' with an argument list of type '(Int, Int, bar: Int)'}}
+  obj.foo(1, 2, bar: 3) // expected-error{{argument 'bar' must precede unnamed argument #2}}
 }
 
 func testFactoryMethodAvailability() {
@@ -544,11 +544,11 @@ func testStrangeSelectors(obj: StrangeSelectors) {
 
 func testProtocolQualified(_ obj: CopyableNSObject, cell: CopyableSomeCell,
                            plainObj: NSObject, plainCell: SomeCell) {
-  _ = obj as NSObject // expected-error {{'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') is not convertible to 'NSObject'}} 
+  _ = obj as NSObject // expected-error {{'CopyableNSObject' (aka 'any NSCopying & NSObjectProtocol') is not convertible to 'NSObject'}}
   // expected-note@-1 {{did you mean to use 'as!' to force downcast?}} {{11-13=as!}}
   _ = obj as NSObjectProtocol
   _ = obj as NSCopying
-  _ = obj as SomeCell // expected-error {{'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') is not convertible to 'SomeCell'}}
+  _ = obj as SomeCell // expected-error {{'CopyableNSObject' (aka 'any NSCopying & NSObjectProtocol') is not convertible to 'SomeCell'}}
   // expected-note@-1 {{did you mean to use 'as!' to force downcast?}} {{11-13=as!}}
 
   _ = cell as NSObject
@@ -556,8 +556,8 @@ func testProtocolQualified(_ obj: CopyableNSObject, cell: CopyableSomeCell,
   _ = cell as NSCopying
   _ = cell as SomeCell
   
-  _ = plainObj as CopyableNSObject // expected-error {{cannot convert value of type 'NSObject' to type 'CopyableNSObject' (aka 'NSCopying & NSObjectProtocol') in coercion}}
-  _ = plainCell as CopyableSomeCell // expected-error {{cannot convert value of type 'SomeCell' to type 'CopyableSomeCell' (aka 'SomeCell & NSCopying') in coercion}}
+  _ = plainObj as CopyableNSObject // expected-error {{cannot convert value of type 'NSObject' to type 'CopyableNSObject' (aka 'any NSCopying & NSObjectProtocol') in coercion}}
+  _ = plainCell as CopyableSomeCell // expected-error {{cannot convert value of type 'SomeCell' to type 'CopyableSomeCell' (aka 'any SomeCell & NSCopying') in coercion}}
 }
 
 extension Printing {
@@ -645,9 +645,12 @@ class NewtypeUser {
   @objc func intNewtype(a: MyInt) {}
   @objc func intNewtypeOptional(a: MyInt?) {} // expected-error {{method cannot be marked @objc because the type of the parameter cannot be represented in Objective-C}}
   @objc func intNewtypeArray(a: [MyInt]) {} // expected-error {{method cannot be marked @objc because the type of the parameter cannot be represented in Objective-C}}
+  // expected-note@-1 {{Swift structs cannot be represented in Objective-C}}
   @objc func intNewtypeDictionary(a: [MyInt: NSObject]) {} // expected-error {{method cannot be marked @objc because the type of the parameter cannot be represented in Objective-C}}
+  // expected-note@-1 {{Swift structs cannot be represented in Objective-C}}
   @objc func cfNewtype(a: CFNewType) {}
   @objc func cfNewtypeArray(a: [CFNewType]) {} // expected-error {{method cannot be marked @objc because the type of the parameter cannot be represented in Objective-C}}
+  // expected-note@-1 {{Swift structs cannot be represented in Objective-C}}
 
   typealias MyTuple = (Int, AnyObject?)
   typealias MyNamedTuple = (a: Int, b: AnyObject?)

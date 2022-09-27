@@ -85,28 +85,24 @@ var _: [Float: Int] = [1] // expected-error {{dictionary of type '[Float : Int]'
 
 var _: [Int: Int] = ["foo"] // expected-error {{dictionary of type '[Int : Int]' cannot be initialized with array literal}}
 // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{27-27=: <#value#>}}
-// expected-error@-2 {{cannot convert value of type 'String' to expected dictionary key type 'Int'}}
 
 var _ = useDictStringInt(["Key"]) // expected-error {{dictionary of type 'DictStringInt' cannot be used with array literal}}
 // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{32-32=: <#value#>}}
 
 var _ = useDictStringInt([4]) // expected-error {{dictionary of type 'DictStringInt' cannot be used with array literal}}
 // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{28-28=: <#value#>}}
-// expected-error@-2 {{cannot convert value of type 'Int' to expected dictionary key type 'DictStringInt.Key' (aka 'String')}}
 
 var _: [[Int: Int]] = [[5]] // expected-error {{dictionary of type '[Int : Int]' cannot be used with array literal}}
 // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{26-26=: <#value#>}}
 
 var _: [[Int: Int]] = [["bar"]] // expected-error {{dictionary of type '[Int : Int]' cannot be used with array literal}}
 // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{30-30=: <#value#>}}
-// expected-error@-2 {{cannot convert value of type 'String' to expected dictionary key type 'Int'}}
 
 assignDict = [1] // expected-error {{dictionary of type '[Int : Int]' cannot be used with array literal}}
 // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{16-16=: <#value#>}}
 
 assignDict = [""] // expected-error {{dictionary of type '[Int : Int]' cannot be used with array literal}}
 // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{17-17=: <#value#>}}
-// expected-error@-2 {{cannot convert value of type 'String' to expected dictionary key type 'Int'}}
 
 func arrayLiteralDictionaryMismatch<T>(a: inout T) where T: ExpressibleByDictionaryLiteral, T.Key == Int, T.Value == Int {
   a = [] // expected-error {{use [:] to get an empty dictionary literal}} {{8-8=:}}
@@ -116,7 +112,6 @@ func arrayLiteralDictionaryMismatch<T>(a: inout T) where T: ExpressibleByDiction
 
   a = [""] // expected-error {{dictionary of type 'T' cannot be used with array literal}}
   // expected-note@-1 {{did you mean to use a dictionary literal instead?}} {{10-10=: <#value#>}}
-  // expected-error@-2 {{cannot convert value of type 'String' to expected dictionary key type 'Int'}}
 }
 
 
@@ -144,6 +139,7 @@ func testDefaultExistentials() {
            "b": ["a", 2, 3.14159],
            "c": ["a": 2, "b": 3.5]]
   // expected-error@-3{{heterogeneous collection literal could only be inferred to '[String : Any]'; add explicit type annotation if this is intentional}}
+  // expected-warning@-3{{heterogeneous collection literal could only be inferred to '[Any]'; add explicit type annotation if this is intentional}}
 
   let d3 = ["b" : B(), "c" : C()]
   let _: Int = d3 // expected-error{{value of type '[String : A]'}}
@@ -155,7 +151,9 @@ func testDefaultExistentials() {
   // expected-error@-1{{heterogeneous collection literal could only be inferred to '[AnyHashable : String]'}}
 }
 
-// SR-4952, rdar://problem/32330004 - Assertion failure during swift::ASTVisitor<::FailureDiagnosis,...>::visit
+/// rdar://problem/32330004
+/// https://github.com/apple/swift/issues/47529
+/// Assertion failure during `swift::ASTVisitor<::FailureDiagnosis,...>::visit`
 func rdar32330004_1() -> [String: Any] {
   return ["a""one": 1, "two": 2, "three": 3] // expected-note {{did you mean to use a dictionary literal instead?}}
   // expected-error@-1 {{expected ',' separator}}
@@ -167,3 +165,35 @@ func rdar32330004_2() -> [String: Any] {
   // expected-error@-1 {{dictionary of type '[String : Any]' cannot be used with array literal}}
   // expected-note@-2 {{did you mean to use a dictionary literal instead?}} {{14-15=:}} {{24-25=:}} {{34-35=:}} {{46-47=:}}
 }
+
+// https://github.com/apple/swift/issues/59215
+class S59215 {
+  var m: [String: [String: String]] = [:]
+  init() {
+    m["a"] = ["", 1] //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+    // expected-note@-1{{did you mean to use a dictionary literal instead?}} {{17-18=:}}
+    m["a"] = [1 , ""] //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+    // expected-note@-1{{did you mean to use a dictionary literal instead?}} {{17-18=:}}
+    m["a"] = ["", ""] //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+    // expected-note@-1{{did you mean to use a dictionary literal instead?}} {{17-18=:}}
+    m["a"] = [1 , 1] //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+    // expected-note@-1{{did you mean to use a dictionary literal instead?}} {{17-18=:}}
+    m["a"] = Optional(["", ""]) //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+    // expected-note@-1{{did you mean to use a dictionary literal instead?}} {{26-27=:}}
+  }
+}
+
+func f59215(_ a: [String: String]) {}
+f59215(["", 1]) //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+// expected-note@-1{{did you mean to use a dictionary literal instead?}} {{11-12=:}}
+f59215([1 , ""]) //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+// expected-note@-1{{did you mean to use a dictionary literal instead?}} {{11-12=:}}
+f59215([1 , 1]) //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+// expected-note@-1{{did you mean to use a dictionary literal instead?}} {{11-12=:}}
+f59215(["", ""]) //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+// expected-note@-1{{did you mean to use a dictionary literal instead?}} {{11-12=:}}
+
+f59215(["", "", "", ""]) //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+// expected-note@-1{{did you mean to use a dictionary literal instead?}} {{11-12=:}} {{19-20=:}}
+f59215(["", "", "", ""]) //expected-error{{dictionary of type '[String : String]' cannot be used with array literal}}
+// expected-note@-1{{did you mean to use a dictionary literal instead?}} {{11-12=:}} {{19-20=:}}

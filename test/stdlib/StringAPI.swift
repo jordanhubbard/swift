@@ -157,6 +157,28 @@ func checkStringComparison(
   expectEqual(expected.isGE(), lhs >= rhs, stackTrace: stackTrace)
   expectEqual(expected.isGT(), lhs > rhs, stackTrace: stackTrace)
   checkComparable(expected, lhs, rhs, stackTrace: stackTrace.withCurrentLoc())
+  
+  // Substring / Substring
+  // Matching slices of != Strings may still be ==, but not vice versa
+  if expected.isEQ() {
+    for i in 0 ..< Swift.min(lhs.count, rhs.count) {
+      let lhsSub = lhs.dropFirst(i)
+      let rhsSub = rhs.dropFirst(i)
+      
+      expectEqual(expected.isEQ(), lhsSub == rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isNE(), lhsSub != rhsSub, stackTrace: stackTrace)
+      checkHashable(
+        expectedEqual: expected.isEQ(),
+        lhs, rhs, stackTrace: stackTrace.withCurrentLoc())
+      
+      expectEqual(expected.isLT(), lhsSub < rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isLE(), lhsSub <= rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isGE(), lhsSub >= rhsSub, stackTrace: stackTrace)
+      expectEqual(expected.isGT(), lhsSub > rhsSub, stackTrace: stackTrace)
+      checkComparable(
+        expected, lhsSub, rhsSub, stackTrace: stackTrace.withCurrentLoc())
+    }
+  }
 
 #if _runtime(_ObjC)
   // NSString / NSString
@@ -342,8 +364,10 @@ StringTests.test("[String].joined() -> String") {
 }
 
 StringTests.test("UnicodeScalarView.Iterator.Lifetime") {
-  // Tests that String.UnicodeScalarView.Iterator is maintaining the lifetime of
-  // an underlying String buffer. https://bugs.swift.org/browse/SR-5401
+  // https://github.com/apple/swift/issues/47975
+  //
+  // Tests that 'String.UnicodeScalarView.Iterator' is maintaining the lifetime
+  // of an underlying 'String' buffer.
   //
   // WARNING: it is very easy to write this test so it produces false negatives
   // (i.e. passes even when the code is broken).  The array, for example, seems
@@ -390,7 +414,7 @@ StringTests.test("Regression/corelibs-foundation") {
     }
     //If we come here, then the range has created unpaired surrogates on either end.
     //An unpaired surrogate is replaced by OXFFFD - the Unicode Replacement Character.
-    //The CRLF ("\r\n") sequence is also treated like a surrogate pair, but its constinuent
+    //The CRLF ("\r\n") sequence is also treated like a surrogate pair, but its constituent
     //characters "\r" and "\n" can exist outside the pair!
 
     let replacementCharacter = String(describing: UnicodeScalar(0xFFFD)!)
@@ -471,5 +495,15 @@ StringTests.test("Regression/corelibs-foundation") {
   expectEqual(substring(of: s5, with: NSFakeRange(1,6)), "\ncats�")
 }
 
+StringTests.test("Regression/radar-87371813") {
+  let s1 = "what♕/".dropFirst(5)
+  let s2 = "/"[...]
+  let s3 = "/⚅".dropLast()
+  expectEqual(s1, s2)
+  expectEqual(s1, s3)
+  expectEqual(s1, s3)
+  expectEqual(s1.hashValue, s2.hashValue)
+  expectEqual(s2.hashValue, s3.hashValue)
+}
 
 runAllTests()

@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-cxx-interop)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop -Xfrontend -cxx-interop-getters-setters-as-properties)
 //
 // REQUIRES: executable_test
 //
@@ -32,7 +32,7 @@ ImplicitComputedPropertiesTestSuite.test("UpperCaseMix") {
 }
 
 ImplicitComputedPropertiesTestSuite.test("GetterOnly") {
-    var d = GetterOnly()
+    let d = GetterOnly()
     expectEqual(d.foo, 42)
 }
 
@@ -77,6 +77,20 @@ ImplicitComputedPropertiesTestSuite.test("non trivial") {
     expectEqual(Object.x.value, 42)
     Object.x = NonTrivial(value: 20)
     expectEqual(Object.x.value, 20)
+}
+
+ImplicitComputedPropertiesTestSuite.test("SnakeCaseGetterSetter") {
+    var object = SnakeCaseGetterSetter()
+    expectEqual(object.foo, 42)
+    object.foo = 32
+    expectEqual(object.foo, 32)
+}
+
+ImplicitComputedPropertiesTestSuite.test("SnakeCaseUTF8Str") {
+    var object = SnakeCaseUTF8Str()
+    expectEqual(object.utf8String, 42)
+    object.utf8String = 32
+    expectEqual(object.utf8String, 32)
 }
 
 runAllTests()

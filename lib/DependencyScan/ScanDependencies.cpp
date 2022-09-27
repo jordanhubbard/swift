@@ -16,6 +16,7 @@
 #include "swift/AST/Decl.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/DiagnosticsDriver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ModuleDependencies.h"
@@ -177,7 +178,8 @@ resolveDirectDependencies(CompilerInstance &instance, ModuleDependencyID module,
     // Figure out what kind of module we need.
     bool onlyClangModule = !isSwift || module.first == dependsOn;
     if (auto found = ctx.getModuleDependencies(dependsOn, onlyClangModule,
-                                               cache, ASTDelegate, cacheOnly)) {
+                                               cache, ASTDelegate, cacheOnly,
+                                               module)) {
       result.insert({dependsOn, found->getKind()});
     }
   }
@@ -245,7 +247,7 @@ resolveDirectDependencies(CompilerInstance &instance, ModuleDependencyID module,
   return std::vector<ModuleDependencyID>(result.begin(), result.end());
 }
 
-static void discoverCrosssImportOverlayDependencies(
+static void discoverCrossImportOverlayDependencies(
     CompilerInstance &instance, StringRef mainModuleName,
     ArrayRef<ModuleDependencyID> allDependencies,
     ModuleDependenciesCache &cache, InterfaceSubContextDelegate &ASTDelegate,
@@ -316,7 +318,7 @@ static void discoverCrosssImportOverlayDependencies(
                   std::set<ModuleDependencyID>>
       allModules;
 
-  // Seed the all module list from the dummpy main module.
+  // Seed the all module list from the dummy main module.
   allModules.insert({dummyMainName.str(), dummyMainDependencies.getKind()});
 
   // Explore the dependencies of every module.
@@ -1024,9 +1026,9 @@ static void updateCachedInstanceOpts(CompilerInstance &cachedInstance,
   cachedInstance.getASTContext().SearchPathOpts =
       invocationInstance.getASTContext().SearchPathOpts;
 
-  // The Clang Importer arguments must consiste of a combination of
+  // The Clang Importer arguments must consist of a combination of
   // Clang Importer arguments of the current invocation to inherit its Clang-specific
-  // search path options, followed by the options speicific to the given batch-entry,
+  // search path options, followed by the options specific to the given batch-entry,
   // which may overload some of the invocation's options (e.g. target)
   cachedInstance.getASTContext().ClangImporterOpts =
       invocationInstance.getASTContext().ClangImporterOpts;
@@ -1053,7 +1055,7 @@ forEachBatchEntry(CompilerInstance &invocationInstance,
                   llvm::function_ref<void(BatchScanInput, CompilerInstance &,
                                           ModuleDependenciesCache &)>
                       scanningAction) {
-  const CompilerInvocation &invok = invocationInstance.getInvocation();
+  const CompilerInvocation &invoke = invocationInstance.getInvocation();
   bool localSubInstanceMap = false;
   CompilerArgInstanceCacheMap *subInstanceMap;
   if (versionedPCMInstanceCache)
@@ -1082,39 +1084,42 @@ forEachBatchEntry(CompilerInstance &invocationInstance,
       // those of the current scanner invocation.
       updateCachedInstanceOpts(*pInstance, invocationInstance, entry.arguments);
     } else {
-      // We must reset option occurences because we are handling an unrelated command-line
+      // We must reset option occurrences because we are handling an unrelated command-line
       // to those parsed before. We must do so because LLVM options parsing is done
       // using a managed static `GlobalParser`.
       llvm::cl::ResetAllOptionOccurrences();
 
       // Create a new instance by the arguments and save it in the map.
       auto newGlobalCache = std::make_unique<GlobalModuleDependenciesCache>();
-      subInstanceMap->insert(
-          {entry.arguments,
-           std::make_tuple(std::make_unique<CompilerInstance>(),
-                           std::move(newGlobalCache),
-                           std::make_unique<ModuleDependenciesCache>(*newGlobalCache))});
+      auto newInstance = std::make_unique<CompilerInstance>();
 
-      pInstance = std::get<0>((*subInstanceMap)[entry.arguments]).get();
-      auto globalCache = std::get<1>((*subInstanceMap)[entry.arguments]).get();
-      pCache = std::get<2>((*subInstanceMap)[entry.arguments]).get();
       SmallVector<const char *, 4> args;
       llvm::cl::TokenizeGNUCommandLine(entry.arguments, saver, args);
-      CompilerInvocation subInvok = invok;
-      pInstance->addDiagnosticConsumer(&FDC);
-      if (subInvok.parseArgs(args, diags)) {
+      CompilerInvocation subInvoke = invoke;
+      newInstance->addDiagnosticConsumer(&FDC);
+      if (subInvoke.parseArgs(args, diags)) {
         invocationInstance.getDiags().diagnose(
             SourceLoc(), diag::scanner_arguments_invalid, entry.arguments);
         return true;
       }
       std::string InstanceSetupError;
-      if (pInstance->setup(subInvok, InstanceSetupError)) {
+      if (newInstance->setup(subInvoke, InstanceSetupError)) {
         invocationInstance.getDiags().diagnose(
             SourceLoc(), diag::scanner_arguments_invalid, entry.arguments);
         return true;
       }
-      globalCache->configureForTriple(pInstance->getInvocation()
-                                                .getLangOptions().Target.str());
+      newGlobalCache->configureForTriple(
+          newInstance->getInvocation().getLangOptions().Target.str());
+      
+      auto mainModuleName = newInstance->getMainModule()->getNameStr();
+      auto newLocalCache = std::make_unique<ModuleDependenciesCache>(
+          *newGlobalCache, mainModuleName);
+      pInstance = newInstance.get();
+      pCache = newLocalCache.get();
+      subInstanceMap->insert(
+          {entry.arguments,
+           std::make_tuple(std::move(newInstance), std::move(newGlobalCache),
+                           std::move(newLocalCache))});
     }
     assert(pInstance);
     assert(pCache);
@@ -1223,7 +1228,7 @@ static void deserializeDependencyCache(CompilerInstance &instance,
   auto loadPath = opts.SerializedDependencyScannerCachePath;
   if (module_dependency_cache_serialization::readInterModuleDependenciesCache(
           loadPath, cache)) {
-    Context.Diags.diagnose(SourceLoc(), diag::warn_scaner_deserialize_failed,
+    Context.Diags.diagnose(SourceLoc(), diag::warn_scanner_deserialize_failed,
                            loadPath);
   } else if (opts.EmitDependencyScannerCacheRemarks) {
     Context.Diags.diagnose(SourceLoc(), diag::remark_reuse_cache, loadPath);
@@ -1252,7 +1257,8 @@ bool swift::dependencies::scanDependencies(CompilerInstance &instance) {
   if (opts.ReuseDependencyScannerCache)
     deserializeDependencyCache(instance, globalCache);
 
-  ModuleDependenciesCache cache(globalCache);
+  ModuleDependenciesCache cache(globalCache,
+                                instance.getMainModule()->getNameStr());
 
   // Execute scan
   auto dependenciesOrErr = performModuleScan(instance, cache);
@@ -1287,7 +1293,8 @@ bool swift::dependencies::prescanDependencies(CompilerInstance &instance) {
   GlobalModuleDependenciesCache singleUseGlobalCache;
   singleUseGlobalCache.configureForTriple(instance.getInvocation()
                                                   .getLangOptions().Target.str());
-  ModuleDependenciesCache cache(singleUseGlobalCache);
+  ModuleDependenciesCache cache(singleUseGlobalCache,
+                                instance.getMainModule()->getNameStr());
   if (out.has_error() || EC) {
     Context.Diags.diagnose(SourceLoc(), diag::error_opening_output, path,
                            EC.message());
@@ -1318,7 +1325,8 @@ bool swift::dependencies::batchScanDependencies(
   GlobalModuleDependenciesCache singleUseGlobalCache;
   singleUseGlobalCache.configureForTriple(instance.getInvocation()
                                                   .getLangOptions().Target.str());
-  ModuleDependenciesCache cache(singleUseGlobalCache);
+  ModuleDependenciesCache cache(singleUseGlobalCache,
+                                instance.getMainModule()->getNameStr());
   (void)instance.getMainModule();
   llvm::BumpPtrAllocator alloc;
   llvm::StringSaver saver(alloc);
@@ -1353,7 +1361,8 @@ bool swift::dependencies::batchPrescanDependencies(
   GlobalModuleDependenciesCache singleUseGlobalCache;
   singleUseGlobalCache.configureForTriple(instance.getInvocation()
                                                   .getLangOptions().Target.str());
-  ModuleDependenciesCache cache(singleUseGlobalCache);
+  ModuleDependenciesCache cache(singleUseGlobalCache,
+                                instance.getMainModule()->getNameStr());
   (void)instance.getMainModule();
   llvm::BumpPtrAllocator alloc;
   llvm::StringSaver saver(alloc);
@@ -1434,13 +1443,13 @@ swift::dependencies::performModuleScan(CompilerInstance &instance,
   }
 
   // We have all explicit imports now, resolve cross import overlays.
-  discoverCrosssImportOverlayDependencies(
+  discoverCrossImportOverlayDependencies(
       instance, mainModuleName,
       /*All transitive dependencies*/ allModules.getArrayRef().slice(1), cache,
       ASTDelegate, [&](ModuleDependencyID id) { allModules.insert(id); },
       currentImportPathSet);
 
-  // Dignose cycle in dependency graph.
+  // Diagnose cycle in dependency graph.
   if (diagnoseCycle(instance, cache, /*MainModule*/ allModules.front(),
                     ASTDelegate))
     return std::make_error_code(std::errc::not_supported);

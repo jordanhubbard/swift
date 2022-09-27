@@ -1,4 +1,4 @@
-// RUN: %target-run-simple-swift(-I %S/Inputs/ -Xfrontend -enable-cxx-interop)
+// RUN: %target-run-simple-swift(-I %S/Inputs/ -Xfrontend -enable-experimental-cxx-interop)
 //
 // REQUIRES: executable_test
 //
@@ -9,6 +9,12 @@ import StdlibUnittest
 import Fields
 
 var FieldsTestSuite = TestSuite("Getting and setting fields in base classes")
+
+struct SwiftStructWrapper {
+  let value: DerivedFromOneField
+}
+
+func optionalDerivedFromAll() -> DerivedFromAll? { DerivedFromAll() }
 
 FieldsTestSuite.test("Fields from derived from all") {
   let derived = DerivedFromAll()
@@ -29,6 +35,23 @@ FieldsTestSuite.test("Fields from derived from all") {
   expectEqual(mutable.d, 44)
   expectEqual(mutable.e, 46)
   expectEqual(mutable.f, 48)
+}
+
+FieldsTestSuite.test("Optional") {
+  let derived = optionalDerivedFromAll()
+  expectEqual(derived!.a, 1)
+  expectEqual(derived!.b, 2)
+  expectEqual(derived!.c, 3)
+  expectEqual(derived!.d, 4)
+  expectEqual(derived!.e, 5)
+  expectEqual(derived!.f, 6)
+}
+
+FieldsTestSuite.test("Struct holding derived from one field") {
+  let derived = DerivedFromOneField()
+  let s = SwiftStructWrapper(value: derived)
+
+  expectEqual(s.value.value, 42)
 }
 
 FieldsTestSuite.test("Fields from derived from non trivial") {

@@ -214,7 +214,7 @@ protocol P11 {
   associatedtype A: Equatable
   // FIXME: Should not resolve witness for 'method', but Type::subst doesn't care
   // about conditional requirements when querying type witnesses.
-  // expected-note@+1 {{protocol requires function 'method()' with type '() -> Conformer.A' (aka '() -> Array<P11>'); do you want to add a stub?}}
+  // expected-note@+1 {{protocol requires function 'method()' with type '() -> Conformer.A' (aka '() -> Array<any P11>'); do you want to add a stub?}}
   func method() -> A
 }
 do {
@@ -223,7 +223,7 @@ do {
     // expected-error@-2 {{type 'any P11' does not conform to protocol 'Equatable'}} // FIXME: Crappy diagnostics
     // expected-error@-3 {{'P11' requires that 'any P11' conform to 'Equatable'}}
     // expected-note@-4 {{requirement specified as 'any P11' : 'Equatable'}}
-    // expected-note@-5 {{requirement from conditional conformance of 'Conformer.A' (aka 'Array<P11>') to 'Equatable'}}
+    // expected-note@-5 {{requirement from conditional conformance of 'Conformer.A' (aka 'Array<any P11>') to 'Equatable'}}
     typealias A = Array<any P11>
   }
 }
@@ -245,5 +245,19 @@ protocol P12 {
 do {
   struct Conformer: P12 { // expected-error {{type 'Conformer' does not conform to protocol 'P12'}}
     typealias A = Bool // expected-note {{possibly intended match 'Conformer.A' (aka 'Bool') does not conform to 'Sequence'}}
+  }
+}
+
+class Class13 {}
+protocol P13a {
+  associatedtype A
+}
+protocol P13b: P13a where A: Class13 {}
+do {
+  struct Conformer: P13b {
+    // expected-error@-1 {{type 'Conformer' does not conform to protocol 'P13b'}}
+    // expected-error@-2 {{'P13b' requires that 'Conformer.A' (aka 'Array<Bool>') inherit from 'Class13'}}
+    // expected-note@-3 {{requirement specified as 'Self.A' : 'Class13' [with Self = Conformer]}}
+    typealias A = Array<Bool>
   }
 }

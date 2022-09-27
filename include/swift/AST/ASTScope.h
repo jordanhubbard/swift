@@ -203,7 +203,7 @@ private:
 
 #pragma mark common queries
 public:
-  virtual NullablePtr<ClosureExpr> getClosureIfClosureScope() const;
+  virtual NullablePtr<AbstractClosureExpr> getClosureIfClosureScope() const;
   virtual ASTContext &getASTContext() const;
   virtual NullablePtr<Decl> getDeclIfAny() const { return nullptr; };
   virtual NullablePtr<Stmt> getStmtIfAny() const { return nullptr; };
@@ -342,7 +342,7 @@ protected:
 
 public:
   /// The tree is organized by source location and for most nodes this is also
-  /// what obtaines for scoping. However, guards are different. The scope after
+  /// what obtains for scoping. However, guards are different. The scope after
   /// the guard else must hop into the innermoset scope of the guard condition.
   virtual NullablePtr<const ASTScopeImpl> getLookupParent() const {
     return getParent();
@@ -544,7 +544,7 @@ public:
   /// \c tryBindExtension needs to get the extended nominal, and the DeclContext
   /// is the parent of the \c ExtensionDecl. If the \c SourceRange of an \c
   /// ExtensionScope were to start where the \c ExtensionDecl says, the lookup
-  /// source locaiton would fall within the \c ExtensionScope. This inclusion
+  /// source location would fall within the \c ExtensionScope. This inclusion
   /// would cause the lazy \c ExtensionScope to be expanded which would ask for
   /// its generic parameters in order to create those sub-scopes. That request
   /// would cause a cycle because it would ask for the extended nominal. So,
@@ -1032,9 +1032,9 @@ public:
 /// For a closure with named parameters, this scope does the local bindings.
 class ClosureParametersScope final : public ASTScopeImpl {
 public:
-  ClosureExpr *const closureExpr;
+  AbstractClosureExpr *const closureExpr;
 
-  ClosureParametersScope(ClosureExpr *closureExpr)
+  ClosureParametersScope(AbstractClosureExpr *closureExpr)
       : closureExpr(closureExpr) {}
   virtual ~ClosureParametersScope() {}
 
@@ -1042,7 +1042,7 @@ public:
   SourceRange
   getSourceRangeOfThisASTNode(bool omitAssertions = false) const override;
 
-  NullablePtr<ClosureExpr> getClosureIfClosureScope() const override {
+  NullablePtr<AbstractClosureExpr> getClosureIfClosureScope() const override {
     return closureExpr;
   }
   NullablePtr<Expr> getExprIfAny() const override { return closureExpr; }
@@ -1541,7 +1541,7 @@ public:
   SourceRange
   getSourceRangeOfThisASTNode(bool omitAssertions = false) const override;
 
-  NullablePtr<ClosureExpr> parentClosureIfAny() const; // public??
+  NullablePtr<AbstractClosureExpr> parentClosureIfAny() const; // public??
   Stmt *getStmt() const override { return stmt; }
 
 protected:

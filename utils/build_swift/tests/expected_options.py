@@ -7,8 +7,6 @@
 # See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 
 
-from __future__ import absolute_import, unicode_literals
-
 import multiprocessing
 
 from build_swift import argparse
@@ -66,11 +64,15 @@ EXPECTED_DEFAULTS = {
     'build_jobs': multiprocessing.cpu_count(),
     'build_libdispatch': False,
     'build_libicu': False,
+    'build_libxml2': False,
+    'build_zlib': False,
+    'build_curl': False,
     'build_linux': True,
     'build_llbuild': False,
     'build_lldb': False,
     'build_libcxx': False,
     'build_ninja': False,
+    'build_lld': False,
     'build_osx': True,
     'build_playgroundsupport': False,
     'build_runtime_with_host_compiler': False,
@@ -88,6 +90,7 @@ EXPECTED_DEFAULTS = {
     'build_swiftpm': False,
     'build_swift_driver': False,
     'build_early_swift_driver': True,
+    'build_early_swiftsyntax': True,
     'build_swiftsyntax': False,
     'build_libparser_only': False,
     'build_skstresstester': False,
@@ -131,6 +134,7 @@ EXPECTED_DEFAULTS = {
     'cross_compile_append_host_target_to_destdir': True,
     'cross_compile_deps_path': None,
     'cross_compile_hosts': [],
+    'infer_cross_compile_hosts_on_darwin': False,
     'darwin_deployment_version_ios':
         defaults.DARWIN_DEPLOYMENT_VERSION_IOS,
     'darwin_deployment_version_osx':
@@ -181,6 +185,10 @@ EXPECTED_DEFAULTS = {
     'legacy_impl': False,
     'libdispatch_build_variant': 'Debug',
     'libicu_build_variant': 'Debug',
+    'libxml2_build_variant': 'Debug',
+    'lit_jobs': multiprocessing.cpu_count(),
+    'zlib_build_variant': 'Debug',
+    'curl_build_variant': 'Debug',
     'bootstrapping_mode': None,
     'lit_args': '-sv',
     'llbuild_assertions': True,
@@ -239,8 +247,7 @@ EXPECTED_DEFAULTS = {
     'test_cygwin': False,
     'test_freebsd': False,
     'test_ios': False,
-    'test_ios_32bit_simulator': False,
-    'test_watchos_32bit_simulator': True,
+    'test_watchos_32bit_simulator': False,
     'test_ios_host': False,
     'test_ios_simulator': False,
     'test_linux': False,
@@ -359,7 +366,7 @@ class DisableOption(_BaseOption):
 
 
 class ChoicesOption(_BaseOption):
-    """Option that accepts an argument from a predifined list of choices."""
+    """Option that accepts an argument from a predefined list of choices."""
 
     def __init__(self, *args, **kwargs):
         self.choices = kwargs.pop('choices', None)
@@ -429,6 +436,9 @@ EXPECTED_OPTIONS = [
     SetOption('--debug-libdispatch',
               dest='libdispatch_build_variant', value='Debug'),
     SetOption('--debug-libicu', dest='libicu_build_variant', value='Debug'),
+    SetOption('--debug-libxml2', dest='libxml2_build_variant', value='Debug'),
+    SetOption('--debug-zlib', dest='zlib_build_variant', value='Debug'),
+    SetOption('--debug-curl', dest='curl_build_variant', value='Debug'),
     SetOption('--debug-lldb', dest='lldb_build_variant', value='Debug'),
     SetOption('--lldb-build-with-xcode', dest='lldb_build_with_xcode',
               value='1'),
@@ -531,6 +541,7 @@ EXPECTED_OPTIONS = [
     EnableOption('--android'),
     EnableOption('--build-external-benchmarks'),
     EnableOption('--build-ninja'),
+    EnableOption('--build-lld'),
     EnableOption('--build-runtime-with-host-compiler'),
     EnableOption('--build-swift-dynamic-sdk-overlay'),
     EnableOption('--build-swift-dynamic-stdlib'),
@@ -560,6 +571,9 @@ EXPECTED_OPTIONS = [
     EnableOption('--only-non-executable-test'),
     EnableOption('--libdispatch', dest='build_libdispatch'),
     EnableOption('--libicu', dest='build_libicu'),
+    EnableOption('--static-libxml2', dest='build_libxml2'),
+    EnableOption('--static-zlib', dest='build_zlib'),
+    EnableOption('--static-curl', dest='build_curl'),
     EnableOption('--indexstore-db', dest='build_indexstoredb'),
     EnableOption('--test-indexstore-db-sanitize-all',
                  dest='test_indexstoredb_sanitize_all'),
@@ -622,6 +636,7 @@ EXPECTED_OPTIONS = [
     DisableOption('--skip-clean-xctest', dest='clean_xctest'),
     DisableOption('--skip-clean-llbuild', dest='clean_llbuild'),
     DisableOption('--skip-early-swift-driver', dest='build_early_swift_driver'),
+    DisableOption('--skip-early-swiftsyntax', dest='build_early_swiftsyntax'),
     DisableOption('--skip-clean-swiftpm', dest='clean_swiftpm'),
     DisableOption('--skip-clean-swift-driver', dest='clean_swift_driver'),
     DisableOption('--skip-test-android', dest='test_android'),
@@ -629,8 +644,6 @@ EXPECTED_OPTIONS = [
     DisableOption('--skip-test-cygwin', dest='test_cygwin'),
     DisableOption('--skip-test-freebsd', dest='test_freebsd'),
     DisableOption('--skip-test-ios', dest='test_ios'),
-    DisableOption('--skip-test-ios-32bit-simulator',
-                  dest='test_ios_32bit_simulator'),
     DisableOption('--skip-test-watchos-32bit-simulator',
                   dest='test_watchos_32bit_simulator'),
     DisableOption('--skip-test-ios-host', dest='test_ios_host'),
@@ -663,6 +676,9 @@ EXPECTED_OPTIONS = [
                   dest='test_swift_inspect'),
     DisableOption('--skip-build-clang-tools-extra',
                   dest='build_clang_tools_extra'),
+    DisableOption('--skip-build-libxml2', dest='build_libxml2'),
+    DisableOption('--skip-build-zlib', dest='build_zlib'),
+    DisableOption('--skip-build-curl', dest='build_curl'),
 
     ChoicesOption('--compiler-vendor',
                   choices=['none', 'apple']),
@@ -717,9 +733,11 @@ EXPECTED_OPTIONS = [
     IntOption('--swift-tools-max-parallel-lto-link-jobs'),
     EnableOption('--swift-tools-ld64-lto-codegen-only-for-supporting-targets'),
     IntOption('-j', dest='build_jobs'),
+    IntOption('--lit-jobs', dest='lit_jobs'),
     IntOption('--dsymutil-jobs', dest='dsymutil_jobs'),
 
     AppendOption('--cross-compile-hosts'),
+    SetTrueOption('--infer-cross-compile-hosts-on-darwin'),
     AppendOption('--extra-cmake-options'),
     AppendOption('--extra-swift-args'),
     AppendOption('--test-paths'),
@@ -734,7 +752,7 @@ EXPECTED_OPTIONS = [
     UnsupportedOption('--skip-test-optimize-none-with-implicit-dynamic'),
     UnsupportedOption('--skip-test-optimized'),
 
-    # Options forwared to build-script-impl
+    # Options forwarded to build-script-impl
     BuildScriptImplOption('--skip-test-swift', dest='impl_skip_test_swift'),
     BuildScriptImplOption('--install-swift', dest='impl_install_swift'),
 

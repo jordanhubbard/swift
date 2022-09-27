@@ -4,8 +4,12 @@
 //
 // RUN: %target-codesign %t/a.out_Debug
 // RUN: %target-codesign %t/a.out_Release
-// RUN: %target-run %t/a.out_Debug
-// RUN: %target-run %t/a.out_Release
+// RUN: env %env-SWIFT_BINARY_COMPATIBILITY_VERSION=0x050700 %target-run %t/a.out_Debug
+// RUN: env %env-SWIFT_BINARY_COMPATIBILITY_VERSION=0x050700 %target-run %t/a.out_Release
+
+// Note: the environment variable above forces the stdlib's bincompat version to
+// 5.7 so that we can test new behavior even if the SDK we're using predates it.
+
 // REQUIRES: executable_test
 // UNSUPPORTED: OS=wasi
 
@@ -17,6 +21,7 @@ import Foundation // For NSString
 let testSuiteSuffix = _isDebugAssertConfiguration() ? "_debug" : "_release"
 
 var StringTraps = TestSuite("StringTraps" + testSuiteSuffix)
+defer { runAllTests() }
 
 StringTraps.test("startIndex/predecessor")
   .skip(.custom(
@@ -352,6 +357,3 @@ StringTraps.test("UTF8View foreign index(before:) trap on i == startIndex")
   i = s.utf8.index(before: i)
 }
 #endif
-
-runAllTests()
-

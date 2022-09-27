@@ -46,7 +46,7 @@
 #define SWIFT_REFLECTION_METADATA_ELF_NOTE_MAGIC_STRING "swift_reflection_metadata_magic_string"
 #endif // defined(__ELF__)
 
-#include "../SwiftShims/Visibility.h"
+#include "swift/shims/Visibility.h"
 #include <cstdint>
 #include <cstddef>
 
@@ -79,7 +79,7 @@ void swift_addNewDSOImage(struct swift::MetadataSections *sections);
 /// \param context An additional context pointer to pass to \a body.
 ///
 /// On Mach-O-based platforms (i.e. Apple platforms), this function is
-/// unavailable. On those plaforms, use dyld API to enumerate loaded images and
+/// unavailable. On those platforms, use dyld API to enumerate loaded images and
 /// their corresponding metadata sections.
 SWIFT_RUNTIME_EXPORT SWIFT_WEAK_IMPORT
 void swift_enumerateAllMetadataSections(

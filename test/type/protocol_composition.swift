@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -swift-version 4 -requirement-machine-protocol-signatures=verify -requirement-machine-inferred-signatures=verify
+// RUN: %target-typecheck-verify-swift -swift-version 4
 
 func canonical_empty_protocol() -> Any {
   return 1
@@ -160,10 +160,11 @@ struct S03: Optional<P5> & P6 {} // expected-error {{non-protocol, non-class typ
 struct S04<T : P5 & (P6)> {}
 struct S05<T> where T : P5? & P6 {} // expected-error {{non-protocol, non-class type '(any P5)?' cannot be used within a protocol-constrained type}}
 
-// SR-3124 - Protocol Composition Often Migrated Incorrectly
-struct S3124<T: protocol<P1, P3>> {} // expected-error {{'protocol<...>' composition syntax has been removed; join the protocols using '&'}} {{17-34=P1 & P3>}}
-func f3124_1<U where U: protocol<P1, P3>>(x: U)  {} // expected-error {{'protocol<...>' composition syntax has been removed; join the protocols using '&'}} {{25-42=P1 & P3>}} // expected-error {{'where' clause}}
-func f3124_2<U : protocol<P1>>(x: U)  {} // expected-error {{'protocol<...>' composition syntax has been removed and is not needed here}} {{18-31=P1>}}
+// https://github.com/apple/swift/issues/45712
+// Protocol Composition Often Migrated Incorrectly
+struct S_45712<T: protocol<P1, P3>> {} // expected-error {{'protocol<...>' composition syntax has been removed; join the protocols using '&'}} {{19-36=P1 & P3>}}
+func f1_45712<U where U: protocol<P1, P3>>(_: U)  {} // expected-error {{'protocol<...>' composition syntax has been removed; join the protocols using '&'}} {{26-43=P1 & P3>}} // expected-error {{'where' clause}}
+func f2_45712<U : protocol<P1>>(_: U)  {} // expected-error {{'protocol<...>' composition syntax has been removed and is not needed here}} {{19-32=P1>}}
 
 // Make sure we correctly form compositions in expression context
 func takesP1AndP2(_: [AnyObject & P1 & P2]) {}
@@ -173,6 +174,10 @@ takesP1AndP2([Swift.AnyObject & P1 & P2]())
 takesP1AndP2([AnyObject & protocol_composition.P1 & P2]())
 takesP1AndP2([AnyObject & P1 & protocol_composition.P2]())
 takesP1AndP2([DoesNotExist & P1 & P2]()) // expected-error {{cannot find 'DoesNotExist' in scope}}
+// expected-error@-1 {{binary operator '&' cannot be applied to operands of type 'UInt8' and '(any P2).Type'}}
+// expected-error@-2 {{binary operator '&' cannot be applied to operands of type 'UInt8' and '(any P1).Type'}}
+// expected-note@-3 2 {{overloads for '&' exist with these partially matching parameter lists}}
+// expected-error@-4 {{cannot call value of non-function type '[UInt8]'}}
 takesP1AndP2([Swift.DoesNotExist & P1 & P2]()) // expected-error {{module 'Swift' has no member named 'DoesNotExist'}}
 // expected-error@-1 {{binary operator '&' cannot be applied to operands of type 'UInt8' and '(any P2).Type'}}
 // expected-error@-2 {{binary operator '&' cannot be applied to operands of type 'UInt8' and '(any P1).Type'}}

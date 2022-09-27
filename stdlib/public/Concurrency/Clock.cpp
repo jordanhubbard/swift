@@ -39,6 +39,11 @@ void swift_get_time(
       *nanoseconds = continuous.tv_nsec;
 #elif defined(__APPLE__) && HAS_TIME
       struct timespec continuous;
+      clock_gettime(CLOCK_MONOTONIC_RAW, &continuous);
+      *seconds = continuous.tv_sec;
+      *nanoseconds = continuous.tv_nsec;
+#elif (defined(__OpenBSD__) || defined(__wasi__)) && HAS_TIME
+      struct timespec continuous;
       clock_gettime(CLOCK_MONOTONIC, &continuous);
       *seconds = continuous.tv_sec;
       *nanoseconds = continuous.tv_nsec;
@@ -63,12 +68,22 @@ void swift_get_time(
     case swift_clock_id_suspending: {
 #if defined(__linux__) && HAS_TIME
       struct timespec suspending;
-      clock_gettime(CLOCK_MONOTONIC_RAW, &suspending);
+      clock_gettime(CLOCK_MONOTONIC, &suspending);
       *seconds = suspending.tv_sec;
       *nanoseconds = suspending.tv_nsec;
 #elif defined(__APPLE__) && HAS_TIME
       struct timespec suspending;
       clock_gettime(CLOCK_UPTIME_RAW, &suspending);
+      *seconds = suspending.tv_sec;
+      *nanoseconds = suspending.tv_nsec;
+#elif defined(__wasi__) && HAS_TIME
+      struct timespec suspending;
+      clock_gettime(CLOCK_MONOTONIC, &suspending);
+      *seconds = suspending.tv_sec;
+      *nanoseconds = suspending.tv_nsec;
+#elif defined(__OpenBSD__) && HAS_TIME
+      struct timespec suspending;
+      clock_gettime(CLOCK_UPTIME, &suspending);
       *seconds = suspending.tv_sec;
       *nanoseconds = suspending.tv_nsec;
 #elif defined(_WIN32)
@@ -108,6 +123,11 @@ switch (clock_id) {
       *nanoseconds = continuous.tv_nsec;
 #elif defined(__APPLE__) && HAS_TIME
       struct timespec continuous;
+      clock_getres(CLOCK_MONOTONIC_RAW, &continuous);
+      *seconds = continuous.tv_sec;
+      *nanoseconds = continuous.tv_nsec;
+#elif (defined(__OpenBSD__) || defined(__wasi__)) && HAS_TIME
+      struct timespec continuous;
       clock_getres(CLOCK_MONOTONIC, &continuous);
       *seconds = continuous.tv_sec;
       *nanoseconds = continuous.tv_nsec;
@@ -127,6 +147,14 @@ switch (clock_id) {
       *nanoseconds = suspending.tv_nsec;
 #elif defined(__APPLE__) && HAS_TIME
       clock_getres(CLOCK_UPTIME_RAW, &suspending);
+      *seconds = suspending.tv_sec;
+      *nanoseconds = suspending.tv_nsec;
+#elif defined(__wasi__) && HAS_TIME
+      clock_getres(CLOCK_MONOTONIC, &suspending);
+      *seconds = suspending.tv_sec;
+      *nanoseconds = suspending.tv_nsec;
+#elif defined(__OpenBSD__) && HAS_TIME
+      clock_getres(CLOCK_UPTIME, &suspending);
       *seconds = suspending.tv_sec;
       *nanoseconds = suspending.tv_nsec;
 #elif defined(_WIN32)

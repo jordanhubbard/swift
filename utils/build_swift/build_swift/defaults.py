@@ -11,9 +11,6 @@
 Default option value definitions.
 """
 
-
-from __future__ import absolute_import, unicode_literals
-
 import os
 import platform
 
@@ -49,7 +46,7 @@ BUILD_VARIANT = 'Debug'
 CMAKE_GENERATOR = 'Ninja'
 
 COMPILER_VENDOR = 'none'
-SWIFT_USER_VISIBLE_VERSION = Version('5.7')
+SWIFT_USER_VISIBLE_VERSION = Version('5.8')
 CLANG_USER_VISIBLE_VERSION = Version('13.0.0')
 SWIFT_ANALYZE_CODE_COVERAGE = 'false'
 
@@ -87,7 +84,7 @@ def _default_llvm_lto_link_jobs():
     """Use the formula (GB Memory - 3)/6.0GB to get the number of parallel
     link threads we can support. This gives the OS 3 GB of room to work with.
 
-    This is a bit conservative, but I have found that this hueristic prevents
+    This is a bit conservative, but I have found that this heuristic prevents
     me from swapping on my test machine.
     """
 
@@ -102,7 +99,7 @@ def _default_swift_lto_link_jobs():
     """Use the formula (GB Memory - 3)/8.0GB to get the number of parallel
     link threads we can support. This gives the OS 3 GB of room to work with.
 
-    This is a bit conservative, but I have found that this hueristic prevents
+    This is a bit conservative, but I have found that this heuristic prevents
     me from swapping on my test machine.
     """
 

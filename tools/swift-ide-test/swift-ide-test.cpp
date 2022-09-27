@@ -10,8 +10,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "XMLValidator.h"
 #include "ModuleAPIDiff.h"
+#include "XMLValidator.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTDemangler.h"
 #include "swift/AST/ASTMangler.h"
@@ -27,34 +27,37 @@
 #include "swift/AST/RawComment.h"
 #include "swift/AST/USRGeneration.h"
 #include "swift/Basic/BasicSourceInfo.h"
+#include "swift/Basic/InitializeSwiftModules.h"
+#include "swift/Basic/LLVMInitialize.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/PrimitiveParsing.h"
-#include "swift/Basic/LLVMInitialize.h"
+#include "swift/Config.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/Driver/FrontendUtil.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
-#include "swift/IDE/CompletionInstance.h"
 #include "swift/IDE/CodeCompletionResultPrinter.h"
 #include "swift/IDE/CommentConversion.h"
+#include "swift/IDE/CompletionInstance.h"
 #include "swift/IDE/ConformingMethodList.h"
+#include "swift/IDE/IDERequests.h"
 #include "swift/IDE/ModuleInterfacePrinting.h"
 #include "swift/IDE/REPLCodeCompletion.h"
 #include "swift/IDE/SourceEntityWalker.h"
 #include "swift/IDE/SyntaxModel.h"
 #include "swift/IDE/TypeContextInfo.h"
 #include "swift/IDE/Utils.h"
-#include "swift/IDE/IDERequests.h"
 #include "swift/Index/Index.h"
+#include "swift/Markup/Markup.h"
+#include "swift/Parse/ParseVersion.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/SyntaxParse/SyntaxTreeCreator.h"
-#include "swift/Markup/Markup.h"
-#include "swift/Config.h"
 #include "clang/Rewrite/Core/RewriteBuffer.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/PrettyStackTrace.h"
@@ -63,12 +66,12 @@
 #include "llvm/Support/Signals.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/ManagedStatic.h"
 #include <system_error>
 
+#include <algorithm>
+#include <chrono>
 #include <random>
 #include <string>
-#include <chrono>
 
 using namespace swift;
 using namespace ide;
@@ -761,9 +764,14 @@ static llvm::cl::opt<bool>
                        llvm::cl::cat(Category), llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
-    EnableCxxInterop("enable-cxx-interop",
+    EnableCxxInterop("enable-experimental-cxx-interop",
                      llvm::cl::desc("Enable C++ interop."),
                      llvm::cl::cat(Category), llvm::cl::init(false));
+
+static llvm::cl::opt<bool>
+    CxxInteropGettersSettersAsProperties("cxx-interop-getters-setters-as-properties",
+        llvm::cl::desc("Imports getters and setters as computed properties."),
+        llvm::cl::cat(Category), llvm::cl::init(false));
 
 static llvm::cl::opt<bool>
 CanonicalizeType("canonicalize-type", llvm::cl::Hidden,
@@ -794,6 +802,11 @@ DisableImplicitConcurrencyImport("disable-implicit-concurrency-module-import",
                                  llvm::cl::desc("Disable implicit import of _Concurrency module"),
                                  llvm::cl::init(false));
 
+static llvm::cl::opt<bool>
+DisableImplicitStringProcessingImport("disable-implicit-string-processing-module-import",
+                                      llvm::cl::desc("Disable implicit import of _StringProcessing module"),
+                                      llvm::cl::init(false));
+
 static llvm::cl::opt<bool> EnableExperimentalNamedOpaqueTypes(
     "enable-experimental-named-opaque-types",
     llvm::cl::desc("Enable experimental support for named opaque result types"),
@@ -803,6 +816,21 @@ static llvm::cl::opt<bool>
 EnableExperimentalDistributed("enable-experimental-distributed",
                               llvm::cl::desc("Enable experimental distributed actors and functions"),
                               llvm::cl::init(false));
+
+static llvm::cl::opt<bool> EnableExperimentalStringProcessing(
+    "enable-experimental-string-processing",
+    llvm::cl::desc("Enable experimental string processing"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> EnableBareSlashRegexLiterals(
+    "enable-bare-slash-regex",
+    llvm::cl::desc("Enable the ability to write '/.../' regex literals"),
+    llvm::cl::init(false));
+
+static llvm::cl::list<std::string>
+  EnableExperimentalFeatures("enable-experimental-feature",
+                             llvm::cl::desc("Enable an experimental feature"),
+                             llvm::cl::cat(Category));
 
 static llvm::cl::list<std::string>
 AccessNotesPath("access-notes-path", llvm::cl::desc("Path to access notes file"),
@@ -1060,11 +1088,10 @@ doConformingMethodList(const CompilerInvocation &InitInvok,
       });
 }
 
-static void
-printCodeCompletionResultsImpl(ArrayRef<CodeCompletionResult *> Results,
-                               llvm::raw_ostream &OS, bool IncludeKeywords,
-                               bool IncludeComments, bool IncludeSourceText,
-                               bool PrintAnnotatedDescription) {
+static void printCodeCompletionResultsImpl(
+    ArrayRef<CodeCompletionResult *> Results, llvm::raw_ostream &OS,
+    bool IncludeKeywords, bool IncludeComments, bool IncludeSourceText,
+    bool PrintAnnotatedDescription, const ASTContext &Ctx) {
   unsigned NumResults = 0;
   for (auto Result : Results) {
     if (!IncludeKeywords &&
@@ -1107,10 +1134,13 @@ printCodeCompletionResultsImpl(ArrayRef<CodeCompletionResult *> Results,
       OS << "; comment=" << comment;
     }
 
-    if (Result->getDiagnosticSeverity() !=
+    SmallString<256> Scratch;
+    auto DiagSeverityAndMessage =
+        Result->getDiagnosticSeverityAndMessage(Scratch, Ctx);
+    if (DiagSeverityAndMessage.first !=
         CodeCompletionDiagnosticSeverity::None) {
       OS << "; diagnostics=" << comment;
-      switch (Result->getDiagnosticSeverity()) {
+      switch (DiagSeverityAndMessage.first) {
       case CodeCompletionDiagnosticSeverity::Error:
         OS << "error";
         break;
@@ -1126,7 +1156,8 @@ printCodeCompletionResultsImpl(ArrayRef<CodeCompletionResult *> Results,
       case CodeCompletionDiagnosticSeverity::None:
         llvm_unreachable("none");
       }
-      OS << ":" << Result->getDiagnosticMessage();
+      SmallString<256> Scratch;
+      OS << ":" << DiagSeverityAndMessage.second;
     }
 
     OS << "\n";
@@ -1142,7 +1173,8 @@ static int printCodeCompletionResults(
       CancellableResult, [&](CodeCompleteResult &Result) {
         printCodeCompletionResultsImpl(
             Result.ResultSink.Results, llvm::outs(), IncludeKeywords,
-            IncludeComments, IncludeSourceText, PrintAnnotatedDescription);
+            IncludeComments, IncludeSourceText, PrintAnnotatedDescription,
+            Result.Info.compilerInstance->getASTContext());
         return 0;
       });
 }
@@ -1518,10 +1550,11 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
           case CancellableResultKind::Success: {
             wasASTContextReused =
                 Result->Info.completionContext->ReusingASTContext;
-            printCodeCompletionResultsImpl(Result->ResultSink.Results, OS,
-                                           IncludeKeywords, IncludeComments,
-                                           IncludeSourceText,
-                                           CodeCompletionAnnotateResults);
+            printCodeCompletionResultsImpl(
+                Result->ResultSink.Results, OS, IncludeKeywords,
+                IncludeComments, IncludeSourceText,
+                CodeCompletionAnnotateResults,
+                Result->Info.compilerInstance->getASTContext());
             break;
           }
           case CancellableResultKind::Failure:
@@ -1602,6 +1635,17 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
         for (auto arg : FileCheckArgs)
           llvm::errs() << " " << arg;
         llvm::errs() << "\n";
+        llvm::errs() << "Code completion results:\n";
+        SmallVector<StringRef, 20> ResultLines;
+        llvm::SplitString(ResultStr, ResultLines, "\n");
+        for (size_t LineNo = 0;
+             LineNo < std::min(ResultLines.size(), static_cast<size_t>(20));
+             LineNo++) {
+          llvm::errs() << ResultLines[LineNo] << '\n';
+        }
+        if (ResultLines.size() > 20) {
+          llvm::errs() << " + " << (ResultLines.size() - 20) << " more lines\n";
+        }
       }
     }
 
@@ -1623,6 +1667,7 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
   llvm::errs() << "----\n";
   if (!FailedTokens.empty()) {
     llvm::errs() << "Unexpected failures: ";
+    llvm::sort(FailedTokens);
     llvm::interleave(
         FailedTokens, [&](StringRef name) { llvm::errs() << name; },
         [&]() { llvm::errs() << ", "; });
@@ -1630,6 +1675,7 @@ static int doBatchCodeCompletion(const CompilerInvocation &InitInvok,
   }
   if (!UPassTokens.empty()) {
     llvm::errs() << "Unexpected passes: ";
+    llvm::sort(UPassTokens);
     llvm::interleave(
         UPassTokens, [&](StringRef name) { llvm::errs() << name; },
         [&]() { llvm::errs() << ", "; });
@@ -1781,6 +1827,7 @@ public:
     case SyntaxNodeKind::Keyword: Id = "kw"; break;
     // Skip identifier.
     case SyntaxNodeKind::Identifier: return;
+    case SyntaxNodeKind::Operator: return;
     case SyntaxNodeKind::DollarIdent: Id = "dollar"; break;
     case SyntaxNodeKind::Integer: Id = "int"; break;
     case SyntaxNodeKind::Floating: Id = "float"; break;
@@ -1812,6 +1859,7 @@ public:
     case SyntaxNodeKind::Keyword: Col = llvm::raw_ostream::MAGENTA; break;
     // Skip identifier.
     case SyntaxNodeKind::Identifier: return;
+    case SyntaxNodeKind::Operator: Col = llvm::raw_ostream::MAGENTA; break;
     case SyntaxNodeKind::DollarIdent: Col = llvm::raw_ostream::MAGENTA; break;
     case SyntaxNodeKind::Integer: Col = llvm::raw_ostream::BLUE; break;
     case SyntaxNodeKind::Floating: Col = llvm::raw_ostream::BLUE; break;
@@ -3169,7 +3217,7 @@ public:
   ASTTypePrinter(SourceManager &SM, const PrintOptions &Options)
       : OS(llvm::outs()), SM(SM), Options(Options) {}
 
-  bool walkToDeclPre(Decl *D) override {
+  PreWalkAction walkToDeclPre(Decl *D) override {
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
       OS.indent(IndentLevel * 2);
       OS << Decl::getKindName(VD->getKind()) << "Decl '''"
@@ -3178,15 +3226,15 @@ public:
       OS << "\n";
     }
     IndentLevel++;
-    return true;
+    return Action::Continue();
   }
 
-  bool walkToDeclPost(Decl *D) override {
+  PostWalkAction walkToDeclPost(Decl *D) override {
     IndentLevel--;
-    return true;
+    return Action::Continue();
   }
 
-  std::pair<bool, Expr *> walkToExprPre(Expr *E) override {
+  PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     StringRef SourceCode{ "<unknown>" };
     unsigned Line = ~0U;
 
@@ -3209,12 +3257,12 @@ public:
     E->getType().print(OS, Options);
     OS << "\n";
     IndentLevel++;
-    return { true, E };
+    return Action::Continue(E);
   }
 
-  Expr *walkToExprPost(Expr *E) override {
+  PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
     IndentLevel--;
-    return E;
+    return Action::Continue(E);
   }
 };
 } // unnamed namespace
@@ -3252,16 +3300,16 @@ class ASTDocCommentDumper : public ASTWalker {
 public:
   ASTDocCommentDumper() : OS(llvm::outs()) {}
 
-  bool walkToDeclPre(Decl *D) override {
+  PreWalkAction walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
-      return true;
+      return Action::Continue();
 
     swift::markup::MarkupContext MC;
     auto DC = getSingleDocComment(MC, D);
     if (DC)
       swift::markup::dump(DC->getDocument(), OS);
 
-    return true;
+    return Action::Continue();
   }
 };
 } // end anonymous namespace
@@ -3406,9 +3454,9 @@ public:
     }
   }
 
-  bool walkToDeclPre(Decl *D) override {
+  PreWalkAction walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
-      return true;
+      return Action::Continue();
 
     if (auto *VD = dyn_cast<ValueDecl>(D)) {
       SourceLoc Loc = D->getLoc(/*SerializedOK=*/true);
@@ -3443,7 +3491,7 @@ public:
       printDocComment(D);
       OS << "\n";
     }
-    return true;
+    return Action::Continue();
   }
 };
 } // unnamed namespace
@@ -4116,6 +4164,7 @@ void anchorForGetMainExecutable() {}
 int main(int argc, char *argv[]) {
   PROGRAM_START(argc, argv);
   INITIALIZE_LLVM();
+  initializeSwiftModules();
 
   if (argc > 1) {
     // Handle integrated test tools which do not use
@@ -4186,14 +4235,16 @@ int main(int argc, char *argv[]) {
             *contextFreeResult, SemanticContextKind::OtherModule,
             CodeCompletionFlair(),
             /*numBytesToErase=*/0, /*TypeContext=*/nullptr, /*DC=*/nullptr,
-            /*USRTypeContext=*/nullptr, ContextualNotRecommendedReason::None,
-            CodeCompletionDiagnosticSeverity::None, /*DiagnosticMessage=*/"");
+            /*USRTypeContext=*/nullptr, /*CanCurrDeclContextHandleAsync=*/false,
+            ContextualNotRecommendedReason::None);
         contextualResults.push_back(contextualResult);
       }
+      auto CompInstance = std::make_unique<CompilerInstance>();
       printCodeCompletionResultsImpl(
           contextualResults, llvm::outs(), options::CodeCompletionKeywords,
           options::CodeCompletionComments, options::CodeCompletionSourceText,
-          options::CodeCompletionAnnotateResults);
+          options::CodeCompletionAnnotateResults,
+          CompInstance->getASTContext());
     }
 
     return 0;
@@ -4258,24 +4309,37 @@ int main(int argc, char *argv[]) {
   if (options::EnableCxxInterop) {
     InitInvok.getLangOptions().EnableCXXInterop = true;
   }
+  if (options::CxxInteropGettersSettersAsProperties) {
+    InitInvok.getLangOptions().CxxInteropGettersSettersAsProperties = true;
+  }
   if (options::EnableExperimentalConcurrency) {
     InitInvok.getLangOptions().EnableExperimentalConcurrency = true;
   }
   if (options::WarnConcurrency) {
-    InitInvok.getLangOptions().WarnConcurrency = true;
+    InitInvok.getLangOptions().StrictConcurrencyLevel =
+        StrictConcurrency::Complete;
   }
   if (options::DisableImplicitConcurrencyImport) {
     InitInvok.getLangOptions().DisableImplicitConcurrencyModuleImport = true;
   }
+  if (options::DisableImplicitStringProcessingImport) {
+    InitInvok.getLangOptions().DisableImplicitStringProcessingModuleImport = true;
+  }
   if (options::EnableExperimentalNamedOpaqueTypes) {
-    InitInvok.getLangOptions().EnableExperimentalNamedOpaqueTypes = true;
+    InitInvok.getLangOptions().Features.insert(Feature::NamedOpaqueTypes);
+  }
+  if (options::EnableExperimentalStringProcessing) {
+    InitInvok.getLangOptions().EnableExperimentalStringProcessing = true;
+  }
+  if (options::EnableBareSlashRegexLiterals) {
+    InitInvok.getLangOptions().Features.insert(Feature::BareSlashRegexLiterals);
+    InitInvok.getLangOptions().EnableExperimentalStringProcessing = true;
   }
 
-  if (options::EnableExperimentalDistributed) {
-    // distributed implies concurrency features:
-    InitInvok.getLangOptions().EnableExperimentalConcurrency = true;
-    // enable 'distributed' parsing and features
-    InitInvok.getLangOptions().EnableExperimentalDistributed = true;
+  for (const auto &featureArg : options::EnableExperimentalFeatures) {
+    if (auto feature = getExperimentalFeature(featureArg)) {
+      InitInvok.getLangOptions().Features.insert(*feature);
+    }
   }
 
   if (!options::Triple.empty())
@@ -4284,9 +4348,8 @@ int main(int argc, char *argv[]) {
     // Honor the *last* -swift-version specified.
     const auto &LastSwiftVersion =
       options::SwiftVersion[options::SwiftVersion.size()-1];
-    if (auto swiftVersion =
-          version::Version::parseVersionString(LastSwiftVersion,
-                                               SourceLoc(), nullptr)) {
+    if (auto swiftVersion = VersionParser::parseVersionString(
+            LastSwiftVersion, SourceLoc(), nullptr)) {
       if (auto actual = swiftVersion.getValue().getEffectiveLanguageVersion())
         InitInvok.getLangOptions().EffectiveLanguageVersion = actual.getValue();
     }

@@ -17,10 +17,6 @@
 
 SWIFT_BEGIN_NULLABILITY_ANNOTATIONS
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 typedef struct {
   BridgedFunction function;
   BridgedPassContext passContext;
@@ -30,6 +26,11 @@ typedef struct {
   BridgedInstruction instruction;
   BridgedPassContext passContext;
 } BridgedInstructionPassCtxt;
+
+typedef struct {
+  const BridgedVTable * _Nullable vTables;
+  size_t count;
+} BridgedVTableArray;
 
 typedef struct {
   const void * _Nonnull aliasAnalysis;
@@ -62,6 +63,10 @@ typedef struct {
 } BridgedBasicBlockSet;
 
 typedef struct {
+  void * _Nullable nds;
+} BridgedNodeSet;
+
+typedef struct {
   void * _Nullable data;
 } BridgedSlab;
 
@@ -77,13 +82,15 @@ typedef struct {
   void * _Nonnull functionInfo;
 } BridgedRCIdentityFunctionInfo;
 
+typedef void (* _Nonnull BridgedModulePassRunFn)(BridgedPassContext);
 typedef void (* _Nonnull BridgedFunctionPassRunFn)(BridgedFunctionPassCtxt);
 typedef void (* _Nonnull BridgedInstructionPassRunFn)(BridgedInstructionPassCtxt);
 
-void SILPassManager_registerFunctionPass(BridgedStringRef name,
+void SILPassManager_registerModulePass(llvm::StringRef name,
+                                       BridgedModulePassRunFn runFn);
+void SILPassManager_registerFunctionPass(llvm::StringRef name,
                                          BridgedFunctionPassRunFn runFn);
-
-void SILCombine_registerInstructionPass(BridgedStringRef name,
+void SILCombine_registerInstructionPass(llvm::StringRef name,
                                         BridgedInstructionPassRunFn runFn);
 
 BridgedAliasAnalysis PassContext_getAliasAnalysis(BridgedPassContext context);
@@ -96,8 +103,9 @@ BridgedCalleeAnalysis PassContext_getCalleeAnalysis(BridgedPassContext context);
 
 BridgedCalleeList CalleeAnalysis_getCallees(BridgedCalleeAnalysis calleeAnalysis,
                                             BridgedValue callee);
-BridgedCalleeList CalleeAnalysis_getInstCallees(BridgedCalleeAnalysis calleeAnalysis,
-                                                BridgedInstruction inst);
+BridgedCalleeList CalleeAnalysis_getDestructors(BridgedCalleeAnalysis calleeAnalysis,
+                                                BridgedType type,
+                                                SwiftInt isExactType);
 SwiftInt BridgedFunctionArray_size(BridgedCalleeList callees);
 BridgedFunction BridgedFunctionArray_get(BridgedCalleeList callees,
                                          SwiftInt index);
@@ -134,22 +142,49 @@ BridgedBasicBlockSet PassContext_allocBasicBlockSet(BridgedPassContext context);
 void PassContext_freeBasicBlockSet(BridgedPassContext context,
                                    BridgedBasicBlockSet set);
 SwiftInt BasicBlockSet_contains(BridgedBasicBlockSet set, BridgedBasicBlock block);
-void BasicBlockSet_insert(BridgedBasicBlockSet set, BridgedBasicBlock block);
+SwiftInt BasicBlockSet_insert(BridgedBasicBlockSet set, BridgedBasicBlock block);
 void BasicBlockSet_erase(BridgedBasicBlockSet set, BridgedBasicBlock block);
 BridgedFunction BasicBlockSet_getFunction(BridgedBasicBlockSet set);
 
+BridgedNodeSet PassContext_allocNodeSet(BridgedPassContext context);
+void PassContext_freeNodeSet(BridgedPassContext context,
+                             BridgedNodeSet set);
+SwiftInt NodeSet_containsValue(BridgedNodeSet set, BridgedValue value);
+SwiftInt NodeSet_insertValue(BridgedNodeSet set, BridgedValue value);
+void NodeSet_eraseValue(BridgedNodeSet set, BridgedValue value);
+SwiftInt NodeSet_containsInstruction(BridgedNodeSet set, BridgedInstruction inst);
+SwiftInt NodeSet_insertInstruction(BridgedNodeSet set, BridgedInstruction inst);
+void NodeSet_eraseInstruction(BridgedNodeSet set, BridgedInstruction inst);
+BridgedFunction NodeSet_getFunction(BridgedNodeSet set);
+
 void AllocRefInstBase_setIsStackAllocatable(BridgedInstruction arb);
 
-OptionalBridgedFunction PassContext_getDestructor(BridgedPassContext context,
-                                                  BridgedType type);
-
-BridgedSubstitutionMap
+swift::SubstitutionMap
 PassContext_getContextSubstitutionMap(BridgedPassContext context,
                                       BridgedType bridgedType);
 
-#ifdef __cplusplus
-} // extern "C"
-#endif
+void PassContext_beginTransformFunction(BridgedFunction function,
+                                        BridgedPassContext ctxt);
+void PassContext_endTransformFunction(BridgedPassContext ctxt);
+
+OptionalBridgedFunction
+PassContext_firstFunctionInModule(BridgedPassContext context);
+OptionalBridgedFunction
+PassContext_nextFunctionInModule(BridgedFunction function);
+BridgedVTableArray PassContext_getVTables(BridgedPassContext context);
+OptionalBridgedWitnessTable
+PassContext_firstWitnessTableInModule(BridgedPassContext context);
+OptionalBridgedWitnessTable
+PassContext_nextWitnessTableInModule(BridgedWitnessTable table);
+OptionalBridgedDefaultWitnessTable
+PassContext_firstDefaultWitnessTableInModule(BridgedPassContext context);
+OptionalBridgedDefaultWitnessTable
+PassContext_nextDefaultWitnessTableInModule(BridgedDefaultWitnessTable table);
+
+OptionalBridgedFunction
+PassContext_loadFunction(BridgedPassContext context, llvm::StringRef name);
+
+SwiftInt SILOptions_enableStackProtection(BridgedPassContext context);
 
 SWIFT_END_NULLABILITY_ANNOTATIONS
 

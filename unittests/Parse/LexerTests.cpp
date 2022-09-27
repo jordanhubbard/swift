@@ -422,7 +422,7 @@ TEST_F(LexerTest, BOMNoCommentTrivia) {
   ParsedTrivia LeadingTriviaPieces = TriviaLexer::lexTrivia(LeadingTrivia);
   ParsedTrivia TrailingTriviaPieces = TriviaLexer::lexTrivia(TrailingTrivia);
   ASSERT_EQ((ParsedTrivia{{
-    ParsedTriviaPiece(TriviaKind::GarbageText, strlen("\xEF\xBB\xBF")),
+    ParsedTriviaPiece(TriviaKind::UnexpectedText, strlen("\xEF\xBB\xBF")),
     ParsedTriviaPiece(TriviaKind::LineComment, strlen("// comment")),
     ParsedTriviaPiece(TriviaKind::Newline, 1)
   }}), LeadingTriviaPieces);
@@ -472,7 +472,7 @@ TEST_F(LexerTest, BOMAttachCommentTrivia) {
   ParsedTrivia LeadingTriviaPieces = TriviaLexer::lexTrivia(LeadingTrivia);
   ParsedTrivia TrailingTriviaPieces = TriviaLexer::lexTrivia(TrailingTrivia);
   ASSERT_EQ((ParsedTrivia{{
-    ParsedTriviaPiece(TriviaKind::GarbageText, strlen("\xEF\xBB\xBF")),
+    ParsedTriviaPiece(TriviaKind::UnexpectedText, strlen("\xEF\xBB\xBF")),
     ParsedTriviaPiece(TriviaKind::LineComment, strlen("// comment")),
     ParsedTriviaPiece(TriviaKind::Newline, 1)
   }}), LeadingTriviaPieces);
@@ -803,6 +803,9 @@ TEST_F(LexerTest, DiagnoseEmbeddedNul) {
   Lexer L(LangOpts, SourceMgr, BufferID, &Diags,
           LexerMode::Swift, HashbangMode::Disallowed,
           CommentRetentionMode::None, TriviaRetentionMode::WithTrivia);
+
+  Token Tok;
+  L.lex(Tok);
 
   ASSERT_TRUE(containsPrefix(DiagConsumer.messages,
                              "1, 2: nul character embedded in middle of file"));

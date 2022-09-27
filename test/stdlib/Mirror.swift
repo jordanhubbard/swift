@@ -26,6 +26,9 @@
 // REQUIRES: shell
 // REQUIRES: reflection
 
+// rdar://96439408
+// UNSUPPORTED: use_os_stdlib
+
 import StdlibUnittest
 
 
@@ -558,14 +561,12 @@ func verifyWeakUnownedReflection
     expectEqual(child.label, name)
     expectNotNil(child.value)
 
-    // FIXME: These casts are currently broken (Dec 2019)
-    // Once they are fixed, enable additional checks:
-    //let vp1 = child.value as? WeakUnownedTestsP1
-    //expectNotNil(vp1)
-    //expectEqual(vp1!.f1(), 2)
-    //let vp2 = child.value as? WeakUnownedTestsP2
-    //expectNotNil(vp2)
-    //expectEqual(vp2!.f2(), "b")
+    let vp1 = child.value as? WeakUnownedTestsP1
+    expectNotNil(vp1)
+    expectEqual(vp1!.f1(), 2)
+    let vp2 = child.value as? WeakUnownedTestsP2
+    expectNotNil(vp2)
+    expectEqual(vp2!.f2(), "b")
 
     let v = child.value as? ExpectedClass
     expectNotNil(v)
@@ -588,8 +589,9 @@ func verifyWeakUnownedReflection
   verifyExistentialField(child: i.next()!, name: "unowned_unsafe_existential")
   expectNil(i.next())
 
-  // The original bug report from SR-5289 crashed when the print() code
-  // attempted to reflect the contents of an unowned field.
+  // The original bug report from https://github.com/apple/swift/issues/47864
+  // crashed when the print() code attempted to reflect the contents of an
+  // unowned field.
   // The tests above _should_ suffice to check this, but let's print everything
   // anyway just to be sure.
   for c in m.children {
@@ -598,9 +600,10 @@ func verifyWeakUnownedReflection
 }
 
 #if _runtime(_ObjC)
-// Related: SR-5289 reported a crash when using Mirror to inspect Swift
-// class objects containing unowned pointers to Obj-C class objects.
-mirrors.test("Weak and Unowned Obj-C refs in class (SR-5289)") {
+// Related: https://github.com/apple/swift/issues/47864 reported a crash when
+// using 'Mirror' to inspect Swift class objects containing unowned pointers
+// to Obj-C class objects.
+mirrors.test("Weak and Unowned Obj-C refs in class") {
   class SwiftClassWithWeakAndUnowned {
     var strong_class: WeakUnownedObjCClass
     var strong_existential: WeakUnownedTestsP1 & WeakUnownedTestsP2
@@ -1554,6 +1557,7 @@ mirrors.test("CustomMirrorIsInherited") {
 //===----------------------------------------------------------------------===//
 
 protocol SomeNativeProto {}
+protocol SomeOtherNativeProto {}
 extension Int: SomeNativeProto {}
 
 class SomeClass {}
@@ -1588,6 +1592,14 @@ mirrors.test("MetatypeMirror") {
     output = ""
     dump(nativeProtocolConcreteMetatype, to: &output)
     expectEqual(expectedNativeProtocolConcrete, output)
+
+    let nativeProtocolCompositionMetatype =
+        (SomeNativeProto & SomeOtherNativeProto).self
+    output = ""
+    dump(nativeProtocolCompositionMetatype, to: &output)
+    expectEqual(
+      "- Mirror.SomeNativeProto & Mirror.SomeOtherNativeProto #0\n",
+      output)
   }
 }
 

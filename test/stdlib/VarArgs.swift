@@ -3,10 +3,10 @@
 
 import Swift
 
+// FIXME: https://github.com/apple/swift/issues/57444
 // Work around the inability for static-library based Swift runtime builds to
 // directly link against Darwin.swiftmodule by using a benign dependency on
 // StdlibUnittest.
-// https://bugs.swift.org/browse/SR-15118
 import StdlibUnittest
 runAllTests()
 
@@ -134,7 +134,7 @@ func test_varArgs5() {
   // the GP register-save area after the SSE register-save area was
   // exhausted, rather than spilling into the overflow argument area.
   //
-  // This is not caught by test_varArgs1 above, because it exhauses the
+  // This is not caught by test_varArgs1 above, because it exhausts the
   // GP register-save area before the SSE area.
 
   var format = "rdar-32547102: "

@@ -1,4 +1,4 @@
-// RUN: %target-swift-ide-test -print-module -module-to-print=MemberTemplates -I %S/Inputs -source-filename=x -enable-cxx-interop | %FileCheck %s
+// RUN: %target-swift-ide-test -print-module -module-to-print=MemberTemplates -I %S/Inputs -source-filename=x -enable-experimental-cxx-interop | %FileCheck %s
 
 // CHECK: struct HasMemberTemplates {
 // CHECK:   mutating func addSameTypeParams<T>(_ a: T, _ b: T) -> T
@@ -25,4 +25,23 @@
 // CHECK:   static func add<T>(_ a: T, _ b: T) -> T
 // CHECK:   static func addTwoTemplates<T, U>(_ a: T, _ b: U) -> T
 // CHECK:   static func removeReference<T>(_ a: inout T) -> T
+// CHECK: }
+
+// CHECK: struct __CxxTemplateInst17MyTemplatedStructIiE {
+// CHECK:   init()
+// CHECK: }
+
+// CHECK: struct HasTemplatedField {
+// CHECK:   init(x: __CxxTemplateInst17MyTemplatedStructIiE)
+// CHECK:   var x: __CxxTemplateInst17MyTemplatedStructIiE
+// CHECK: }
+
+// CHECK: struct __CxxTemplateInst33HasUninstantiatableTemplateMemberIN39HasTemplateInstantiationWithForwardDecl12NoDefinitionE32TemplateClassWithMemberTemplatesIS1_EE {
+// CHECK:   init(pointer: OpaquePointer!)
+// CHECK:   var pointer: OpaquePointer!
+// CHECK: }
+
+// CHECK: struct HasTemplateInstantiationWithForwardDecl {
+// CHECK:   init(noDefMember: __CxxTemplateInst33HasUninstantiatableTemplateMemberIN39HasTemplateInstantiationWithForwardDecl12NoDefinitionE32TemplateClassWithMemberTemplatesIS1_EE)
+// CHECK:   var noDefMember: __CxxTemplateInst33HasUninstantiatableTemplateMemberIN39HasTemplateInstantiationWithForwardDecl12NoDefinitionE32TemplateClassWithMemberTemplatesIS1_EE
 // CHECK: }

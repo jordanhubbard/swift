@@ -55,6 +55,7 @@ STATISTIC(NumAllocStackCaptured, "Number of AllocStack captured");
 STATISTIC(NumInstRemoved,        "Number of Instructions removed");
 
 static bool shouldAddLexicalLifetime(AllocStackInst *asi);
+static bool isGuaranteedLexicalValue(SILValue src);
 
 namespace {
 
@@ -89,13 +90,23 @@ struct LiveValues {
 
   /// The value with which usages of the provided AllocStackInst should be
   /// replaced.
-  ///
-  /// For lexical AllocStackInsts, that is the copy made of the borrowed value.
-  /// For those that are non-lexical, that is the value that was stored into the
-  /// storage.
-  SILValue replacement(AllocStackInst *asi) {
-    return shouldAddLexicalLifetime(asi) ? copy : stored;
-  };
+  SILValue replacement(AllocStackInst *asi, SILInstruction *toReplace) {
+    if (!shouldAddLexicalLifetime(asi)) {
+      return stored;
+    }
+    // For lexical AllocStackInsts, which are store_borrow locations, we may
+    // have created a borrow if the stored value is a non-lexical guaranteed
+    // value. Otherwise we would have created a borrow of the @owned stored
+    // value and a copy of the borrowed value.
+    assert(stored->getOwnershipKind() != OwnershipKind::Guaranteed ||
+           isGuaranteedLexicalValue(stored) || borrow);
+    assert(stored->getOwnershipKind() != OwnershipKind::Owned ||
+           copy && borrow);
+    if (isa<LoadBorrowInst>(toReplace)) {
+      return borrow ? borrow : stored;
+    }
+    return copy ? copy : borrow ? borrow : stored;
+  }
 };
 
 /// A transient structure used only by promoteAllocationInBlock and
@@ -202,15 +213,24 @@ static void promoteDebugValueAddr(DebugValueInst *dvai, SILValue value,
 
 /// Returns true if \p I is a load which loads from \p ASI.
 static bool isLoadFromStack(SILInstruction *i, AllocStackInst *asi) {
-  if (!isa<LoadInst>(i))
+  if (!isa<LoadInst>(i) && !isa<LoadBorrowInst>(i))
     return false;
+
+  if (auto *lbi = dyn_cast<LoadBorrowInst>(i)) {
+    if (BorrowedValue(lbi).hasReborrow())
+      return false;
+  }
 
   // Skip struct and tuple address projections.
   ValueBase *op = i->getOperand(0);
   while (op != asi) {
     if (!isa<UncheckedAddrCastInst>(op) && !isa<StructElementAddrInst>(op) &&
-        !isa<TupleElementAddrInst>(op))
+        !isa<TupleElementAddrInst>(op) && !isa<StoreBorrowInst>(op))
       return false;
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(op)) {
+      op = sbi->getDest();
+      continue;
+    }
     op = cast<SingleValueInstruction>(op)->getOperand(0);
   }
   return true;
@@ -218,9 +238,9 @@ static bool isLoadFromStack(SILInstruction *i, AllocStackInst *asi) {
 
 /// Collects all load instructions which (transitively) use \p I as address.
 static void collectLoads(SILInstruction *i,
-                         SmallVectorImpl<LoadInst *> &foundLoads) {
-  if (auto *load = dyn_cast<LoadInst>(i)) {
-    foundLoads.push_back(load);
+                         SmallVectorImpl<SILInstruction *> &foundLoads) {
+  if (isa<LoadInst>(i) || isa<LoadBorrowInst>(i)) {
+    foundLoads.push_back(i);
     return;
   }
   if (!isa<UncheckedAddrCastInst>(i) && !isa<StructElementAddrInst>(i) &&
@@ -234,22 +254,28 @@ static void collectLoads(SILInstruction *i,
 }
 
 static void
-replaceLoad(LoadInst *li, SILValue newValue, AllocStackInst *asi,
+replaceLoad(SILInstruction *inst, SILValue newValue, AllocStackInst *asi,
             SILBuilderContext &ctx, InstructionDeleter &deleter,
             SmallVectorImpl<SILInstruction *> &instructionsToDelete) {
+  assert(isa<LoadInst>(inst) || isa<LoadBorrowInst>(inst));
   ProjectionPath projections(newValue->getType());
-  SILValue op = li->getOperand();
-  SILBuilderWithScope builder(li, ctx);
+  SILValue op = inst->getOperand(0);
+  SILBuilderWithScope builder(inst, ctx);
   SILOptScope scope;
 
   while (op != asi) {
     assert(isa<UncheckedAddrCastInst>(op) || isa<StructElementAddrInst>(op) ||
-           isa<TupleElementAddrInst>(op) &&
+           isa<TupleElementAddrInst>(op) ||
+           isa<StoreBorrowInst>(op) &&
                "found instruction that should have been skipped in "
                "isLoadFromStack");
-    auto *inst = cast<SingleValueInstruction>(op);
-    projections.push_back(Projection(inst));
-    op = inst->getOperand(0);
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(op)) {
+      op = sbi->getDest();
+      continue;
+    }
+    auto *projInst = cast<SingleValueInstruction>(op);
+    projections.push_back(Projection(projInst));
+    op = projInst->getOperand(0);
   }
 
   for (const auto &proj : llvm::reverse(projections)) {
@@ -262,37 +288,61 @@ replaceLoad(LoadInst *li, SILValue newValue, AllocStackInst *asi,
     // to guaranteed!
     if (proj.getKind() == ProjectionKind::Struct ||
         proj.getKind() == ProjectionKind::Tuple) {
-      if (auto opVal = scope.borrowValue(li, newValue)) {
+      if (auto opVal = scope.borrowValue(inst, newValue)) {
         assert(*opVal != newValue &&
                "Valid value should be different from input value");
         newValue = *opVal;
       }
     }
     newValue =
-        proj.createObjectProjection(builder, li->getLoc(), newValue).get();
+        proj.createObjectProjection(builder, inst->getLoc(), newValue).get();
   }
 
-  op = li->getOperand();
+  op = inst->getOperand(0);
 
-  // Replace users of the loaded value with `val`
-  // If we have a load [copy], replace the users with copy_value of `val`
-  if (li->getOwnershipQualifier() == LoadOwnershipQualifier::Copy) {
-    li->replaceAllUsesWith(builder.createCopyValue(li->getLoc(), newValue));
+  if (auto *lbi = dyn_cast<LoadBorrowInst>(inst)) {
+    if (shouldAddLexicalLifetime(asi)) {
+      assert(newValue->getOwnershipKind() == OwnershipKind::Guaranteed);
+      SmallVector<SILInstruction *, 4> endBorrows;
+      for (auto *ebi : lbi->getUsersOfType<EndBorrowInst>()) {
+        endBorrows.push_back(ebi);
+      }
+      for (auto *ebi : endBorrows) {
+        prepareForDeletion(ebi, instructionsToDelete);
+      }
+      lbi->replaceAllUsesWith(newValue);
+    }
+    else {
+      auto *borrow = SILBuilderWithScope(lbi, ctx).createBeginBorrow(
+          lbi->getLoc(), newValue, asi->isLexical());
+      lbi->replaceAllUsesWith(borrow);
+    }
   } else {
-    assert(!asi->getFunction()->hasOwnership() ||
-           newValue.getOwnershipKind() != OwnershipKind::Guaranteed);
-    li->replaceAllUsesWith(newValue);
+    auto *li = cast<LoadInst>(inst);
+    // Replace users of the loaded value with `newValue`
+    // If we have a load [copy], replace the users with copy_value of `newValue`
+    if (li->getOwnershipQualifier() == LoadOwnershipQualifier::Copy) {
+      li->replaceAllUsesWith(builder.createCopyValue(li->getLoc(), newValue));
+    } else {
+      li->replaceAllUsesWith(newValue);
+    }
   }
 
   // Pop the scope so that we emit cleanups.
   std::move(scope).popAtEndOfScope(&*builder.getInsertionPoint());
 
   // Delete the load
-  prepareForDeletion(li, instructionsToDelete);
+  prepareForDeletion(inst, instructionsToDelete);
 
   while (op != asi && op->use_empty()) {
     assert(isa<UncheckedAddrCastInst>(op) || isa<StructElementAddrInst>(op) ||
-           isa<TupleElementAddrInst>(op));
+           isa<TupleElementAddrInst>(op) || isa<StoreBorrowInst>(op));
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(op)) {
+      SILValue next = sbi->getDest();
+      deleter.forceDelete(sbi);
+      op = next;
+      continue;
+    }
     auto *inst = cast<SingleValueInstruction>(op);
     SILValue next = inst->getOperand(0);
     deleter.forceDelete(inst);
@@ -327,6 +377,29 @@ static bool shouldAddLexicalLifetime(AllocStackInst *asi) {
          !asi->getElementType().isTrivial(*asi->getFunction());
 }
 
+static bool isGuaranteedLexicalValue(SILValue src) {
+  if (src->getOwnershipKind() != OwnershipKind::Guaranteed) {
+    return false;
+  }
+  if (isa<SILFunctionArgument>(src)) {
+    return true;
+  }
+  if (auto *bbi = dyn_cast<BeginBorrowInst>(src)) {
+    return bbi->isLexical();
+  }
+  return false;
+}
+
+/// Returns true if we have enough information to end the lifetime.
+///
+/// The lifetime cannot be ended during this if we don't have enough information
+/// to end it.  That can occur when the running value associated with a
+/// store_borrow does not have a borrow, because the source already guarantees
+/// lexical lifetime or we have a load which was not preceeded by a store in the
+/// basic block.  In that case, the lifetime end will be added later, when we
+/// have enough information, namely the live in values, to end it.
+static bool canEndLexicalLifetime(LiveValues values) { return values.borrow; }
+
 /// Begin a lexical borrow scope for the value stored into the provided
 /// StoreInst after that instruction.
 ///
@@ -334,24 +407,36 @@ static bool shouldAddLexicalLifetime(AllocStackInst *asi) {
 ///
 ///     %lifetime = begin_borrow %original
 ///     %copy = copy_value %lifetime
+/// For a StoreBorrowInst, begin a lexical borrow scope only if the stored value
+/// is non-lexical.
 static StorageStateTracking<LiveValues>
-beginLexicalLifetimeAfterStore(AllocStackInst *asi, StoreInst *si) {
+beginLexicalLifetimeAfterStore(AllocStackInst *asi, SILInstruction *inst) {
+  assert(isa<StoreInst>(inst) || isa<StoreBorrowInst>(inst));
   assert(shouldAddLexicalLifetime(asi));
+  SILValue stored = inst->getOperand(CopyLikeInstruction::Src);
+  SILLocation loc = RegularLocation::getAutoGeneratedLocation(inst->getLoc());
+
+  if (auto *sbi = dyn_cast<StoreBorrowInst>(inst)) {
+    if (isGuaranteedLexicalValue(sbi->getSrc())) {
+      return {{stored, SILValue(), SILValue()}, /*isStorageValid*/ true};
+    }
+    auto *borrow = SILBuilderWithScope(sbi->getNextInstruction())
+                       .createBeginBorrow(loc, stored, /*isLexical*/ true);
+    return {{stored, borrow, SILValue()}, /*isStorageValid*/ true};
+  }
   BeginBorrowInst *bbi = nullptr;
   CopyValueInst *cvi = nullptr;
-  SILBuilderWithScope::insertAfter(si, [&](SILBuilder &builder) {
-    SILLocation loc = RegularLocation::getAutoGeneratedLocation(si->getLoc());
-    bbi = builder.createBeginBorrow(loc, si->getSrc(),
-                                    /*isLexical*/ true);
+  SILBuilderWithScope::insertAfter(inst, [&](SILBuilder &builder) {
+    bbi = builder.createBeginBorrow(loc, stored, /*isLexical*/ true);
     cvi = builder.createCopyValue(loc, bbi);
   });
-  StorageStateTracking<LiveValues> vals = {{si->getSrc(), bbi, cvi},
+  StorageStateTracking<LiveValues> vals = {{stored, bbi, cvi},
                                            /*isStorageValid=*/true};
   return vals;
 }
 
-/// End the lexical borrow scope described by the provided LiveValues struct
-/// before the specified instruction.
+/// End the lexical borrow scope for an @owned stored value described by the
+/// provided LiveValues struct before the specified instruction.
 ///
 /// The end of the scope looks like
 ///
@@ -363,10 +448,10 @@ beginLexicalLifetimeAfterStore(AllocStackInst *asi, StoreInst *si) {
 ///
 ///     %lifetime = begin_borrow %original
 ///     %copy = copy_value %lifetime
-static void endLexicalLifetimeBeforeInst(AllocStackInst *asi,
-                                         SILInstruction *beforeInstruction,
-                                         SILBuilderContext &ctx,
-                                         LiveValues values) {
+static void endOwnedLexicalLifetimeBeforeInst(AllocStackInst *asi,
+                                              SILInstruction *beforeInstruction,
+                                              SILBuilderContext &ctx,
+                                              LiveValues values) {
   assert(shouldAddLexicalLifetime(asi));
   assert(beforeInstruction);
 
@@ -374,7 +459,21 @@ static void endLexicalLifetimeBeforeInst(AllocStackInst *asi,
   SILLocation loc =
       RegularLocation::getAutoGeneratedLocation(beforeInstruction->getLoc());
   builder.createEndBorrow(loc, values.borrow);
-  builder.emitDestroyValueOperation(loc, values.stored);
+  builder.createDestroyValue(loc, values.stored);
+}
+
+/// End the lexical borrow scope for an @guaranteed stored value described by
+/// the provided LiveValues struct before the specified instruction.
+static void endGuaranteedLexicalLifetimeBeforeInst(
+    AllocStackInst *asi, SILInstruction *beforeInstruction,
+    SILBuilderContext &ctx, LiveValues values) {
+  assert(shouldAddLexicalLifetime(asi));
+  assert(beforeInstruction);
+  assert(values.borrow);
+
+  SILBuilderWithScope builder(beforeInstruction);
+  builder.createEndBorrow(RegularLocation::getAutoGeneratedLocation(),
+                          values.borrow);
 }
 
 //===----------------------------------------------------------------------===//
@@ -429,11 +528,13 @@ class StackAllocationPromoter {
   ///
   /// The live-out values for every block can be derived from these.
   ///
-  /// For non-lexical alloc_stacks, that is just a StoreInst.  For lexical
-  /// alloc_stacks, that is the StoreInst, a BeginBorrowInst of the
+  /// For non-lexical alloc_stacks, that is just a StoreInst or a
+  /// StoreBorrowInst.
+  /// For lexical alloc_stacks, that is the StoreInst, a BeginBorrowInst of the
   /// value stored into the StoreInst and a CopyValueInst of the result of the
-  /// BeginBorrowInst.
-  BlockToInstMap<StoreInst> initializationPoints;
+  /// BeginBorrowInst or a StoreBorrowInst, and a BeginBorrowInst of the stored
+  /// value if it did not have a guaranteed lexical scope.
+  BlockToInstMap<> initializationPoints;
 
   /// The first instruction in each block that deinitializes the storage that is
   /// not preceeded by an instruction that initializes it.
@@ -442,7 +543,8 @@ class StackAllocationPromoter {
   ///     store
   ///     destroy_addr
   ///     load [take]
-  ///
+  /// Or
+  ///     end_borrow
   /// Ending lexical lifetimes before these instructions is one way that the
   /// cross-block lexical lifetimes of initializationPoints can be ended in
   /// StackAllocationPromoter::endLexicalLifetime.
@@ -539,12 +641,12 @@ private:
   /// for the first load and the last store.
   /// \returns the last StoreInst found, whose storage was not subsequently
   ///          deinitialized
-  StoreInst *promoteAllocationInBlock(SILBasicBlock *block);
+  SILInstruction *promoteAllocationInBlock(SILBasicBlock *block);
 };
 
 } // end of namespace
 
-StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
+SILInstruction *StackAllocationPromoter::promoteAllocationInBlock(
     SILBasicBlock *blockPromotingWithin) {
   LLVM_DEBUG(llvm::dbgs() << "*** Promoting ASI in block: " << *asi);
 
@@ -553,20 +655,7 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
   Optional<StorageStateTracking<LiveValues>> runningVals;
   // Keep track of the last StoreInst that we found and the BeginBorrowInst and
   // CopyValueInst that we created in response if the alloc_stack was lexical.
-  Optional<StorageStateTracking<StoreInst *>> lastStoreInst;
-
-  /// Returns true if we have enough information to end the lifetime during
-  /// promoteAllocationInBlock.
-  ///
-  /// The lifetime cannot be ended during this function's execution if we don't
-  /// yet have enough information to end it.  That occurs when the running
-  /// values are from a load which was not preceeded by a store.  In that case,
-  /// the lifetime end will be added later, when we have enough information,
-  /// namely the live in values, to end it.
-  auto canEndLexicalLifetime =
-      [](StorageStateTracking<LiveValues> values) -> bool {
-    return values.value.borrow;
-  };
+  Optional<SILInstruction *> lastStoreInst;
 
   // For all instructions in the block.
   for (auto bbi = blockPromotingWithin->begin(),
@@ -577,15 +666,15 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
 
     if (isLoadFromStack(inst, asi)) {
       assert(!runningVals || runningVals->isStorageValid);
-      auto *li = cast<LoadInst>(inst);
-      if (li->getOwnershipQualifier() == LoadOwnershipQualifier::Take) {
+      auto *li = dyn_cast<LoadInst>(inst);
+      if (li && li->getOwnershipQualifier() == LoadOwnershipQualifier::Take) {
         if (shouldAddLexicalLifetime(asi)) {
           // End the lexical lifetime at a load [take].  The storage is no
           // longer keeping the value alive.
-          if (runningVals && canEndLexicalLifetime(*runningVals)) {
+          if (runningVals && canEndLexicalLifetime(runningVals->value)) {
             // End it right now if we have enough information.
-            endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/li, ctx,
-                                         runningVals->value);
+            endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/li,
+                                              ctx, runningVals->value);
           } else {
             // If we dont't have enough information, end it endLexicalLifetime.
             assert(!deinitializationPoints[blockPromotingWithin]);
@@ -594,17 +683,16 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
         }
         if (runningVals)
           runningVals->isStorageValid = false;
-        if (lastStoreInst)
-          lastStoreInst->isStorageValid = false;
       }
+
       if (runningVals) {
         // If we are loading from the AllocStackInst and we already know the
         // content of the Alloca then use it.
-        LLVM_DEBUG(llvm::dbgs() << "*** Promoting load: " << *li);
-        replaceLoad(li, runningVals->value.replacement(asi), asi, ctx, deleter,
-                    instructionsToDelete);
+        LLVM_DEBUG(llvm::dbgs() << "*** Promoting load: " << *inst);
+        replaceLoad(inst, runningVals->value.replacement(asi, inst), asi, ctx,
+                    deleter, instructionsToDelete);
         ++NumInstRemoved;
-      } else if (li->getOperand() == asi &&
+      } else if (li && li->getOperand() == asi &&
                  li->getOwnershipQualifier() != LoadOwnershipQualifier::Copy) {
         // If we don't know the content of the AllocStack then the loaded
         // value *is* the new value;
@@ -630,7 +718,7 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
         if (runningVals) {
           assert(runningVals->isStorageValid);
           SILBuilderWithScope(si, ctx).createDestroyValue(
-              si->getLoc(), runningVals->value.replacement(asi));
+              si->getLoc(), runningVals->value.replacement(asi, si));
         } else {
           SILBuilderWithScope localBuilder(si, ctx);
           auto *newLoad = localBuilder.createLoad(si->getLoc(), asi,
@@ -646,14 +734,14 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
 
       // If we met a store before this one, delete it.
       if (lastStoreInst) {
-        assert(lastStoreInst->value->getOwnershipQualifier() !=
+        assert(cast<StoreInst>(*lastStoreInst)->getOwnershipQualifier() !=
                    StoreOwnershipQualifier::Assign &&
                "store [assign] to the stack location should have been "
                "transformed to a store [init]");
         LLVM_DEBUG(llvm::dbgs()
-                   << "*** Removing redundant store: " << lastStoreInst->value);
+                   << "*** Removing redundant store: " << *lastStoreInst);
         ++NumInstRemoved;
-        prepareForDeletion(lastStoreInst->value, instructionsToDelete);
+        prepareForDeletion(*lastStoreInst, instructionsToDelete);
       }
 
       auto oldRunningVals = runningVals;
@@ -662,32 +750,68 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
                      /*isStorageValid=*/true};
       // The current store is now the lastStoreInst (until we see
       // another).
-      lastStoreInst = {si, /*isStorageValid=*/true};
+      lastStoreInst = inst;
       if (shouldAddLexicalLifetime(asi)) {
         if (oldRunningVals && oldRunningVals->isStorageValid &&
-            canEndLexicalLifetime(*oldRunningVals)) {
-          endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/si, ctx,
-                                       oldRunningVals->value);
+            canEndLexicalLifetime(oldRunningVals->value)) {
+          endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/inst,
+                                            ctx, oldRunningVals->value);
         }
-        runningVals = beginLexicalLifetimeAfterStore(asi, si);
-        // Create a use of the newly created copy in order to keep phi pruning
-        // from deleting our lifetime beginning instructions.
-        //
-        // TODO: Remove this hack, it is only necessary because erasePhiArgument
-        //       calls deleteEdgeValue which calls
-        //       deleteTriviallyDeadOperandsOfDeadArgument and deletes the copy
-        //       and borrow that we added and want not to have deleted.
-        SILBuilderWithScope::insertAfter(
-            runningVals->value.copy->getDefiningInstruction(),
-            [&](auto builder) {
-              SILLocation loc = RegularLocation::getAutoGeneratedLocation();
-              auto *useOfCopy =
-                  builder.createCopyValue(loc, runningVals->value.copy);
-              // Note that we don't call prepareToDelete useOfCopy because we
-              // specifically want this instruction to remain a use of copy.
-              instructionsToDelete.push_back(useOfCopy);
-            });
+        runningVals = beginLexicalLifetimeAfterStore(asi, inst);
       }
+      continue;
+    }
+
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(inst)) {
+      if (sbi->getDest() != asi)
+        continue;
+
+      // If we met a store before this one, delete it.
+      if (lastStoreInst) {
+        LLVM_DEBUG(llvm::dbgs()
+                   << "*** Removing redundant store: " << *lastStoreInst);
+        ++NumInstRemoved;
+        prepareForDeletion(*lastStoreInst, instructionsToDelete);
+      }
+
+      // The stored value is the new running value.
+      runningVals = {LiveValues::toReplace(asi, sbi->getSrc()),
+                     /*isStorageValid=*/true};
+      // The current store is now the lastStoreInst.
+      lastStoreInst = inst;
+      if (shouldAddLexicalLifetime(asi)) {
+        runningVals = beginLexicalLifetimeAfterStore(asi, inst);
+      }
+      continue;
+    }
+
+    // End the lexical lifetime of the store_borrow source.
+    if (auto *ebi = dyn_cast<EndBorrowInst>(inst)) {
+      if (!shouldAddLexicalLifetime(asi)) {
+        continue;
+      }
+      auto *sbi = dyn_cast<StoreBorrowInst>(ebi->getOperand());
+      if (!sbi) {
+        continue;
+      }
+      if (sbi->getDest() != asi) {
+        continue;
+      }
+      assert(!deinitializationPoints[blockPromotingWithin]);
+      deinitializationPoints[blockPromotingWithin] = inst;
+      if (!runningVals.hasValue()) {
+        continue;
+      }
+      if (sbi->getSrc() != runningVals->value.stored) {
+        continue;
+      }
+      // Mark storage as invalid and mark end_borrow as a deinit point.
+      runningVals->isStorageValid = false;
+      if (!canEndLexicalLifetime(runningVals->value)) {
+        continue;
+      }
+      endGuaranteedLexicalLifetimeBeforeInst(asi, ebi->getNextInstruction(),
+                                             ctx, runningVals->value);
       continue;
     }
 
@@ -697,40 +821,29 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
     // promote this when we deal with hooking up phis.
     if (auto *dvi = DebugValueInst::hasAddrVal(inst)) {
       if (dvi->getOperand() == asi && runningVals)
-        promoteDebugValueAddr(dvi, runningVals->value.replacement(asi), ctx,
-                              deleter);
+        promoteDebugValueAddr(dvi, runningVals->value.replacement(asi, dvi),
+                              ctx, deleter);
       continue;
     }
 
     // Replace destroys with a release of the value.
     if (auto *dai = dyn_cast<DestroyAddrInst>(inst)) {
-      if (dai->getOperand() == asi) {
-        if (runningVals) {
-          replaceDestroy(dai, runningVals->value.replacement(asi), ctx, deleter,
-                         instructionsToDelete);
-          if (shouldAddLexicalLifetime(asi)) {
-            endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/dai, ctx,
-                                         runningVals->value);
-          }
-          runningVals->isStorageValid = false;
-          if (lastStoreInst)
-            lastStoreInst->isStorageValid = false;
-        } else {
-          assert(!deinitializationPoints[blockPromotingWithin]);
-          deinitializationPoints[blockPromotingWithin] = dai;
+      if (dai->getOperand() != asi) {
+        continue;
+      }
+      if (runningVals) {
+        replaceDestroy(dai, runningVals->value.replacement(asi, dai), ctx,
+                       deleter, instructionsToDelete);
+        if (shouldAddLexicalLifetime(asi)) {
+          endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/dai, ctx,
+                                            runningVals->value);
         }
+        runningVals->isStorageValid = false;
+      } else {
+        assert(!deinitializationPoints[blockPromotingWithin]);
+        deinitializationPoints[blockPromotingWithin] = dai;
       }
       continue;
-    }
-
-    if (auto *dvi = dyn_cast<DestroyValueInst>(inst)) {
-      if (runningVals &&
-          dvi->getOperand() == runningVals->value.replacement(asi)) {
-        // Reset LastStore.
-        // So that we don't end up passing dead values as phi args in
-        // StackAllocationPromoter::fixBranchesAndUses
-        lastStoreInst = llvm::None;
-      }
     }
 
     // Stop on deallocation.
@@ -740,14 +853,15 @@ StoreInst *StackAllocationPromoter::promoteAllocationInBlock(
     }
   }
 
-  if (lastStoreInst && lastStoreInst->isStorageValid) {
-    assert(lastStoreInst->value->getOwnershipQualifier() !=
-               StoreOwnershipQualifier::Assign &&
+  if (lastStoreInst && runningVals->isStorageValid) {
+    assert((isa<StoreBorrowInst>(*lastStoreInst) ||
+            (cast<StoreInst>(*lastStoreInst)->getOwnershipQualifier() !=
+             StoreOwnershipQualifier::Assign)) &&
            "store [assign] to the stack location should have been "
            "transformed to a store [init]");
-    LLVM_DEBUG(llvm::dbgs() << "*** Finished promotion. Last store: "
-                            << lastStoreInst->value);
-    return lastStoreInst->value;
+    LLVM_DEBUG(llvm::dbgs()
+               << "*** Finished promotion. Last store: " << *lastStoreInst);
+    return *lastStoreInst;
   }
 
   LLVM_DEBUG(llvm::dbgs() << "*** Finished promotion with no stores.\n");
@@ -780,20 +894,29 @@ StackAllocationPromoter::getLiveOutValues(BlockSetVector &phiBlocks,
     SILBasicBlock *domBlock = domNode->getBlock();
 
     // If there is a store (that must come after the phi), use its value.
-    BlockToInstMap<StoreInst>::iterator it =
-        initializationPoints.find(domBlock);
+    BlockToInstMap<>::iterator it = initializationPoints.find(domBlock);
     if (it != initializationPoints.end()) {
-      auto *si = it->second;
-      LLVM_DEBUG(llvm::dbgs() << "*** Found Store def " << si->getSrc());
-      SILValue stored = si->getSrc();
-      SILValue borrow = SILValue();
-      SILValue copy = SILValue();
-      if (shouldAddLexicalLifetime(asi)) {
-        auto *bbi = cast<BeginBorrowInst>(&*std::next(si->getIterator()));
-        borrow = bbi;
-        auto *cvi = cast<CopyValueInst>(bbi->getNextInstruction());
-        copy = cvi;
+      auto *inst = it->second;
+      assert(isa<StoreInst>(inst) || isa<StoreBorrowInst>(inst));
+
+      SILValue stored = inst->getOperand(CopyLikeInstruction::Src);
+      LLVM_DEBUG(llvm::dbgs() << "*** Found Store def " << stored);
+
+      if (!shouldAddLexicalLifetime(asi)) {
+        LiveValues values = {stored, SILValue(), SILValue()};
+        return values;
       }
+      if (auto *sbi = dyn_cast<StoreBorrowInst>(inst)) {
+        if (isGuaranteedLexicalValue(sbi->getSrc())) {
+          LiveValues values = {stored, SILValue(), SILValue()};
+          return values;
+        }
+        auto borrow = cast<BeginBorrowInst>(sbi->getNextInstruction());
+        LiveValues values = {stored, borrow, SILValue()};
+        return values;
+      }
+      auto borrow = cast<BeginBorrowInst>(inst->getNextInstruction());
+      auto copy = cast<CopyValueInst>(borrow->getNextInstruction());
       LiveValues values = {stored, borrow, copy};
       return values;
     }
@@ -887,13 +1010,13 @@ void StackAllocationPromoter::fixPhiPredBlock(BlockSetVector &phiBlocks,
                                               SILBasicBlock *destBlock,
                                               SILBasicBlock *predBlock) {
   TermInst *ti = predBlock->getTerminator();
-  LLVM_DEBUG(llvm::dbgs() << "*** Fixing the terminator " << ti << ".\n");
+  LLVM_DEBUG(llvm::dbgs() << "*** Fixing the terminator " << *ti << ".\n");
 
   LiveValues def = getEffectiveLiveOutValues(phiBlocks, predBlock);
 
-  LLVM_DEBUG(llvm::dbgs() << "*** Found the definition: " << *def.copy);
+  LLVM_DEBUG(llvm::dbgs() << "*** Found the definition: " << def.stored);
 
-  llvm::SmallVector<SILValue> vals;
+  SmallVector<SILValue> vals;
   vals.push_back(def.stored);
   if (shouldAddLexicalLifetime(asi)) {
     vals.push_back(def.borrow);
@@ -938,7 +1061,7 @@ void StackAllocationPromoter::propagateLiveness(
   // If liveness has not been propagated, go over the incoming operands and mark
   // any operand values that are proactivePhis as live
   livePhis.insert(proactivePhi);
-  SmallVector<SILValue, 4> incomingPhiVals;
+  SmallVector<SILValue> incomingPhiVals;
   proactivePhi->getIncomingPhiValues(incomingPhiVals);
   for (auto &inVal : incomingPhiVals) {
     auto *inPhi = dyn_cast<SILPhiArgument>(inVal);
@@ -953,10 +1076,22 @@ void StackAllocationPromoter::propagateLiveness(
 void StackAllocationPromoter::fixBranchesAndUses(BlockSetVector &phiBlocks,
                                                  BlockSetVector &phiBlocksOut) {
   // First update uses of the value.
-  SmallVector<LoadInst *, 4> collectedLoads;
+  SmallVector<SILInstruction *, 4> collectedLoads;
+  // Collect all alloc_stack uses.
+  SmallVector<Operand *, 4> uses(asi->getUses());
 
-  for (auto ui = asi->use_begin(), ue = asi->use_end(); ui != ue;) {
-    auto *user = ui->getUser();
+  // Collect uses of store_borrows to alloc_stack.
+  for (unsigned i = 0; i < uses.size(); i++) {
+    auto *use = uses[i];
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(use->getUser())) {
+      for (auto *sbuse : sbi->getUses()) {
+        uses.push_back(sbuse);
+      }
+    }
+  }
+
+  for (auto ui = uses.begin(), ue = uses.end(); ui != ue;) {
+    auto *user = (*ui)->getUser();
     ++ui;
     bool removedUser = false;
 
@@ -972,10 +1107,10 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSetVector &phiBlocks,
       def = getEffectiveLiveInValues(phiBlocks, loadBlock);
 
       LLVM_DEBUG(llvm::dbgs() << "*** Replacing " << *li << " with Def "
-                              << def.replacement(asi));
+                              << def.replacement(asi, li));
 
       // Replace the load with the definition that we found.
-      replaceLoad(li, def.replacement(asi), asi, ctx, deleter,
+      replaceLoad(li, def.replacement(asi, li), asi, ctx, deleter,
                   instructionsToDelete);
       removedUser = true;
       ++NumInstRemoved;
@@ -993,7 +1128,7 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSetVector &phiBlocks,
       // Replace debug_value w/ address-type value with
       // a new debug_value w/ promoted value.
       auto def = getEffectiveLiveInValues(phiBlocks, userBlock);
-      promoteDebugValueAddr(dvi, def.replacement(asi), ctx, deleter);
+      promoteDebugValueAddr(dvi, def.replacement(asi, dvi), ctx, deleter);
       ++NumInstRemoved;
       continue;
     }
@@ -1001,7 +1136,7 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSetVector &phiBlocks,
     // Replace destroys with a release of the value.
     if (auto *dai = dyn_cast<DestroyAddrInst>(user)) {
       auto def = getEffectiveLiveInValues(phiBlocks, userBlock);
-      replaceDestroy(dai, def.replacement(asi), ctx, deleter,
+      replaceDestroy(dai, def.replacement(asi, dai), ctx, deleter,
                      instructionsToDelete);
       continue;
     }
@@ -1043,7 +1178,8 @@ void StackAllocationPromoter::fixBranchesAndUses(BlockSetVector &phiBlocks,
       auto *phi = cast<SILPhiArgument>(
           block->getArgument(block->getNumArguments() - 1));
       phi->replaceAllUsesWithUndef();
-      erasePhiArgument(block, block->getNumArguments() - 1);
+      erasePhiArgument(block, block->getNumArguments() - 1,
+                       /*cleanupDeadPhiOp*/ false);
     };
     for (auto *block : phiBlocks) {
       auto *proactivePhi = cast<SILPhiArgument>(
@@ -1159,8 +1295,18 @@ void StackAllocationPromoter::endLexicalLifetime(BlockSetVector &phiBlocks) {
     case AvailableValuesKind::In: {
       if (auto *inst = deinitializationPoints[bb]) {
         auto values = getLiveInValues(phiBlocks, bb);
-        endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/inst, ctx,
-                                     *values);
+        if (isa<EndBorrowInst>(inst)) {
+          // Not all store_borrows will have a begin_borrow [lexical] that needs
+          // to be ended. If the source is already lexical, we don't create it.
+          if (!canEndLexicalLifetime(*values)) {
+            continue;
+          }
+          endGuaranteedLexicalLifetimeBeforeInst(
+              asi, /*beforeInstruction=*/inst, ctx, *values);
+          continue;
+        }
+        endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/inst, ctx,
+                                          *values);
         continue;
       }
       worklist.insert({bb, AvailableValuesKind::Out});
@@ -1174,7 +1320,15 @@ void StackAllocationPromoter::endLexicalLifetime(BlockSetVector &phiBlocks) {
       };
       if (terminatesInUnreachable || uniqueSuccessorLacksLiveInValues()) {
         auto values = getLiveOutValues(phiBlocks, bb);
-        endLexicalLifetimeBeforeInst(
+        if (values->stored->getOwnershipKind() == OwnershipKind::Guaranteed) {
+          if (!canEndLexicalLifetime(*values)) {
+            continue;
+          }
+          endGuaranteedLexicalLifetimeBeforeInst(
+              asi, /*beforeInstruction=*/bb->getTerminator(), ctx, *values);
+          continue;
+        }
+        endOwnedLexicalLifetimeBeforeInst(
             asi, /*beforeInstruction=*/bb->getTerminator(), ctx, *values);
         continue;
       }
@@ -1221,7 +1375,7 @@ void StackAllocationPromoter::promoteAllocationToPhi() {
   for (auto *use : asi->getUses()) {
     SILInstruction *user = use->getUser();
     // We need to place Phis for this block.
-    if (isa<StoreInst>(user)) {
+    if (isa<StoreInst>(user) || isa<StoreBorrowInst>(user)) {
       // If the block is in the dom tree (dominated by the entry block).
       if (auto *node = domInfo->getNode(user->getParent()))
         priorityQueue.push(std::make_pair(node, domTreeLevels[node]));
@@ -1378,8 +1532,8 @@ class MemoryToRegisters {
     return *domTreeLevels;
   }
 
-  /// Check if the AllocStackInst \p ASI is only written into.
-  bool isWriteOnlyAllocation(AllocStackInst *asi);
+  /// Check if \p def is a write-only allocation.
+  bool isWriteOnlyAllocation(SILValue def);
 
   /// Promote all of the AllocStacks in a single basic block in one
   /// linear scan. Note: This function deletes all of the users of the
@@ -1416,6 +1570,13 @@ static bool isAddressForLoad(SILInstruction *load, SILBasicBlock *&singleBlock,
     // projection.  See below for further discussion.
     if (involvesUntakableProjection &&
         li->getOwnershipQualifier() == LoadOwnershipQualifier::Take) {
+      return false;
+    }
+    return true;
+  }
+
+  if (isa<LoadBorrowInst>(load)) {
+    if (involvesUntakableProjection) {
       return false;
     }
     return true;
@@ -1479,13 +1640,13 @@ static bool isDeadAddrProjection(SILInstruction *inst) {
   return true;
 }
 
-/// Returns true if this AllocStacks is captured.
-/// Sets \p inSingleBlock to true if all uses of \p ASI are in a single block.
-static bool isCaptured(AllocStackInst *asi, bool &inSingleBlock) {
-  SILBasicBlock *singleBlock = asi->getParent();
+/// Returns true if this \p def is captured.
+/// Sets \p inSingleBlock to true if all uses of \p def are in a single block.
+static bool isCaptured(SILValue def, bool *inSingleBlock) {
+  SILBasicBlock *singleBlock = def->getParentBlock();
 
-  // For all users of the AllocStack instruction.
-  for (auto *use : asi->getUses()) {
+  // For all users of the def
+  for (auto *use : def->getUses()) {
     SILInstruction *user = use->getUser();
 
     if (user->getParent() != singleBlock)
@@ -1498,12 +1659,24 @@ static bool isCaptured(AllocStackInst *asi, bool &inSingleBlock) {
 
     // We can store into an AllocStack (but not the pointer).
     if (auto *si = dyn_cast<StoreInst>(user))
-      if (si->getDest() == asi)
+      if (si->getDest() == def)
         continue;
+
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(user)) {
+      if (sbi->getDest() == def) {
+        if (isCaptured(sbi, inSingleBlock)) {
+          return true;
+        }
+        continue;
+      }
+    }
 
     // Deallocation is also okay, as are DebugValue w/ address value. We will
     // promote the latter into normal DebugValue.
     if (isa<DeallocStackInst>(user) || DebugValueInst::hasAddrVal(user))
+      continue;
+
+    if (isa<EndBorrowInst>(user))
       continue;
 
     // Destroys of loadable types can be rewritten as releases, so
@@ -1518,23 +1691,37 @@ static bool isCaptured(AllocStackInst *asi, bool &inSingleBlock) {
   }
 
   // None of the users capture the AllocStack.
-  inSingleBlock = (singleBlock != nullptr);
+  *inSingleBlock = (singleBlock != nullptr);
   return false;
 }
 
-/// Returns true if the AllocStack is only stored into.
-bool MemoryToRegisters::isWriteOnlyAllocation(AllocStackInst *asi) {
-  // For all users of the AllocStack:
-  for (auto *use : asi->getUses()) {
+/// Returns true if the \p def is only stored into.
+bool MemoryToRegisters::isWriteOnlyAllocation(SILValue def) {
+  assert(isa<AllocStackInst>(def) || isa<StoreBorrowInst>(def));
+
+  // For all users of the def:
+  for (auto *use : def->getUses()) {
     SILInstruction *user = use->getUser();
 
-    // It is okay to store into this AllocStack.
+    // It is okay to store into the AllocStack.
     if (auto *si = dyn_cast<StoreInst>(user))
       if (!isa<AllocStackInst>(si->getSrc()))
         continue;
 
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(user)) {
+      // Since all uses of the alloc_stack will be via store_borrow, check if
+      // there are any non-writes from the store_borrow location.
+      if (!isWriteOnlyAllocation(sbi)) {
+        return false;
+      }
+      continue;
+    }
+
     // Deallocation is also okay.
     if (isa<DeallocStackInst>(user))
+      continue;
+
+    if (isa<EndBorrowInst>(user))
       continue;
 
     // If we haven't already promoted the AllocStack, we may see
@@ -1557,7 +1744,6 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
   LLVM_DEBUG(llvm::dbgs() << "*** Promoting in-block: " << *asi);
 
   SILBasicBlock *parentBlock = asi->getParent();
-
   // The default value of the AllocStack is NULL because we don't have
   // uninitialized variables in Swift.
   Optional<StorageStateTracking<LiveValues>> runningVals;
@@ -1580,18 +1766,19 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
             /*isStorageValid=*/true};
       }
       assert(runningVals && runningVals->isStorageValid);
-      if (cast<LoadInst>(inst)->getOwnershipQualifier() ==
-          LoadOwnershipQualifier::Take) {
+      auto *loadInst = dyn_cast<LoadInst>(inst);
+      if (loadInst &&
+          loadInst->getOwnershipQualifier() == LoadOwnershipQualifier::Take) {
         if (shouldAddLexicalLifetime(asi)) {
           // End the lexical lifetime at a load [take].  The storage is no
           // longer keeping the value alive.
-          endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/inst, ctx,
-                                       runningVals->value);
+          endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/inst,
+                                            ctx, runningVals->value);
         }
         runningVals->isStorageValid = false;
       }
-      replaceLoad(cast<LoadInst>(inst), runningVals->value.replacement(asi),
-                  asi, ctx, deleter, instructionsToDelete);
+      replaceLoad(inst, runningVals->value.replacement(asi, inst), asi, ctx,
+                  deleter, instructionsToDelete);
       ++NumInstRemoved;
       continue;
     }
@@ -1599,26 +1786,62 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     // Remove stores and record the value that we are saving as the running
     // value.
     if (auto *si = dyn_cast<StoreInst>(inst)) {
-      if (si->getDest() == asi) {
-        if (si->getOwnershipQualifier() == StoreOwnershipQualifier::Assign) {
-          assert(runningVals && runningVals->isStorageValid);
-          SILBuilderWithScope(si, ctx).createDestroyValue(
-              si->getLoc(), runningVals->value.replacement(asi));
-        }
-        auto oldRunningVals = runningVals;
-        runningVals = {LiveValues::toReplace(asi, /*replacement=*/si->getSrc()),
-                       /*isStorageValid=*/true};
-        if (shouldAddLexicalLifetime(asi)) {
-          if (oldRunningVals && oldRunningVals->isStorageValid) {
-            endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/si, ctx,
-                                         oldRunningVals->value);
-          }
-          runningVals = beginLexicalLifetimeAfterStore(asi, si);
-        }
-        deleter.forceDelete(inst);
-        ++NumInstRemoved;
+      if (si->getDest() != asi) {
         continue;
       }
+      if (si->getOwnershipQualifier() == StoreOwnershipQualifier::Assign) {
+        assert(runningVals && runningVals->isStorageValid);
+        SILBuilderWithScope(si, ctx).createDestroyValue(
+            si->getLoc(), runningVals->value.replacement(asi, si));
+      }
+      auto oldRunningVals = runningVals;
+      runningVals = {LiveValues::toReplace(asi, /*replacement=*/si->getSrc()),
+                     /*isStorageValid=*/true};
+      if (shouldAddLexicalLifetime(asi)) {
+        if (oldRunningVals && oldRunningVals->isStorageValid) {
+          endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/si, ctx,
+                                            oldRunningVals->value);
+        }
+        runningVals = beginLexicalLifetimeAfterStore(asi, si);
+      }
+      deleter.forceDelete(inst);
+      ++NumInstRemoved;
+      continue;
+    }
+
+    if (auto *sbi = dyn_cast<StoreBorrowInst>(inst)) {
+      if (sbi->getDest() != asi) {
+        continue;
+      }
+      runningVals = {LiveValues::toReplace(asi, /*replacement=*/sbi->getSrc()),
+                     /*isStorageValid=*/true};
+      if (shouldAddLexicalLifetime(asi)) {
+        runningVals = beginLexicalLifetimeAfterStore(asi, inst);
+      }
+      continue;
+    }
+
+    if (auto *ebi = dyn_cast<EndBorrowInst>(inst)) {
+      auto *sbi = dyn_cast<StoreBorrowInst>(ebi->getOperand());
+      if (!sbi) {
+        continue;
+      }
+      if (sbi->getDest() != asi) {
+        continue;
+      }
+      if (!runningVals.hasValue()) {
+        continue;
+      }
+      if (sbi->getSrc() != runningVals->value.stored) {
+        continue;
+      }
+      runningVals->isStorageValid = false;
+      if (!canEndLexicalLifetime(runningVals->value)) {
+        continue;
+      }
+      endGuaranteedLexicalLifetimeBeforeInst(asi, ebi->getNextInstruction(),
+                                             ctx, runningVals->value);
+      continue;
     }
 
     // Replace debug_value w/ address value with debug_value of
@@ -1626,8 +1849,8 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     if (auto *dvi = DebugValueInst::hasAddrVal(inst)) {
       if (dvi->getOperand() == asi) {
         if (runningVals) {
-          promoteDebugValueAddr(dvi, runningVals->value.replacement(asi), ctx,
-                                deleter);
+          promoteDebugValueAddr(dvi, runningVals->value.replacement(asi, dvi),
+                                ctx, deleter);
         } else {
           // Drop debug_value of uninitialized void values.
           assert(asi->getElementType().isVoid() &&
@@ -1642,11 +1865,11 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     if (auto *dai = dyn_cast<DestroyAddrInst>(inst)) {
       if (dai->getOperand() == asi) {
         assert(runningVals && runningVals->isStorageValid);
-        replaceDestroy(dai, runningVals->value.replacement(asi), ctx, deleter,
-                       instructionsToDelete);
+        replaceDestroy(dai, runningVals->value.replacement(asi, dai), ctx,
+                       deleter, instructionsToDelete);
         if (shouldAddLexicalLifetime(asi)) {
-          endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/dai, ctx,
-                                       runningVals->value);
+          endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/dai, ctx,
+                                            runningVals->value);
         }
         runningVals->isStorageValid = false;
       }
@@ -1656,7 +1879,7 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     // Remove deallocation.
     if (auto *dsi = dyn_cast<DeallocStackInst>(inst)) {
       if (dsi->getOperand() == asi) {
-        deleter.forceDelete(inst);
+        deleter.forceDelete(dsi);
         NumInstRemoved++;
         // No need to continue scanning after deallocation.
         break;
@@ -1676,51 +1899,23 @@ void MemoryToRegisters::removeSingleBlockAllocation(AllocStackInst *asi) {
     }
   }
 
-  if (runningVals && runningVals->isStorageValid &&
-      shouldAddLexicalLifetime(asi)) {
+  if (shouldAddLexicalLifetime(asi) && runningVals &&
+      runningVals->isStorageValid &&
+      runningVals->value.stored->getOwnershipKind().isCompatibleWith(
+          OwnershipKind::Owned)) {
     // There is still valid storage after visiting all instructions in this
     // block which are the only instructions involving this alloc_stack.
     // This can only happen if all paths from this block end in unreachable.
     //
-    // We need to end the lexical lifetime at the last possible location, either
-    // just before an unreachable instruction or just before a branch to a block
-    // that is not dominated by parentBlock.
-
-    // Walk forward from parentBlock until finding blocks which either
-    // (1) terminate in unreachable
-    // (2) have successors which are not dominated by parentBlock
-    GraphNodeWorklist<SILBasicBlock *, 2> worklist;
-    worklist.initialize(parentBlock);
-    while (auto *block = worklist.pop()) {
-      assert(domInfo->dominates(parentBlock, block));
+    // We need to end the lexical lifetime at the last possible location, at the
+    // boundary blocks which are the predecessors of dominance frontier
+    // dominated by the alloc_stack.
+    SmallVector<SILBasicBlock *, 4> boundary;
+    computeDominatedBoundaryBlocks(asi->getParent(), domInfo, boundary);
+    for (auto *block : boundary) {
       auto *terminator = block->getTerminator();
-      if (isa<UnreachableInst>(terminator)) {
-        endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/terminator, ctx,
-                                     runningVals->value);
-        continue;
-      }
-      SILBasicBlock *successor = nullptr;
-      // If any successor is not dominated by the parentBlock, then we must end
-      // the lifetime before that successor.
-      //
-      // Suppose that a successor is not dominated by parentBlock.  Recall that
-      // block _is_ dominated by parentBlock.  Thus that successor must have
-      // more than one predecessor: block, and at least one other.  (Otherwise
-      // it would be dominated by parentBlock contrary to our assumption.)
-      // Recall that SIL does not allow critical edges.  Therefore block has
-      // only a single successor.
-      //
-      // Use the above fact to only look for lack of domination of a successor
-      // if that successor is the single successor of block.
-      if ((successor = block->getSingleSuccessorBlock()) &&
-          (!domInfo->dominates(parentBlock, successor))) {
-        endLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/terminator, ctx,
-                                     runningVals->value);
-        continue;
-      }
-      for (auto *successor : block->getSuccessorBlocks()) {
-        worklist.insert(successor);
-      }
+      endOwnedLexicalLifetimeBeforeInst(asi, /*beforeInstruction=*/terminator,
+                                        ctx, runningVals->value);
     }
   }
 }
@@ -1741,16 +1936,15 @@ bool MemoryToRegisters::promoteSingleAllocation(AllocStackInst *alloc) {
 
   // Don't handle captured AllocStacks.
   bool inSingleBlock = false;
-  if (isCaptured(alloc, inSingleBlock)) {
+  if (isCaptured(alloc, &inSingleBlock)) {
     ++NumAllocStackCaptured;
     return false;
   }
 
   // Remove write-only AllocStacks.
   if (isWriteOnlyAllocation(alloc) && !shouldAddLexicalLifetime(alloc)) {
-    deleter.forceDeleteWithUsers(alloc);
-
     LLVM_DEBUG(llvm::dbgs() << "*** Deleting store-only AllocStack: "<< *alloc);
+    deleter.forceDeleteWithUsers(alloc);
     return true;
   }
 
@@ -1761,17 +1955,7 @@ bool MemoryToRegisters::promoteSingleAllocation(AllocStackInst *alloc) {
 
     LLVM_DEBUG(llvm::dbgs() << "*** Deleting single block AllocStackInst: "
                             << *alloc);
-    if (alloc->use_empty()) {
-      deleter.forceDelete(alloc);
-    } else {
-      // Handle a corner case where the ASI still has uses:
-      // This can come up if the source contains a withUnsafePointer where
-      // the pointer escapes. It's illegal code but we should not crash.
-      // Re-insert a dealloc_stack so that the verifier is happy.
-      auto *next = alloc->getNextInstruction();
-      SILBuilderWithScope b(next, ctx);
-      b.createDeallocStack(next->getLoc(), alloc);
-    }
+    deleter.forceDeleteWithUsers(alloc);
     return true;
   } else {
     // For enums we require that all uses are in the same block.

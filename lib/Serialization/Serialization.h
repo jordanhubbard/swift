@@ -219,6 +219,10 @@ class Serializer : public SerializerBase {
                        index_block::GENERIC_SIGNATURE_OFFSETS>
   GenericSignaturesToSerialize;
 
+  ASTBlockRecordKeeper<const GenericEnvironment *, GenericEnvironmentID,
+                       index_block::GENERIC_ENVIRONMENT_OFFSETS>
+  GenericEnvironmentsToSerialize;
+
   ASTBlockRecordKeeper<SubstitutionMap, SubstitutionMapID,
                        index_block::SUBSTITUTION_MAP_OFFSETS>
   SubstitutionMapsToSerialize;
@@ -251,7 +255,7 @@ public:
 
   using DeclMembersData = SmallVector<DeclID, 2>;
   // In-memory representation of what will eventually be an on-disk
-  // hash table of all ValueDecl-members of a paticular DeclBaseName.
+  // hash table of all ValueDecl-members of a particular DeclBaseName.
   using DeclMembersTable = llvm::MapVector<uint32_t, DeclMembersData>;
 
   using DeclMemberNamesData = std::pair<serialization::BitOffset,
@@ -353,6 +357,9 @@ private:
   /// Writes a generic signature.
   void writeASTBlockEntity(GenericSignature sig);
 
+  /// Writes a generic environment.
+  void writeASTBlockEntity(const GenericEnvironment *env);
+
   /// Writes a substitution map.
   void writeASTBlockEntity(const SubstitutionMap substitutions);
 
@@ -400,7 +407,7 @@ private:
   /// Top-level entry point for serializing a module.
   void writeAST(ModuleOrSourceFile DC);
 
-  /// Serializes the given dependnecy graph into the incremental information
+  /// Serializes the given dependency graph into the incremental information
   /// section of this swift module.
   void writeIncrementalInfo(
       const fine_grained_dependencies::SourceFileDepGraph *DepGraph);
@@ -483,6 +490,9 @@ public:
   /// The GenericSignature will be scheduled for serialization if necessary.
   GenericSignatureID addGenericSignatureRef(GenericSignature sig);
 
+  /// Records the use of the given opened generic environment.
+  GenericEnvironmentID addGenericEnvironmentRef(GenericEnvironment *env);
+
   /// Records the use of the given substitution map.
   ///
   /// The SubstitutionMap will be scheduled for serialization if necessary.
@@ -518,10 +528,13 @@ public:
   /// may not be exactly the same as the name of the module containing DC;
   /// instead, it will match the containing file's "exported module name".
   ///
+  /// \param ignoreExport When true, register the real module name,
+  /// ignoring exported_as definitions.
   /// \returns The ID for the identifier for the module's name, or one of the
   /// special module codes defined above.
   /// \see FileUnit::getExportedModuleName
-  IdentifierID addContainingModuleRef(const DeclContext *DC);
+  IdentifierID addContainingModuleRef(const DeclContext *DC,
+                                      bool ignoreExport);
 
   /// Records the module \m.
   IdentifierID addModuleRef(const ModuleDecl *m);
@@ -540,6 +553,9 @@ public:
 
   /// Writes a protocol's associated type table.
   void writeAssociatedTypes(ArrayRef<AssociatedTypeDecl *> assocTypes);
+
+  /// Writes a protocol's primary associated type table.
+  void writePrimaryAssociatedTypes(ArrayRef<AssociatedTypeDecl *> assocTypes);
 
   bool allowCompilerErrors() const;
 };

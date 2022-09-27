@@ -27,6 +27,7 @@
 
 #include "swift/ABI/Enum.h"
 #include "swift/ABI/ObjectFile.h"
+#include "swift/Concurrency/Actor.h"
 #include "swift/Remote/MemoryReader.h"
 #include "swift/Remote/MetadataReader.h"
 #include "swift/Reflection/Records.h"
@@ -42,6 +43,32 @@
 #include <vector>
 
 #include <inttypes.h>
+
+// The Swift runtime can be built in two ways: with or without
+// SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION enabled. In order to decode the
+// lock used in a runtime with priority escalation enabled, we need inline
+// functions from dispatch/swift_concurrency_private.h. If we don't have that
+// header at build time, we can still build but we'll be unable to decode the
+// lock and thus information about a running task is degraded. There are four
+// combinations:
+//
+//      Runtime        | swift_concurrency_private.h | task running info
+// --------------------+-----------------------------+------------------
+// without escalation  |         present             |       full
+// without escalation  |       not present           |       full
+//   with escalation   |         present             |       full
+//   with escalation   |       not present           |     DEGRADED
+//
+// Currently, degraded info has these effects:
+// 1. Task.IsRunning is not available, indicated with Task.HasIsRunning = false.
+// 2. Task async backtraces are not provided.
+// 3. Task and actor thread ports are not available, indicated with
+//    HasThreadPort = false.
+
+#if __has_include(<dispatch/swift_concurrency_private.h>)
+#include <dispatch/swift_concurrency_private.h>
+#define HAS_DISPATCH_LOCK_IS_LOCKED 1
+#endif
 
 namespace {
 
@@ -145,8 +172,26 @@ public:
   };
 
   struct AsyncTaskInfo {
-    uint32_t JobFlags;
-    uint64_t TaskStatusFlags;
+    // Job flags.
+    unsigned Kind;
+    unsigned EnqueuePriority;
+    bool IsChildTask;
+    bool IsFuture;
+    bool IsGroupChildTask;
+    bool IsAsyncLetTask;
+
+    // Task flags.
+    unsigned MaxPriority;
+    bool IsCancelled;
+    bool IsStatusRecordLocked;
+    bool IsEscalated;
+    bool HasIsRunning; // If false, the IsRunning flag is not valid.
+    bool IsRunning;
+    bool IsEnqueued;
+
+    bool HasThreadPort;
+    uint32_t ThreadPort;
+
     uint64_t Id;
     StoredPointer RunJob;
     StoredPointer AllocatorSlabPtr;
@@ -155,13 +200,21 @@ public:
   };
 
   struct ActorInfo {
-    StoredSize Flags;
     StoredPointer FirstJob;
+
+    uint8_t State;
+    bool IsPriorityEscalated;
+    bool IsDistributedRemote;
+    uint8_t MaxPriority;
+
+    bool HasThreadPort;
+    uint32_t ThreadPort;
   };
 
-  explicit ReflectionContext(std::shared_ptr<MemoryReader> reader)
-    : super(std::move(reader), *this)
-  {}
+  explicit ReflectionContext(
+      std::shared_ptr<MemoryReader> reader,
+      remote::ExternalTypeRefCache *externalCache = nullptr)
+      : super(std::move(reader), *this, externalCache) {}
 
   ReflectionContext(const ReflectionContext &other) = delete;
   ReflectionContext &operator=(const ReflectionContext &other) = delete;
@@ -175,7 +228,12 @@ public:
     return sizeof(StoredPointer) * 2;
   }
 
-  template <typename T> bool readMachOSections(RemoteAddress ImageStart) {
+  /// On success returns the ID of the newly registered Reflection Info.
+  template <typename T>
+  llvm::Optional<uint32_t>
+  readMachOSections(
+      RemoteAddress ImageStart,
+      llvm::SmallVector<llvm::StringRef, 1> PotentialModuleNames = {}) {
     auto Buf =
         this->getReader().readBytes(ImageStart, sizeof(typename T::Header));
     if (!Buf)
@@ -285,17 +343,17 @@ public:
         MPEnumMdSec.first == nullptr)
       return false;
 
-    ReflectionInfo info = {
-        {FieldMdSec.first, FieldMdSec.second},
-        {AssocTySec.first, AssocTySec.second},
-        {BuiltinTySec.first, BuiltinTySec.second},
-        {CaptureSec.first, CaptureSec.second},
-        {TypeRefMdSec.first, TypeRefMdSec.second},
-        {ReflStrMdSec.first, ReflStrMdSec.second},
-        {ConformMdSec.first, ConformMdSec.second},
-        {MPEnumMdSec.first, MPEnumMdSec.second}};
+    ReflectionInfo info = {{FieldMdSec.first, FieldMdSec.second},
+                           {AssocTySec.first, AssocTySec.second},
+                           {BuiltinTySec.first, BuiltinTySec.second},
+                           {CaptureSec.first, CaptureSec.second},
+                           {TypeRefMdSec.first, TypeRefMdSec.second},
+                           {ReflStrMdSec.first, ReflStrMdSec.second},
+                           {ConformMdSec.first, ConformMdSec.second},
+                           {MPEnumMdSec.first, MPEnumMdSec.second},
+                           PotentialModuleNames};
 
-    this->addReflectionInfo(info);
+    auto InfoID = this->addReflectionInfo(info);
 
     // Find the __DATA segment.
     for (unsigned I = 0; I < NumCommands; ++I) {
@@ -319,10 +377,13 @@ public:
 
     savedBuffers.push_back(std::move(Buf));
     savedBuffers.push_back(std::move(Sections));
-    return true;
+    return InfoID;
   }
 
-  bool readPECOFFSections(RemoteAddress ImageStart) {
+  /// On success returns the ID of the newly registered Reflection Info.
+  llvm::Optional<uint32_t> readPECOFFSections(
+      RemoteAddress ImageStart,
+      llvm::SmallVector<llvm::StringRef, 1> PotentialModuleNames = {}) {
     auto DOSHdrBuf = this->getReader().readBytes(
         ImageStart, sizeof(llvm::object::dos_header));
     if (!DOSHdrBuf)
@@ -411,20 +472,21 @@ public:
         MPEnumMdSec.first == nullptr)
       return false;
 
-    ReflectionInfo Info = {
-        {FieldMdSec.first, FieldMdSec.second},
-        {AssocTySec.first, AssocTySec.second},
-        {BuiltinTySec.first, BuiltinTySec.second},
-        {CaptureSec.first, CaptureSec.second},
-        {TypeRefMdSec.first, TypeRefMdSec.second},
-        {ReflStrMdSec.first, ReflStrMdSec.second},
-        {ConformMdSec.first, ConformMdSec.second},
-        {MPEnumMdSec.first, MPEnumMdSec.second}};
-    this->addReflectionInfo(Info);
-    return true;
+    ReflectionInfo Info = {{FieldMdSec.first, FieldMdSec.second},
+                           {AssocTySec.first, AssocTySec.second},
+                           {BuiltinTySec.first, BuiltinTySec.second},
+                           {CaptureSec.first, CaptureSec.second},
+                           {TypeRefMdSec.first, TypeRefMdSec.second},
+                           {ReflStrMdSec.first, ReflStrMdSec.second},
+                           {ConformMdSec.first, ConformMdSec.second},
+                           {MPEnumMdSec.first, MPEnumMdSec.second},
+                           PotentialModuleNames};
+    return this->addReflectionInfo(Info);
   }
 
-  bool readPECOFF(RemoteAddress ImageStart) {
+  /// On success returns the ID of the newly registered Reflection Info.
+  llvm::Optional<uint32_t> readPECOFF(RemoteAddress ImageStart,
+                  llvm::SmallVector<llvm::StringRef, 1> PotentialModuleNames = {}) {
     auto Buf = this->getReader().readBytes(ImageStart,
                                            sizeof(llvm::object::dos_header));
     if (!Buf)
@@ -443,12 +505,15 @@ public:
     if (memcmp(Buf.get(), llvm::COFF::PEMagic, sizeof(llvm::COFF::PEMagic)))
       return false;
 
-    return readPECOFFSections(ImageStart);
+    return readPECOFFSections(ImageStart, PotentialModuleNames);
   }
 
+  /// On success returns the ID of the newly registered Reflection Info.
   template <typename T>
-  bool readELFSections(RemoteAddress ImageStart,
-                       llvm::Optional<llvm::sys::MemoryBlock> FileBuffer) {
+  llvm::Optional<uint32_t> readELFSections(
+      RemoteAddress ImageStart,
+      llvm::Optional<llvm::sys::MemoryBlock> FileBuffer,
+      llvm::SmallVector<llvm::StringRef, 1> PotentialModuleNames = {}) {
     // When reading from the FileBuffer we can simply return a pointer to
     // the underlying data.
     // When reading from the process, we need to keep the memory around
@@ -603,18 +668,17 @@ public:
         MPEnumMdSec.first == nullptr)
       return false;
 
-    ReflectionInfo info = {
-        {FieldMdSec.first, FieldMdSec.second},
-        {AssocTySec.first, AssocTySec.second},
-        {BuiltinTySec.first, BuiltinTySec.second},
-        {CaptureSec.first, CaptureSec.second},
-        {TypeRefMdSec.first, TypeRefMdSec.second},
-        {ReflStrMdSec.first, ReflStrMdSec.second},
-        {ConformMdSec.first, ConformMdSec.second},
-        {MPEnumMdSec.first, MPEnumMdSec.second}};
+    ReflectionInfo info = {{FieldMdSec.first, FieldMdSec.second},
+                           {AssocTySec.first, AssocTySec.second},
+                           {BuiltinTySec.first, BuiltinTySec.second},
+                           {CaptureSec.first, CaptureSec.second},
+                           {TypeRefMdSec.first, TypeRefMdSec.second},
+                           {ReflStrMdSec.first, ReflStrMdSec.second},
+                           {ConformMdSec.first, ConformMdSec.second},
+                           {MPEnumMdSec.first, MPEnumMdSec.second},
+                           PotentialModuleNames};
 
-    this->addReflectionInfo(info);
-    return true;
+    return this->addReflectionInfo(info);
   }
 
   /// Parses metadata information from an ELF image. Because the Section
@@ -633,34 +697,40 @@ public:
   ///     instance's memory reader.
   ///
   /// \return
-  ///     /b True if the metadata information was parsed successfully,
-  ///     /b false otherwise.
-  bool readELF(RemoteAddress ImageStart, llvm::Optional<llvm::sys::MemoryBlock> FileBuffer) {
+  ///     \b  The newly added reflection info ID if successful,
+  ///     \b llvm::None otherwise.
+  llvm::Optional<uint32_t>
+  readELF(RemoteAddress ImageStart,
+          llvm::Optional<llvm::sys::MemoryBlock> FileBuffer,
+          llvm::SmallVector<llvm::StringRef, 1> PotentialModuleNames = {}) {
     auto Buf =
         this->getReader().readBytes(ImageStart, sizeof(llvm::ELF::Elf64_Ehdr));
     if (!Buf)
-      return false;
+      return llvm::None;
 
     // Read the header.
     auto Hdr = reinterpret_cast<const llvm::ELF::Elf64_Ehdr *>(Buf.get());
 
     if (!Hdr->checkMagic())
-      return false;
+      return llvm::None;
 
     // Check if we have a ELFCLASS32 or ELFCLASS64
     unsigned char FileClass = Hdr->getFileClass();
     if (FileClass == llvm::ELF::ELFCLASS64) {
       return readELFSections<ELFTraits<llvm::ELF::ELFCLASS64>>(
-          ImageStart, FileBuffer);
+          ImageStart, FileBuffer, PotentialModuleNames);
     } else if (FileClass == llvm::ELF::ELFCLASS32) {
       return readELFSections<ELFTraits<llvm::ELF::ELFCLASS32>>(
-          ImageStart, FileBuffer);
+          ImageStart, FileBuffer, PotentialModuleNames);
     } else {
-      return false;
+      return llvm::None;
     }
   }
 
-  bool addImage(RemoteAddress ImageStart) {
+  /// On success returns the ID of the newly registered Reflection Info.
+  llvm::Optional<uint32_t>
+  addImage(RemoteAddress ImageStart,
+           llvm::SmallVector<llvm::StringRef, 1> PotentialModuleNames = {}) {
     // Read the first few bytes to look for a magic header.
     auto Magic = this->getReader().readBytes(ImageStart, sizeof(uint32_t));
     if (!Magic)
@@ -671,18 +741,18 @@ public:
 
     // 32- and 64-bit Mach-O.
     if (MagicWord == llvm::MachO::MH_MAGIC) {
-      return readMachOSections<MachOTraits<4>>(ImageStart);
+      return readMachOSections<MachOTraits<4>>(ImageStart, PotentialModuleNames);
     }
 
     if (MagicWord == llvm::MachO::MH_MAGIC_64) {
-      return readMachOSections<MachOTraits<8>>(ImageStart);
+      return readMachOSections<MachOTraits<8>>(ImageStart, PotentialModuleNames);
     }
 
     // PE. (This just checks for the DOS header; `readPECOFF` will further
     // validate the existence of the PE header.)
     auto MagicBytes = (const char*)Magic.get();
     if (MagicBytes[0] == 'M' && MagicBytes[1] == 'Z') {
-      return readPECOFF(ImageStart);
+      return readPECOFF(ImageStart, PotentialModuleNames);
     }
 
 
@@ -691,11 +761,12 @@ public:
         && MagicBytes[1] == llvm::ELF::ElfMagic[1]
         && MagicBytes[2] == llvm::ELF::ElfMagic[2]
         && MagicBytes[3] == llvm::ELF::ElfMagic[3]) {
-      return readELF(ImageStart, llvm::Optional<llvm::sys::MemoryBlock>());
+      return readELF(ImageStart, llvm::Optional<llvm::sys::MemoryBlock>(),
+                     PotentialModuleNames);
     }
 
     // We don't recognize the format.
-    return false;
+    return llvm::None;
   }
 
   /// Adds an image using the FindSection closure to find the swift metadata
@@ -704,11 +775,13 @@ public:
   ///     of freeing the memory buffer in the RemoteRef return value.
   ///     process.
   /// \return
-  ///     \b True if any of the reflection sections were registered,
-  ///     \b false otherwise.
-  bool addImage(llvm::function_ref<
-                std::pair<RemoteRef<void>, uint64_t>(ReflectionSectionKind)>
-                    FindSection) {
+  ///     \b  The newly added reflection info ID if successful,
+  ///     \b llvm::None otherwise.
+  llvm::Optional<uint32_t>
+  addImage(llvm::function_ref<
+               std::pair<RemoteRef<void>, uint64_t>(ReflectionSectionKind)>
+               FindSection,
+           llvm::SmallVector<llvm::StringRef, 1> PotentialModuleNames = {}) {
     auto Sections = {
         ReflectionSectionKind::fieldmd, ReflectionSectionKind::assocty,
         ReflectionSectionKind::builtin, ReflectionSectionKind::capture,
@@ -730,19 +803,23 @@ public:
 
     // If we didn't find any sections, return.
     if (llvm::all_of(Pairs, [](const auto &Pair) { return !Pair.first; }))
-      return false;
+      return {};
 
-    ReflectionInfo Info = {
-        {Pairs[0].first, Pairs[0].second}, {Pairs[1].first, Pairs[1].second},
-        {Pairs[2].first, Pairs[2].second}, {Pairs[3].first, Pairs[3].second},
-        {Pairs[4].first, Pairs[4].second}, {Pairs[5].first, Pairs[5].second},
-        {Pairs[6].first, Pairs[6].second}, {Pairs[7].first, Pairs[7].second}};
-    this->addReflectionInfo(Info);
-    return true;
+    ReflectionInfo Info = {{Pairs[0].first, Pairs[0].second},
+                           {Pairs[1].first, Pairs[1].second},
+                           {Pairs[2].first, Pairs[2].second},
+                           {Pairs[3].first, Pairs[3].second},
+                           {Pairs[4].first, Pairs[4].second},
+                           {Pairs[5].first, Pairs[5].second},
+                           {Pairs[6].first, Pairs[6].second},
+                           {Pairs[7].first, Pairs[7].second},
+                           PotentialModuleNames};
+    return addReflectionInfo(Info);
   }
 
-  void addReflectionInfo(ReflectionInfo I) {
-    getBuilder().addReflectionInfo(I);
+  /// Adds the reflection info and returns it's id.
+  uint32_t addReflectionInfo(ReflectionInfo I) {
+    return getBuilder().addReflectionInfo(I);
   }
 
   bool ownsObject(RemoteAddress ObjectAddress) {
@@ -1254,6 +1331,8 @@ public:
     case ExistentialMetatypeValueWitnessTablesTag:
     case ExistentialMetatypesTag:
     case ExistentialTypesTag:
+    case ExtendedExistentialTypesTag:
+    case ExtendedExistentialTypeShapesTag:
     case OpaqueExistentialValueWitnessTablesTag:
     case ClassExistentialValueWitnessTablesTag:
     case ForeignWitnessTablesTag:
@@ -1323,8 +1402,15 @@ public:
       return std::string("failure reading allocation pool contents");
     auto Pool = reinterpret_cast<const PoolRange *>(PoolBytes.get());
 
+    // Limit how many iterations of this loop we'll do, to avoid potential
+    // infinite loops when reading bad data. Limit to 1 million iterations. In
+    // normal operation, each pool allocation is 16kB, so that would be ~16GB of
+    // metadata which is far more than any normal program should have.
+    unsigned LoopCount = 0;
+    unsigned LoopLimit = 1000000;
+
     auto TrailerPtr = Pool->Begin + Pool->Remaining;
-    while (TrailerPtr) {
+    while (TrailerPtr && LoopCount++ < LoopLimit) {
       auto TrailerBytes = getReader()
         .readBytes(RemoteAddress(TrailerPtr), sizeof(PoolTrailer));
       if (!TrailerBytes)
@@ -1372,8 +1458,15 @@ public:
     if (!BacktraceListNextPtr)
       return llvm::None;
 
+    // Limit how many iterations of this loop we'll do, to avoid potential
+    // infinite loops when reading bad data. Limit to 1 billion iterations. In
+    // normal operation, a program shouldn't have anywhere near 1 billion
+    // metadata allocations.
+    unsigned LoopCount = 0;
+    unsigned LoopLimit = 1000000000;
+
     auto BacktraceListNext = BacktraceListNextPtr->getResolvedAddress();
-    while (BacktraceListNext) {
+    while (BacktraceListNext && LoopCount++ < LoopLimit) {
       auto HeaderBytes = getReader().readBytes(
           RemoteAddress(BacktraceListNext),
           sizeof(MetadataAllocationBacktraceHeader<Runtime>));
@@ -1419,42 +1512,167 @@ public:
     // provide the whole thing as one big chunk.
     size_t HeaderSize =
         llvm::alignTo(sizeof(*Slab), llvm::Align(MaximumAlignment));
-    AsyncTaskAllocationChunk Chunk;
 
-    Chunk.Start = SlabPtr + HeaderSize;
-    Chunk.Length = Slab->CurrentOffset;
-    Chunk.Kind = AsyncTaskAllocationChunk::ChunkKind::Unknown;
+    AsyncTaskAllocationChunk AllocatedSpaceChunk;
+    AllocatedSpaceChunk.Start = SlabPtr + HeaderSize;
+    AllocatedSpaceChunk.Length = Slab->CurrentOffset;
+    AllocatedSpaceChunk.Kind = AsyncTaskAllocationChunk::ChunkKind::Unknown;
+
+    // Provide a second chunk just for the Next pointer, so the client knows
+    // that there's an allocation there.
+    AsyncTaskAllocationChunk NextPtrChunk;
+    NextPtrChunk.Start =
+        SlabPtr + offsetof(typename StackAllocator::Slab, Next);
+    NextPtrChunk.Length = sizeof(Slab->Next);
+    NextPtrChunk.Kind = AsyncTaskAllocationChunk::ChunkKind::RawPointer;
 
     // Total slab size is the slab's capacity plus the header.
     StoredPointer SlabSize = Slab->Capacity + HeaderSize;
 
-    return {llvm::None, {Slab->Next, SlabSize, {Chunk}}};
+    return {llvm::None,
+            {Slab->Next, SlabSize, {NextPtrChunk, AllocatedSpaceChunk}}};
   }
 
   std::pair<llvm::Optional<std::string>, AsyncTaskInfo>
-  asyncTaskInfo(StoredPointer AsyncTaskPtr) {
+  asyncTaskInfo(StoredPointer AsyncTaskPtr, unsigned ChildTaskLimit,
+                unsigned AsyncBacktraceLimit) {
     loadTargetPointers();
 
-    if (supportsPriorityEscalation) {
-      return {std::string("Failure reading async task with escalation support"), {}};
-    }
+    if (supportsPriorityEscalation)
+      return asyncTaskInfo<
+          AsyncTask<Runtime, ActiveTaskStatusWithEscalation<Runtime>>>(
+          AsyncTaskPtr, ChildTaskLimit, AsyncBacktraceLimit);
+    else
+      return asyncTaskInfo<
+          AsyncTask<Runtime, ActiveTaskStatusWithoutEscalation<Runtime>>>(
+          AsyncTaskPtr, ChildTaskLimit, AsyncBacktraceLimit);
+  }
 
-    using AsyncTask = AsyncTask<Runtime, ActiveTaskStatusWithoutEscalation<Runtime>>;
-    auto AsyncTaskObj = readObj<AsyncTask>(AsyncTaskPtr);
+  std::pair<llvm::Optional<std::string>, ActorInfo>
+  actorInfo(StoredPointer ActorPtr) {
+    if (supportsPriorityEscalation)
+      return actorInfo<
+          DefaultActorImpl<Runtime, ActiveActorStatusWithEscalation<Runtime>>>(
+          ActorPtr);
+    else
+      return actorInfo<DefaultActorImpl<
+          Runtime, ActiveActorStatusWithoutEscalation<Runtime>>>(ActorPtr);
+  }
+
+  StoredPointer nextJob(StoredPointer JobPtr) {
+    using Job = Job<Runtime>;
+
+    auto JobBytes = getReader().readBytes(RemoteAddress(JobPtr), sizeof(Job));
+    auto *JobObj = reinterpret_cast<const Job *>(JobBytes.get());
+    if (!JobObj)
+      return 0;
+
+    // This is a JobRef which stores flags in the low bits.
+    return JobObj->SchedulerPrivate[0] & ~StoredPointer(0x3);
+  }
+
+private:
+  void setIsRunning(
+      AsyncTaskInfo &Info,
+      const AsyncTask<Runtime, ActiveTaskStatusWithEscalation<Runtime>> *Task) {
+#if HAS_DISPATCH_LOCK_IS_LOCKED
+    Info.HasIsRunning = true;
+    Info.IsRunning =
+        dispatch_lock_is_locked(Task->PrivateStorage.Status.ExecutionLock[0]);
+#else
+    // The target runtime was built with priority escalation but we don't have
+    // the swift_concurrency_private.h header needed to decode the running
+    // status in the task. Set HasIsRunning to false to indicate that we can't
+    // tell whether or not the task is running.
+    Info.HasIsRunning = false;
+#endif
+  }
+
+  void setIsRunning(
+      AsyncTaskInfo &Info,
+      const AsyncTask<Runtime, ActiveTaskStatusWithoutEscalation<Runtime>>
+          *Task) {
+    Info.HasIsRunning = true;
+    Info.IsRunning =
+        Task->PrivateStorage.Status.Flags[0] & ActiveTaskStatusFlags::IsRunning;
+  }
+
+  std::pair<bool, uint32_t> getThreadPort(
+      const AsyncTask<Runtime, ActiveTaskStatusWithEscalation<Runtime>> *Task) {
+#if HAS_DISPATCH_LOCK_IS_LOCKED
+    return {true,
+            dispatch_lock_owner(Task->PrivateStorage.Status.ExecutionLock[0])};
+#else
+    // The target runtime was built with priority escalation but we don't have
+    // the swift_concurrency_private.h header needed to decode the lock.
+    return {false, 0};
+#endif
+  }
+
+  std::pair<bool, uint32_t> getThreadPort(
+      const AsyncTask<Runtime, ActiveTaskStatusWithoutEscalation<Runtime>>
+          *Task) {
+    // Tasks without escalation have no thread port to query.
+    return {false, 0};
+  }
+
+  std::pair<bool, uint32_t> getThreadPort(
+      const DefaultActorImpl<Runtime, ActiveActorStatusWithEscalation<Runtime>>
+          *Actor) {
+#if HAS_DISPATCH_LOCK_IS_LOCKED
+    return {true, dispatch_lock_owner(Actor->Status.DrainLock[0])};
+#else
+    // The target runtime was built with priority escalation but we don't have
+    // the swift_concurrency_private.h header needed to decode the lock.
+    return {false, 0};
+#endif
+  }
+
+  std::pair<bool, uint32_t>
+  getThreadPort(const DefaultActorImpl<
+                Runtime, ActiveActorStatusWithoutEscalation<Runtime>> *Actor) {
+    // Actors without escalation have no thread port to query.
+    return {false, 0};
+  }
+
+  template <typename AsyncTaskType>
+  std::pair<llvm::Optional<std::string>, AsyncTaskInfo>
+  asyncTaskInfo(StoredPointer AsyncTaskPtr, unsigned ChildTaskLimit,
+                unsigned AsyncBacktraceLimit) {
+    auto AsyncTaskObj = readObj<AsyncTaskType>(AsyncTaskPtr);
     if (!AsyncTaskObj)
       return {std::string("failure reading async task"), {}};
 
     AsyncTaskInfo Info{};
-    Info.JobFlags = AsyncTaskObj->Flags;
-    Info.TaskStatusFlags = AsyncTaskObj->PrivateStorage.Status.Flags[0];
+
+    swift::JobFlags JobFlags(AsyncTaskObj->Flags);
+    Info.Kind = static_cast<unsigned>(JobFlags.getKind());
+    Info.EnqueuePriority = static_cast<unsigned>(JobFlags.getPriority());
+    Info.IsChildTask = JobFlags.task_isChildTask();
+    Info.IsFuture = JobFlags.task_isFuture();
+    Info.IsGroupChildTask = JobFlags.task_isGroupChildTask();
+    Info.IsAsyncLetTask = JobFlags.task_isAsyncLetTask();
+
+    uint32_t TaskStatusFlags = AsyncTaskObj->PrivateStorage.Status.Flags[0];
+    Info.IsCancelled = TaskStatusFlags & ActiveTaskStatusFlags::IsCancelled;
+    Info.IsStatusRecordLocked =
+        TaskStatusFlags & ActiveTaskStatusFlags::IsStatusRecordLocked;
+    Info.IsEscalated = TaskStatusFlags & ActiveTaskStatusFlags::IsEscalated;
+    Info.IsEnqueued = TaskStatusFlags & ActiveTaskStatusFlags::IsEnqueued;
+
+    setIsRunning(Info, AsyncTaskObj.get());
+    std::tie(Info.HasThreadPort, Info.ThreadPort) =
+        getThreadPort(AsyncTaskObj.get());
+
     Info.Id =
         AsyncTaskObj->Id | ((uint64_t)AsyncTaskObj->PrivateStorage.Id << 32);
     Info.AllocatorSlabPtr = AsyncTaskObj->PrivateStorage.Allocator.FirstSlab;
     Info.RunJob = getRunJob(AsyncTaskObj.get());
 
     // Find all child tasks.
+    unsigned ChildTaskLoopCount = 0;
     auto RecordPtr = AsyncTaskObj->PrivateStorage.Status.Record;
-    while (RecordPtr) {
+    while (RecordPtr && ChildTaskLoopCount++ < ChildTaskLimit) {
       auto RecordObj = readObj<TaskStatusRecord<Runtime>>(RecordPtr);
       if (!RecordObj)
         break;
@@ -1479,8 +1697,7 @@ public:
       while (ChildTask) {
         Info.ChildTasks.push_back(ChildTask);
 
-        StoredPointer ChildFragmentAddr =
-            ChildTask + sizeof(AsyncTask);
+        StoredPointer ChildFragmentAddr = ChildTask + sizeof(*AsyncTaskObj);
         auto ChildFragmentObj =
             readObj<ChildFragment<Runtime>>(ChildFragmentAddr);
         if (ChildFragmentObj)
@@ -1492,15 +1709,11 @@ public:
       RecordPtr = RecordObj->Parent;
     }
 
-    // Walk the async backtrace if the task isn't running or cancelled.
-    // TODO: Use isEnqueued from https://github.com/apple/swift/pull/41088/ once
-    // that's available.
-    int IsCancelledFlag = 0x100;
-    int IsRunningFlag = 0x800;
-    if (!(AsyncTaskObj->PrivateStorage.Status.Flags[0] & IsCancelledFlag) &&
-        !(AsyncTaskObj->PrivateStorage.Status.Flags[0] & IsRunningFlag)) {
+    // Walk the async backtrace.
+    if (Info.HasIsRunning && !Info.IsRunning) {
       auto ResumeContext = AsyncTaskObj->ResumeContextAndReserved[0];
-      while (ResumeContext) {
+      unsigned AsyncBacktraceLoopCount = 0;
+      while (ResumeContext && AsyncBacktraceLoopCount++ < AsyncBacktraceLimit) {
         auto ResumeContextObj = readObj<AsyncContext<Runtime>>(ResumeContext);
         if (!ResumeContextObj)
           break;
@@ -1513,47 +1726,40 @@ public:
     return {llvm::None, Info};
   }
 
+  template <typename ActorType>
   std::pair<llvm::Optional<std::string>, ActorInfo>
   actorInfo(StoredPointer ActorPtr) {
-    if (supportsPriorityEscalation) {
-      return {std::string("Failure reading actor with escalation support"), {}};
-    }
-
-    using DefaultActorImpl = DefaultActorImpl<Runtime, ActiveActorStatusWithoutEscalation<Runtime>>;
-
-    auto ActorObj = readObj<DefaultActorImpl>(ActorPtr);
+    auto ActorObj = readObj<ActorType>(ActorPtr);
     if (!ActorObj)
       return {std::string("failure reading actor"), {}};
 
     ActorInfo Info{};
-    Info.Flags = ActorObj->Status.Flags[0];
 
-    // Status is the low 3 bits of Flags. Status of 0 is Idle. Don't read
-    // FirstJob when idle.
-    auto Status = Info.Flags & 0x7;
-    if (Status != 0) {
+    uint32_t Flags = ActorObj->Status.Flags[0];
+    Info.State = Flags & concurrency::ActorFlagConstants::ActorStateMask;
+    Info.IsPriorityEscalated =
+        Flags & concurrency::ActorFlagConstants::IsPriorityEscalated;
+    Info.MaxPriority =
+        (Flags & concurrency::ActorFlagConstants::PriorityMask) >>
+        concurrency::ActorFlagConstants::PriorityShift;
+    Info.IsDistributedRemote = ActorObj->IsDistributedRemote;
+
+    // Don't read FirstJob when idle.
+    if (Info.State != concurrency::ActorFlagConstants::Idle) {
       // This is a JobRef which stores flags in the low bits.
       Info.FirstJob = ActorObj->Status.FirstJob & ~StoredPointer(0x3);
     }
+
+    std::tie(Info.HasThreadPort, Info.ThreadPort) =
+        getThreadPort(ActorObj.get());
+
     return {llvm::None, Info};
   }
 
-  StoredPointer nextJob(StoredPointer JobPtr) {
-    using Job = Job<Runtime>;
-
-    auto JobBytes = getReader().readBytes(RemoteAddress(JobPtr), sizeof(Job));
-    auto *JobObj = reinterpret_cast<const Job *>(JobBytes.get());
-    if (!JobObj)
-      return 0;
-
-    // This is a JobRef which stores flags in the low bits.
-    return JobObj->SchedulerPrivate[0] & ~StoredPointer(0x3);
-  }
-
-private:
   // Get the most human meaningful "run job" function pointer from the task,
   // like AsyncTask::getResumeFunctionForLogging does.
-  StoredPointer getRunJob(const AsyncTask<Runtime, ActiveTaskStatusWithoutEscalation<Runtime>> *AsyncTaskObj) {
+  template <typename AsyncTaskType>
+  StoredPointer getRunJob(const AsyncTaskType *AsyncTaskObj) {
     auto Fptr = stripSignedPointer(AsyncTaskObj->RunJob);
 
     loadTargetPointers();
@@ -1612,9 +1818,11 @@ private:
         getFunc("_swift_concurrency_debug_task_wait_throwing_resume_adapter");
     target_task_future_wait_resume_adapter =
         getFunc("_swift_concurrency_debug_task_future_wait_resume_adapter");
-    auto supportsPriorityEscalationAddr = getReader().getSymbolAddress("_swift_concurrency_debug_supportsPriorityEscalation");
+    auto supportsPriorityEscalationAddr = getReader().getSymbolAddress(
+        "_swift_concurrency_debug_supportsPriorityEscalation");
     if (supportsPriorityEscalationAddr) {
-      getReader().readInteger(supportsPriorityEscalationAddr, &supportsPriorityEscalation);
+      getReader().readInteger(supportsPriorityEscalationAddr,
+                              &supportsPriorityEscalation);
     }
 
     setupTargetPointers = true;

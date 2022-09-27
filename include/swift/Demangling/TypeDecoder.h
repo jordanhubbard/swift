@@ -434,8 +434,7 @@ void decodeRequirement(NodePointer node,
             Builder.getLayoutConstraintWithSizeAlign(*kind, size, alignment);
       }
 
-      requirements.push_back(
-          BuiltRequirement(RequirementKind::Layout, subjectType, layout));
+      requirements.push_back(BuiltRequirement(RequirementKind::Layout, subjectType, layout));
       break;
     }
     default:
@@ -464,6 +463,9 @@ class TypeDecoder {
   using BuiltSubstitution = typename BuilderType::BuiltSubstitution;
   using BuiltRequirement = typename BuilderType::BuiltRequirement;
   using BuiltLayoutConstraint = typename BuilderType::BuiltLayoutConstraint;
+  using BuiltGenericTypeParam = typename BuilderType::BuiltGenericTypeParam;
+  using BuiltGenericSignature = typename BuilderType::BuiltGenericSignature;
+  using BuiltSubstitutionMap = typename BuilderType::BuiltSubstitutionMap;
   using NodeKind = Demangle::Node::Kind;
 
   BuilderType &Builder;
@@ -544,18 +546,8 @@ protected:
                                     Node->getNumChildren());
 
       llvm::SmallVector<BuiltType, 8> args;
-
-      const auto &genericArgs = Node->getChild(1);
-      if (genericArgs->getKind() != NodeKind::TypeList)
-        return MAKE_NODE_TYPE_ERROR0(genericArgs, "is not TypeList");
-
-      for (auto genericArg : *genericArgs) {
-        auto paramType = decodeMangledType(genericArg, depth + 1,
-                                           /*forRequirement=*/false);
-        if (paramType.isError())
-          return paramType;
-        args.push_back(paramType.getType());
-      }
+      if (auto error = decodeGenericArgs(Node->getChild(1), depth+1, args))
+        return *error;
 
       auto ChildNode = Node->getChild(0);
       if (ChildNode->getKind() == NodeKind::Type &&
@@ -662,6 +654,18 @@ protected:
                                      "had a different kind when re-checked");
       }
     }
+    case NodeKind::SymbolicExtendedExistentialType: {
+      if (Node->getNumChildren() < 2)
+        return MAKE_NODE_TYPE_ERROR0(Node, "not enough children");
+
+      auto shapeNode = Node->getChild(0);
+      llvm::SmallVector<BuiltType, 8> args;
+      if (auto error = decodeGenericArgs(Node->getChild(1), depth + 1, args))
+        return *error;
+
+      return Builder.createSymbolicExtendedExistentialType(shapeNode, args);
+    }
+
     case NodeKind::ProtocolList:
     case NodeKind::ProtocolListWithAnyObject:
     case NodeKind::ProtocolListWithClass: {
@@ -710,7 +714,7 @@ protected:
                                                    forRequirement);
     }
 
-    case NodeKind::ParameterizedProtocol: {
+    case NodeKind::ConstrainedExistential: {
       if (Node->getNumChildren() < 2)
         return MAKE_NODE_TYPE_ERROR(Node,
                                     "fewer children (%zu) than required (2)",
@@ -720,23 +724,20 @@ protected:
       if (protocolType.isError())
         return protocolType;
 
-      llvm::SmallVector<BuiltType, 8> args;
+      llvm::SmallVector<BuiltRequirement, 8> requirements;
 
-      const auto &genericArgs = Node->getChild(1);
-      if (genericArgs->getKind() != NodeKind::TypeList)
-        return MAKE_NODE_TYPE_ERROR0(genericArgs, "is not TypeList");
+      auto *reqts = Node->getChild(1);
+      if (reqts->getKind() != NodeKind::ConstrainedExistentialRequirementList)
+        return MAKE_NODE_TYPE_ERROR0(reqts, "is not requirement list");
 
-      for (auto genericArg : *genericArgs) {
-        auto paramType = decodeMangledType(genericArg, depth + 1,
-                                           /*forRequirement=*/false);
-        if (paramType.isError())
-          return paramType;
-        args.push_back(paramType.getType());
-      }
+      decodeRequirement<BuiltType, BuiltRequirement, BuiltLayoutConstraint,
+                        BuilderType>(reqts, requirements, Builder);
 
-      return Builder.createParameterizedProtocolType(protocolType.getType(),
-                                                     args);
+      return Builder.createConstrainedExistentialType(protocolType.getType(),
+                                                      requirements);
     }
+    case NodeKind::ConstrainedExistentialSelf:
+      return Builder.createGenericTypeParameterType(/*depth*/ 0, /*index*/ 0);
 
     case NodeKind::Protocol:
     case NodeKind::ProtocolSymbolicReference: {
@@ -1378,6 +1379,22 @@ private:
 
     results.emplace_back(result.getType(), *convention, diffKind);
     return false;
+  }
+
+  llvm::Optional<TypeLookupError>
+  decodeGenericArgs(Demangle::NodePointer node, unsigned depth,
+                    llvm::SmallVectorImpl<BuiltType> &args) {
+    if (node->getKind() != NodeKind::TypeList)
+      return MAKE_NODE_TYPE_ERROR0(node, "is not TypeList");
+
+    for (auto genericArg : *node) {
+      auto paramType = decodeMangledType(genericArg, depth,
+                                         /*forRequirement=*/false);
+      if (paramType.isError())
+        return *paramType.getError();
+      args.push_back(paramType.getType());
+    }
+    return llvm::None;
   }
 
   llvm::Optional<TypeLookupError>

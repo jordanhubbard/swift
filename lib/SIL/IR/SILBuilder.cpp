@@ -154,6 +154,18 @@ SILBuilder::createUncheckedReinterpretCast(SILLocation Loc, SILValue Op,
   if (SILType::canRefCast(Op->getType(), Ty, getModule()))
     return createUncheckedRefCast(Loc, Op, Ty);
 
+  // If the source and destination types are functions with the same
+  // kind of representation, then do a function conversion.
+  if (Op->getType().isObject() && Ty.isObject()) {
+    if (auto OpFnTy = Op->getType().getAs<SILFunctionType>()) {
+      if (auto DestFnTy = Ty.getAs<SILFunctionType>()) {
+        if (OpFnTy->getRepresentation() == DestFnTy->getRepresentation()) {
+          return createConvertFunction(Loc, Op, Ty, /*withoutActuallyEscaping*/ false);
+        }
+      }
+    }
+  }
+  
   // The destination type is nontrivial, and may be smaller than the source
   // type, so RC identity cannot be assumed.
   return insert(UncheckedBitwiseCastInst::create(
@@ -175,6 +187,18 @@ SILBuilder::createUncheckedBitCast(SILLocation Loc, SILValue Op, SILType Ty) {
   if (SILType::canRefCast(Op->getType(), Ty, getModule()))
     return createUncheckedRefCast(Loc, Op, Ty);
 
+  // If the source and destination types are functions with the same
+  // kind of representation, then do a function conversion.
+  if (Op->getType().isObject() && Ty.isObject()) {
+    if (auto OpFnTy = Op->getType().getAs<SILFunctionType>()) {
+      if (auto DestFnTy = Ty.getAs<SILFunctionType>()) {
+        if (OpFnTy->getRepresentation() == DestFnTy->getRepresentation()) {
+          return createConvertFunction(Loc, Op, Ty, /*withoutActuallyEscaping*/ false);
+        }
+      }
+    }
+  }
+  
   // The destination type is nontrivial, and may be smaller than the source
   // type, so RC identity cannot be assumed.
   return createUncheckedValueCast(Loc, Op, Ty);
@@ -456,16 +480,12 @@ SILBuilder::emitDestroyValue(SILLocation Loc, SILValue Operand) {
 
 SILValue SILBuilder::emitThickToObjCMetatype(SILLocation Loc, SILValue Op,
                                              SILType Ty) {
-  // If the operand is an otherwise-unused 'metatype' instruction in the
-  // same basic block, zap it and create a 'metatype' instruction that
-  // directly produces an Objective-C metatype.
+  // If the operand is a 'metatype' instruction accessing a known static type's
+  // metadata, create a 'metatype' instruction that
+  // directly produces the Objective-C class object representation instead.
   if (auto metatypeInst = dyn_cast<MetatypeInst>(Op)) {
-    if (metatypeInst->use_empty() &&
-        metatypeInst->getParent() == getInsertionBB()) {
-      auto origLoc = metatypeInst->getLoc();
-      metatypeInst->eraseFromParent();
-      return createMetatype(origLoc, Ty);
-    }
+    auto origLoc = metatypeInst->getLoc();
+    return createMetatype(origLoc, Ty);
   }
 
   // Just create the thick_to_objc_metatype instruction.
@@ -474,16 +494,12 @@ SILValue SILBuilder::emitThickToObjCMetatype(SILLocation Loc, SILValue Op,
 
 SILValue SILBuilder::emitObjCToThickMetatype(SILLocation Loc, SILValue Op,
                                              SILType Ty) {
-  // If the operand is an otherwise-unused 'metatype' instruction in the
-  // same basic block, zap it and create a 'metatype' instruction that
-  // directly produces a thick metatype.
+  // If the operand is a 'metatype' instruction accessing a known static type's
+  // metadata, create a 'metatype' instruction that directly produces the
+  // Swift metatype representation instead.
   if (auto metatypeInst = dyn_cast<MetatypeInst>(Op)) {
-    if (metatypeInst->use_empty() &&
-        metatypeInst->getParent() == getInsertionBB()) {
-      auto origLoc = metatypeInst->getLoc();
-      metatypeInst->eraseFromParent();
-      return createMetatype(origLoc, Ty);
-    }
+    auto origLoc = metatypeInst->getLoc();
+    return createMetatype(origLoc, Ty);
   }
 
   // Just create the objc_to_thick_metatype instruction.
@@ -573,24 +589,26 @@ void SILBuilder::emitDestructureValueOperation(
 DebugValueInst *SILBuilder::createDebugValue(SILLocation Loc, SILValue src,
                                              SILDebugVariable Var,
                                              bool poisonRefs,
-                                             bool operandWasMoved) {
+                                             bool operandWasMoved,
+                                             bool trace) {
   llvm::SmallString<4> Name;
   // Debug location overrides cannot apply to debug value instructions.
   DebugLocOverrideRAII LocOverride{*this, None};
   return insert(DebugValueInst::create(
       getSILDebugLocation(Loc), src, getModule(),
-      *substituteAnonymousArgs(Name, Var, Loc), poisonRefs, operandWasMoved));
+      *substituteAnonymousArgs(Name, Var, Loc), poisonRefs, operandWasMoved,
+      trace));
 }
 
 DebugValueInst *SILBuilder::createDebugValueAddr(SILLocation Loc, SILValue src,
                                                  SILDebugVariable Var,
-                                                 bool wasMoved) {
+                                                 bool wasMoved, bool trace) {
   llvm::SmallString<4> Name;
   // Debug location overrides cannot apply to debug addr instructions.
   DebugLocOverrideRAII LocOverride{*this, None};
   return insert(DebugValueInst::createAddr(
       getSILDebugLocation(Loc), src, getModule(),
-      *substituteAnonymousArgs(Name, Var, Loc), wasMoved));
+      *substituteAnonymousArgs(Name, Var, Loc), wasMoved, trace));
 }
 
 void SILBuilder::emitScopedBorrowOperation(SILLocation loc, SILValue original,
@@ -638,7 +656,7 @@ void SILBuilder::emitScopedBorrowOperation(SILLocation loc, SILValue original,
 /// copy. This does require the client code to handle ending the lifetime of an
 /// owned result even if the input was passed as guaranteed.
 ///
-/// Note: For simplicitly, ownership None is not propagated for any statically
+/// Note: For simplicity, ownership None is not propagated for any statically
 /// nontrivial result, even if \p targetType may also be dynamically
 /// trivial. For example, the operand of a switch_enum could be a nested enum
 /// such that all switch cases may be dynamically trivial. Or a checked_cast_br
@@ -648,9 +666,9 @@ void SILBuilder::emitScopedBorrowOperation(SILLocation loc, SILValue original,
 static ValueOwnershipKind deriveForwardingOwnership(SILValue operand,
                                                     SILType targetType,
                                                     SILFunction &func) {
-  if (operand.getOwnershipKind() != OwnershipKind::None
-      || targetType.isTrivial(func)) {
-    return operand.getOwnershipKind();
+  if (operand->getOwnershipKind() != OwnershipKind::None ||
+      targetType.isTrivial(func)) {
+    return operand->getOwnershipKind();
   }
   return OwnershipKind::Owned;
 }

@@ -155,7 +155,7 @@ protocol ProtocolWithInheritance4 : FooClass, FooProtocol {}
 // NO-TYREPR: {{^}}protocol ProtocolWithInheritance4 : FooClass, FooProtocol {{{$}}
 // TYREPR: {{^}}protocol ProtocolWithInheritance4 : FooClass, FooProtocol {{{$}}
 
-protocol ProtocolWithInheritance5 : FooClass, BarClass {} // expected-error{{multiple inheritance from classes 'FooClass' and 'BarClass'}} expected-error{{type 'Self' cannot be a subclass of both 'BarClass' and 'FooClass'}} // expected-note{{constraint conflicts with 'Self' : 'FooClass'}}
+protocol ProtocolWithInheritance5 : FooClass, BarClass {} // expected-error{{multiple inheritance from classes 'FooClass' and 'BarClass'}} expected-error{{no type for 'Self' can satisfy both 'Self : BarClass' and 'Self : FooClass'}}
 // NO-TYREPR: {{^}}protocol ProtocolWithInheritance5 : <<error type>>, <<error type>> {{{$}}
 // TYREPR: {{^}}protocol ProtocolWithInheritance5 : FooClass, BarClass {{{$}}
 
@@ -169,7 +169,7 @@ typealias Typealias1 = FooNonExistentProtocol // expected-error {{cannot find ty
 // NO-TYREPR: {{^}}typealias Typealias1 = <<error type>>{{$}}
 // TYREPR: {{^}}typealias Typealias1 = FooNonExistentProtocol{{$}}
 
-// sr-197
+// https://github.com/apple/swift/issues/42819
 func foo(bar: Typealias1<Int>) {} // Should not generate error "cannot specialize non-generic type '<<error type>>'"
 
 // Associated types.

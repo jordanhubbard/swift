@@ -27,6 +27,7 @@
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/SourceManager.h"
 #include "llvm/ADT/SmallVector.h"
+#include "swift/AST/TypeRepr.h"
 
 namespace swift {
 class ASTContext;
@@ -36,11 +37,14 @@ class TypeDecl;
 class ValueDecl;
 struct SelfBounds;
 class NominalTypeDecl;
-
 namespace ast_scope {
 class ASTSourceFileScope;
 class ASTScopeImpl;
 } // namespace ast_scope
+
+/// Walk the type representation recursively, collecting any
+/// `OpaqueReturnTypeRepr`s, `CompositionTypeRepr`s  or `IdentTypeRepr`s.
+CollectedOpaqueReprs collectOpaqueReturnTypeReprs(TypeRepr *, ASTContext &ctx, DeclContext *dc);
 
 /// LookupResultEntry - One result of unqualified lookup.
 struct LookupResultEntry {
@@ -210,7 +214,7 @@ public:
   filter(llvm::function_ref<bool(LookupResultEntry, /*isOuter*/ bool)> pred);
 
   /// Shift down results by dropping inner results while keeping outer
-  /// results (if any), the innermost of which are recogized as inner
+  /// results (if any), the innermost of which are recognized as inner
   /// results afterwards.
   void shiftDownResults();
 };
@@ -420,13 +424,17 @@ public:
 class UsableFilteringDeclConsumer final : public VisibleDeclConsumer {
   const SourceManager &SM;
   const DeclContext *DC;
+  const DeclContext *typeContext;
   SourceLoc Loc;
+  llvm::DenseMap<DeclBaseName, std::pair<ValueDecl *, DeclVisibilityKind>>
+      SeenNames;
   VisibleDeclConsumer &ChainedConsumer;
 
 public:
   UsableFilteringDeclConsumer(const SourceManager &SM, const DeclContext *DC,
                               SourceLoc loc, VisibleDeclConsumer &consumer)
-      : SM(SM), DC(DC), Loc(loc), ChainedConsumer(consumer) {}
+      : SM(SM), DC(DC), typeContext(DC->getInnermostTypeContext()), Loc(loc),
+        ChainedConsumer(consumer) {}
 
   void foundDecl(ValueDecl *D, DeclVisibilityKind reason,
                  DynamicLookupInfo dynamicLookupInfo) override;
@@ -491,7 +499,17 @@ void lookupVisibleMemberDecls(VisibleDeclConsumer &Consumer,
 
 namespace namelookup {
 
+/// Add semantic members to \p type before attempting a semantic lookup.
+void installSemanticMembersIfNeeded(Type type, DeclNameRef name);
+
+/// Extracts directly referenced nominal type decls from a given type, asserting
+/// if the type does not contain any references to a nominal.
 void extractDirectlyReferencedNominalTypes(
+    Type type, SmallVectorImpl<NominalTypeDecl *> &decls);
+
+/// Extracts directly referenced nominal type decls from a given type, or leaves
+/// the vector empty if the type does not contain any references to a nominal.
+void tryExtractDirectlyReferencedNominalTypes(
     Type type, SmallVectorImpl<NominalTypeDecl *> &decls);
 
 /// Once name lookup has gathered a set of results, perform any necessary
@@ -544,6 +562,11 @@ SmallVector<InheritedNominalEntry, 4> getDirectlyInheritedNominalTypeDecls(
 /// given protocol or protocol extension.
 SelfBounds getSelfBoundsFromWhereClause(
     llvm::PointerUnion<const TypeDecl *, const ExtensionDecl *> decl);
+
+/// Retrieve the set of nominal type declarations that appear as the
+/// constraint type of any "Self" constraints in the generic signature of the
+/// given protocol or protocol extension.
+SelfBounds getSelfBoundsFromGenericSignature(const ExtensionDecl *extDecl);
 
 /// Retrieve the TypeLoc at the given \c index from among the set of
 /// type declarations that are directly "inherited" by the given declaration.
@@ -618,9 +641,9 @@ private:
   void visitDoCatchStmt(DoCatchStmt *S);
   
 };
-  
-  
-/// The bridge between the legacy UnqualifedLookupFactory and the new ASTScope
+
+
+/// The bridge between the legacy UnqualifiedLookupFactory and the new ASTScope
 /// lookup system
 class AbstractASTScopeDeclConsumer {
 public:

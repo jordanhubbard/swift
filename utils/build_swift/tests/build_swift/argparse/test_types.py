@@ -7,8 +7,6 @@
 # See https://swift.org/CONTRIBUTORS.txt for the list of Swift project authors
 
 
-from __future__ import absolute_import, unicode_literals
-
 import os.path
 import platform
 import unittest
@@ -99,7 +97,7 @@ class TestPathType(unittest.TestCase):
         path_type(__file__)
 
         with self.assertRaises(ArgumentTypeError):
-            path_type('/nonsensisal/path/')
+            path_type('/nonsensical/path/')
 
         with self.assertRaises(ArgumentTypeError):
             path_type('~/not-a-real/path to a file')

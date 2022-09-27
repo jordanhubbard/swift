@@ -1,6 +1,9 @@
 // RUN: %target-run-simple-swift
 // REQUIRES: executable_test
 
+// rdar://91405760
+// UNSUPPORTED: use_os_stdlib, back_deployment_runtime
+
 import StdlibUnittest
 defer { runAllTests() }
 
@@ -37,7 +40,8 @@ StringCreateTests.test("String(decoding:as:)") {
     validateDecodingAs(simpleString.rawValue)
   }
 
-  // Corner-case: UBP with null pointer (https://bugs.swift.org/browse/SR-9869)
+  // https://github.com/apple/swift/issues/52275
+  // Corner-case: UBP with null pointer.
   expectEqual(
     "", String(decoding: UnsafeBufferPointer(_empty: ()), as: UTF8.self))
   expectEqual(

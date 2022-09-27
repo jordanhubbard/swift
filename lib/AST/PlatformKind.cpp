@@ -58,18 +58,61 @@ Optional<PlatformKind> swift::platformFromString(StringRef Name) {
       .Default(Optional<PlatformKind>());
 }
 
+Optional<StringRef> swift::closestCorrectedPlatformString(StringRef candidate) {
+  auto lowerCasedCandidate = candidate.lower();
+  auto lowerCasedCandidateRef = StringRef(lowerCasedCandidate);
+  auto minDistance = std::numeric_limits<unsigned int>::max();
+  Optional<StringRef> result = None;
+#define AVAILABILITY_PLATFORM(X, PrettyName)                                   \
+  {                                                                            \
+    auto platform = StringRef(#X);                                             \
+    auto distance = lowerCasedCandidateRef.edit_distance(platform.lower());    \
+    if (distance == 0) {                                                       \
+      return platform;                                                         \
+    }                                                                          \
+    if (distance < minDistance) {                                              \
+      minDistance = distance;                                                  \
+      result = platform;                                                       \
+    }                                                                          \
+  }
+#include "swift/AST/PlatformKinds.def"
+  // If the most similar platform distance is greater than this threshold,
+  // it's not similar enough to be suggested as correction.
+  const unsigned int distanceThreshold = 5;
+  return (minDistance < distanceThreshold) ? result : None;
+}
+
+static bool isApplicationExtensionPlatform(PlatformKind Platform) {
+  switch (Platform) {
+  case PlatformKind::macOSApplicationExtension:
+  case PlatformKind::iOSApplicationExtension:
+  case PlatformKind::macCatalystApplicationExtension:
+  case PlatformKind::tvOSApplicationExtension:
+  case PlatformKind::watchOSApplicationExtension:
+    return true;
+  case PlatformKind::macOS:
+  case PlatformKind::iOS:
+  case PlatformKind::macCatalyst:
+  case PlatformKind::tvOS:
+  case PlatformKind::watchOS:
+  case PlatformKind::OpenBSD:
+  case PlatformKind::Windows:
+  case PlatformKind::none:
+    return false;
+  }
+  llvm_unreachable("bad PlatformKind");
+}
+
 static bool isPlatformActiveForTarget(PlatformKind Platform,
                                       const llvm::Triple &Target,
                                       bool EnableAppExtensionRestrictions) {
   if (Platform == PlatformKind::none)
     return true;
-  
-  if (Platform == PlatformKind::macOSApplicationExtension ||
-      Platform == PlatformKind::iOSApplicationExtension ||
-      Platform == PlatformKind::macCatalystApplicationExtension)
-    if (!EnableAppExtensionRestrictions)
-      return false;
-  
+
+  if (!EnableAppExtensionRestrictions &&
+      isApplicationExtensionPlatform(Platform))
+    return false;
+
   // FIXME: This is an awful way to get the current OS.
   switch (Platform) {
     case PlatformKind::macOS:

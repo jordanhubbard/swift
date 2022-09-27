@@ -17,27 +17,21 @@
 
 #include "swift/Runtime/Concurrency.h"
 #include <atomic>
-
-#ifdef _WIN32
-// On Windows, an include below triggers an indirect include of minwindef.h
-// which contains a definition of the `max` macro, generating an error in our
-// use of std::max in this file. This define prevents those macros from being
-// defined.
-#define NOMINMAX
-#endif
+#include <new>
 
 #include "../CompatibilityOverride/CompatibilityOverride.h"
-#include "swift/Runtime/Atomic.h"
-#include "swift/Runtime/AccessibleFunction.h"
-#include "swift/Runtime/Casting.h"
-#include "swift/Runtime/Once.h"
-#include "swift/Runtime/Mutex.h"
-#include "swift/Runtime/ThreadLocal.h"
-#include "swift/Runtime/ThreadLocalStorage.h"
-#include "swift/Runtime/DispatchShims.h"
-#include "swift/ABI/Task.h"
 #include "swift/ABI/Actor.h"
+#include "swift/ABI/Task.h"
 #include "swift/Basic/ListMerger.h"
+#include "swift/Concurrency/Actor.h"
+#include "swift/Runtime/AccessibleFunction.h"
+#include "swift/Runtime/Atomic.h"
+#include "swift/Runtime/Casting.h"
+#include "swift/Runtime/DispatchShims.h"
+#include "swift/Threading/Mutex.h"
+#include "swift/Threading/Once.h"
+#include "swift/Threading/Thread.h"
+#include "swift/Threading/ThreadLocalStorage.h"
 #ifdef SWIFT_CONCURRENCY_BACK_DEPLOYMENT
 // All platforms where we care about back deployment have a known
 // configurations.
@@ -50,6 +44,12 @@
 
 #if SWIFT_CONCURRENCY_ENABLE_DISPATCH
 #include <dispatch/dispatch.h>
+#endif
+
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+#define SWIFT_CONCURRENCY_ACTORS_AS_LOCKS 1
+#else
+#define SWIFT_CONCURRENCY_ACTORS_AS_LOCKS 0
 #endif
 
 #if SWIFT_STDLIB_HAS_ASL
@@ -66,19 +66,8 @@
 #include <sys/syscall.h>
 #endif
 
-#if defined(_POSIX_THREADS)
-#include <pthread.h>
-
-// Only use __has_include since HAVE_PTHREAD_NP_H is not provided.
-#if __has_include(<pthread_np.h>)
-#include <pthread_np.h>
-#endif
-#endif
-
 #if defined(_WIN32)
 #include <io.h>
-#include <handleapi.h>
-#include <processthreadsapi.h>
 #endif
 
 #if SWIFT_OBJC_INTEROP
@@ -124,9 +113,9 @@ class ExecutorTrackingInfo {
   /// the right executor. It would make sense for that to be a
   /// separate thread-local variable (or whatever is most efficient
   /// on the target platform).
-  static SWIFT_RUNTIME_DECLARE_THREAD_LOCAL(
-      Pointer<ExecutorTrackingInfo>, ActiveInfoInThread,
-      SWIFT_CONCURRENCY_EXECUTOR_TRACKING_INFO_KEY);
+  static SWIFT_THREAD_LOCAL_TYPE(Pointer<ExecutorTrackingInfo>,
+                                 tls_key::concurrency_executor_tracking_info)
+      ActiveInfoInThread;
 
   /// The active executor.
   ExecutorRef ActiveExecutor = ExecutorRef::generic();
@@ -149,7 +138,7 @@ public:
 
   /// Unconditionally initialize a fresh tracking state on the
   /// current state, shadowing any previous tracking state.
-  /// leave() must be called beforet the object goes out of scope.
+  /// leave() must be called before the object goes out of scope.
   void enterAndShadow(ExecutorRef currentExecutor) {
     ActiveExecutor = currentExecutor;
     SavedInfo = ActiveInfoInThread.get();
@@ -192,8 +181,8 @@ public:
 class ActiveTask {
   /// A thread-local variable pointing to the active tracking
   /// information about the current thread, if any.
-  static SWIFT_RUNTIME_DECLARE_THREAD_LOCAL(Pointer<AsyncTask>, Value,
-                                            SWIFT_CONCURRENCY_TASK_KEY);
+  static SWIFT_THREAD_LOCAL_TYPE(Pointer<AsyncTask>,
+                                 tls_key::concurrency_task) Value;
 
 public:
   static void set(AsyncTask *task) { Value.set(task); }
@@ -201,15 +190,12 @@ public:
 };
 
 /// Define the thread-locals.
-SWIFT_RUNTIME_DECLARE_THREAD_LOCAL(
-  Pointer<AsyncTask>,
-  ActiveTask::Value,
-  SWIFT_CONCURRENCY_TASK_KEY);
+SWIFT_THREAD_LOCAL_TYPE(Pointer<AsyncTask>, tls_key::concurrency_task)
+ActiveTask::Value;
 
-SWIFT_RUNTIME_DECLARE_THREAD_LOCAL(
-  Pointer<ExecutorTrackingInfo>,
-  ExecutorTrackingInfo::ActiveInfoInThread,
-  SWIFT_CONCURRENCY_EXECUTOR_TRACKING_INFO_KEY);
+SWIFT_THREAD_LOCAL_TYPE(Pointer<ExecutorTrackingInfo>,
+                        tls_key::concurrency_executor_tracking_info)
+ExecutorTrackingInfo::ActiveInfoInThread;
 
 } // end anonymous namespace
 
@@ -230,10 +216,12 @@ void swift::runJobInEstablishedExecutorContext(Job *job) {
     // it afterwards.
     task->flagAsRunning();
 
+    auto traceHandle = concurrency::trace::job_run_begin(job);
     task->runInFullyEstablishedContext();
+    concurrency::trace::job_run_end(traceHandle);
 
     assert(ActiveTask::get() == nullptr &&
-           "active task wasn't cleared before susspending?");
+           "active task wasn't cleared before suspending?");
   } else {
     // There's no extra bookkeeping to do for simple jobs besides swapping in
     // the voucher.
@@ -267,6 +255,12 @@ AsyncTask *swift::_swift_task_clearCurrent() {
   return task;
 }
 
+AsyncTask *swift::_swift_task_setCurrent(AsyncTask *new_task) {
+  auto task = ActiveTask::get();
+  ActiveTask::set(new_task);
+  return task;
+}
+
 SWIFT_CC(swift)
 static ExecutorRef swift_task_getCurrentExecutorImpl() {
   auto currentTracking = ExecutorTrackingInfo::current();
@@ -276,34 +270,18 @@ static ExecutorRef swift_task_getCurrentExecutorImpl() {
   return result;
 }
 
-#if defined(_WIN32)
-static HANDLE __initialPthread = INVALID_HANDLE_VALUE;
-#endif
-
 /// Determine whether we are currently executing on the main thread
 /// independently of whether we know that we are on the main actor.
 static bool isExecutingOnMainThread() {
-#if SWIFT_STDLIB_SINGLE_THREADED_RUNTIME
-  return true;
-#elif defined(__linux__)
-  return syscall(SYS_gettid) == getpid();
-#elif defined(_WIN32)
-  if (__initialPthread == INVALID_HANDLE_VALUE) {
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(),
-                    GetCurrentProcess(), &__initialPthread, 0, FALSE,
-                    DUPLICATE_SAME_ACCESS);
-  }
-
-  return __initialPthread == GetCurrentThread();
-#elif defined(__wasi__)
+#if SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY
   return true;
 #else
-  return pthread_main_np() == 1;
+  return Thread::onMainThread();
 #endif
 }
 
 JobPriority swift::swift_task_getCurrentThreadPriority() {
-#if SWIFT_STDLIB_SINGLE_THREADED_RUNTIME
+#if SWIFT_STDLIB_SINGLE_THREADED_CONCURRENCY
   return JobPriority::UserInitiated;
 #elif defined(__APPLE__)
   return static_cast<JobPriority>(qos_class_self());
@@ -331,6 +309,7 @@ static bool swift_task_isCurrentExecutorImpl(ExecutorRef executor) {
 static unsigned unexpectedExecutorLogLevel = 1;
 
 static void checkUnexpectedExecutorLogLevel(void *context) {
+#if SWIFT_STDLIB_HAS_ENVIRON
   const char *levelStr = getenv("SWIFT_UNEXPECTED_EXECUTOR_LOG_LEVEL");
   if (!levelStr)
     return;
@@ -338,6 +317,7 @@ static void checkUnexpectedExecutorLogLevel(void *context) {
   long level = strtol(levelStr, nullptr, 0);
   if (level >= 0 && level < 3)
     unexpectedExecutorLogLevel = level;
+#endif // SWIFT_STDLIB_HAS_ENVIRON
 }
 
 SWIFT_CC(swift)
@@ -345,8 +325,8 @@ void swift::swift_task_reportUnexpectedExecutor(
     const unsigned char *file, uintptr_t fileLength, bool fileIsASCII,
     uintptr_t line, ExecutorRef executor) {
   // Make sure we have an appropriate log level.
-  static swift_once_t logLevelToken;
-  swift_once(&logLevelToken, checkUnexpectedExecutorLogLevel, nullptr);
+  static swift::once_t logLevelToken;
+  swift::once(logLevelToken, checkUnexpectedExecutorLogLevel, nullptr);
 
   bool isFatalError = false;
   switch (unexpectedExecutorLogLevel) {
@@ -418,20 +398,7 @@ namespace {
 
 class DefaultActorImpl;
 
-/// A job to process a default actor.  Allocated inline in the actor.
-class ProcessInlineJob : public Job {
-public:
-  ProcessInlineJob(JobPriority priority)
-    : Job({JobKind::DefaultActorInline, priority}, &process) {}
-
-  SWIFT_CC(swiftasync)
-  static void process(Job *job);
-
-  static bool classof(const Job *job) {
-    return job->Flags.getKind() == JobKind::DefaultActorInline;
-  }
-};
-
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
 /// A job to process a default actor that's allocated separately from
 /// the actor.
 class ProcessOutOfLineJob : public Job {
@@ -446,25 +413,6 @@ public:
 
   static bool classof(const Job *job) {
     return job->Flags.getKind() == JobKind::DefaultActorSeparate;
-  }
-};
-
-/// Information about the currently-running processing job.
-struct RunningJobInfo {
-  enum KindType : uint8_t {
-    Inline, Other
-  };
-  KindType Kind;
-
-  bool wasInlineJob() const {
-    return Kind == Inline;
-  }
-
-  static RunningJobInfo forOther() {
-    return {Other};
-  }
-  static RunningJobInfo forInline() {
-    return {Inline};
   }
 };
 
@@ -488,7 +436,7 @@ public:
     return { job, 0 };
   }
 
-  /// Return a reference to a job that hasn't been preprocesssed yet.
+  /// Return a reference to a job that hasn't been preprocessed yet.
   static JobRef getUnpreprocessed(Job *job) {
     assert(job && "passing a null job");
     return { job, NeedsPreprocessing };
@@ -608,47 +556,6 @@ public:
 ///     DefaultActorImpl. The additional alignment requirements are
 ///     enforced by static asserts below.
 class alignas(sizeof(void *) * 2) ActiveActorStatus {
-  enum : uint32_t {
-    // Bits 0-2: Actor state
-    //
-    // Possible state transitions for an actor:
-    //
-    // Idle -> Running
-    // Running -> Idle
-    // Running -> Scheduled
-    // Scheduled -> Running
-    // Idle -> Deallocated
-    // Running -> Zombie_ReadyForDeallocation
-    // Zombie_ReadyForDeallocation -> Deallocated
-    //
-    // It is possible for an actor to be in Running and yet completely released
-    // by clients. However, the actor needs to be kept alive until it is done
-    // executing the task that is running on it and gives it up. It is only
-    // after that that we can safely deallocate it.
-    ActorStateMask = 0x7,
-
-    /// The actor is not currently scheduled.  Completely redundant
-    /// with the job list being empty.
-    Idle = 0x0,
-    /// There actor is scheduled
-    Scheduled = 0x1,
-    /// There is currently a thread running the actor.
-    Running = 0x2,
-    /// The actor is ready for deallocation once it stops running
-    Zombie_ReadyForDeallocation = 0x3,
-
-    // Bit 3
-    DistributedRemote = 0x8,
-    // Bit 4
-    isPriorityEscalated = 0x10,
-
-    // Bits 8 - 15. We only need 8 bits of the whole size_t to represent Job
-    // Priority
-    PriorityMask = 0xFF00,
-    PriorityAndOverrideMask = PriorityMask | isPriorityEscalated,
-    PriorityShift = 0x8,
-  };
-
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_4_BYTES
   uint32_t Flags;
   dispatch_lock_t DrainLock;
@@ -673,10 +580,10 @@ class alignas(sizeof(void *) * 2) ActiveActorStatus {
 #endif
 
   uint32_t getActorState() const {
-    return Flags & ActorStateMask;
+    return Flags & concurrency::ActorFlagConstants::ActorStateMask;
   }
   uint32_t setActorState(uint32_t state) const {
-    return (Flags & ~ActorStateMask) | state;
+    return (Flags & ~concurrency::ActorFlagConstants::ActorStateMask) | state;
   }
 
 public:
@@ -689,17 +596,8 @@ public:
       : Flags(), FirstJob(JobRef()) {}
 #endif
 
-  bool isDistributedRemote() const { return Flags & DistributedRemote; }
-  ActiveActorStatus withDistributedRemote() const {
-#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-    return ActiveActorStatus(Flags | DistributedRemote, DrainLock, FirstJob);
-#else
-    return ActiveActorStatus(Flags | DistributedRemote, FirstJob);
-#endif
-  }
-
   bool isIdle() const {
-    bool isIdle = (getActorState() == Idle);
+    bool isIdle = (getActorState() == concurrency::ActorFlagConstants::Idle);
     if (isIdle) {
       assert(!FirstJob);
     }
@@ -707,57 +605,79 @@ public:
   }
   ActiveActorStatus withIdle() const {
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-    return ActiveActorStatus(setActorState(Idle), DLOCK_OWNER_NULL, FirstJob);
+    return ActiveActorStatus(
+        setActorState(concurrency::ActorFlagConstants::Idle), DLOCK_OWNER_NULL,
+        FirstJob);
 #else
-    return ActiveActorStatus(setActorState(Idle), FirstJob);
+    return ActiveActorStatus(
+        setActorState(concurrency::ActorFlagConstants::Idle), FirstJob);
 #endif
   }
 
   bool isAnyRunning() const {
     uint32_t state = getActorState();
-    return (state == Running) || (state == Zombie_ReadyForDeallocation);
+    return (state == concurrency::ActorFlagConstants::Running) ||
+           (state ==
+            concurrency::ActorFlagConstants::Zombie_ReadyForDeallocation);
   }
   bool isRunning() const {
-    return getActorState() == Running;
+    return getActorState() == concurrency::ActorFlagConstants::Running;
   }
   ActiveActorStatus withRunning() const {
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-    return ActiveActorStatus(setActorState(Running), dispatch_lock_value_for_self(), FirstJob);
+    return ActiveActorStatus(
+        setActorState(concurrency::ActorFlagConstants::Running),
+        dispatch_lock_value_for_self(), FirstJob);
 #else
-    return ActiveActorStatus(setActorState(Running), FirstJob);
+    return ActiveActorStatus(
+        setActorState(concurrency::ActorFlagConstants::Running), FirstJob);
 #endif
   }
 
   bool isScheduled() const {
-    return getActorState() == Scheduled;
+    return getActorState() == concurrency::ActorFlagConstants::Scheduled;
   }
 
   ActiveActorStatus withScheduled() const {
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-    return ActiveActorStatus(setActorState(Scheduled), DLOCK_OWNER_NULL, FirstJob);
+    return ActiveActorStatus(
+        setActorState(concurrency::ActorFlagConstants::Scheduled),
+        DLOCK_OWNER_NULL, FirstJob);
 #else
-    return ActiveActorStatus(setActorState(Scheduled), FirstJob);
+    return ActiveActorStatus(
+        setActorState(concurrency::ActorFlagConstants::Scheduled), FirstJob);
 #endif
   }
 
   bool isZombie_ReadyForDeallocation() const {
-    return getActorState() == Zombie_ReadyForDeallocation;
+    return getActorState() ==
+           concurrency::ActorFlagConstants::Zombie_ReadyForDeallocation;
   }
   ActiveActorStatus withZombie_ReadyForDeallocation() const {
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
     assert(dispatch_lock_owner(DrainLock) != DLOCK_OWNER_NULL);
-    return ActiveActorStatus(setActorState(Zombie_ReadyForDeallocation), DrainLock, FirstJob);
+    return ActiveActorStatus(
+        setActorState(
+            concurrency::ActorFlagConstants::Zombie_ReadyForDeallocation),
+        DrainLock, FirstJob);
 #else
-    return ActiveActorStatus(setActorState(Zombie_ReadyForDeallocation), FirstJob);
+    return ActiveActorStatus(
+        setActorState(
+            concurrency::ActorFlagConstants::Zombie_ReadyForDeallocation),
+        FirstJob);
 #endif
   }
 
   JobPriority getMaxPriority() const {
-    return (JobPriority) ((Flags & PriorityMask) >> PriorityShift);
+    return (
+        JobPriority)((Flags & concurrency::ActorFlagConstants::PriorityMask) >>
+                     concurrency::ActorFlagConstants::PriorityShift);
   }
   ActiveActorStatus withNewPriority(JobPriority priority) const {
-    uint32_t flags = Flags & ~PriorityAndOverrideMask;
-    flags |= (uint32_t(priority) << PriorityShift);
+    uint32_t flags =
+        Flags & ~concurrency::ActorFlagConstants::PriorityAndOverrideMask;
+    flags |=
+        (uint32_t(priority) << concurrency::ActorFlagConstants::PriorityShift);
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
     return ActiveActorStatus(flags, DrainLock, FirstJob);
 #else
@@ -768,13 +688,19 @@ public:
     return withNewPriority(JobPriority::Unspecified);
   }
 
-  bool isMaxPriorityEscalated() const { return Flags & isPriorityEscalated; }
+  bool isMaxPriorityEscalated() const {
+    return Flags & concurrency::ActorFlagConstants::IsPriorityEscalated;
+  }
   ActiveActorStatus withEscalatedPriority(JobPriority priority) const {
-    JobPriority currentPriority = JobPriority((Flags & PriorityMask) >> PriorityShift);
+    JobPriority currentPriority =
+        JobPriority((Flags & concurrency::ActorFlagConstants::PriorityMask) >>
+                    concurrency::ActorFlagConstants::PriorityShift);
     assert(priority > currentPriority);
 
-    uint32_t flags = (Flags & ~PriorityMask) | (uint32_t(priority) << PriorityShift);
-    flags |= isPriorityEscalated;
+    uint32_t flags =
+        (Flags & ~concurrency::ActorFlagConstants::PriorityMask) |
+        (uint32_t(priority) << concurrency::ActorFlagConstants::PriorityShift);
+    flags |= concurrency::ActorFlagConstants::IsPriorityEscalated;
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
     return ActiveActorStatus(flags, DrainLock, FirstJob);
 #else
@@ -783,9 +709,13 @@ public:
   }
   ActiveActorStatus withoutEscalatedPriority() const {
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-    return ActiveActorStatus(Flags & ~isPriorityEscalated, DrainLock, FirstJob);
+    return ActiveActorStatus(
+        Flags & ~concurrency::ActorFlagConstants::IsPriorityEscalated,
+        DrainLock, FirstJob);
 #else
-    return ActiveActorStatus(Flags & ~isPriorityEscalated, FirstJob);
+    return ActiveActorStatus(
+        Flags & ~concurrency::ActorFlagConstants::IsPriorityEscalated,
+        FirstJob);
 #endif
   }
 
@@ -817,6 +747,30 @@ public:
     return offsetof(ActiveActorStatus, DrainLock);
   }
 #endif
+
+  void traceStateChanged(HeapObject *actor) {
+    // Convert our state to a consistent raw value. These values currently match
+    // the enum values, but this explicit conversion provides room for change.
+    uint8_t traceState = 255;
+    switch (getActorState()) {
+    case concurrency::ActorFlagConstants::Idle:
+      traceState = 0;
+      break;
+    case concurrency::ActorFlagConstants::Scheduled:
+      traceState = 1;
+      break;
+    case concurrency::ActorFlagConstants::Running:
+      traceState = 2;
+      break;
+    case concurrency::ActorFlagConstants::Zombie_ReadyForDeallocation:
+      traceState = 3;
+      break;
+    }
+    concurrency::trace::actor_state_changed(
+        actor, getFirstJob().getRawJob(), getFirstJob().needsPreprocessing(),
+        traceState, swift_distributed_actor_is_remote((DefaultActor *) actor),
+        isMaxPriorityEscalated(), static_cast<uint8_t>(getMaxPriority()));
+  }
 };
 
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_4_BYTES
@@ -826,6 +780,7 @@ public:
 #endif
 static_assert(sizeof(ActiveActorStatus) == ACTIVE_ACTOR_STATUS_SIZE,
   "ActiveActorStatus is of incorrect size");
+#endif /* !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS */
 
 /// The default actor implementation.
 ///
@@ -873,36 +828,34 @@ static_assert(sizeof(ActiveActorStatus) == ACTIVE_ACTOR_STATUS_SIZE,
 ///     We must either release the actor or create a new processing job
 ///     for it to maintain the balance.
 ///
-/// The current behaviour of actors is such that we only use the inline
-/// processing job to schedule the actor and not OOL jobs. As a result, the
-/// subset of rules that currently apply are (1), (3), (5), (6).
+/// The current behaviour of actors is such that we only have a single
+/// processing job for an actor at a given time. Stealers jobs support does not
+/// exist yet. As a result, the subset of rules that currently apply
+/// are (1), (3), (5), (6).
 class DefaultActorImpl : public HeapObject {
-  friend class ProcessInlineJob;
-  union {
-    // When the ProcessInlineJob storage is initialized, its metadata pointer
-    // will point to Job's metadata. When it isn't, the metadata pointer is
-    // NULL. Use HeapObject to initialize the metadata pointer to NULL and allow
-    // it to be checked without fully initializing the ProcessInlineJob.
-    HeapObject JobStorageHeapObject{nullptr};
-
-    ProcessInlineJob JobStorage;
-  };
-  // This field needs to be aligned to ACTIVE_ACTOR_STATUS but we need to
-  // hide this from the compiler cause otherwise it adds a bunch of extra
-  // padding to the structure. We will enforce this via static asserts.
-  char StatusStorage[sizeof(ActiveActorStatus)];
+#if SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+  // If actors are locks, we don't need to maintain any extra bookkeeping in the
+  // ActiveActorStatus since all threads which are contending will block
+  // synchronously, no job queue is needed and the lock will handle all priority
+  // escalation logic
+  Mutex drainLock;
+#else
+  // Note: There is some padding that is added here by the compiler in order to
+  // enforce alignment. This is space that is available for us to use in
+  // the future
+  alignas(sizeof(ActiveActorStatus)) char StatusStorage[sizeof(ActiveActorStatus)];
+#endif
+  // TODO(rokhinip): Make this a flagset
+  bool isDistributedRemoteActor;
 
 public:
   /// Properly construct an actor, except for the heap header.
   void initialize(bool isDistributedRemote = false) {
-    ActiveActorStatus status = ActiveActorStatus();
-    if (isDistributedRemote) {
-      status = status.withDistributedRemote();
-    }
-    _status().store(status, std::memory_order_relaxed);
-
+    this->isDistributedRemoteActor = isDistributedRemote;
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+   _status().store(ActiveActorStatus(), std::memory_order_relaxed);
+#endif
     SWIFT_TASK_DEBUG_LOG("Creating default actor %p", this);
-    JobStorageHeapObject.metadata = nullptr;
     concurrency::trace::actor_create(this);
   }
 
@@ -917,15 +870,17 @@ public:
   /// Try to lock the actor, if it is already running or scheduled, fail
   bool tryLock(bool asDrainer);
 
+  /// Unlock an actor
+  bool unlock(bool forceUnlock);
+
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
   /// Enqueue a job onto the actor. This typically means that the actor hit
   /// contention during the tryLock and so we're taking the slow path
   void enqueue(Job *job, JobPriority priority);
 
-  /// Unlock an actor
-  bool unlock(bool forceUnlock);
-
   // The calling thread must be holding the actor lock while calling this
   Job *drainOne();
+#endif
 
   /// Check if the actor is actually a distributed *remote* actor.
   ///
@@ -933,6 +888,7 @@ public:
   /// ordinary default (local) actor, and no special handling is needed for them.
   bool isDistributedRemote();
 
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
   swift::atomic<ActiveActorStatus> &_status() {
     return reinterpret_cast<swift::atomic<ActiveActorStatus>&> (this->StatusStorage);
   }
@@ -943,40 +899,41 @@ public:
 
   // Only for static assert use below, not for actual use otherwise
   static constexpr size_t offsetOfActiveActorStatus() {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Winvalid-offsetof"
     return offsetof(DefaultActorImpl, StatusStorage);
+#pragma clang diagnostic pop
   }
+#endif /* !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS */
 
 private:
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
   dispatch_lock_t *drainLockAddr();
 #endif
+  /// Schedule a processing job.  This can generally only be
+  /// done if we know nobody else is trying to do it at the same time,
+  /// e.g. if this thread just successfully transitioned the actor from
+  /// Idle to Scheduled.
+  void scheduleActorProcessJob(JobPriority priority);
+#endif /* !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS */
 
   void deallocateUnconditional();
-
-  /// Schedule an inline processing job.  This can generally only be
-  /// done if we know nobody else is trying to do it at the same time,
-  /// e.g. if this thread just sucessfully transitioned the actor from
-  /// Idle to Scheduled.
-  void scheduleActorProcessJob(JobPriority priority,
-                                     bool hasActiveInlineJob);
-
-  static DefaultActorImpl *fromInlineJob(Job *job) {
-    assert(isa<ProcessInlineJob>(job));
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Winvalid-offsetof"
-    return reinterpret_cast<DefaultActorImpl*>(
-      reinterpret_cast<char*>(job) - offsetof(DefaultActorImpl, JobStorage));
-#pragma clang diagnostic pop
-  }
 };
 
 } /// end anonymous namespace
 
-static_assert(sizeof(DefaultActorImpl) <= sizeof(DefaultActor) &&
+// We can't use sizeof(DefaultActor) since the alignment requirement on the
+// default actor means that we have some padding added when calculating
+// sizeof(DefaultActor). However that padding isn't available for us to use
+// in DefaultActorImpl.
+static_assert(sizeof(DefaultActorImpl) <= ((sizeof(void *) * NumWords_DefaultActor) + sizeof(HeapObject)) &&
               alignof(DefaultActorImpl) <= alignof(DefaultActor),
               "DefaultActorImpl doesn't fit in DefaultActor");
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
 static_assert(DefaultActorImpl::offsetOfActiveActorStatus() % ACTIVE_ACTOR_STATUS_SIZE == 0,
               "ActiveActorStatus is aligned to the right size");
+#endif
 
 static DefaultActorImpl *asImpl(DefaultActor *actor) {
   return reinterpret_cast<DefaultActorImpl*>(actor);
@@ -990,6 +947,7 @@ static DefaultActor *asAbstract(DefaultActorImpl *actor) {
 /******************** NEW DEFAULT ACTOR IMPLEMENTATION ***********************/
 /*****************************************************************************/
 
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
 /// Given that a job is enqueued normally on a default actor, get/set
 /// the next job in the actor's queue.
 static JobRef getNextJobInQueue(Job *job) {
@@ -1124,43 +1082,10 @@ static void traceJobQueue(DefaultActorImpl *actor, Job *first) {
 static SWIFT_ATTRIBUTE_ALWAYS_INLINE void traceActorStateTransition(DefaultActorImpl *actor,
     ActiveActorStatus oldState, ActiveActorStatus newState) {
 
-  SWIFT_TASK_DEBUG_LOG("Actor %p transitioned from %zx to %zx (%s)\n", actor,
-    oldState.getOpaqueFlags(), newState.getOpaqueFlags(), __FUNCTION__);
-  concurrency::trace::actor_state_changed(actor,
-        newState.getFirstJob().getRawJob(), newState.getFirstJob().needsPreprocessing(),
-        newState.getOpaqueFlags());
-}
-
-void DefaultActorImpl::destroy() {
-  auto oldState = _status().load(std::memory_order_relaxed);
-  // Tasks on an actor are supposed to keep the actor alive until they start
-  // running and we can only get here if ref count of the object = 0 which means
-  // there should be no more tasks enqueued on the actor.
-  assert(!oldState.getFirstJob() && "actor has queued jobs at destruction");
-
-  if (oldState.isIdle()) {
-      return;
-  }
-  assert(oldState.isRunning() && "actor scheduled but not running at destruction");
-}
-
-void DefaultActorImpl::deallocate() {
-  // If we're running, mark ourselves as ready for deallocation but don't
-  // deallocate yet. When we stop running the actor - at unlock() time - we'll
-  // do the actual deallocation.
-  //
-  // If we're idle, just deallocate immediately
-  auto oldState = _status().load(std::memory_order_relaxed);
-  while (oldState.isRunning()) {
-    auto newState = oldState.withZombie_ReadyForDeallocation();
-    if (_status().compare_exchange_weak(oldState, newState,
-                                           std::memory_order_relaxed,
-                                           std::memory_order_relaxed))
-      return;
-  }
-
-  assert(oldState.isIdle());
-  deallocateUnconditional();
+  SWIFT_TASK_DEBUG_LOG("Actor %p transitioned from %#x to %#x (%s)", actor,
+                       oldState.getOpaqueFlags(), newState.getOpaqueFlags(),
+                       __FUNCTION__);
+  newState.traceStateChanged(actor);
 }
 
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
@@ -1168,98 +1093,23 @@ dispatch_lock_t *DefaultActorImpl::drainLockAddr() {
   ActiveActorStatus *actorStatus = (ActiveActorStatus *) &this->StatusStorage;
   return (dispatch_lock_t *) (((char *) actorStatus) + ActiveActorStatus::drainLockOffset());
 }
-#endif
+#endif /* SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION */
 
-void DefaultActorImpl::deallocateUnconditional() {
-  concurrency::trace::actor_deallocate(this);
-
-  if (JobStorageHeapObject.metadata != nullptr)
-    JobStorage.~ProcessInlineJob();
-  auto metadata = cast<ClassMetadata>(this->metadata);
-  swift_deallocObject(this, metadata->getInstanceSize(),
-                      metadata->getInstanceAlignMask());
-}
-
-void DefaultActorImpl::scheduleActorProcessJob(JobPriority priority, bool useInlineJob) {
-  Job *job;
-  if (useInlineJob) {
-    if (JobStorageHeapObject.metadata != nullptr)
-      JobStorage.~ProcessInlineJob();
-    job = new (&JobStorage) ProcessInlineJob(priority);
-  } else {
-    assert(false && "Should not be here - we don't have support for any OOL actor process jobs yet");
-    // TODO (rokhinip): Don't we need to take a +1 per ref count rules specified?
-    swift_retain(this);
-    job = new ProcessOutOfLineJob(this, priority);
-  }
-  SWIFT_TASK_DEBUG_LOG("Scheduling processing job %p for actor %p at priority %#x", job, this, priority);
+void DefaultActorImpl::scheduleActorProcessJob(JobPriority priority) {
+  Job *job = new ProcessOutOfLineJob(this, priority);
+  SWIFT_TASK_DEBUG_LOG(
+      "Scheduling processing job %p for actor %p at priority %#zx", job, this,
+      priority);
   swift_task_enqueueGlobal(job);
-}
-
-
-bool DefaultActorImpl::tryLock(bool asDrainer) {
-#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-  SWIFT_TASK_DEBUG_LOG("Thread %#x attempting to jump onto %p, as drainer = %d", dispatch_lock_value_for_self(), this, asDrainer);
-  dispatch_thread_override_info_s threadOverrideInfo;
-  threadOverrideInfo = swift_dispatch_thread_get_current_override_qos_floor();
-  qos_class_t overrideFloor = threadOverrideInfo.override_qos_floor;
-
-retry:;
-#else
-  SWIFT_TASK_DEBUG_LOG("Thread attempting to jump onto %p, as drainer = %d", this, asDrainer);
-#endif
-
-  auto oldState = _status().load(std::memory_order_relaxed);
-  while (true) {
-
-    if (asDrainer) {
-      // TODO (rokhinip): Once we have OOL process job support, this assert can
-      // potentially fail due to a race with an actor stealer that might have
-      // won the race and started running the actor
-      assert(oldState.isScheduled());
-
-#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-      // We only want to self override a thread if we are taking the actor lock
-      // as a drainer because there might have been higher priority work
-      // enqueued that might have escalated the max priority of the actor to be
-      // higher than the original thread request.
-      qos_class_t maxActorPriority = (qos_class_t) oldState.getMaxPriority();
-
-      if (threadOverrideInfo.can_override && (maxActorPriority > overrideFloor)) {
-        SWIFT_TASK_DEBUG_LOG("[Override] Self-override thread with oq_floor %#x to match max actor %p's priority %#x", overrideFloor, this, maxActorPriority);
-
-        (void) swift_dispatch_thread_override_self(maxActorPriority);
-        overrideFloor = maxActorPriority;
-        goto retry;
-      }
-#endif
-    } else {
-      // We're trying to take the lock in an uncontended manner
-      if (oldState.isRunning() || oldState.isScheduled()) {
-        SWIFT_TASK_DEBUG_LOG("Failed to jump to %p in fast path", this);
-        return false;
-      }
-
-      assert(oldState.getMaxPriority() == JobPriority::Unspecified);
-      assert(!oldState.getFirstJob());
-    }
-
-    auto newState = oldState.withRunning();
-    if (_status().compare_exchange_weak(oldState, newState,
-                                 std::memory_order_relaxed,
-                                 std::memory_order_relaxed)) {
-      _swift_tsan_acquire(this);
-      traceActorStateTransition(this, oldState, newState);
-      return true;
-    }
-  }
 }
 
 void DefaultActorImpl::enqueue(Job *job, JobPriority priority) {
   // We can do relaxed loads here, we are just using the current head in the
   // atomic state and linking that into the new job we are inserting, we don't
   // need acquires
-  SWIFT_TASK_DEBUG_LOG("Enqueueing job %p onto actor %p at priority %#x", job, this, priority);
+  SWIFT_TASK_DEBUG_LOG("Enqueueing job %p onto actor %p at priority %#zx", job,
+                       this, priority);
+  concurrency::trace::actor_enqueue(this, job);
   auto oldState = _status().load(std::memory_order_relaxed);
   while (true) {
     auto newState = oldState;
@@ -1290,7 +1140,7 @@ void DefaultActorImpl::enqueue(Job *job, JobPriority priority) {
       if (!oldState.isScheduled() && newState.isScheduled()) {
         // We took responsibility to schedule the actor for the first time. See
         // also ownership rule (1)
-        return scheduleActorProcessJob(newState.getMaxPriority(), true);
+        return scheduleActorProcessJob(newState.getMaxPriority());
       }
 
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
@@ -1312,84 +1162,6 @@ void DefaultActorImpl::enqueue(Job *job, JobPriority priority) {
       }
 #endif
       return;
-    }
-  }
-}
-
-/* This can be called in 2 ways:
- *    * force_unlock = true: Thread is following task and therefore wants to
- *    give up the current actor since task is switching away.
- *    * force_unlock = false: Thread is not necessarily following the task, it
- *    may want to follow actor if there is more work on it.
- *
- *    Returns true if we managed to unlock the actor, false if we didn't. If the
- *    actor has more jobs remaining on it during unlock, this method will
- *    schedule the actor
- */
-bool DefaultActorImpl::unlock(bool forceUnlock)
-{
-  auto oldState = _status().load(std::memory_order_relaxed);
-  SWIFT_TASK_DEBUG_LOG("Try unlock-ing actor %p with forceUnlock = %d", this, forceUnlock);
-
-  _swift_tsan_release(this);
-  while (true) {
-    assert(oldState.isAnyRunning());
-#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-    assert(dispatch_lock_is_locked_by_self(*(this->drainLockAddr())));
-#endif
-
-    if (oldState.isZombie_ReadyForDeallocation()) {
-#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-      // Reset any override on this thread as a result of this thread running
-      // the actor
-      if (oldState.isMaxPriorityEscalated()) {
-        swift_dispatch_lock_override_end((qos_class_t)oldState.getMaxPriority());
-      }
-#endif
-      deallocateUnconditional();
-      SWIFT_TASK_DEBUG_LOG("Unlock-ing actor %p succeeded with full deallocation", this);
-      return true;
-    }
-
-    auto newState = oldState;
-    if (oldState.getFirstJob()) {
-      // There is work left to do, don't unlock the actor
-      if (!forceUnlock) {
-        SWIFT_TASK_DEBUG_LOG("Unlock-ing actor %p failed", this);
-        return false;
-      }
-      // We need to schedule the actor - remove any escalation bits since we'll
-      // schedule the actor at the max priority currently on it
-      newState = newState.withScheduled();
-      newState = newState.withoutEscalatedPriority();
-    } else {
-      // There is no work left to do - actor goes idle
-      newState = newState.withIdle();
-      newState = newState.resetPriority();
-    }
-
-    if (_status().compare_exchange_weak(oldState, newState,
-                      /* success */ std::memory_order_relaxed,
-                      /* failure */ std::memory_order_relaxed)) {
-      traceActorStateTransition(this, oldState, newState);
-
-      if (newState.isScheduled()) {
-        // See ownership rule (6) in DefaultActorImpl
-        assert(newState.getFirstJob());
-        scheduleActorProcessJob(newState.getMaxPriority(), true);
-      } else {
-        // See ownership rule (5) in DefaultActorImpl
-        SWIFT_TASK_DEBUG_LOG("Actor %p is idle now", this);
-      }
-
-#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
-      // Reset any override on this thread as a result of this thread running
-      // the actor. Only do this after we have reenqueued the actor
-      if (oldState.isMaxPriorityEscalated()) {
-        swift_dispatch_lock_override_end((qos_class_t) oldState.getMaxPriority());
-      }
-#endif
-      return true;
     }
   }
 }
@@ -1418,10 +1190,11 @@ Job * DefaultActorImpl::drainOne() {
     // Dequeue the first job and set up a new head
     newState = newState.withFirstJob(getNextJobInQueue(firstJob));
     if (_status().compare_exchange_weak(oldState, newState,
-                            /* sucess */ std::memory_order_release,
+                            /* success */ std::memory_order_release,
                             /* failure */ std::memory_order_acquire)) {
       SWIFT_TASK_DEBUG_LOG("Drained first job %p from actor %p", firstJob, this);
       traceActorStateTransition(this, oldState, newState);
+      concurrency::trace::actor_dequeue(this, firstJob);
       return firstJob;
     }
 
@@ -1520,8 +1293,215 @@ static void defaultActorDrain(DefaultActorImpl *actor) {
   // Leave the tracking info.
   trackingInfo.leave();
 
-  // Balances with the retain taken in Process{Inline,OutOfLine}Job::process
+  // Balances with the retain taken in ProcessOutOfLineJob::process
   swift_release(actor);
+}
+
+SWIFT_CC(swiftasync)
+void ProcessOutOfLineJob::process(Job *job) {
+  auto self = cast<ProcessOutOfLineJob>(job);
+  DefaultActorImpl *actor = self->Actor;
+
+  delete self;
+
+  // Balances with the swift_release in defaultActorDrain()
+  swift_retain(actor);
+  return defaultActorDrain(actor); // 'return' forces tail call
+}
+
+#endif /* !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS */
+
+void DefaultActorImpl::destroy() {
+#if SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+  // TODO (rokhinip): Do something to assert that the lock is unowned
+#else
+  auto oldState = _status().load(std::memory_order_relaxed);
+  // Tasks on an actor are supposed to keep the actor alive until they start
+  // running and we can only get here if ref count of the object = 0 which means
+  // there should be no more tasks enqueued on the actor.
+  assert(!oldState.getFirstJob() && "actor has queued jobs at destruction");
+
+  if (oldState.isIdle()) {
+      return;
+  }
+  assert(oldState.isRunning() && "actor scheduled but not running at destruction");
+#endif
+}
+
+void DefaultActorImpl::deallocate() {
+#if !SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+  // If we're running, mark ourselves as ready for deallocation but don't
+  // deallocate yet. When we stop running the actor - at unlock() time - we'll
+  // do the actual deallocation.
+  //
+  // If we're idle, just deallocate immediately
+  auto oldState = _status().load(std::memory_order_relaxed);
+  while (oldState.isRunning()) {
+    auto newState = oldState.withZombie_ReadyForDeallocation();
+    if (_status().compare_exchange_weak(oldState, newState,
+                                           std::memory_order_relaxed,
+                                           std::memory_order_relaxed))
+      return;
+  }
+
+  assert(oldState.isIdle());
+#endif
+  deallocateUnconditional();
+}
+
+void DefaultActorImpl::deallocateUnconditional() {
+  concurrency::trace::actor_deallocate(this);
+
+  auto metadata = cast<ClassMetadata>(this->metadata);
+  swift_deallocClassInstance(this, metadata->getInstanceSize(),
+                             metadata->getInstanceAlignMask());
+}
+
+bool DefaultActorImpl::tryLock(bool asDrainer) {
+#if SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+  this->drainLock.lock();
+  return true;
+#else /* SWIFT_CONCURRENCY_ACTORS_AS_LOCKS */
+
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+  SWIFT_TASK_DEBUG_LOG("Thread %#x attempting to jump onto %p, as drainer = %d", dispatch_lock_value_for_self(), this, asDrainer);
+  dispatch_thread_override_info_s threadOverrideInfo;
+  threadOverrideInfo = swift_dispatch_thread_get_current_override_qos_floor();
+  qos_class_t overrideFloor = threadOverrideInfo.override_qos_floor;
+
+retry:;
+#else
+  SWIFT_TASK_DEBUG_LOG("Thread attempting to jump onto %p, as drainer = %d", this, asDrainer);
+#endif
+
+  auto oldState = _status().load(std::memory_order_relaxed);
+  while (true) {
+
+    if (asDrainer) {
+      // TODO (rokhinip): Once we have multiple OOL process job support, this
+      // assert can potentially fail due to a race with an actor stealer that
+      // might have won the race and started running the actor
+      assert(oldState.isScheduled());
+
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+      // We only want to self override a thread if we are taking the actor lock
+      // as a drainer because there might have been higher priority work
+      // enqueued that might have escalated the max priority of the actor to be
+      // higher than the original thread request.
+      qos_class_t maxActorPriority = (qos_class_t) oldState.getMaxPriority();
+
+      if (threadOverrideInfo.can_override && (maxActorPriority > overrideFloor)) {
+        SWIFT_TASK_DEBUG_LOG("[Override] Self-override thread with oq_floor %#x to match max actor %p's priority %#x", overrideFloor, this, maxActorPriority);
+
+        (void) swift_dispatch_thread_override_self(maxActorPriority);
+        overrideFloor = maxActorPriority;
+        goto retry;
+      }
+#endif /* SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION */
+    } else {
+      // We're trying to take the lock in an uncontended manner
+      if (oldState.isRunning() || oldState.isScheduled()) {
+        SWIFT_TASK_DEBUG_LOG("Failed to jump to %p in fast path", this);
+        return false;
+      }
+
+      assert(oldState.getMaxPriority() == JobPriority::Unspecified);
+      assert(!oldState.getFirstJob());
+    }
+
+    auto newState = oldState.withRunning();
+    if (_status().compare_exchange_weak(oldState, newState,
+                                 std::memory_order_relaxed,
+                                 std::memory_order_relaxed)) {
+      _swift_tsan_acquire(this);
+      traceActorStateTransition(this, oldState, newState);
+      return true;
+    }
+  }
+#endif /* SWIFT_CONCURRENCY_ACTORS_AS_LOCKS */
+}
+
+/* This can be called in 2 ways:
+ *    * force_unlock = true: Thread is following task and therefore wants to
+ *    give up the current actor since task is switching away.
+ *    * force_unlock = false: Thread is not necessarily following the task, it
+ *    may want to follow actor if there is more work on it.
+ *
+ *    Returns true if we managed to unlock the actor, false if we didn't. If the
+ *    actor has more jobs remaining on it during unlock, this method will
+ *    schedule the actor
+ */
+bool DefaultActorImpl::unlock(bool forceUnlock)
+{
+#if SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+  this->drainLock.unlock();
+  return true;
+#else
+  auto oldState = _status().load(std::memory_order_relaxed);
+  SWIFT_TASK_DEBUG_LOG("Try unlock-ing actor %p with forceUnlock = %d", this, forceUnlock);
+
+  _swift_tsan_release(this);
+  while (true) {
+    assert(oldState.isAnyRunning());
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+    assert(dispatch_lock_is_locked_by_self(*(this->drainLockAddr())));
+#endif
+
+    if (oldState.isZombie_ReadyForDeallocation()) {
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+      // Reset any override on this thread as a result of this thread running
+      // the actor
+      if (oldState.isMaxPriorityEscalated()) {
+        swift_dispatch_lock_override_end((qos_class_t)oldState.getMaxPriority());
+      }
+#endif
+      deallocateUnconditional();
+      SWIFT_TASK_DEBUG_LOG("Unlock-ing actor %p succeeded with full deallocation", this);
+      return true;
+    }
+
+    auto newState = oldState;
+    if (oldState.getFirstJob()) {
+      // There is work left to do, don't unlock the actor
+      if (!forceUnlock) {
+        SWIFT_TASK_DEBUG_LOG("Unlock-ing actor %p failed", this);
+        return false;
+      }
+      // We need to schedule the actor - remove any escalation bits since we'll
+      // schedule the actor at the max priority currently on it
+      newState = newState.withScheduled();
+      newState = newState.withoutEscalatedPriority();
+    } else {
+      // There is no work left to do - actor goes idle
+      newState = newState.withIdle();
+      newState = newState.resetPriority();
+    }
+
+    if (_status().compare_exchange_weak(oldState, newState,
+                      /* success */ std::memory_order_relaxed,
+                      /* failure */ std::memory_order_relaxed)) {
+      traceActorStateTransition(this, oldState, newState);
+
+      if (newState.isScheduled()) {
+        // See ownership rule (6) in DefaultActorImpl
+        assert(newState.getFirstJob());
+        scheduleActorProcessJob(newState.getMaxPriority());
+      } else {
+        // See ownership rule (5) in DefaultActorImpl
+        SWIFT_TASK_DEBUG_LOG("Actor %p is idle now", this);
+      }
+
+#if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION
+      // Reset any override on this thread as a result of this thread running
+      // the actor. Only do this after we have reenqueued the actor
+      if (oldState.isMaxPriorityEscalated()) {
+        swift_dispatch_lock_override_end((qos_class_t) oldState.getMaxPriority());
+      }
+#endif
+      return true;
+    }
+  }
+#endif
 }
 
 SWIFT_CC(swift)
@@ -1535,12 +1515,10 @@ static void swift_job_runImpl(Job *job, ExecutorRef executor) {
   if (!executor.isGeneric()) trackingInfo.disallowSwitching();
 
   trackingInfo.enterAndShadow(executor);
-  auto traceHandle = concurrency::trace::job_run_begin(job, &executor);
 
   SWIFT_TASK_DEBUG_LOG("job %p", job);
   runJobInEstablishedExecutorContext(job);
 
-  concurrency::trace::job_run_end(&executor, traceHandle);
   trackingInfo.leave();
 
   // Give up the current executor if this is a switching context
@@ -1552,26 +1530,6 @@ static void swift_job_runImpl(Job *job, ExecutorRef executor) {
   }
 }
 
-SWIFT_CC(swiftasync)
-void ProcessInlineJob::process(Job *job) {
-  DefaultActorImpl *actor = DefaultActorImpl::fromInlineJob(job);
-
-  swift_retain(actor);
-  return defaultActorDrain(actor); // 'return' forces tail call
-}
-
-// Currently unused
-SWIFT_CC(swiftasync)
-void ProcessOutOfLineJob::process(Job *job) {
-  auto self = cast<ProcessOutOfLineJob>(job);
-  DefaultActorImpl *actor = self->Actor;
-
-  delete self;
-
-  swift_retain(actor);
-  return defaultActorDrain(actor); // 'return' forces tail call
-}
-
 void swift::swift_defaultActor_initialize(DefaultActor *_actor) {
   asImpl(_actor)->initialize();
 }
@@ -1581,7 +1539,11 @@ void swift::swift_defaultActor_destroy(DefaultActor *_actor) {
 }
 
 void swift::swift_defaultActor_enqueue(Job *job, DefaultActor *_actor) {
+#if SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+  assert(false && "Should not enqueue onto default actor in actor as locks model");
+#else
   asImpl(_actor)->enqueue(job, job->getPriority());
+#endif
 }
 
 void swift::swift_defaultActor_deallocate(DefaultActor *_actor) {
@@ -1650,7 +1612,8 @@ static bool canGiveUpThreadForSwitch(ExecutorTrackingInfo *trackingInfo,
 /// do that in runOnAssumedThread.
 static void giveUpThreadForSwitch(ExecutorRef currentExecutor) {
   if (currentExecutor.isGeneric()) {
-    SWIFT_TASK_DEBUG_LOG("Giving up current generic executor %p", currentExecutor);
+    SWIFT_TASK_DEBUG_LOG("Giving up current generic executor %p",
+                         currentExecutor.getIdentity());
     return;
   }
 
@@ -1686,7 +1649,7 @@ static void runOnAssumedThread(AsyncTask *task, ExecutorRef executor,
   // Note that this doesn't change the active task and so doesn't
   // need to either update ActiveTask or flagAsRunning/flagAsSuspended.
 
-  // If there's alreaady tracking info set up, just change the executor
+  // If there's already tracking info set up, just change the executor
   // there and tail-call the task.  We don't want these frames to
   // potentially accumulate linearly.
   if (oldTracking) {
@@ -1794,8 +1757,13 @@ static void swift_task_enqueueImpl(Job *job, ExecutorRef executor) {
   if (executor.isGeneric())
     return swift_task_enqueueGlobal(job);
 
-  if (executor.isDefaultActor())
+  if (executor.isDefaultActor()) {
+#if SWIFT_CONCURRENCY_ACTORS_AS_LOCKS
+    assert(false && "Should not enqueue tasks on actors in actors as locks model");
+#else
     return asImpl(executor.getDefaultActor())->enqueue(job, job->getPriority());
+#endif
+  }
 
   auto wtable = executor.getSerialExecutorWitnessTable();
   auto executorObject = executor.getIdentity();
@@ -1843,6 +1811,5 @@ bool swift::swift_distributed_actor_is_remote(DefaultActor *_actor) {
 }
 
 bool DefaultActorImpl::isDistributedRemote() {
-  auto state = _status().load(std::memory_order_relaxed);
-  return state.isDistributedRemote();
+  return this->isDistributedRemoteActor;
 }

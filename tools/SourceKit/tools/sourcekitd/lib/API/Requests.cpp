@@ -31,6 +31,7 @@
 
 #include "swift/Basic/ExponentialGrowthAppendingBinaryByteStream.h"
 #include "swift/Basic/LLVMInitialize.h"
+#include "swift/Basic/InitializeSwiftModules.h"
 #include "swift/Basic/Mangler.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/Version.h"
@@ -106,13 +107,15 @@ static void fillDictionaryForDiagnosticInfo(ResponseBuilder::Dictionary Elem,
 static SourceKit::Context *GlobalCtx = nullptr;
 
 void sourcekitd::initializeService(
-    StringRef runtimeLibPath, StringRef diagnosticDocumentationPath,
+    llvm::StringRef swiftExecutablePath, StringRef runtimeLibPath,
+    StringRef diagnosticDocumentationPath,
     std::function<void(sourcekitd_response_t)> postNotification) {
   INITIALIZE_LLVM();
+  initializeSwiftModules();
   llvm::EnablePrettyStackTrace();
-  GlobalCtx =
-      new SourceKit::Context(runtimeLibPath, diagnosticDocumentationPath,
-                             SourceKit::createSwiftLangSupport);
+  GlobalCtx = new SourceKit::Context(swiftExecutablePath, runtimeLibPath,
+                                     diagnosticDocumentationPath,
+                                     SourceKit::createSwiftLangSupport);
   auto noteCenter = GlobalCtx->getNotificationCenter();
 
   noteCenter->addDocumentUpdateNotificationReceiver([postNotification](StringRef DocumentName) {
@@ -3109,12 +3112,9 @@ void serializeSyntaxTreeAsJson(
   auto StartClock = clock();
   // 4096 is a heuristic buffer size that appears to usually be able to fit an
   // incremental syntax tree
-  size_t ReserveBufferSize = 4096;
-  std::string SyntaxTreeString;
-  SyntaxTreeString.reserve(ReserveBufferSize);
+  llvm::SmallString<4096> SyntaxTreeString;
   {
-    llvm::raw_string_ostream SyntaxTreeStream(SyntaxTreeString);
-    SyntaxTreeStream.SetBufferSize(ReserveBufferSize);
+    llvm::raw_svector_ostream SyntaxTreeStream(SyntaxTreeString);
     swift::json::Output::UserInfoMap JsonUserInfo;
     swift::json::Output SyntaxTreeOutput(SyntaxTreeStream, JsonUserInfo,
                                          /*PrettyPrint=*/false);

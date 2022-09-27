@@ -399,7 +399,7 @@ template <class Impl>
 class EffectsHandlingWalker : public ASTWalker {
   Impl &asImpl() { return *static_cast<Impl*>(this); }
 public:
-  bool walkToDeclPre(Decl *D) override {
+  PreWalkAction walkToDeclPre(Decl *D) override {
     ShouldRecurse_t recurse = ShouldRecurse;
     // Skip the implementations of all local declarations... except
     // PBD.  We should really just have a PatternBindingStmt.
@@ -411,10 +411,10 @@ public:
     } else {
       recurse = ShouldNotRecurse;
     }
-    return bool(recurse);
+    return Action::VisitChildrenIf(bool(recurse));
   }
 
-  std::pair<bool, Expr*> walkToExprPre(Expr *E) override {
+  PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     visitExprPre(E);
     ShouldRecurse_t recurse = ShouldRecurse;
     if (isa<ErrorExpr>(E)) {
@@ -444,13 +444,13 @@ public:
     // type checking. If an unchecked expression is still around, the code was
     // invalid.
 #define UNCHECKED_EXPR(KIND, BASE) \
-    else if (isa<KIND##Expr>(E)) return {false, nullptr};
+    else if (isa<KIND##Expr>(E)) return Action::Stop();
 #include "swift/AST/ExprNodes.def"
 
-    return {bool(recurse), E};
+    return Action::VisitChildrenIf(bool(recurse), E);
   }
 
-  std::pair<bool, Stmt*> walkToStmtPre(Stmt *S) override {
+  PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
     ShouldRecurse_t recurse = ShouldRecurse;
     if (auto doCatch = dyn_cast<DoCatchStmt>(S)) {
       recurse = asImpl().checkDoCatch(doCatch);
@@ -459,7 +459,10 @@ public:
     } else if (auto forEach = dyn_cast<ForEachStmt>(S)) {
       recurse = asImpl().checkForEach(forEach);
     }
-    return {bool(recurse), S};
+    if (!recurse)
+      return Action::SkipChildren(S);
+
+    return Action::Continue(S);
   }
 
   ShouldRecurse_t checkDoCatch(DoCatchStmt *S) {
@@ -745,32 +748,36 @@ public:
 
   /// Check to see if the given function application throws or is async.
   Classification classifyApply(ApplyExpr *E) {
-    if (isa<SelfApplyExpr>(E)) {
-      assert(!E->isImplicitlyAsync());
-      return Classification();
-    }
-
     // An apply expression is a potential throw site if the function throws.
     // But if the expression didn't type-check, suppress diagnostics.
     if (!E->getType() || E->getType()->hasError())
       return Classification::forInvalidCode();
+
+    if (auto *SAE = dyn_cast<SelfApplyExpr>(E)) {
+      assert(!E->isImplicitlyAsync());
+    }
 
     auto type = E->getFn()->getType();
     if (!type) return Classification::forInvalidCode();
     auto fnType = type->getAs<AnyFunctionType>();
     if (!fnType) return Classification::forInvalidCode();
 
-    // If the function doesn't have any effects, we're done here.
+    auto fnRef = AbstractFunction::getAppliedFn(E);
+    auto conformances = fnRef.getSubstitutions().getConformances();
+    const auto hasAnyConformances = !conformances.empty();
+
+    // If the function doesn't have any effects or conformances, we're done
+    // here.
     if (!fnType->isThrowing() &&
         !E->implicitlyThrows() &&
         !fnType->isAsync() &&
-        !E->isImplicitlyAsync()) {
+        !E->isImplicitlyAsync() &&
+        !hasAnyConformances) {
       return Classification();
     }
 
     // Decompose the application.
     auto *args = E->getArgs();
-    auto fnRef = AbstractFunction::getAppliedFn(E);
 
     // If any of the arguments didn't type check, fail.
     for (auto arg : *args) {
@@ -1768,6 +1775,9 @@ public:
   void diagnoseUnhandledThrowSite(DiagnosticEngine &Diags, ASTNode E,
                                   bool isTryCovered,
                                   const PotentialEffectReason &reason) {
+    if (E.isImplicit())
+      return;
+
     switch (getKind()) {
     case Kind::PotentiallyHandled:
       if (IsNonExhaustiveCatch) {
@@ -1947,6 +1957,9 @@ public:
   void diagnoseUnhandledAsyncSite(DiagnosticEngine &Diags, ASTNode node,
                                   Optional<PotentialEffectReason> maybeReason,
                                   bool forAwait = false) {
+    if (node.isImplicit())
+      return;
+
     switch (getKind()) {
     case Kind::PotentiallyHandled: {
       Diags.diagnose(node.getStartLoc(), diag::async_in_nonasync_function,
@@ -2201,7 +2214,7 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
       // in the Context itself, used to postpone diagnostic emission
       // to a parent "try" expression. If something was diagnosed
       // during this ContextScope, the flag may have been set, and
-      // we need to preseve its value when restoring the old Context.
+      // we need to preserve its value when restoring the old Context.
       bool DiagnoseErrorOnTry = Self.CurContext.shouldDiagnoseErrorOnTry();
       OldContext.setDiagnoseErrorOnTry(DiagnoseErrorOnTry);
     }
@@ -2562,17 +2575,17 @@ private:
       CheckEffectsCoverage &CEC;
       ConservativeThrowChecker(CheckEffectsCoverage &CEC) : CEC(CEC) {}
       
-      Expr *walkToExprPost(Expr *E) override {
+      PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
         if (isa<TryExpr>(E))
           CEC.Flags.set(ContextFlags::HasAnyThrowSite);
-        return E;
+        return Action::Continue(E);
       }
       
-      Stmt *walkToStmtPost(Stmt *S) override {
+      PostWalkResult<Stmt *> walkToStmtPost(Stmt *S) override {
         if (isa<ThrowStmt>(S))
           CEC.Flags.set(ContextFlags::HasAnyThrowSite);
 
-        return S;
+        return Action::Continue(S);
       }
     };
 
@@ -2851,7 +2864,7 @@ private:
          if (call && call->isImplicitlyAsync()) {
            // Emit a tailored note if the call is implicitly async, meaning the
            // callee is isolated to an actor.
-           auto callee = call->getCalledValue();
+           auto callee = call->getCalledValue(/*skipFunctionConversions=*/true);
            if (callee) {
              Ctx.Diags.diagnose(diag.expr.getStartLoc(), diag::actor_isolated_sync_func,
                                 callee->getDescriptiveKind(), callee->getName());
@@ -2874,15 +2887,15 @@ private:
 
 // Find nested functions and perform effects checking on them.
 struct LocalFunctionEffectsChecker : ASTWalker {
-  bool walkToDeclPre(Decl *D) override {
+  PreWalkAction walkToDeclPre(Decl *D) override {
     if (auto func = dyn_cast<AbstractFunctionDecl>(D)) {
       if (func->getDeclContext()->isLocalContext())
         TypeChecker::checkFunctionEffects(func);
 
-      return false;
+      return Action::SkipChildren();
     }
 
-    return true;
+    return Action::Continue();
   }
 };
 
@@ -2896,8 +2909,10 @@ void TypeChecker::checkTopLevelEffects(TopLevelCodeDecl *code) {
   if (ctx.LangOpts.EnableThrowWithoutTry)
     checker.setTopLevelThrowWithoutTry();
 
-  code->getBody()->walk(checker);
-  code->getBody()->walk(LocalFunctionEffectsChecker());
+  if (auto *body = code->getBody()) {
+    body->walk(checker);
+    body->walk(LocalFunctionEffectsChecker());
+  }
 }
 
 void TypeChecker::checkFunctionEffects(AbstractFunctionDecl *fn) {
@@ -2957,6 +2972,7 @@ void TypeChecker::checkPropertyWrapperEffects(
 }
 
 bool TypeChecker::canThrow(Expr *expr) {
-  return (ApplyClassifier().classifyExpr(expr, EffectKind::Throws)
-          == ConditionalEffectKind::Always);
+  ApplyClassifier classifier;
+  auto effect = classifier.classifyExpr(expr, EffectKind::Throws);
+  return (effect != ConditionalEffectKind::None);
 }

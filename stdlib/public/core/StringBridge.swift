@@ -167,8 +167,9 @@ internal func _cocoaStringSubscript(
 }
 
 @_effects(releasenone)
-private func _NSStringCopyUTF8(
+private func _NSStringCopyBytes(
   _ o: _StringSelectorHolder,
+  encoding: UInt,
   into bufPtr: UnsafeMutableRawBufferPointer
 ) -> Int? {
   let ptr = bufPtr.baseAddress._unsafelyUnwrappedUnchecked
@@ -179,7 +180,7 @@ private func _NSStringCopyUTF8(
     ptr,
     maxLength: bufPtr.count,
     usedLength: &usedLen,
-    encoding: _cocoaUTF8Encoding,
+    encoding: encoding,
     options: 0,
     range: _SwiftNSRange(location: 0, length: len),
     remaining: &remainingRange
@@ -195,7 +196,23 @@ internal func _cocoaStringCopyUTF8(
   _ target: _CocoaString,
   into bufPtr: UnsafeMutableRawBufferPointer
 ) -> Int? {
-  return _NSStringCopyUTF8(_objc(target), into: bufPtr)
+  return _NSStringCopyBytes(
+    _objc(target),
+    encoding: _cocoaUTF8Encoding,
+    into: bufPtr
+  )
+}
+
+@_effects(releasenone)
+internal func _cocoaStringCopyASCII(
+  _ target: _CocoaString,
+  into bufPtr: UnsafeMutableRawBufferPointer
+) -> Int? {
+  return _NSStringCopyBytes(
+    _objc(target),
+    encoding: _cocoaASCIIEncoding,
+    into: bufPtr
+  )
 }
 
 @_effects(readonly)
@@ -335,8 +352,9 @@ internal enum _KnownCocoaString {
 #if !(arch(i386) || arch(arm) || arch(arm64_32))
 
 // Resiliently write a tagged _CocoaString's contents into a buffer.
-// TODO: move this to the Foundation overlay and reimplement it with
-// _NSTaggedPointerStringGetBytes
+// The Foundation overlay takes care of bridging tagged pointer strings before
+// they reach us, but this may still be called by older code, or by strings
+// entering our domain via the arguments to -isEqual:, etc...
 @_effects(releasenone) // @opaque
 internal func _bridgeTagged(
   _ cocoa: _CocoaString,
@@ -345,15 +363,28 @@ internal func _bridgeTagged(
   _internalInvariant(_isObjCTaggedPointer(cocoa))
   return _cocoaStringCopyUTF8(cocoa, into: bufPtr)
 }
+
+@_effects(releasenone) // @opaque
+internal func _bridgeTaggedASCII(
+  _ cocoa: _CocoaString,
+  intoUTF8 bufPtr: UnsafeMutableRawBufferPointer
+) -> Int? {
+  _internalInvariant(_isObjCTaggedPointer(cocoa))
+  return _cocoaStringCopyASCII(cocoa, into: bufPtr)
+}
 #endif
 
 @_effects(readonly)
 private func _NSStringASCIIPointer(_ str: _StringSelectorHolder) -> UnsafePointer<UInt8>? {
- // TODO(String bridging): Is there a better interface here? Ideally we'd be
-  // able to ask for UTF8 rather than just ASCII
   //TODO(String bridging): Unconditionally asking for nul-terminated contents is
   // overly conservative and hurts perf with some NSStrings
   return str._fastCStringContents(1)?._asUInt8
+}
+
+@_effects(readonly)
+private func _NSStringUTF8Pointer(_ str: _StringSelectorHolder) -> UnsafePointer<UInt8>? {
+  //We don't have a way to ask for UTF8 here currently
+  return _NSStringASCIIPointer(str)
 }
 
 @_effects(readonly) // @opaque
@@ -370,12 +401,43 @@ private func _withCocoaASCIIPointer<R>(
     if requireStableAddress {
       return nil // tagged pointer strings don't support _fastCStringContents
     }
-    let tmp = _StringGuts(_SmallString(taggedCocoa: str))
-    return tmp.withFastUTF8 { work($0.baseAddress._unsafelyUnwrappedUnchecked) }
+    if let smol = _SmallString(taggedASCIICocoa: str) {
+      return _StringGuts(smol).withFastUTF8 {
+        work($0.baseAddress._unsafelyUnwrappedUnchecked)
+      }
+    }
   }
   #endif
   defer { _fixLifetime(str) }
   if let ptr = _NSStringASCIIPointer(_objc(str)) {
+    return work(ptr)
+  }
+  return nil
+}
+
+@_effects(readonly) // @opaque
+private func _withCocoaUTF8Pointer<R>(
+  _ str: _CocoaString,
+  requireStableAddress: Bool,
+  work: (UnsafePointer<UInt8>) -> R?
+) -> R? {
+  #if !(arch(i386) || arch(arm) || arch(arm64_32))
+  if _isObjCTaggedPointer(str) {
+    if let ptr = getConstantTaggedCocoaContents(str)?.asciiContentsPointer {
+      return work(ptr)
+    }
+    if requireStableAddress {
+      return nil // tagged pointer strings don't support _fastCStringContents
+    }
+    if let smol = _SmallString(taggedCocoa: str) {
+      return _StringGuts(smol).withFastUTF8 {
+        work($0.baseAddress._unsafelyUnwrappedUnchecked)
+      }
+    }
+  }
+  #endif
+  defer { _fixLifetime(str) }
+  if let ptr = _NSStringUTF8Pointer(_objc(str)) {
     return work(ptr)
   }
   return nil
@@ -389,10 +451,24 @@ internal func withCocoaASCIIPointer<R>(
   return _withCocoaASCIIPointer(str, requireStableAddress: false, work: work)
 }
 
+@_effects(readonly) // @opaque
+internal func withCocoaUTF8Pointer<R>(
+  _ str: _CocoaString,
+  work: (UnsafePointer<UInt8>) -> R?
+) -> R? {
+  return _withCocoaUTF8Pointer(str, requireStableAddress: false, work: work)
+}
+
 @_effects(readonly)
 internal func stableCocoaASCIIPointer(_ str: _CocoaString)
   -> UnsafePointer<UInt8>? {
   return _withCocoaASCIIPointer(str, requireStableAddress: true, work: { $0 })
+}
+
+@_effects(readonly)
+internal func stableCocoaUTF8Pointer(_ str: _CocoaString)
+  -> UnsafePointer<UInt8>? {
+  return _withCocoaUTF8Pointer(str, requireStableAddress: true, work: { $0 })
 }
 
 private enum CocoaStringPointer {
@@ -503,7 +579,11 @@ internal func _bridgeCocoaString(_ cocoaString: _CocoaString) -> _StringGuts {
       cocoaString, to: __SharedStringStorage.self).asString._guts
 #if !(arch(i386) || arch(arm) || arch(arm64_32))
   case .tagged:
-    return _StringGuts(_SmallString(taggedCocoa: cocoaString))
+    // Foundation should be taking care of tagged pointer strings before they
+    // reach here, so the only ones reaching this point should be back deployed,
+    // which will never have tagged pointer strings that aren't small, hence
+    // the force unwrap here.
+    return _StringGuts(_SmallString(taggedCocoa: cocoaString)!)
 #if arch(arm64)
   case .constantTagged:
     let taggedContents = getConstantTaggedCocoaContents(cocoaString)!
@@ -530,7 +610,11 @@ internal func _bridgeCocoaString(_ cocoaString: _CocoaString) -> _StringGuts {
 
 #if !(arch(i386) || arch(arm) || arch(arm64_32))
     if _isObjCTaggedPointer(immutableCopy) {
-      return _StringGuts(_SmallString(taggedCocoa: immutableCopy))
+      // Copying a tagged pointer can produce a tagged pointer, but only if it's
+      // small enough to definitely fit in a _SmallString
+      return _StringGuts(
+        _SmallString(taggedCocoa: immutableCopy).unsafelyUnwrapped
+      )
     }
 #endif
 

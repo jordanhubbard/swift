@@ -41,6 +41,7 @@ static void forAllRequirementTypes(
   std::move(source).visitRequirements(TypeResolutionStage::Interface,
       [&](const Requirement &req, RequirementRepr *reqRepr) {
     switch (req.getKind()) {
+    case RequirementKind::SameCount:
     case RequirementKind::Conformance:
     case RequirementKind::SameType:
     case RequirementKind::Superclass:
@@ -108,6 +109,8 @@ public:
   void checkGenericParamAccess(
     const GenericContext *ownerCtx,
     const ValueDecl *ownerDecl);
+
+  void checkGlobalActorAccess(const Decl *D);
 };
 
 class TypeAccessScopeDiagnoser : private ASTWalker {
@@ -116,30 +119,21 @@ class TypeAccessScopeDiagnoser : private ASTWalker {
   bool treatUsableFromInlineAsPublic;
   const ComponentIdentTypeRepr *offendingType = nullptr;
 
-  bool walkToTypeReprPre(TypeRepr *TR) override {
-    // Exit early if we've already found a problem type.
-    if (offendingType)
-      return false;
-
+  PreWalkAction walkToTypeReprPre(TypeRepr *TR) override {
     auto CITR = dyn_cast<ComponentIdentTypeRepr>(TR);
     if (!CITR)
-      return true;
+      return Action::Continue();
 
     const ValueDecl *VD = CITR->getBoundDecl();
     if (!VD)
-      return true;
+      return Action::Continue();
 
     if (VD->getFormalAccessScope(useDC, treatUsableFromInlineAsPublic)
         != accessScope)
-      return true;
+      return Action::Continue();
 
     offendingType = CITR;
-    return false;
-  }
-
-  bool walkToTypeReprPost(TypeRepr *T) override {
-    // Exit early if we've already found a problem type.
-    return offendingType != nullptr;
+    return Action::Stop();
   }
 
   explicit TypeAccessScopeDiagnoser(AccessScope accessScope,
@@ -409,6 +403,41 @@ void AccessControlCheckerBase::checkGenericParamAccess(
                           ownerDecl->getFormalAccess());
 }
 
+void AccessControlCheckerBase::checkGlobalActorAccess(const Decl *D) {
+  auto VD = dyn_cast<ValueDecl>(D);
+  if (!VD)
+    return;
+
+  auto globalActorAttr = D->getGlobalActorAttr();
+  if (!globalActorAttr)
+    return;
+
+  auto customAttr = globalActorAttr->first;
+  auto globalActorDecl = globalActorAttr->second;
+  checkTypeAccess(
+      customAttr->getType(), customAttr->getTypeRepr(), VD,
+      /*mayBeInferred*/ false,
+      [&](AccessScope typeAccessScope, const TypeRepr *complainRepr,
+          DowngradeToWarning downgradeToWarning) {
+        if (checkUsableFromInline) {
+          auto diag = D->diagnose(diag::global_actor_not_usable_from_inline,
+                                  D->getDescriptiveKind(), VD->getName());
+          highlightOffendingType(diag, complainRepr);
+          return;
+        }
+
+        auto globalActorAccess = typeAccessScope.accessLevelForDiagnostics();
+        bool isExplicit = D->getAttrs().hasAttribute<AccessControlAttr>();
+        auto declAccess = isExplicit
+                              ? VD->getFormalAccess()
+                              : typeAccessScope.requiredAccessForDiagnostics();
+        auto diag = D->diagnose(diag::global_actor_access, declAccess,
+                                D->getDescriptiveKind(), VD->getName(),
+                                globalActorAccess, globalActorDecl->getName());
+        highlightOffendingType(diag, complainRepr);
+      });
+}
+
 namespace {
 class AccessControlChecker : public AccessControlCheckerBase,
                              public DeclVisitor<AccessControlChecker> {
@@ -425,6 +454,7 @@ public:
       return;
 
     DeclVisitor<AccessControlChecker>::visit(D);
+    checkGlobalActorAccess(D);
   }
 
   // Force all kinds to be handled at a lower level.
@@ -447,6 +477,9 @@ public:
   UNREACHABLE(Param, "does not have access control")
   UNREACHABLE(GenericTypeParam, "does not have access control")
   UNREACHABLE(MissingMember, "does not have access control")
+
+  UNREACHABLE(BuiltinTuple, "BuiltinTupleDecl should not show up here")
+
 #undef UNREACHABLE
 
 #define UNINTERESTING(KIND) \
@@ -1047,6 +1080,7 @@ public:
         return;
 
     DeclVisitor<UsableFromInlineChecker>::visit(D);
+    checkGlobalActorAccess(D);
   }
 
   // Force all kinds to be handled at a lower level.
@@ -1067,6 +1101,7 @@ public:
   UNREACHABLE(Param, "does not have access control")
   UNREACHABLE(GenericTypeParam, "does not have access control")
   UNREACHABLE(MissingMember, "does not have access control")
+  UNREACHABLE(BuiltinTuple, "BuiltinTupleDecl should not show up here")
 #undef UNREACHABLE
 
 #define UNINTERESTING(KIND) \
@@ -1503,11 +1538,27 @@ swift::getDisallowedOriginKind(const Decl *decl,
   downgradeToWarning = DowngradeToWarning::No;
   ModuleDecl *M = decl->getModuleContext();
   auto *SF = where.getDeclContext()->getParentSourceFile();
-  if (SF->isImportedImplementationOnly(M)) {
+
+  RestrictedImportKind howImported = SF->getRestrictedImportKind(M);
+  if (howImported != RestrictedImportKind::None) {
     // Temporarily downgrade implementation-only exportability in SPI to
     // a warning.
-    if (where.isSPI())
+    if (where.isSPI() &&
+        where.getFragileFunctionKind().kind == FragileFunctionKind::None &&
+        !SF->getASTContext().LangOpts.EnableSPIOnlyImports)
       downgradeToWarning = DowngradeToWarning::Yes;
+
+    if (where.isSPI() && howImported == RestrictedImportKind::SPIOnly)
+      return DisallowedOriginKind::None;
+
+    // Before Swift 6, implicit imports were not reported unless an
+    // implementation-only import was also present. Downgrade to a warning
+    // just in this case.
+    if (howImported == RestrictedImportKind::MissingImport &&
+        !SF->getASTContext().isSwiftVersionAtLeast(6) &&
+        !SF->hasImportsWithFlag(ImportFlags::ImplementationOnly)) {
+      downgradeToWarning = DowngradeToWarning::Yes;
+    }
 
     // Even if the current module is @_implementationOnly, Swift should
     // not report an error in the cases where the decl is also exported from
@@ -1529,9 +1580,12 @@ swift::getDisallowedOriginKind(const Decl *decl,
             continue;
           }
         }
+        auto owningModule = redecl->getOwningModule();
+        if (!owningModule)
+          continue;
         auto moduleWrapper =
             decl->getASTContext().getClangModuleLoader()->getWrapperForModule(
-                redecl->getOwningModule());
+                owningModule);
         auto visibleAccessPath =
             find_if(sfImportedModules, [&moduleWrapper](auto importedModule) {
               return importedModule.importedModule == moduleWrapper ||
@@ -1543,9 +1597,35 @@ swift::getDisallowedOriginKind(const Decl *decl,
         }
       }
     }
-    // Implementation-only imported, cannot be reexported.
-    return DisallowedOriginKind::ImplementationOnly;
+
+    // Restrictively imported, cannot be reexported.
+    switch (howImported) {
+    case RestrictedImportKind::MissingImport:
+      return DisallowedOriginKind::MissingImport;
+    case RestrictedImportKind::SPIOnly:
+      return DisallowedOriginKind::SPIOnly;
+    case RestrictedImportKind::ImplementationOnly:
+      return DisallowedOriginKind::ImplementationOnly;
+    default:
+      llvm_unreachable("RestrictedImportKind isn't handled");
+    }
   } else if ((decl->isSPI() || decl->isAvailableAsSPI()) && !where.isSPI()) {
+    if (decl->isAvailableAsSPI() && !decl->isSPI()) {
+      // Allowing unavailable context to use @_spi_available decls.
+      // Decls with @_spi_available aren't hidden entirely from public interfaces,
+      // thus public interfaces may still refer them. Be forgiving here so public
+      // interfaces can compile.
+      if (where.getUnavailablePlatformKind().hasValue())
+        return DisallowedOriginKind::None;
+      // We should only diagnose SPI_AVAILABLE usage when the library level is API.
+      // Using SPI_AVAILABLE symbols in private frameworks or executable targets
+      // should be allowed.
+      if (auto *mod = where.getDeclContext()->getParentModule()) {
+        if (mod->getLibraryLevel() != LibraryLevel::API) {
+          return DisallowedOriginKind::None;
+        }
+      }
+    }
     // SPI can only be exported in SPI.
     return where.getDeclContext()->getParentModule() == M ?
       DisallowedOriginKind::SPILocal :
@@ -1563,22 +1643,15 @@ class DeclAvailabilityChecker : public DeclVisitor<DeclAvailabilityChecker> {
 
   void checkType(Type type, const TypeRepr *typeRepr, const Decl *context,
                  ExportabilityReason reason=ExportabilityReason::General,
-                 bool allowUnavailableProtocol=false) {
+                 DeclAvailabilityFlags flags=None) {
     // Don't bother checking errors.
     if (type && type->hasError())
       return;
-
-    DeclAvailabilityFlags flags = None;
-
-    // We allow a type to conform to a protocol that is less available than
-    // the type itself. This enables a type to retroactively model or directly
-    // conform to a protocol only available on newer OSes and yet still be used on
-    // older OSes.
-    //
-    // To support this, inside inheritance clauses we allow references to
-    // protocols that are unavailable in the current type refinement context.
-    if (allowUnavailableProtocol)
-      flags |= DeclAvailabilityFlag::AllowPotentiallyUnavailableProtocol;
+    
+    // If the decl which references this type is unavailable on the current
+    // platform, don't diagnose the availability of the type.
+    if (AvailableAttr::isUnavailable(context))
+      return;
 
     diagnoseTypeAvailability(typeRepr, type, context->getLoc(),
                              Where.withReason(reason), flags);
@@ -1612,6 +1685,15 @@ public:
   explicit DeclAvailabilityChecker(ExportContext where)
     : Where(where) {}
 
+  void visit(Decl *D) {
+    DeclVisitor<DeclAvailabilityChecker>::visit(D);
+    
+    if (auto globalActor = D->getGlobalActorAttr()) {
+      auto customAttr = globalActor->first;
+      checkType(customAttr->getType(), customAttr->getTypeRepr(), D);
+    }
+  }
+  
   // Force all kinds to be handled at a lower level.
   void visitDecl(Decl *D) = delete;
   void visitValueDecl(ValueDecl *D) = delete;
@@ -1657,6 +1739,11 @@ public:
       return;
 
     checkType(theVar->getValueInterfaceType(), /*typeRepr*/nullptr, theVar);
+
+    for (auto attr : theVar->getAttachedPropertyWrappers()) {
+      checkType(attr->getType(), attr->getTypeRepr(), theVar,
+                ExportabilityReason::PropertyWrapper);
+    }
   }
 
   /// \see visitPatternBindingDecl
@@ -1737,20 +1824,29 @@ public:
   void visitNominalTypeDecl(const NominalTypeDecl *nominal) {
     checkGenericParams(nominal, nominal);
 
-    llvm::for_each(nominal->getInherited(),
-                   [&](TypeLoc inherited) {
-      checkType(inherited.getType(), inherited.getTypeRepr(),
-                nominal, ExportabilityReason::General,
-                /*allowUnavailableProtocol=*/true);
+    DeclAvailabilityFlags flags =
+        DeclAvailabilityFlag::AllowPotentiallyUnavailableProtocol;
+
+    // As a concession to source compatibility for API libraries, downgrade
+    // diagnostics about inheritance from a less available type when the
+    // following conditions are met:
+    // 1. The inherited type is only potentially unavailable before the
+    //    deployment target.
+    // 2. The inheriting type is `@usableFromInline`.
+    if (nominal->getAttrs().hasAttribute<UsableFromInlineAttr>())
+      flags |= DeclAvailabilityFlag::
+          WarnForPotentialUnavailabilityBeforeDeploymentTarget;
+
+    llvm::for_each(nominal->getInherited(), [&](TypeLoc inherited) {
+      checkType(inherited.getType(), inherited.getTypeRepr(), nominal,
+                ExportabilityReason::General, flags);
     });
   }
 
   void visitProtocolDecl(ProtocolDecl *proto) {
-    llvm::for_each(proto->getInherited(),
-                  [&](TypeLoc requirement) {
+    llvm::for_each(proto->getInherited(), [&](TypeLoc requirement) {
       checkType(requirement.getType(), requirement.getTypeRepr(), proto,
-                ExportabilityReason::General,
-                /*allowUnavailableProtocol=*/false);
+                ExportabilityReason::General);
     });
 
     if (proto->getTrailingWhereClause()) {
@@ -1778,6 +1874,9 @@ public:
         auto wrapperType = P->getAttachedPropertyWrapperType(index);
         checkType(wrapperType, wrapperAttrs[index]->getTypeRepr(), fn);
       }
+
+      if (auto attr = P->getAttachedResultBuilder())
+        checkType(P->getResultBuilderType(), attr->getTypeRepr(), fn);
 
       checkType(P->getInterfaceType(), P->getTypeRepr(), fn);
     }
@@ -1825,11 +1924,10 @@ public:
     //
     // 1) If the extension defines conformances, the conformed-to protocols
     // must be exported.
-    llvm::for_each(ED->getInherited(),
-                   [&](TypeLoc inherited) {
-      checkType(inherited.getType(), inherited.getTypeRepr(),
-                ED, ExportabilityReason::General,
-                /*allowUnavailableProtocol=*/true);
+    llvm::for_each(ED->getInherited(), [&](TypeLoc inherited) {
+      checkType(inherited.getType(), inherited.getTypeRepr(), ED,
+                ExportabilityReason::General,
+                DeclAvailabilityFlag::AllowPotentiallyUnavailableProtocol);
     });
 
     auto wasWhere = Where;
@@ -1858,7 +1956,7 @@ public:
   void checkPrecedenceGroup(const PrecedenceGroupDecl *PGD,
                             const Decl *refDecl, SourceLoc diagLoc,
                             SourceRange refRange) {
-    // Bail on invalid predence groups. This can happen when the user spells a
+    // Bail on invalid precedence groups. This can happen when the user spells a
     // relation element that doesn't actually exist.
     if (!PGD) {
       return;
@@ -1866,7 +1964,8 @@ public:
 
     const SourceFile *SF = refDecl->getDeclContext()->getParentSourceFile();
     ModuleDecl *M = PGD->getModuleContext();
-    if (!SF->isImportedImplementationOnly(M))
+    RestrictedImportKind howImported = SF->getRestrictedImportKind(M);
+    if (howImported == RestrictedImportKind::None)
       return;
 
     auto &DE = PGD->getASTContext().Diags;

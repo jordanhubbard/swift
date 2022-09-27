@@ -77,12 +77,21 @@ transferNodesFromList(llvm::ilist_traits<SILInstruction> &L2,
   // If transferring instructions within the same basic block, no reason to
   // update their parent pointers.
   SILBasicBlock *ThisParent = getContainingBlock();
-  if (ThisParent == L2.getContainingBlock()) return;
+  SILBasicBlock *l2Block = L2.getContainingBlock();
+  if (ThisParent == l2Block) return;
+  
+  bool differentFunctions = (ThisParent->getFunction() != l2Block->getFunction());
 
   // Update the parent fields in the instructions.
   for (; first != last; ++first) {
     SWIFT_FUNC_STAT_NAMED("sil");
     first->ParentBB = ThisParent;
+    if (differentFunctions) {
+      for (SILValue result : first->getResults()) {
+        result->resetBitfields();
+      }
+      first->asSILNode()->resetBitfields();
+    }
   }
 }
 
@@ -94,24 +103,6 @@ transferNodesFromList(llvm::ilist_traits<SILInstruction> &L2,
 #define NODE(CLASS, PARENT) \
   ASSERT_IMPLEMENTS_STATIC(CLASS, PARENT, classof, bool(SILNodePointer));
 #include "swift/SIL/SILNodes.def"
-
-SILFunction *SILInstruction::getFunction() const {
-  return getParent()->getParent();
-}
-
-SILModule &SILInstruction::getModule() const {
-  return getFunction()->getModule();
-}
-
-SILInstruction *SILInstruction::getPreviousInstruction() {
-  auto pos = getIterator();
-  return pos == getParent()->begin() ? nullptr : &*std::prev(pos);
-}
-
-SILInstruction *SILInstruction::getNextInstruction() {
-  auto nextPos = std::next(getIterator());
-  return nextPos == getParent()->end() ? nullptr : &*nextPos;
-}
 
 void SILInstruction::removeFromParent() {
 #ifndef NDEBUG
@@ -240,7 +231,7 @@ SILInstructionKind swift::getSILInstructionKind(StringRef name) {
   llvm::errs() << "Unknown SIL instruction name\n";
   abort();
 #endif
-  llvm_unreachable("Unknown SIL insruction name");
+  llvm_unreachable("Unknown SIL instruction name");
 }
 
 /// Map SILInstructionKind to a corresponding SILInstruction name.
@@ -654,9 +645,8 @@ namespace {
     }
 
     bool visitIndexAddrInst(IndexAddrInst *RHS) {
-      // We have already compared the operands/types, so we should have equality
-      // at this point.
-      return true;
+      auto *lhs = cast<IndexAddrInst>(LHS);
+      return lhs->needsStackProtection() == RHS->needsStackProtection();
     }
 
     bool visitTailAddrInst(TailAddrInst *RHS) {
@@ -763,7 +753,8 @@ namespace {
     }
 
     bool visitAddressToPointerInst(AddressToPointerInst *RHS) {
-      return true;
+      auto *lhs = cast<AddressToPointerInst>(LHS);
+      return lhs->needsStackProtection() == RHS->needsStackProtection();
     }
 
     bool visitPointerToAddressInst(PointerToAddressInst *RHS) {
@@ -842,12 +833,6 @@ namespace {
       return true;
     }
     bool visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *X) {
-      return true;
-    }
-    bool visitThinFunctionToPointerInst(ThinFunctionToPointerInst *X) {
-      return true;
-    }
-    bool visitPointerToThinFunctionInst(PointerToThinFunctionInst *X) {
       return true;
     }
 
@@ -1162,7 +1147,6 @@ bool SILInstruction::mayRelease() const {
     return true;
 
   case SILInstructionKind::UnconditionalCheckedCastAddrInst:
-  case SILInstructionKind::UnconditionalCheckedCastValueInst:
   case SILInstructionKind::UncheckedOwnershipConversionInst:
     return true;
 
@@ -1368,7 +1352,6 @@ bool SILInstruction::mayTrap() const {
   case SILInstructionKind::CondFailInst:
   case SILInstructionKind::UnconditionalCheckedCastInst:
   case SILInstructionKind::UnconditionalCheckedCastAddrInst:
-  case SILInstructionKind::UnconditionalCheckedCastValueInst:
     return true;
   default:
     return false;
@@ -1393,6 +1376,15 @@ bool SILInstruction::isMetaInstruction() const {
     return false;
   }
   llvm_unreachable("Instruction not handled in isMetaInstruction()!");
+}
+
+unsigned SILInstruction::getCachedFieldIndex(NominalTypeDecl *decl,
+                                             VarDecl *property) {
+  return getModule().getFieldIndex(decl, property);
+}
+
+unsigned SILInstruction::getCachedCaseIndex(EnumElementDecl *enumElement) {
+  return getModule().getCaseIndex(enumElement);
 }
 
 //===----------------------------------------------------------------------===//
@@ -1452,7 +1444,7 @@ SILInstructionResultArray::SILInstructionResultArray(
   auto *Value = static_cast<const ValueBase *>(SVI);
   assert(uintptr_t(Value) != uintptr_t(SVI) &&
          "Expected value to be offset from SVI since it is not the first "
-         "multi-inheritence parent");
+         "multi-inheritance parent");
   Pointer = reinterpret_cast<const uint8_t *>(Value);
 
 #ifndef NDEBUG
@@ -1608,17 +1600,17 @@ MultipleValueInstructionResult::MultipleValueInstructionResult(
 
 void MultipleValueInstructionResult::setOwnershipKind(
     ValueOwnershipKind NewKind) {
-  Bits.MultipleValueInstructionResult.VOKind = unsigned(NewKind);
+  sharedUInt8().MultipleValueInstructionResult.valueOwnershipKind = uint8_t(NewKind);
 }
 
 void MultipleValueInstructionResult::setIndex(unsigned NewIndex) {
   // We currently use 32 bits to store the Index. A previous comment wrote
   // that "500k fields is probably enough".
-  Bits.MultipleValueInstructionResult.Index = NewIndex;
+  sharedUInt32().MultipleValueInstructionResult.index = NewIndex;
 }
 
 ValueOwnershipKind MultipleValueInstructionResult::getOwnershipKind() const {
-  return ValueOwnershipKind(Bits.MultipleValueInstructionResult.VOKind);
+  return ValueOwnershipKind(sharedUInt8().MultipleValueInstructionResult.valueOwnershipKind);
 }
 
 MultipleValueInstruction *MultipleValueInstructionResult::getParentImpl() const {
@@ -1653,6 +1645,10 @@ MultipleValueInstruction *MultipleValueInstructionResult::getParentImpl() const 
 bool SILInstruction::maySuspend() const {
   // await_async_continuation always suspends the current task.
   if (isa<AwaitAsyncContinuationInst>(this))
+    return true;
+
+  // hop_to_executor also may cause a suspension
+  if (isa<HopToExecutorInst>(this))
     return true;
   
   // Fully applying an async function may suspend the caller.

@@ -42,6 +42,8 @@ typealias OtherAndP2 = Other & P2
 
 protocol P3 : class {}
 
+protocol P4 {}
+
 struct Unrelated {}
 
 //
@@ -69,6 +71,18 @@ func alreadyConforms(_: P3 & AnyObject) {} // expected-error {{invalid redeclara
 
 func alreadyConformsMeta(_: P3.Type) {} // expected-note {{'alreadyConformsMeta' previously declared here}}
 func alreadyConformsMeta(_: (P3 & AnyObject).Type) {} // expected-error {{invalid redeclaration of 'alreadyConformsMeta'}}
+
+func notARedeclaration(_: P4) {}
+func notARedeclaration(_: P4 & AnyObject) {}
+
+do {
+  class C: P4 {}
+  struct S<T: P4> {
+    // Don't crash when computing minimal compositions inside a generic context.
+    func redeclaration(_: C & P4) {} // expected-note {{'redeclaration' previously declared here}}
+    func redeclaration(_: C & P4) {} // expected-error {{invalid redeclaration of 'redeclaration'}}
+  }
+}
 
 // SE-0156 stipulates that a composition can contain multiple classes, as long
 // as they are all the same.
@@ -308,14 +322,13 @@ func dependentMemberTypes<T : BaseIntAndP2>(
   _: T.FullyConcrete,
 
   _: BaseIntAndP2.DependentInConcreteConformance, // FIXME expected-error {{}}
-  _: BaseIntAndP2.DependentProtocol, // expected-error {{type alias 'DependentProtocol' can only be used with a concrete type or generic parameter base}}
+  _: BaseIntAndP2.DependentProtocol, // expected-error {{cannot access type alias 'DependentProtocol' from 'BaseIntAndP2' (aka 'Base<Int> & P2'); use a concrete type or generic parameter base instead}}
   _: BaseIntAndP2.DependentClass,
   _: BaseIntAndP2.FullyConcrete) {}
 
 func conformsToAnyObject<T : AnyObject>(_: T) {}
 // expected-note@-1 {{where 'T' = 'any P1'}}
 func conformsToP1<T : P1>(_: T) {}
-// expected-note@-1 {{required by global function 'conformsToP1' where 'T' = 'any P1'}}
 func conformsToP2<T : P2>(_: T) {}
 func conformsToBaseIntAndP2<T : Base<Int> & P2>(_: T) {}
 // expected-note@-1 {{where 'T' = 'FakeDerived'}}
@@ -428,8 +441,6 @@ func conformsTo<T1 : P2, T2 : Base<Int> & P2>(
   // expected-error@-1 {{global function 'conformsToAnyObject' requires that 'any P1' be a class type}}
 
   conformsToP1(p1)
-  // expected-error@-1 {{type 'any P1' cannot conform to 'P1'}}
-  // expected-note@-2 {{only concrete types such as structs, enums and classes can conform to protocols}}
 
   // FIXME: Following diagnostics are not great because when
   // `conformsTo*` methods are re-typechecked, they loose information

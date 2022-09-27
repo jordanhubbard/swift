@@ -23,10 +23,18 @@
 #include "swift/Config.h"
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/raw_ostream.h"
 #include <limits.h>
 
 using namespace swift;
+
+LangOptions::LangOptions() {
+  // Note: Introduce default-on language options here.
+#ifndef NDEBUG
+  Features.insert(Feature::ParserRoundTrip);
+#endif
+}
 
 struct SupportedConditionalValue {
   StringRef value;
@@ -224,6 +232,30 @@ bool LangOptions::isCustomConditionalCompilationFlagSet(StringRef Name) const {
       != CustomConditionalCompilationFlags.end();
 }
 
+bool LangOptions::hasFeature(Feature feature) const {
+  if (Features.contains(feature))
+    return true;
+
+  if (feature == Feature::BareSlashRegexLiterals &&
+      EnableBareSlashRegexLiterals)
+    return true;
+
+  if (auto version = getFeatureLanguageVersion(feature))
+    return isSwiftVersionAtLeast(*version);
+
+  return false;
+}
+
+bool LangOptions::hasFeature(llvm::StringRef featureName) const {
+  if (auto feature = getUpcomingFeature(featureName))
+    return hasFeature(*feature);
+
+  if (auto feature = getExperimentalFeature(featureName))
+    return hasFeature(*feature);
+
+  return false;
+}
+
 std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
   clearAllPlatformConditionValues();
 
@@ -235,11 +267,12 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
     llvm::raw_svector_ostream osx(osxBuf);
     osx << llvm::Triple::getOSTypeName(llvm::Triple::MacOSX);
 
-    unsigned major, minor, micro;
-    triple.getMacOSXVersion(major, minor, micro);
-    osx << major << "." << minor;
-    if (micro != 0)
-      osx << "." << micro;
+    llvm::VersionTuple OSVersion;
+    triple.getMacOSXVersion(OSVersion);
+
+    osx << OSVersion.getMajor() << "." << OSVersion.getMinor().getValueOr(0);
+    if (auto Subminor = OSVersion.getSubminor())
+      osx << "." << *Subminor;
 
     triple.setOSName(osx.str());
   }
@@ -407,6 +440,34 @@ bool swift::isSuppressibleFeature(Feature feature) {
 #include "swift/Basic/Features.def"
   }
   llvm_unreachable("covered switch");
+}
+
+llvm::Optional<Feature> swift::getUpcomingFeature(llvm::StringRef name) {
+  return llvm::StringSwitch<Optional<Feature>>(name)
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)
+#define UPCOMING_FEATURE(FeatureName, SENumber, Version) \
+                   .Case(#FeatureName, Feature::FeatureName)
+#include "swift/Basic/Features.def"
+                   .Default(None);
+}
+
+llvm::Optional<Feature> swift::getExperimentalFeature(llvm::StringRef name) {
+  return llvm::StringSwitch<Optional<Feature>>(name)
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)
+#define EXPERIMENTAL_FEATURE(FeatureName) \
+                   .Case(#FeatureName, Feature::FeatureName)
+#include "swift/Basic/Features.def"
+                   .Default(None);
+}
+
+llvm::Optional<unsigned> swift::getFeatureLanguageVersion(Feature feature) {
+  switch (feature) {
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)
+#define UPCOMING_FEATURE(FeatureName, SENumber, Version) \
+  case Feature::FeatureName: return Version;
+#include "swift/Basic/Features.def"
+  default: return None;
+  }
 }
 
 DiagnosticBehavior LangOptions::getAccessNoteFailureLimit() const {

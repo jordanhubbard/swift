@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 import argparse
 import os
@@ -61,7 +61,7 @@ def create_benchmark_file(name):
 
 
 def add_import_benchmark(name):
-    """Adds an `import` statement to the `main.swift` file for the new 
+    """Adds an `import` statement to the `main.swift` file for the new
     benchmark.
     """
     relative_path = create_relative_path("../utils/main.swift")

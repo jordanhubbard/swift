@@ -317,6 +317,15 @@ public:
     return { Files.begin(), Files.size() };
   }
 
+  /// Add the given file to this module.
+  ///
+  /// FIXME: Remove this function from public view. Modules never need to add
+  /// files once they are created.
+  ///
+  /// \warning There are very few safe points to call this function once a
+  /// \c ModuleDecl has been created. If you find yourself needing to insert
+  /// a file in the middle of e.g. semantic analysis, use a \c
+  /// SynthesizedFileUnit instead.
   void addFile(FileUnit &newFile);
 
   /// Creates a map from \c #filePath strings to corresponding \c #fileID
@@ -405,11 +414,10 @@ private:
   /// present overlays as if they were part of their underlying module.
   std::pair<ModuleDecl *, Identifier> getDeclaringModuleAndBystander();
 
+public:
   ///  If this is a traditional (non-cross-import) overlay, get its underlying
   ///  module if one exists.
   ModuleDecl *getUnderlyingModuleIfOverlay() const;
-
-public:
 
   /// Returns true if this module is an underscored cross import overlay
   /// declared by \p other or its underlying clang module, either directly or
@@ -677,6 +685,9 @@ public:
   // Is \p spiGroup accessible as an explicitly imported SPI from this module?
   bool isImportedAsSPI(Identifier spiGroup, const ModuleDecl *fromModule) const;
 
+  /// Is \p module imported as \c @_weakLinked from this module?
+  bool isImportedAsWeakLinked(const ModuleDecl *module) const;
+
   /// \sa getImportedModules
   enum class ImportFilterKind {
     /// Include imports declared with `@_exported`.
@@ -685,11 +696,13 @@ public:
     Default = 1 << 1,
     /// Include imports declared with `@_implementationOnly`.
     ImplementationOnly = 1 << 2,
-    /// Include imports of SPIs declared with `@_spi`
+    /// Include imports of SPIs declared with `@_spi`.
     SPIAccessControl = 1 << 3,
+    /// Include imports declared with `@_spiOnly`.
+    SPIOnly = 1 << 4,
     /// Include imports shadowed by a cross-import overlay. Unshadowed imports
     /// are included whether or not this flag is specified.
-    ShadowedByCrossImportOverlay = 1 << 4
+    ShadowedByCrossImportOverlay = 1 << 5
   };
   /// \sa getImportedModules
   using ImportFilter = OptionSet<ImportFilterKind>;
@@ -700,6 +713,10 @@ public:
   /// in this list.
   void getImportedModules(SmallVectorImpl<ImportedModule> &imports,
                           ImportFilter filter = ImportFilterKind::Exported) const;
+
+  /// Lists modules that are not imported from a file and used in API.
+  void
+  getMissingImportedModules(SmallVectorImpl<ImportedModule> &imports) const;
 
   /// Looks up which modules are imported by this module, ignoring any that
   /// won't contain top-level decls.
@@ -824,6 +841,8 @@ public:
     return EntryPointInfo.hasEntryPoint();
   }
 
+  NominalTypeDecl *getMainTypeDecl() const;
+
   /// Returns the associated clang module if one exists.
   const clang::Module *findUnderlyingClangModule() const;
 
@@ -940,7 +959,10 @@ inline SourceLoc extractNearestSourceLoc(const ModuleDecl *mod) {
 }
 
 /// Collects modules that this module imports via `@_exported import`.
-void collectParsedExportedImports(const ModuleDecl *M, SmallPtrSetImpl<ModuleDecl *> &Imports);
+void collectParsedExportedImports(const ModuleDecl *M,
+                                  SmallPtrSetImpl<ModuleDecl *> &Imports,
+                                  llvm::SmallDenseMap<ModuleDecl *, SmallPtrSet<Decl *, 4>, 4> &QualifiedImports,
+                                  llvm::function_ref<bool(AttributedImport<ImportedModule>)> includeImport = nullptr);
 
 } // end namespace swift
 

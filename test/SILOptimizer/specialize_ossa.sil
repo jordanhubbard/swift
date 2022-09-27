@@ -115,6 +115,18 @@ bb0(%0 : $*T, %1 : $*XXX<T>):
   return %9 : $Int32                              // id: %11
 }
 
+
+sil [ossa] [noinline] @XXX_foo_guaranteed_generic_return : $@convention(method) <T> (@in_guaranteed T, @in XXX<T>) -> @out T {
+bb0(%0 : $*T, %1 : $*T, %2 : $*XXX<T>):
+  %3 = address_to_pointer %1 : $*T to $Builtin.RawPointer
+  %4 = alloc_stack $T
+  %5 = struct_element_addr %2 : $*XXX<T>, #XXX.m_t
+  copy_addr [take] %5 to [initialization] %0 : $*T
+  dealloc_stack %4 : $*T
+  %t = tuple ()
+  return %t : $()
+}
+
 // Swift.Int32._convertFromBuiltinIntegerLiteral (Swift.Int32.Type)(Builtin.IntLiteral) -> Swift.Int32
 sil public_external [ossa] [transparent] @$sSi33_convertFromBuiltinIntegerLiteralySiBI_cSimF : $@convention(thin) (Builtin.IntLiteral, @thin Int32.Type) -> Int32 {
 bb0(%0 : $Builtin.IntLiteral, %1 : $@thin Int32.Type):
@@ -231,10 +243,21 @@ bb0(%arg : @guaranteed $Builtin.NativeObject):
   apply %9(%15g) : $@convention(thin) (Int32) -> ()
   destroy_addr %11g : $*Builtin.NativeObject
   dealloc_stack %11g : $*Builtin.NativeObject    // id: %17
-  destroy_addr %0 : $*XXX<Builtin.NativeObject>
-  dealloc_stack %0 : $*XXX<Builtin.NativeObject> // id: %19
-  %18 = tuple ()                                  // user: %20
-  return %18 : $()                                // id: %20
+
+  %17 = function_ref @XXX_foo_guaranteed_generic_return : $@convention(method) <T> (@in_guaranteed T, @in XXX<T>) -> @out T
+  %18 = alloc_stack $Builtin.NativeObject
+  %19 = alloc_stack $Builtin.NativeObject
+  %arg3 = copy_value %arg : $Builtin.NativeObject
+  store %arg3 to [init] %18 : $*Builtin.NativeObject
+  apply %17<Builtin.NativeObject>(%19, %18, %0) : $@convention(method) <T> (@in_guaranteed T, @in XXX<T>) -> @out T
+  destroy_addr %18 : $*Builtin.NativeObject
+  destroy_addr %19 : $*Builtin.NativeObject
+  dealloc_stack %19 : $*Builtin.NativeObject
+  dealloc_stack %18 : $*Builtin.NativeObject
+
+  dealloc_stack %0 : $*XXX<Builtin.NativeObject>
+  %t = tuple ()
+  return %t : $()
 }
 
 // specialize.useClosure <A>(fun : () -> A) -> A
@@ -661,7 +684,7 @@ sil @action_thunk : $@convention(thin) (@owned @callee_owned () -> (Never, @erro
 //
 // CHECK-LABEL: sil [ossa] @testGenericClosureSpecialization
 // Call of the generic specialization of invokeGenericClosure<Never>
-// CHECK: function_ref @$s20invokeGenericClosures5NeverO_Tg5 : $@convention(thin) (@owned @callee_owned () -> (@out Never, @error Error)) -> (Never, @error Error)
+// CHECK: function_ref @$s20invokeGenericClosures5NeverO_Tg5 : $@convention(thin) (@owned @callee_owned () -> (@out Never, @error any Error)) -> (Never, @error any Error)
 // CHECK: apply [nothrow]
 // CHECK: unreachable
 // CHECK: end sil function 'testGenericClosureSpecialization'
@@ -955,8 +978,8 @@ bb2(%e : @owned $Error):
 // Just make sure we pass the verifiers.
 //
 // CHECK-LABEL: sil [ossa] @test_try_apply : $@convention(thin) (Builtin.Int32, @guaranteed Builtin.NativeObject) -> () {
-// CHECK: try_apply {{%.*}}({{%.*}}) : $@convention(thin) (Builtin.Int32) -> @error Error, normal bb1, error bb2
-// CHECK: try_apply {{%.*}}({{%.*}}) : $@convention(thin) (@guaranteed Builtin.NativeObject) -> @error Error, normal bb4, error bb5
+// CHECK: try_apply {{%.*}}({{%.*}}) : $@convention(thin) (Builtin.Int32) -> @error any Error, normal bb1, error bb2
+// CHECK: try_apply {{%.*}}({{%.*}}) : $@convention(thin) (@guaranteed Builtin.NativeObject) -> @error any Error, normal bb4, error bb5
 // CHECK: } // end sil function 'test_try_apply'
 sil [ossa] @test_try_apply : $@convention(thin) (Builtin.Int32, @guaranteed Builtin.NativeObject) -> () {
 bb0(%0 : $Builtin.Int32, %1 : @guaranteed $Builtin.NativeObject):
@@ -977,8 +1000,8 @@ bb3:
   dealloc_stack %0a : $*Builtin.Int32
 
   %0b = alloc_stack $Builtin.NativeObject
-  store_borrow %1 to %0b : $*Builtin.NativeObject
-  try_apply %f<Builtin.NativeObject>(%0b) : $@convention(thin) <T> (@in_guaranteed T) -> @error Error, normal bb4, error bb5
+  %sb1 = store_borrow %1 to %0b : $*Builtin.NativeObject
+  try_apply %f<Builtin.NativeObject>(%sb1) : $@convention(thin) <T> (@in_guaranteed T) -> @error Error, normal bb4, error bb5
 
 bb4(%result2 : $()):
   br bb6
@@ -988,13 +1011,14 @@ bb5(%e2 : @owned $Error):
   br bb6
 
 bb6:
+  end_borrow %sb1 : $*Builtin.NativeObject
   dealloc_stack %0b : $*Builtin.NativeObject
 
   %0c = alloc_stack $Builtin.NativeObject
-  store_borrow %1 to %0c : $*Builtin.NativeObject
+  %sb2 = store_borrow %1 to %0c : $*Builtin.NativeObject
   %outParam = alloc_stack $Builtin.NativeObject
   %f2 = function_ref @generic_try_apply_callee_out_param : $@convention(thin) <T> (@in_guaranteed T) -> (@out T, @error Error)
-  try_apply %f2<Builtin.NativeObject>(%outParam, %0c) : $@convention(thin) <T> (@in_guaranteed T) -> (@out T, @error Error), normal bb7, error bb8
+  try_apply %f2<Builtin.NativeObject>(%outParam, %sb2) : $@convention(thin) <T> (@in_guaranteed T) -> (@out T, @error Error), normal bb7, error bb8
 
 bb7(%result3 : $()):
   destroy_addr %outParam : $*Builtin.NativeObject
@@ -1005,6 +1029,7 @@ bb8(%error4 : @owned $Error):
   br bb9
 
 bb9:
+  end_borrow %sb2 : $*Builtin.NativeObject
   dealloc_stack %outParam : $*Builtin.NativeObject
   dealloc_stack %0c : $*Builtin.NativeObject
   %9999 = tuple()
@@ -1030,13 +1055,15 @@ bb2(%e : @owned $Error):
 bb3:
   dealloc_stack %0a : $*Builtin.Int32
   %0b = alloc_stack $Builtin.NativeObject
-  store_borrow %1 to %0b : $*Builtin.NativeObject
-  try_apply %f<Builtin.NativeObject>(%0b) : $@convention(thin) <T> (@in_guaranteed T) -> @error Error, normal bb4, error bb5
+  %sb = store_borrow %1 to %0b : $*Builtin.NativeObject
+  try_apply %f<Builtin.NativeObject>(%sb) : $@convention(thin) <T> (@in_guaranteed T) -> @error Error, normal bb4, error bb5
 
 bb4(%result2 : $()):
+  end_borrow %sb : $*Builtin.NativeObject
   br bb6
 
 bb5(%e2 : @owned $Error):
+  end_borrow %sb : $*Builtin.NativeObject
   dealloc_stack %0b : $*Builtin.NativeObject
   br bbError(%e2 : $Error)
 
@@ -1084,8 +1111,8 @@ sil [ossa] @test_try_apply_loadable : $@convention(thin) (@inout Klass, @guarant
 bb0(%0 : $*Klass, %1 : @guaranteed $Klass):
   %f = function_ref @generic_try_apply_callee_loadable_1 : $@convention(thin) <T : AnyObject> (@inout T, @in_guaranteed T) -> @error Error
   %1b = alloc_stack $Klass
-  store_borrow %1 to %1b : $*Klass
-  try_apply %f<Klass>(%0, %1b) : $@convention(thin) <T : AnyObject> (@inout T, @in_guaranteed T) -> @error Error, normal bb4, error bb5
+  %sb = store_borrow %1 to %1b : $*Klass
+  try_apply %f<Klass>(%0, %sb) : $@convention(thin) <T : AnyObject> (@inout T, @in_guaranteed T) -> @error Error, normal bb4, error bb5
 
 bb4(%result2 : $()):
   br bb6
@@ -1095,6 +1122,7 @@ bb5(%e2 : @owned $Error):
   br bb6
 
 bb6:
+  end_borrow %sb : $*Klass
   dealloc_stack %1b : $*Klass
   %9999 = tuple()
   return %9999 : $()

@@ -228,6 +228,12 @@ void SILGenFunction::emitLazyGlobalInitializer(PatternBindingDecl *binding,
                                                unsigned pbdEntry) {
   MagicFunctionName = SILGenModule::getMagicFunctionName(binding->getDeclContext());
 
+  // Add unused context pointer argument required to pass to `Builtin.once`
+  SILBasicBlock &entry = *F.begin();
+  SILType rawPointerSILTy =
+      getLoweredLoadableType(getASTContext().TheRawPointerType);
+  entry.createFunctionArgument(rawPointerSILTy);
+
   {
     Scope scope(Cleanups, binding);
 
@@ -248,7 +254,8 @@ static void emitOnceCall(SILGenFunction &SGF, VarDecl *global,
   // Emit a reference to the global token.
   SILValue onceTokenAddr = SGF.B.createGlobalAddr(global, onceToken);
   onceTokenAddr = SGF.B.createAddressToPointer(global, onceTokenAddr,
-                                               rawPointerSILTy);
+                                               rawPointerSILTy,
+                                               /*needsStackProtection=*/ false);
 
   // Emit a reference to the function to execute.
   SILValue onceFuncRef = SGF.B.createFunctionRefFor(global, onceFunc);
@@ -271,7 +278,8 @@ void SILGenFunction::emitGlobalAccessor(VarDecl *global,
 
   SILType rawPointerSILTy
     = getLoweredLoadableType(getASTContext().TheRawPointerType);
-  addr = B.createAddressToPointer(global, addr, rawPointerSILTy);
+  addr = B.createAddressToPointer(global, addr, rawPointerSILTy,
+                                  /*needsStackProtection=*/ false);
   auto *ret = B.createReturn(global, addr);
   (void)ret;
   assert(ret->getDebugScope() && "instruction without scope");

@@ -13,9 +13,10 @@
 #ifndef SWIFT_SEMA_COMPLETIONCONTEXTFINDER_H
 #define SWIFT_SEMA_COMPLETIONCONTEXTFINDER_H
 
+#include "swift/AST/ASTNode.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Expr.h"
-#include "swift/Sema/CodeCompletionTypeChecking.h"
+#include "swift/IDE/TypeCheckCompletionCallback.h"
 
 namespace swift {
 
@@ -49,10 +50,10 @@ class CompletionContextFinder : public ASTWalker {
 
 public:
   /// Finder for completion contexts within the provided initial expression.
-  CompletionContextFinder(Expr *initialExpr, DeclContext *DC)
-      : InitialExpr(initialExpr), InitialDC(DC) {
+  CompletionContextFinder(ASTNode initialNode, DeclContext *DC)
+      : InitialExpr(initialNode.dyn_cast<Expr *>()), InitialDC(DC) {
     assert(DC);
-    initialExpr->walk(*this);
+    initialNode.walk(*this);
   };
 
   /// Finder for completion contexts within the outermost non-closure context of
@@ -63,9 +64,9 @@ public:
     InitialDC->walkContext(*this);
   }
 
-  std::pair<bool, Expr *> walkToExprPre(Expr *E) override;
+  PreWalkResult<Expr *> walkToExprPre(Expr *E) override;
 
-  Expr *walkToExprPost(Expr *E) override;
+  PostWalkResult<Expr *> walkToExprPost(Expr *E) override;
 
   /// Check whether code completion expression is located inside of a
   /// multi-statement closure.
@@ -73,7 +74,7 @@ public:
     return hasContext(ContextKind::MultiStmtClosure);
   }
 
-  bool locatedInStringIterpolation() const {
+  bool locatedInStringInterpolation() const {
     return hasContext(ContextKind::StringInterpolation);
   }
 
@@ -88,6 +89,10 @@ public:
 
   bool hasCompletionKeyPathComponent() const {
     return CompletionNode.dyn_cast<const KeyPathExpr *>() != nullptr;
+  }
+
+  bool hasCompletion() const {
+    return !CompletionNode.isNull();
   }
 
   /// If we are completing in a key path, returns the \c KeyPath that contains

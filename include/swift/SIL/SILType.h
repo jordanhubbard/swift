@@ -20,9 +20,11 @@
 
 #include "swift/AST/SILLayout.h"
 #include "swift/AST/Types.h"
+#include "swift/SIL/AbstractionPattern.h"
+#include "swift/SIL/Lifetime.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/PointerIntPair.h"
 #include "llvm/Support/ErrorHandling.h"
-#include "llvm/ADT/Hashing.h"
 
 namespace swift {
 
@@ -86,15 +88,18 @@ enum class SILValueCategory : uint8_t {
   Address,
 };
 
+class SILPrinter;
+class SILParser;
+
 /// SILType - A Swift type that has been lowered to a SIL representation type.
 /// In addition to the Swift type system, SIL adds "address" types that can
 /// reference any Swift type (but cannot take the address of an address). *T
 /// is the type of an address pointing at T.
-///
 class SILType {
 public:
   /// The unsigned is a SILValueCategory.
   using ValueType = llvm::PointerIntPair<TypeBase *, 2, unsigned>;
+
 private:
   ValueType value;
 
@@ -113,6 +118,9 @@ private:
 
   friend class Lowering::TypeConverter;
   friend struct llvm::DenseMapInfo<SILType>;
+  friend class SILPrinter;
+  friend class SILParser;
+
 public:
   SILType() = default;
 
@@ -145,7 +153,7 @@ public:
 
   /// Returns the \p Category variant of this type.
   SILType getCategoryType(SILValueCategory Category) const {
-    return SILType(getASTType(), Category);
+    return SILType(getRawASTType(), Category);
   }
 
   /// Returns the variant of this type that matches \p Ty.getCategory()
@@ -156,13 +164,13 @@ public:
   /// Returns the address variant of this type.  Instructions which
   /// manipulate memory will generally work with object addresses.
   SILType getAddressType() const {
-    return SILType(getASTType(), SILValueCategory::Address);
+    return SILType(getRawASTType(), SILValueCategory::Address);
   }
 
   /// Returns the object variant of this type.  Note that address-only
   /// types are not legal to manipulate directly as objects in SIL.
   SILType getObjectType() const {
-    return SILType(getASTType(), SILValueCategory::Object);
+    return SILType(getRawASTType(), SILValueCategory::Object);
   }
 
   /// Returns the canonical AST type referenced by this SIL type.
@@ -179,13 +187,22 @@ public:
   ///    `@thick AnyObject.Type`.
   ///    More generally, you cannot recover a formal type from
   ///    a lowered type. See docs/SIL.rst for more details.
+  /// 3. If the underlying type is move only, the returned CanType will not be
+  ///    pointer equal to the RawASTType since we return the unwrapped inner
+  ///    type. This is done under the assumption that in all cases where we are
+  ///    performing these AST queries on SILType, we are not interested in the
+  ///    move only-ness of the value (which we can query separately anyways).
   CanType getASTType() const {
-    return CanType(value.getPointer());
+    return removingMoveOnlyWrapper().getRawASTType();
   }
-  
+
+  /// Returns the canonical AST type references by this SIL type without looking
+  /// through move only. Should only be used by internal utilities of SILType.
+  CanType getRawASTType() const { return CanType(value.getPointer()); }
+
+public:
   // FIXME -- Temporary until LLDB adopts getASTType()
-  LLVM_ATTRIBUTE_DEPRECATED(CanType getSwiftRValueType() const,
-                            "Please use getASTType()") {
+  [[deprecated("Please use getASTType()")]] CanType getSwiftRValueType() const {
     return getASTType();
   }
 
@@ -214,6 +231,13 @@ public:
 
   bool isVoid() const {
     return value.getPointer()->isVoid();
+  }
+
+  /// Whether the type is an enum, struct, or tuple.
+  bool isAggregate() {
+    return is<TupleType>() || is<StructType>() ||
+           is<BoundGenericStructType>() || is<EnumType>() ||
+           is<BoundGenericEnumType>();
   }
 
   /// Retrieve the ClassDecl for a type that maps to a Swift class or
@@ -304,9 +328,18 @@ public:
   bool isAddressOnly(const SILFunction &F) const;
 
   /// True if the underlying AST type is trivial, meaning it is loadable and can
-  /// be trivially copied, moved or detroyed. Returns false for address types
+  /// be trivially copied, moved or destroyed. Returns false for address types
   /// even though they are technically trivial.
   bool isTrivial(const SILFunction &F) const;
+
+  /// True if the type is the Builtin.RawPointer or a struct/tuple/enum which
+  /// contains a Builtin.RawPointer.
+  /// Returns false for types for which this property is not known, e.g. generic
+  /// types.
+  bool isOrContainsRawPointer(const SILFunction &F) const;
+
+  /// An efficient implementation of `!isTrivial() && isOrContainsRawPointer()`.
+  bool isNonTrivialOrContainsRawPointer(const SILFunction &F) const;
 
   /// True if the type is an empty tuple or an empty struct or a tuple or
   /// struct containing only empty types.
@@ -326,6 +359,15 @@ public:
   bool hasReferenceSemantics() const {
     return getASTType().hasReferenceSemantics();
   }
+
+  /// The lifetime of values of this type (which are not otherwise annotated).
+  ///
+  /// Trivial types are ::None.
+  /// Non-trivial types are ::Lexical by default.
+  /// Non-trivial types which are annotated @_eagerMove are ::EagerMove.
+  /// Aggregates which consist entirely of ::EagerMove fields are ::EagerMove.
+  /// All other types are ::Lexical.
+  Lifetime getLifetime(const SILFunction &F) const;
 
   /// Returns true if the referenced type is any sort of class-reference type,
   /// meaning anything with reference semantics that is not a function type.
@@ -402,9 +444,7 @@ public:
   }
 
   /// True if the type involves any archetypes.
-  bool hasArchetype() const {
-    return getASTType()->hasArchetype();
-  }
+  bool hasArchetype() const { return getASTType()->hasArchetype(); }
 
   /// True if the type involves any opaque archetypes.
   bool hasOpaqueArchetype() const {
@@ -418,7 +458,13 @@ public:
 
   /// True if the given type has at least the size and alignment of a native
   /// pointer.
-  bool isPointerSizeAndAligned();
+  bool isPointerSizeAndAligned(SILModule &M,
+                               ResilienceExpansion expansion) const;
+
+  /// True if the layout of the given type consists of a single native Swift-
+  /// refcounted object reference, possibly nullable.
+  bool isSingleSwiftRefcounted(SILModule &M,
+                               ResilienceExpansion expansion) const;
 
   /// True if `operTy` can be cast by single-reference value into `resultTy`.
   static bool canRefCast(SILType operTy, SILType resultTy, SILModule &M);
@@ -501,7 +547,7 @@ public:
   }
 
   /// Return the reference ownership of this type if it is a reference storage
-  /// type. Otherwse, return None.
+  /// type. Otherwise, return None.
   Optional<ReferenceOwnership> getReferenceStorageOwnership() const {
     auto type = getASTType()->getAs<ReferenceStorageType>();
     if (!type)
@@ -571,7 +617,51 @@ public:
 
   /// Returns true if this is the AnyObject SILType;
   bool isAnyObject() const { return getASTType()->isAnyObject(); }
-  
+
+  /// Returns true if this type is a first class move only type or a move only
+  /// wrapped type.
+  bool isMoveOnly() const;
+
+  /// Returns true if and only if this type is a first class move only
+  /// type. NOTE: Returns false if the type is a move only wrapped type.
+  bool isMoveOnlyType() const;
+
+  /// Returns true if this SILType is a move only wrapper type.
+  ///
+  /// Canonical way to check if a SILType is move only. Using is/getAs/castTo
+  /// will look through moveonly-ness.
+  bool isMoveOnlyWrapped() const {
+    return getRawASTType()->is<SILMoveOnlyWrappedType>();
+  }
+
+  /// If this is already a move only wrapped type, return *this. Otherwise, wrap
+  /// the copyable type in the mov eonly wrapper.
+  SILType addingMoveOnlyWrapper() const {
+    if (isMoveOnlyWrapped())
+      return *this;
+    auto newType = SILMoveOnlyWrappedType::get(getRawASTType());
+    return SILType::getPrimitiveType(newType, getCategory());
+  }
+
+  /// If this is already a copyable type, just return *this. Otherwise, if this
+  /// is a move only wrapped copyable type, return the inner type.
+  SILType removingMoveOnlyWrapper() const {
+    if (!isMoveOnlyWrapped())
+      return *this;
+    auto moveOnly = getRawASTType()->castTo<SILMoveOnlyWrappedType>();
+    return SILType::getPrimitiveType(moveOnly->getInnerType(), getCategory());
+  }
+
+  /// If \p otherType is move only wrapped, return this type that is move only
+  /// as well. Otherwise, returns self. Useful for propagating "move only"-ness
+  /// from a parent type to a subtype.
+  SILType copyingMoveOnlyWrapper(SILType otherType) const {
+    if (otherType.isMoveOnlyWrapped()) {
+      return addingMoveOnlyWrapper();
+    }
+    return *this;
+  }
+
   /// Returns a SILType with any archetypes mapped out of context.
   SILType mapTypeOutOfContext() const;
 
@@ -604,6 +694,12 @@ public:
   llvm::hash_code getHashCode() const {
     return llvm::hash_combine(*this);
   }
+  
+  /// If a type is visibly a singleton aggregate (a tuple with one element, a
+  /// struct with one field, or an enum with a single payload case), return the
+  /// type of its field, which it is guaranteed to have identical layout to.
+  SILType getSingletonAggregateFieldType(SILModule &M,
+                                         ResilienceExpansion expansion) const;
 
   //
   // Accessors for types used in SIL instructions:

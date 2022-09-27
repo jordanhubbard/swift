@@ -434,7 +434,7 @@ final class TangentVectorWB: DummyAdditiveArithmetic, Differentiable {
 }
 // expected-error @+3 {{'Differentiable' requires the types 'VectorSpaceTypeAlias.TangentVector' (aka 'TangentVectorWB') and 'TangentVectorWB.TangentVector' be equivalent}}
 // expected-note @+2 {{requirement specified as 'Self.TangentVector' == 'Self.TangentVector.TangentVector' [with Self = VectorSpaceTypeAlias]}}
-// expected-error @+1 {{type 'VectorSpaceTypeAlias' does not conform to protocol 'Differentiable'}}
+// expected-error @+1 2 {{type 'VectorSpaceTypeAlias' does not conform to protocol 'Differentiable'}} FIXME: Duplicate error
 final class VectorSpaceTypeAlias: DummyAdditiveArithmetic, Differentiable {
   var w: Float
   var b: Float
@@ -542,9 +542,10 @@ where T: AdditiveArithmetic {}
 extension NoMemberwiseInitializerExtended: Differentiable
 where T: Differentiable & AdditiveArithmetic {}
 
-// SR-12793: Test interaction with `@differentiable` and `@derivative` type-checking.
+// https://github.com/apple/swift/issues/55238
+// Test interaction with `@differentiable` and `@derivative` type-checking.
 
-class SR_12793: Differentiable {
+class C_55238: Differentiable {
   @differentiable(reverse)
   var x: Float = 0
 
@@ -593,7 +594,9 @@ class WrappedProperties: Differentiable {
 
   @Wrapper var float: Generic<Float> = Generic()
   @ClassWrapper var float2: Generic<Float> = Generic()
-  // SR-13071: Test `@differentiable` wrapped property.
+
+  // https://github.com/apple/swift/issues/55517
+  // Test `@differentiable` wrapped property.
   @differentiable(reverse) @Wrapper var float3: Generic<Float> = Generic()
 
   @noDerivative @ImmutableWrapper var nondiff: Generic<Int> = Generic()

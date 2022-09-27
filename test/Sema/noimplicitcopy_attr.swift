@@ -20,8 +20,7 @@ func varDecls(_ x: Klass, _ x2: Klass) -> () {
 
 func getKlass() -> Builtin.NativeObject {
     let k = Klass()
-    let b = Builtin.unsafeCastToNativeObject(k)
-    return Builtin.move(b)
+    return Builtin.unsafeCastToNativeObject(k)
 }
 
 @_noImplicitCopy var g: Builtin.NativeObject = getKlass() // expected-error {{'@_noImplicitCopy' attribute can only be applied to local lets}}
@@ -93,7 +92,7 @@ enum MyEnum {
     case none
     case noImplicitCopyCase(Klass)
 
-    // We suport doing it on computed properties though.
+    // We support doing it on computed properties though.
     @_noImplicitCopy var myMoveOnly: Builtin.NativeObject { // expected-error {{'@_noImplicitCopy' attribute can only be applied to local lets}}
         return getKlass()
     }
@@ -105,12 +104,12 @@ enum MyGenericEnum<T> {
     case none
     case noImplicitCopyCase(Klass)
 
-    // We suport doing it on computed properties though.
+    // We support doing it on computed properties though.
     @_noImplicitCopy var myMoveOnly: Builtin.NativeObject { // expected-error {{'@_noImplicitCopy' attribute can only be applied to local lets}}
         return getKlass()
     }
 
-    // We suport doing it on computed properties though.
+    // We support doing it on computed properties though.
     @_noImplicitCopy var myMoveOnly2: T? { // expected-error {{'@_noImplicitCopy' attribute can only be applied to local lets}}
         return nil
     }

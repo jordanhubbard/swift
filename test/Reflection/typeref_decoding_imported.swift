@@ -1,7 +1,7 @@
 // XFAIL: OS=windows-msvc
 
-// SR-12893
-// XFAIL: openbsd
+// https://github.com/apple/swift/issues/55339
+// XFAIL: OS=openbsd
 
 // RUN: %empty-directory(%t)
 

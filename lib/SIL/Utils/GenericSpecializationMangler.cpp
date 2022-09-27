@@ -81,7 +81,10 @@ appendSubstitutions(GenericSignature sig, SubstitutionMap subs) {
   bool First = true;
   sig->forEachParam([&](GenericTypeParamType *ParamType, bool Canonical) {
     if (Canonical) {
-      appendType(Type(ParamType).subst(subs)->getCanonicalType(), nullptr);
+      auto ty = Type(ParamType);
+      auto substTy = ty.subst(subs);
+      auto canTy = substTy->getCanonicalType();
+      appendType(canTy, nullptr);
       appendListSeparator(First);
     }
   });
@@ -105,13 +108,18 @@ mangleNotReabstracted(SubstitutionMap subs) {
 }
                                   
 std::string GenericSpecializationMangler::
-mangleReabstracted(SubstitutionMap subs, bool alternativeMangling) {
+mangleReabstracted(SubstitutionMap subs, bool alternativeMangling,
+                   bool metatyeParamsRemoved) {
   beginMangling();
   appendSubstitutions(getGenericSignature(), subs);
   
   // See ReabstractionInfo::hasConvertedResilientParams for why and when to use
   // the alternative mangling.
-  appendSpecializationOperator(alternativeMangling ? "TB" : "Tg");
+  if (metatyeParamsRemoved) {
+    appendSpecializationOperator(alternativeMangling ? "TBm" : "Tgm");
+  } else {
+    appendSpecializationOperator(alternativeMangling ? "TB" : "Tg");
+  }
   return finalize();
 }
 

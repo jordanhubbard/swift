@@ -178,7 +178,7 @@ ForwardModeTests.test("Generics") {
   let a = SIMD3<Double>(1, 2, 3)
   let g = SIMD3<Double>(1, 1, 1)
 
-  // FIXME(SR-13210): Fix forward-mode SIL verification error.
+  // FIXME: Fix forward-mode SIL verification error (https://github.com/apple/swift/issues/55650).
   /*
   func testInit<Scalar, SIMDType: SIMD>(x: Scalar) -> SIMDType
     where SIMDType.Scalar == Scalar,
@@ -229,7 +229,7 @@ ForwardModeTests.test("Generics") {
   expectEqual(2 - g, df3(2, g))
 
   // SIMDType * Scalar
-  func testMultipication<Scalar, SIMDType: SIMD>(lhs: SIMDType, rhs: Scalar)
+  func testMultiplication<Scalar, SIMDType: SIMD>(lhs: SIMDType, rhs: Scalar)
     -> SIMDType
     where SIMDType.Scalar == Scalar,
       SIMDType : Differentiable,
@@ -239,7 +239,7 @@ ForwardModeTests.test("Generics") {
     return lhs * rhs
   }
   func simd3Multiply(lhs: SIMD3<Double>, rhs: Double) -> SIMD3<Double> {
-    return testMultipication(lhs: lhs, rhs: rhs)
+    return testMultiplication(lhs: lhs, rhs: rhs)
   }
   let (val4, df4) = valueWithDifferential(at: a, 5, of: simd3Multiply)
   expectEqual(SIMD3<Double>(5, 10, 15), val4)

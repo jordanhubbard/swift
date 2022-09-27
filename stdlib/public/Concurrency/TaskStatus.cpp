@@ -15,12 +15,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "../CompatibilityOverride/CompatibilityOverride.h"
-#include "swift/Runtime/Concurrency.h"
-#include "swift/Runtime/Mutex.h"
-#include "swift/Runtime/AtomicWaitQueue.h"
 #include "swift/ABI/TaskStatus.h"
+#include "../CompatibilityOverride/CompatibilityOverride.h"
 #include "TaskPrivate.h"
+#include "swift/Runtime/AtomicWaitQueue.h"
+#include "swift/Runtime/Concurrency.h"
+#include "swift/Threading/Mutex.h"
 #include <atomic>
 
 using namespace swift;
@@ -36,7 +36,7 @@ ActiveTaskStatus::getStatusRecordParent(TaskStatusRecord *ptr) {
 
 /// A lock used to protect management of task-specific status
 /// record locks.
-static StaticMutex StatusRecordLockLock;
+static LazyMutex StatusRecordLockLock;
 
 namespace {
 
@@ -61,9 +61,9 @@ namespace {
 /// it sees that the locked bit is set in the `Status` field, it
 /// must acquire the global status-record lock, find this record
 /// (which should be the innermost record), and wait for an unlock.
-class StatusRecordLockRecord :
-    public AtomicWaitQueue<StatusRecordLockRecord, StaticMutex>,
-    public TaskStatusRecord {
+class StatusRecordLockRecord
+    : public AtomicWaitQueue<StatusRecordLockRecord, LazyMutex>,
+      public TaskStatusRecord {
 public:
   StatusRecordLockRecord(TaskStatusRecord *parent)
     : TaskStatusRecord(TaskStatusRecordKind::Private_RecordLock, parent) {
@@ -77,7 +77,6 @@ public:
     return record->getKind() == TaskStatusRecordKind::Private_RecordLock;
   }
 };
-
 }
 
 /// Wait for a task's status record lock to be unlocked.
@@ -207,8 +206,11 @@ template <class Fn>
 static bool withStatusRecordLock(AsyncTask *task,
                                  LockContext lockContext,
                                  Fn &&fn) {
+  auto loadOrdering = getLoadOrdering(lockContext);
   ActiveTaskStatus status =
-    task->_private()._status().load(getLoadOrdering(lockContext));
+    task->_private()._status().load(loadOrdering);
+  if (loadOrdering == std::memory_order_acquire)
+    _swift_tsan_acquire(task);
   return withStatusRecordLock(task, lockContext, status, [&] {
     fn(status);
   });
@@ -243,6 +245,7 @@ bool swift::addStatusRecord(
       // We have to use a release on success to make the initialization of
       // the new record visible to an asynchronous thread trying to modify the
       // status records
+      _swift_tsan_release(task);
       if (task->_private()._status().compare_exchange_weak(oldStatus, newStatus,
               /*success*/ std::memory_order_release,
               /*failure*/ std::memory_order_relaxed)) {
@@ -461,9 +464,19 @@ static void swift_task_cancelImpl(AsyncTask *task) {
     // Set cancelled bit even if oldStatus.isStatusRecordLocked()
     newStatus = oldStatus.withCancelled();
 
+    // Perform an acquire operation on success, which pairs with the release
+    // operation in addStatusRecord. This ensures that the contents of the
+    // status records are visible to this thread, as well as the contents of any
+    // cancellation handlers and the data they access. We place this acquire
+    // barrier here, because the subsequent call to `withStatusRecordLock` might
+    // not have its own acquire barrier. We're calling the four-argument version
+    // which relies on the caller to have performed the first load, and if the
+    // compare_exchange operation in withStatusRecordLock succeeds the first
+    // time, then it won't perform an acquire.
     if (task->_private()._status().compare_exchange_weak(oldStatus, newStatus,
-            /*success*/ std::memory_order_relaxed,
+            /*success*/ std::memory_order_acquire,
             /*failure*/ std::memory_order_relaxed)) {
+      _swift_tsan_acquire(task);
       break;
     }
   }
@@ -549,7 +562,7 @@ SWIFT_CC(swift)
 JobPriority
 static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
 
-  SWIFT_TASK_DEBUG_LOG("Escalating %p to %#x priority", task, newPriority);
+  SWIFT_TASK_DEBUG_LOG("Escalating %p to %#zx priority", task, newPriority);
   auto oldStatus = task->_private()._status().load(std::memory_order_relaxed);
   auto newStatus = oldStatus;
 
@@ -557,7 +570,7 @@ static swift_task_escalateImpl(AsyncTask *task, JobPriority newPriority) {
     // Fast path: check that the stored priority is already at least
     // as high as the desired priority.
     if (oldStatus.getStoredPriority() >= newPriority) {
-      SWIFT_TASK_DEBUG_LOG("Task is already at %x priority", oldStatus.getStoredPriority());
+      SWIFT_TASK_DEBUG_LOG("Task is already at %#zx priority", oldStatus.getStoredPriority());
       return oldStatus.getStoredPriority();
     }
 

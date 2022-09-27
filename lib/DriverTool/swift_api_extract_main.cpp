@@ -21,6 +21,7 @@
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/Option/Options.h"
+#include "swift/Parse/ParseVersion.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -89,7 +90,7 @@ public:
 
     if (auto *A = ParsedArgs.getLastArg(OPT_swift_version)) {
       bool isValid = false;
-      if (auto Version = version::Version::parseVersionString(
+      if (auto Version = VersionParser::parseVersionString(
               A->getValue(), SourceLoc(), nullptr)) {
         if (auto Effective = Version.getValue().getEffectiveLanguageVersion()) {
           Invocation.getLangOptions().EffectiveLanguageVersion = *Effective;
@@ -215,7 +216,7 @@ public:
       return 1;
 
     if (OutputFilename == "-") {
-      writeAPIJSONFile(M, llvm::outs(), PrettyPrint, nullptr);
+      writeAPIJSONFile(M, llvm::outs(), PrettyPrint);
       return 0;
     }
 
@@ -227,7 +228,7 @@ public:
       return 1;
     }
 
-    writeAPIJSONFile(M, OS, PrettyPrint, nullptr);
+    writeAPIJSONFile(M, OS, PrettyPrint);
     return 0;
   }
 };

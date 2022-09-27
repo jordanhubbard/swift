@@ -20,7 +20,6 @@
 // REQUIRES: OS=macosx
 
 %{
-from __future__ import division
 word_bits = int(WORD_BITS) // 2
 from SwiftIntTypes import all_integer_types
 }%
@@ -421,7 +420,7 @@ tests.test("CountLeadingZeros") {
   expectEqual(0, Int8.min.leadingZeroBitCount)
 }
 
-tests.test("CountTrainlingZeros") {
+tests.test("CountTrailingZeros") {
   expectEqual(0, UInt8.max.trailingZeroBitCount)
   expectEqual(8, UInt8.min.trailingZeroBitCount)
   expectEqual(0, Int8.max.trailingZeroBitCount)
@@ -777,7 +776,7 @@ tests.test("Remainder/DividingBy0") {
 }
 
 tests.test("RemainderReportingOverflow/DividingByMinusOne") {
-  // Work around SR-5964.
+  // Work around https://github.com/apple/swift/issues/48523.
   func minusOne<T : SignedInteger>() -> T {
     return -1 as T
   }
@@ -845,7 +844,7 @@ tests.test("Strideable") {
   expectEqual(dist(${u}Int.max, ${u}x), -10)
 
   // FIXME: The compiler spuriously flags these as overflowing:
-  // https://bugs.swift.org/browse/SR-5882
+  // https://github.com/apple/swift/issues/48452
   // expectEqual(${u}x.distance(to: ${u}Int.max), 10)
 % end
 

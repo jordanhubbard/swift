@@ -30,6 +30,7 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/SaveAndRestore.h"
+#include "clang/AST/ASTContext.h"
 using namespace swift;
 
 #define DEBUG_TYPE "Name lookup"
@@ -85,10 +86,11 @@ ProtocolDecl *DeclContext::getExtendedProtocolDecl() const {
 
 VarDecl *DeclContext::getNonLocalVarDecl() const {
   if (auto *init = dyn_cast<PatternBindingInitializer>(this)) {
-   if (auto *var =
-         init->getBinding()->getAnchoringVarDecl(init->getBindingIndex())) {
-      return var;
-     }
+    if (auto binding = init->getBinding()) {
+      if (auto *var = binding->getAnchoringVarDecl(init->getBindingIndex())) {
+        return var;
+      }
+    }
   }
   return nullptr;
 }
@@ -233,6 +235,16 @@ Decl *DeclContext::getInnermostDeclarationDeclContext() {
   } while ((DC = DC->getParent()));
 
   return nullptr;
+}
+
+Decl *DeclContext::getTopmostDeclarationDeclContext() {
+  auto *dc = this;
+  Decl *topmost = nullptr;
+  while (auto *decl = dc->getInnermostDeclarationDeclContext()) {
+    topmost = decl;
+    dc = decl->getDeclContext();
+  }
+  return topmost;
 }
 
 DeclContext *DeclContext::getInnermostSkippedFunctionContext() {
@@ -732,6 +744,14 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
     }
   }
   }
+
+  if (auto decl = getAsDecl())
+    if (decl->getClangNode().getLocation().isValid()) {
+      auto &clangSM = getASTContext().getClangModuleLoader()
+                          ->getClangASTContext().getSourceManager();
+      OS << " clang_loc=";
+      decl->getClangNode().getLocation().print(OS, clangSM);
+    }
 
   if (!onlyAPartialLine)
     OS << "\n";
@@ -1239,12 +1259,10 @@ bool DeclContext::isAsyncContext() const {
     return false;
   case DeclContextKind::FileUnit:
     if (const SourceFile *sf = dyn_cast<SourceFile>(this))
-      return getASTContext().LangOpts.EnableExperimentalAsyncTopLevel &&
-             sf->isAsyncTopLevelSourceFile();
+      return sf->isAsyncTopLevelSourceFile();
     return false;
   case DeclContextKind::TopLevelCodeDecl:
-    return getASTContext().LangOpts.EnableExperimentalAsyncTopLevel &&
-           getParent()->isAsyncContext();
+    return getParent()->isAsyncContext();
   case DeclContextKind::AbstractClosureExpr:
     return cast<AbstractClosureExpr>(this)->isBodyAsync();
   case DeclContextKind::AbstractFunctionDecl: {
@@ -1286,7 +1304,7 @@ SourceLoc swift::extractNearestSourceLoc(const DeclContext *dc) {
   case DeclContextKind::SerializedLocal:
     return extractNearestSourceLoc(dc->getParent());
   }
-  llvm_unreachable("Unhandled DeclCopntextKindin switch");
+  llvm_unreachable("Unhandled DeclContextKindIn switch");
 }
 
 #define DECL(Id, Parent) \

@@ -1,16 +1,39 @@
 // Test the -require-explicit-availability flag
 // REQUIRES: OS=macosx
+// RUN: %empty-directory(%t)
 
-// RUN: %swiftc_driver -typecheck -parse-as-library -target %target-cpu-apple-macosx10.10 -Xfrontend -verify -require-explicit-availability -require-explicit-availability-target "macOS 10.10"  %s
+/// Using the flag directly raises warnings and fixits.
+// RUN: %swiftc_driver -typecheck -parse-as-library -Xfrontend -verify %s \
+// RUN:   -target %target-cpu-apple-macosx10.10 -require-explicit-availability \
+// RUN:   -require-explicit-availability-target "macOS 10.10"
+// RUN: %swiftc_driver -typecheck -parse-as-library -Xfrontend -verify %s \
+// RUN:   -target %target-cpu-apple-macosx10.10 -require-explicit-availability=warn \
+// RUN:   -require-explicit-availability-target "macOS 10.10"
 
-public struct S { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}}
+/// Upgrade the diagnostic to an error.
+// RUN: sed -e "s/xpected-warning/xpected-error/" < %s > %t/Errors.swift
+// RUN: %target-swift-frontend -typecheck -parse-as-library -verify %t/Errors.swift \
+// RUN:   -target %target-cpu-apple-macosx10.10 -require-explicit-availability=error \
+// RUN:   -require-explicit-availability-target "macOS 10.10"
+
+/// Error on an invalid argument.
+// RUN: not %target-swift-frontend -typecheck %s -require-explicit-availability=NotIt 2>&1 \
+// RUN:   | %FileCheck %s --check-prefix CHECK-ARG
+// CHECK-ARG: error: unknown argument 'NotIt', passed to -require-explicit-availability, expected 'error', 'warn' or 'ignore'
+
+public struct S { // expected-warning {{public declarations should have an availability attribute with an introduction version}}
   public func method() { }
 }
 
-public func foo() { bar() } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+@available(macOS, unavailable)
+public struct UnavailableStruct {
+  public func okMethod() { }
+}
+
+public func foo() { bar() } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 @usableFromInline
-func bar() { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+func bar() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 @available(macOS 10.1, *)
 public func ok() { }
@@ -19,10 +42,10 @@ public func ok() { }
 public func unavailableOk() { }
 
 @available(macOS, deprecated: 10.10)
-public func missingIntro() { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public func missingIntro() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 @available(iOS 9.0, *)
-public func missingTargetPlatform() { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public func missingTargetPlatform() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 func privateFunc() { }
 
@@ -37,18 +60,33 @@ struct SOk {
 precedencegroup MediumPrecedence {}
 infix operator + : MediumPrecedence
 
-public func +(lhs: S, rhs: S) -> S { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public func +(lhs: S, rhs: S) -> S { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
-public enum E { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public enum E { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
-public class C { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+@available(macOS, unavailable)
+public enum UnavailableEnum {
+  case caseOk
+}
 
-public protocol P { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public class C { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
+
+@available(macOS, unavailable)
+public class UnavailableClass {
+  public func okMethod() { }
+}
+
+public protocol P { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
+
+@available(macOS, unavailable)
+public protocol UnavailableProto {
+  func requirementOk()
+}
 
 private protocol PrivateProto { }
 
-extension S { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
-  public func warnForPublicMembers() { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{3-3=@available(macOS 10.10, *)\n  }}
+extension S { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
+  public func warnForPublicMembers() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{3-3=@available(macOS 10.10, *)\n  }}
 }
 
 @available(macOS 10.1, *)
@@ -56,18 +94,26 @@ extension S {
   public func okWhenTheExtensionHasAttribute() { }
 }
 
+@available(macOS, unavailable)
+extension S {
+  public func okWhenTheExtensionIsUnavailable() { }
+}
+
 extension S {
   internal func dontWarnWithoutPublicMembers() { }
   private func dontWarnWithoutPublicMembers1() { }
 }
 
-extension S : P { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+// An empty extension should be ok.
+extension S { }
+
+extension S : P { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 }
 
 extension S : PrivateProto {
 }
 
-open class OpenClass { } // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+open class OpenClass { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 private class PrivateClass { }
 
@@ -91,19 +137,22 @@ extension spiStruct {
   public func spiExtensionMethod() {}
 }
 
-public var publicVar = S() // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public var publicVar = S() // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 @available(macOS 10.10, *)
 public var publicVarOk = S()
 
-public var (a, b) = (S(), S()) // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+@available(macOS, unavailable)
+public var unavailablePublicVarOk = S()
+
+public var (a, b) = (S(), S()) // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 @available(macOS 10.10, *)
 public var (c, d) = (S(), S())
 
 public var _ = S() // expected-error {{global variable declaration does not bind any variables}}
 
-public var implicitGet: S { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public var implicitGet: S { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
   return S()
 }
 
@@ -112,19 +161,24 @@ public var implicitGetOk: S {
   return S()
 }
 
-public var computed: S { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+@available(macOS, unavailable)
+public var unavailableImplicitGetOk: S {
+  return S()
+}
+
+public var computed: S { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
   get { return S() }
   set { }
 }
 
-public var computedHalf: S { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public var computedHalf: S { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
   @available(macOS 10.10, *)
   get { return S() }
   set { }
 }
 
 // FIXME the following warning is not needed.
-public var computedOk: S { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public var computedOk: S { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
   @available(macOS 10.10, *)
   get { return S() }
 
@@ -138,7 +192,7 @@ public var computedOk1: S {
   set { }
 }
 
-public class SomeClass { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
+public class SomeClass { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
   public init () {}
 
   public subscript(index: String) -> Int {
@@ -147,13 +201,13 @@ public class SomeClass { // expected-warning {{public declarations should have a
   }
 }
 
-extension SomeClass { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{1-1=@available(macOS 10.10, *)\n}}
-  public convenience init(s : S) {} // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{3-3=@available(macOS 10.10, *)\n  }}
+extension SomeClass { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
+  public convenience init(s : S) {} // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{3-3=@available(macOS 10.10, *)\n  }}
 
   @available(macOS 10.10, *)
   public convenience init(s : SomeClass) {}
 
-  public subscript(index: Int) -> Int { // expected-warning {{public declarations should have an availability attribute when building with -require-explicit-availability}} {{3-3=@available(macOS 10.10, *)\n  }}
+  public subscript(index: Int) -> Int { // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{3-3=@available(macOS 10.10, *)\n  }}
     get { return 42; }
     set(newValue) { }
   }
@@ -170,5 +224,5 @@ public struct StructWithImplicitMembers { }
 
 extension StructWithImplicitMembers: Hashable { }
 // expected-note @-1 {{add @available attribute to enclosing extension}}
-// expected-warning @-2 {{public declarations should have an availability attribute when building with -require-explicit-availability}}
+// expected-warning @-2 {{public declarations should have an availability attribute with an introduction version}}
 // expected-error @-3 {{'StructWithImplicitMembers' is only available in macOS 10.15 or newer}}

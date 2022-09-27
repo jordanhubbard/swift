@@ -1,13 +1,17 @@
-// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk)  -disable-availability-checking -typecheck -verify -import-objc-header %S/Inputs/Delegate.h %s
+// RUN: %target-swift-frontend(mock-sdk: %clang-importer-sdk)  -disable-availability-checking -typecheck -verify -import-objc-header %S/Inputs/Delegate.h -enable-experimental-feature SendableCompletionHandlers %s
 // REQUIRES: concurrency
 // REQUIRES: objc_interop
-
+// REQUIRES: asserts
 
 // overload resolution should pick sync version in a sync context
 func syncContext() {
   let r = Request()
   let d = Delegate()
-  d.makeRequest1(r) // NOTE: this use to trigger an overload resolution error, see SR-13760
+
+  // https://github.com/apple/swift/issues/56157
+  // This use to trigger an overload resolution error.
+  d.makeRequest1(r)
+
   d.makeRequest2(r)
   d.makeRequest3(r)
 }
@@ -52,4 +56,10 @@ extension Delegate {
       // expected-warning@-1 {{call to main actor-isolated instance method 'finish()' in a synchronous nonisolated context; this is an error in Swift 6}}
     }
   }
+}
+
+// rdar://95887113 - Implementing an ObjC category method in Swift is not strictly valid, but should be tolerated
+
+extension Delegate {
+  @objc public func makeRequest(fromSwift: Request, completionHandler: (() -> Void)?) {}
 }

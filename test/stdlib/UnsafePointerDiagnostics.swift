@@ -125,13 +125,13 @@ func unsafeRawBufferPointerConversions(
   _ = UnsafeRawBufferPointer(start: orp, count: 1)
 }
 
-
-struct SR9800 {
+// https://github.com/apple/swift/issues/52224
+struct S_52224 {
   func foo(_: UnsafePointer<CChar>) {}
   func foo(_: UnsafePointer<UInt8>) {}
 
   func ambiguityTest(buf: UnsafeMutablePointer<CChar>) {
-    foo(UnsafePointer(buf)) // this call should be unambiguoius
+    foo(UnsafePointer(buf)) // this call should be unambiguous
   }
 }
 

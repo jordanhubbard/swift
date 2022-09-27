@@ -21,30 +21,38 @@ namespace symbolgraphgen {
 
 struct SymbolGraphOptions {
   /// The directory to output the symbol graph JSON files.
-  StringRef OutputDir;
+  StringRef OutputDir = {};
 
   /// The target of the module.
-  llvm::Triple Target; 
+  llvm::Triple Target = {};
   /// Pretty-print the JSON with newlines and indentation.
-  bool PrettyPrint;
+  bool PrettyPrint = false;
 
   /// The minimum access level that symbols must have in order to be
   /// included in the graph.
-  AccessLevel MinimumAccessLevel;
+  AccessLevel MinimumAccessLevel = AccessLevel::Public;
 
   /// Emit members gotten through class inheritance or protocol default
   /// implementations with compound, "SYNTHESIZED" USRs.
-  bool EmitSynthesizedMembers;
+  bool EmitSynthesizedMembers = false;
   
   /// Whether to print informational messages when rendering
   /// a symbol graph.
-  bool PrintMessages;
+  bool PrintMessages = false;
   
   /// Whether to skip docs for symbols with compound, "SYNTHESIZED" USRs.
-  bool SkipInheritedDocs;
+  bool SkipInheritedDocs = false;
 
   /// Whether to emit symbols with SPI information.
-  bool IncludeSPISymbols;
+  bool IncludeSPISymbols = false;
+
+  /// Whether to include documentation for clang nodes or not.
+  bool IncludeClangDocs = false;
+
+  /// Whether to emit "swift.extension" symbols for extensions to external types
+  /// along with "extensionTo" relationships instead of directly associating
+  /// members and conformances with the extended nominal.
+  bool EmitExtensionBlockSymbols = false;
 };
 
 } // end namespace symbolgraphgen

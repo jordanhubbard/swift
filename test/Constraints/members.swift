@@ -329,7 +329,8 @@ let _ = .Tomato(cloud: .none)  // expected-error {{reference to member 'Tomato' 
 
 
 
-// SR-650: REGRESSION: Assertion failed: (baseTy && "Couldn't find appropriate context"), function getMemberSubstitutions
+// https://github.com/apple/swift/issues/43267
+// REGRESSION: Assertion failed: (baseTy && "Couldn't find appropriate context"), function getMemberSubstitutions
 enum SomeErrorType {
   case StandaloneError
   case UnderlyingError(String)
@@ -341,15 +342,17 @@ enum SomeErrorType {
   }
 }
 
-// SR-2193: QoI: better diagnostic when a decl exists, but is not a type
-
-enum SR_2193_Error: Error {
-  case Boom
-}
-
+// https://github.com/apple/swift/issues/44801
+// QoI: Better diagnostic when a decl exists, but is not a type
 do {
-  throw SR_2193_Error.Boom
-} catch let e as SR_2193_Error.Boom { // expected-error {{enum case 'Boom' is not a member type of 'SR_2193_Error'}}
+  enum E: Error {
+    case Boom
+  }
+
+  do {
+    throw E.Boom
+  } catch let e as E.Boom { // expected-error {{enum case 'Boom' is not a member type of 'E'}}
+  }
 }
 
 // rdar://problem/25341015
@@ -450,8 +453,9 @@ func rdar33914444() {
   // expected-error@-1 {{type 'A.R<A.S.E>' has no member 'e1'; did you mean 'e'?}}
 }
 
-// SR-5324: Better diagnostic when instance member of outer type is referenced from nested type
-
+// https://github.com/apple/swift/issues/47898
+// Better diagnostic when instance member of outer type is referenced from
+// nested type
 struct Outer {
   var outer: Int
 
@@ -595,10 +599,10 @@ func rdar50679161() {
 
   func foo() {
     _ = { () -> Void in
+      // Missing `.self` or `init` is not diagnosed here because there are errors in
+      // `if let` statement and `MiscDiagnostics` only run if the body is completely valid.
       var foo = S
-      // expected-error@-1 {{expected member name or constructor call after type name}}
-      // expected-note@-2 {{add arguments after the type to construct a value of the type}}
-      // expected-note@-3 {{use '.self' to reference the type object}}
+
       if let v = Int?(1) {
         var _ = Q(
           a: v + foo.w,
@@ -609,6 +613,14 @@ func rdar50679161() {
           // expected-error@-2 {{cannot convert value of type 'Point' to expected argument type 'Int'}}
         )
       }
+    }
+
+    _ = { () -> Void in
+      var foo = S
+      // expected-error@-1 {{expected member name or constructor call after type name}}
+      // expected-note@-2 {{add arguments after the type to construct a value of the type}}
+      // expected-note@-3 {{use '.self' to reference the type object}}
+      print(foo)
     }
   }
 }
@@ -637,15 +649,18 @@ func rdar_50467583_and_50909555() {
   }
 }
 
-// SR-9396 (rdar://problem/46427500) - Nonsensical error message related to constrained extensions
-struct SR_9396<A, B> {}
+// rdar://problem/46427500
+// https://github.com/apple/swift/issues/51862
+// Nonsensical error message related to constrained extensions
 
-extension SR_9396 where A == Bool {  // expected-note {{where 'A' = 'Int'}}
+struct S_51862<A, B> {}
+
+extension S_51862 where A == Bool {  // expected-note {{where 'A' = 'Int'}}
   func foo() {}
 }
 
-func test_sr_9396(_ s: SR_9396<Int, Double>) {
-  s.foo() // expected-error {{referencing instance method 'foo()' on 'SR_9396' requires the types 'Int' and 'Bool' be equivalent}}
+func test_51862(_ s: S_51862<Int, Double>) {
+  s.foo() // expected-error {{referencing instance method 'foo()' on 'S_51862' requires the types 'Int' and 'Bool' be equivalent}}
 }
 
 // rdar://problem/34770265 - Better diagnostic needed for constrained extension method call
@@ -664,7 +679,7 @@ func test_34770265(_ dict: [Int: Int]) {
   // expected-error@-1 {{referencing instance method 'rdar_34770265_val()' on 'Dictionary' requires the types 'Int' and 'String' be equivalent}}
 }
 
-// SR-12672
+// https://github.com/apple/swift/issues/55116
 _ = [.e] // expected-error {{reference to member 'e' cannot be resolved without a contextual type}}
 let _ : [Any] = [.e] // expected-error {{type 'Any' has no member 'e'}}
 _ = [1 :.e] // expected-error {{reference to member 'e' cannot be resolved without a contextual type}}
@@ -673,14 +688,14 @@ let _ : [Int: Any] = [1 : .e] // expected-error {{type 'Any' has no member 'e'}}
 let _ : (Int, Any) = (1, .e) // expected-error {{type 'Any' has no member 'e'}}
 _ = (1, .e) // expected-error {{cannot infer contextual base in reference to member 'e'}}
 
-// SR-13359
+// https://github.com/apple/swift/issues/55799
 typealias Pair = (Int, Int)
-func testSR13359(_ pair: (Int, Int), _ alias: Pair, _ void: Void, labeled: (a: Int, b: Int)) {
+func test_55799(_ pair: (Int, Int), _ alias: Pair, _ void: Void, labeled: (a: Int, b: Int)) {
   _ = pair[0] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; did you mean to use '.0'?}} {{11-14=.0}}
   _ = pair[1] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; did you mean to use '.1'?}} {{11-14=.1}}
   _ = pair[2] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; use '.' notation instead}} {{none}}
   _ = pair[100] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; use '.' notation instead}} {{none}}
-  _ = pair["strting"] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; use '.' notation instead}} {{none}}
+  _ = pair["string"] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; use '.' notation instead}} {{none}}
   _ = pair[-1] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; use '.' notation instead}} {{none}}
   _ = pair[1, 1] // expected-error {{cannot access element using subscript for tuple type '(Int, Int)'; use '.' notation instead}} {{none}}
   _ = void[0] // expected-error {{value of type 'Void' has no subscripts}}
@@ -692,7 +707,7 @@ func testSR13359(_ pair: (Int, Int), _ alias: Pair, _ void: Void, labeled: (a: I
   _ = alias[1] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); did you mean to use '.1'?}} {{12-15=.1}}
   _ = alias[2] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); use '.' notation instead}} {{none}}
   _ = alias[100] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); use '.' notation instead}} {{none}}
-  _ = alias["strting"] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); use '.' notation instead}} {{none}}
+  _ = alias["string"] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); use '.' notation instead}} {{none}}
   _ = alias[-1] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); use '.' notation instead}} {{none}}
   _ = alias[1, 1] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); use '.' notation instead}} {{none}}
   _ = alias[0x00] // expected-error {{cannot access element using subscript for tuple type 'Pair' (aka '(Int, Int)'); use '.' notation instead}} {{none}}
@@ -703,7 +718,7 @@ func testSR13359(_ pair: (Int, Int), _ alias: Pair, _ void: Void, labeled: (a: I
   _ = labeled[1] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; did you mean to use '.1'?}} {{14-17=.1}}
   _ = labeled[2] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; use '.' notation instead}} {{none}}
   _ = labeled[100] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; use '.' notation instead}} {{none}}
-  _ = labeled["strting"] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; use '.' notation instead}} {{none}}
+  _ = labeled["string"] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; use '.' notation instead}} {{none}}
   _ = labeled[-1] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; use '.' notation instead}} {{none}}
   _ = labeled[1, 1] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; use '.' notation instead}} {{none}}
   _ = labeled[0x00] // expected-error {{cannot access element using subscript for tuple type '(a: Int, b: Int)'; use '.' notation instead}} {{none}}
@@ -735,13 +750,36 @@ func rdar55369704() {
   }
 }
 
-// SR-14533
-struct SR14533 {
-  var xs: [Int] 
+// https://github.com/apple/swift/issues/56885
+do {
+  struct S {
+    var xs: [Int] // expected-note {{'xs' declared here}}
+  }
+  func f(_ s: S) {
+    for (x1, x2) in zip(s.xs, s.ys) {
+      // expected-error@-1 {{value of type 'S' has no member 'ys'; did you mean 'xs'?}}
+    }
+  }
 }
 
-func fSR14533(_ s: SR14533) {
-  for (x1, x2) in zip(s.xs, s.ys) {
-    // expected-error@-1{{value of type 'SR14533' has no member 'ys'}}
-  }
+// rdar://92358570
+class SomeClassBound {}
+protocol ClassBoundProtocol: SomeClassBound {
+}
+
+struct RDAR92358570<Element> {}
+
+extension RDAR92358570 where Element : SomeClassBound {
+// expected-note@-1 2 {{where 'Element' = 'any ClassBoundProtocol', 'SomeClassBound' = 'AnyObject'}}
+// expected-note@-2 2 {{where 'Element' = 'any SomeClassBound & ClassBoundProtocol', 'SomeClassBound' = 'AnyObject'}}
+  func doSomething() {}
+  static func doSomethingStatically() {}
+}
+
+func rdar92358570(_ x: RDAR92358570<ClassBoundProtocol>, _ y: RDAR92358570<SomeClassBound & ClassBoundProtocol>) {
+  x.doSomething() // expected-error {{referencing instance method 'doSomething()' on 'RDAR92358570' requires that 'any ClassBoundProtocol' inherit from 'AnyObject'}}
+  RDAR92358570<ClassBoundProtocol>.doSomethingStatically() // expected-error {{referencing static method 'doSomethingStatically()' on 'RDAR92358570' requires that 'any ClassBoundProtocol' inherit from 'AnyObject'}}
+
+  y.doSomething() // expected-error {{referencing instance method 'doSomething()' on 'RDAR92358570' requires that 'any SomeClassBound & ClassBoundProtocol' inherit from 'AnyObject'}}
+  RDAR92358570<SomeClassBound & ClassBoundProtocol>.doSomethingStatically() // expected-error {{referencing static method 'doSomethingStatically()' on 'RDAR92358570' requires that 'any SomeClassBound & ClassBoundProtocol' inherit from 'AnyObject'}}
 }

@@ -1,6 +1,4 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking -requirement-machine-protocol-signatures=off -requirement-machine-abstract-signatures=on
-
-// TODO: Get this to pass with  -requirement-machine-protocol-signatures=on.
+// RUN: %target-typecheck-verify-swift -disable-availability-checking
 
 //===----------------------------------------------------------------------===//
 // Use of protocols with Self or associated type requirements
@@ -696,7 +694,7 @@ protocol MiscTestsProto {
 do {
   func miscTests(_ arg: any MiscTestsProto) {
     var r: any Sequence & IteratorProtocol = arg.getR()
-    r.makeIterator() // expected-warning {{result of call to 'makeIterator()' is unused}}
+    r.makeIterator() // expected-error {{inferred result type 'any IteratorProtocol' requires explicit coercion due to loss of generic requirements}} {{19-19=as any IteratorProtocol}}
     r.next() // expected-warning {{result of call to 'next()' is unused}}
     r.nonexistent() // expected-error {{value of type 'any IteratorProtocol & Sequence' has no member 'nonexistent'}}
 
@@ -804,9 +802,7 @@ do {
 
     let _: any Class<Struct<Bool>.Inner> & ConcreteAssocTypes =
       arg[
-        // FIXME: Sema thinks (any ConcreteAssocTypes).self is a function ref.
-        // expected-warning@+1 {{protocol 'ConcreteAssocTypes' as a type must be explicitly marked as 'any'}}
-        subscript4: Struct<Bool>(), ConcreteAssocTypes.self, { true }
+        subscript4: Struct<Bool>(), (any ConcreteAssocTypes).self, { true }
       ]
   }
 }

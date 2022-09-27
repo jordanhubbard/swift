@@ -17,6 +17,7 @@
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/ASTWalker.h"
 #include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/DebuggerClient.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -36,6 +37,7 @@
 #include "swift/Basic/Statistic.h"
 #include "swift/ClangImporter/ClangImporterRequests.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/Strings.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/DenseMap.h"
@@ -172,16 +174,148 @@ void UsableFilteringDeclConsumer::foundDecl(ValueDecl *D,
 
   switch (reason) {
   case DeclVisibilityKind::LocalVariable:
-    // Skip if Loc is before the found decl, unless its a TypeDecl (whose use
-    // before its declaration is still allowed)
-    if (!isa<TypeDecl>(D) && !SM.isBeforeInBuffer(D->getLoc(), Loc))
+  case DeclVisibilityKind::FunctionParameter:
+    // Skip if Loc is before the found decl if the decl is a var/let decl.
+    // Type and func decls can be referenced before its declaration, or from
+    // within nested type decls.
+    if (isa<VarDecl>(D)) {
+      if (reason == DeclVisibilityKind::LocalVariable) {
+        // Workaround for fast-completion. A loc in the current context might be
+        // in a loc
+        auto tmpLoc = Loc;
+        if (D->getDeclContext() != DC) {
+          if (auto *contextD = DC->getAsDecl())
+            tmpLoc = contextD->getStartLoc();
+        }
+        if (!SM.isBeforeInBuffer(D->getLoc(), Loc))
+          return;
+      }
+
+      // A type context cannot close over values defined in outer type contexts.
+      if (D->getDeclContext()->getInnermostTypeContext() != typeContext)
+        return;
+    }
+    break;
+
+  case DeclVisibilityKind::MemberOfOutsideNominal:
+    // A type context cannot close over members of outer type contexts, except
+    // for type decls.
+    if (!isa<TypeDecl>(D) && !D->isStatic())
       return;
     break;
-  default:
-    // The rest of the file is currently skipped, so no need to check
-    // decl location for VisibleAtTopLevel. Other visibility kinds are always
-    // usable
+
+  case DeclVisibilityKind::MemberOfCurrentNominal:
+  case DeclVisibilityKind::MemberOfSuper:
+  case DeclVisibilityKind::MemberOfProtocolConformedToByCurrentNominal:
+  case DeclVisibilityKind::MemberOfProtocolDerivedByCurrentNominal:
+  case DeclVisibilityKind::DynamicLookup:
+    // Members on 'Self' including inherited/derived ones are always usable.
     break;
+
+  case DeclVisibilityKind::GenericParameter:
+    // Generic params are type decls and are always usable from nested context.
+    break;
+
+  case DeclVisibilityKind::VisibleAtTopLevel:
+    // The rest of the file is currently skipped, so no need to check
+    // decl location for VisibleAtTopLevel.
+    break;
+  }
+
+  // Filter out shadowed decls. Do this for only usable values even though
+  // unusable values actually can shadow outer values, because compilers might
+  // be able to diagnose it with fix-it to add the qualification. E.g.
+  //   func foo(global: T) {}
+  //   struct Outer {
+  //     func foo(outer: T) {}
+  //     func test() {
+  //       struct Inner {
+  //         func test() {
+  //           <HERE>
+  //         }
+  //       }
+  //     }
+  //   }
+  // In this case 'foo(global:)' is shadowed by 'foo(outer:)', but 'foo(outer:)'
+  // is _not_ usable because it's outside the current type context, whereas
+  // 'foo(global:)' is still usable with 'ModuleName.' qualification.
+  // FIXME: (for code completion,) If a global value or a static type member is
+  // shadowd, we should suggest it with prefix (e.g. 'ModuleName.value').
+  auto inserted = SeenNames.insert({D->getBaseName(), {D, reason}});
+  if (!inserted.second) {
+    auto shadowingReason = inserted.first->second.second;
+    auto *shadowingD = inserted.first->second.first;
+
+    // A type decl cannot have overloads, and shadows everything outside the
+    // scope.
+    if (isa<TypeDecl>(shadowingD))
+      return;
+
+    switch (shadowingReason) {
+    case DeclVisibilityKind::LocalVariable:
+    case DeclVisibilityKind::FunctionParameter:
+      // Local func and var/let with a conflicting name.
+      //   func foo() {
+      //     func value(arg: Int) {}
+      //     var value = ""
+      //   }
+      // In this case, 'var value' wins, regardless of their source order.
+      // So, for confilicting local values in the same decl context, even if the
+      // 'var value' is reported after 'func value', don't shadow it, but we
+      // shadow everything with the name after that.
+      if (reason == DeclVisibilityKind::LocalVariable &&
+          isa<VarDecl>(D) && !isa<VarDecl>(shadowingD) &&
+          shadowingD->getDeclContext() == D->getDeclContext()) {
+        // Replace the shadowing decl so we shadow subsequent conflicting decls.
+        inserted.first->second = {D, reason};
+        break;
+      }
+
+      // Otherwise, a local value shadows everything outside the scope.
+      return;
+
+    case DeclVisibilityKind::GenericParameter:
+      // A Generic parameter is a type name. It shadows everything outside the
+      // generic context.
+      return;
+
+    case DeclVisibilityKind::MemberOfCurrentNominal:
+    case DeclVisibilityKind::MemberOfSuper:
+    case DeclVisibilityKind::MemberOfProtocolConformedToByCurrentNominal:
+    case DeclVisibilityKind::MemberOfProtocolDerivedByCurrentNominal:
+    case DeclVisibilityKind::DynamicLookup:
+      switch (reason) {
+      case DeclVisibilityKind::MemberOfCurrentNominal:
+      case DeclVisibilityKind::MemberOfSuper:
+      case DeclVisibilityKind::MemberOfProtocolConformedToByCurrentNominal:
+      case DeclVisibilityKind::MemberOfProtocolDerivedByCurrentNominal:
+      case DeclVisibilityKind::DynamicLookup:
+        // Members on the current type context don't shadow members with the
+        // same base name on the current type contxt. They are overloads.
+        break;
+      default:
+        // Members of a type context shadows values/types outside.
+        return;
+      }
+      break;
+
+    case DeclVisibilityKind::MemberOfOutsideNominal:
+      // For static values, it's unclear _which_ type context (i.e. this type,
+      // super classes, conforming protocols) this decl was found in. For now,
+      // consider all the outer nominals are the same.
+
+      if (reason == DeclVisibilityKind::MemberOfOutsideNominal)
+        break;
+
+      // Values outside the nominal are shadowed.
+      return;
+
+    case DeclVisibilityKind::VisibleAtTopLevel:
+      // Top level decls don't shadow anything.
+      // Well, that's not true. Decls in the current module shadows decls in
+      // the imported modules. But we don't care them here.
+      break;
+    }
   }
 
   ChainedConsumer.foundDecl(D, reason, dynamicLookupInfo);
@@ -518,6 +652,22 @@ static void recordShadowedDeclsAfterTypeMatch(
         if ((firstModule == concurModule) != (secondModule == concurModule)) {
           // If second module is _Concurrency, then it is shadowed by first.
           if (secondModule == concurModule) {
+            shadowed.insert(secondDecl);
+            continue;
+          }
+
+          // Otherwise, the first declaration is shadowed by the second.
+          shadowed.insert(firstDecl);
+          break;
+        }
+      }
+
+      // Next, prefer any other module over the _StringProcessing module.
+      if (auto spModule = ctx.getLoadedModule(ctx.Id_StringProcessing)) {
+        if ((firstModule == spModule) != (secondModule == spModule)) {
+          // If second module is _StringProcessing, then it is shadowed by
+          // first.
+          if (secondModule == spModule) {
             shadowed.insert(secondDecl);
             continue;
           }
@@ -895,7 +1045,8 @@ namespace {
 /// the given parsed type representation.
 static DirectlyReferencedTypeDecls
 directReferencesForTypeRepr(Evaluator &evaluator, ASTContext &ctx,
-                            TypeRepr *typeRepr, DeclContext *dc);
+                            TypeRepr *typeRepr, DeclContext *dc,
+                            bool allowUsableFromInline=false);
 
 /// Retrieve the set of type declarations that are directly referenced from
 /// the given type.
@@ -978,6 +1129,39 @@ SelfBounds swift::getSelfBoundsFromWhereClause(
                        : extDecl->getASTContext();
   return evaluateOrDefault(ctx.evaluator,
                            SelfBoundsFromWhereClauseRequest{decl}, {});
+}
+
+SelfBounds SelfBoundsFromGenericSignatureRequest::evaluate(
+    Evaluator &evaluator, const ExtensionDecl *extDecl) const {
+  SelfBounds result;
+  ASTContext &ctx = extDecl->getASTContext();
+  auto selfType = extDecl->getSelfInterfaceType();
+  for (const auto &req : extDecl->getGenericRequirements()) {
+    auto kind = req.getKind();
+    if (kind != RequirementKind::Conformance &&
+        kind != RequirementKind::Superclass)
+      continue;
+    // The left-hand side of the type constraint must be 'Self'.
+    bool isSelfLHS = selfType->isEqual(req.getFirstType());
+    if (!isSelfLHS)
+      continue;
+
+    auto rhsDecls = directReferencesForType(req.getSecondType());
+    SmallVector<ModuleDecl *, 2> modulesFound;
+    auto rhsNominals = resolveTypeDeclsToNominal(
+        evaluator, ctx, rhsDecls, modulesFound, result.anyObject);
+    result.decls.insert(result.decls.end(), rhsNominals.begin(),
+                        rhsNominals.end());
+  }
+
+  return result;
+}
+
+SelfBounds
+swift::getSelfBoundsFromGenericSignature(const ExtensionDecl *extDecl) {
+  auto &ctx = extDecl->getASTContext();
+  return evaluateOrDefault(ctx.evaluator,
+                           SelfBoundsFromGenericSignatureRequest{extDecl}, {});
 }
 
 TinyPtrVector<TypeDecl *>
@@ -1125,11 +1309,28 @@ namespace {
 
 /// Class member lookup table, which is a member lookup table with a second
 /// table for lookup based on Objective-C selector.
-class ClassDecl::ObjCMethodLookupTable
+class swift::ObjCMethodLookupTable
         : public llvm::DenseMap<std::pair<ObjCSelector, char>,
                                 StoredObjCMethods>,
-          public ASTAllocated<ClassDecl::ObjCMethodLookupTable>
-{};
+          public ASTAllocated<ObjCMethodLookupTable>
+{
+  SWIFT_DEBUG_DUMP {
+    llvm::errs() << "ObjCMethodLookupTable:\n";
+    for (auto pair : *this) {
+      auto selector = pair.getFirst().first;
+      auto isInstanceMethod = pair.getFirst().second;
+      auto &methods = pair.getSecond();
+
+      llvm::errs() << "  \"" << (isInstanceMethod ? "-" : "+") << selector
+                   << "\":\n";
+      for (auto method : methods.Methods) {
+        llvm::errs() << "  - \"";
+        method->dumpRef(llvm::errs());
+        llvm::errs() << "\"\n";
+      }
+    }
+  }
+};
 
 MemberLookupTable::MemberLookupTable(ASTContext &ctx) {
   // Register a cleanup with the ASTContext to call the lookup table
@@ -1483,23 +1684,27 @@ DirectLookupRequest::evaluate(Evaluator &evaluator,
                                       includeAttrImplements);
 }
 
-void ClassDecl::createObjCMethodLookup() {
+bool NominalTypeDecl::createObjCMethodLookup() {
   assert(!ObjCMethodLookup && "Already have an Objective-C member table");
+
+  // Most types cannot have ObjC methods.
+  if (!(isa<ClassDecl>(this) || isa<ProtocolDecl>(this)))
+    return false;
+
   auto &ctx = getASTContext();
   ObjCMethodLookup = new (ctx) ObjCMethodLookupTable();
 
   // Register a cleanup with the ASTContext to call the lookup table
   // destructor.
-  ctx.addCleanup([this]() {
-    this->ObjCMethodLookup->~ObjCMethodLookupTable();
-  });
+  ctx.addDestructorCleanup(*ObjCMethodLookup);
+
+  return true;
 }
 
 TinyPtrVector<AbstractFunctionDecl *>
-ClassDecl::lookupDirect(ObjCSelector selector, bool isInstance) {
-  if (!ObjCMethodLookup) {
-    createObjCMethodLookup();
-  }
+NominalTypeDecl::lookupDirect(ObjCSelector selector, bool isInstance) {
+  if (!ObjCMethodLookup && !createObjCMethodLookup())
+    return {};
 
   // If any modules have been loaded since we did the search last (or if we
   // hadn't searched before), look in those modules, too.
@@ -1514,11 +1719,36 @@ ClassDecl::lookupDirect(ObjCSelector selector, bool isInstance) {
   return stored.Methods;
 }
 
-void ClassDecl::recordObjCMethod(AbstractFunctionDecl *method,
-                                 ObjCSelector selector) {
-  if (!ObjCMethodLookup) {
-    createObjCMethodLookup();
-  }
+/// If there is an apparent conflict between \p newDecl and one of the methods
+/// in \p vec, should we diagnose it?
+static bool
+shouldDiagnoseConflict(NominalTypeDecl *ty, AbstractFunctionDecl *newDecl,
+                       llvm::TinyPtrVector<AbstractFunctionDecl *> &vec) {
+  // Are all conflicting methods imported from ObjC and in our ObjC half or a
+  // bridging header? Some code bases implement ObjC methods in Swift even
+  // though it's not exactly supported.
+  auto newDeclModuleName = newDecl->getModuleContext()->getName();
+  auto newDeclPrivateModuleName = newDecl->getASTContext().getIdentifier(
+                     (llvm::Twine(newDeclModuleName.str()) + "_Private").str());
+  auto bridgingHeaderModuleName = newDecl->getASTContext().getIdentifier(
+                                                     CLANG_HEADER_MODULE_NAME);
+  if (llvm::all_of(vec, [&](AbstractFunctionDecl *oldDecl) {
+    if (!oldDecl->hasClangNode())
+      return false;
+    auto oldDeclModuleName = oldDecl->getModuleContext()->getName();
+    return oldDeclModuleName == newDeclModuleName
+               || oldDeclModuleName == newDeclPrivateModuleName
+               || oldDeclModuleName == bridgingHeaderModuleName;
+  }))
+    return false;
+
+  return true;
+}
+
+void NominalTypeDecl::recordObjCMethod(AbstractFunctionDecl *method,
+                                       ObjCSelector selector) {
+  if (!ObjCMethodLookup && !createObjCMethodLookup())
+    return;
 
   // Record the method.
   bool isInstanceMethod = method->isObjCInstanceMethod();
@@ -1530,12 +1760,11 @@ void ClassDecl::recordObjCMethod(AbstractFunctionDecl *method,
     return;
 
   if (auto *sf = method->getParentSourceFile()) {
-    if (vec.size() == 1) {
-      // We have a conflict.
-      sf->ObjCMethodConflicts.push_back(std::make_tuple(this, selector,
-                                                        isInstanceMethod));
-    } if (vec.empty()) {
+    if (vec.empty()) {
       sf->ObjCMethodList.push_back(method);
+    } else if (shouldDiagnoseConflict(this, method, vec)) {
+      // We have a conflict.
+      sf->ObjCMethodConflicts.insert({ this, selector, isInstanceMethod });
     }
   }
 
@@ -1589,6 +1818,32 @@ void namelookup::pruneLookupResultSet(const DeclContext *dc, NLOptions options,
   filterForDiscriminator(decls, M->getDebugClient());
 }
 
+// An unfortunate hack to kick the decl checker into adding semantic members to
+// the current type before we attempt a semantic lookup. The places this method
+// looks needs to be in sync with \c extractDirectlyReferencedNominalTypes.
+// See the note in \c synthesizeSemanticMembersIfNeeded about a better, more
+// just, and peaceful world.
+void namelookup::installSemanticMembersIfNeeded(Type type, DeclNameRef name) {
+  // Look-through class-bound archetypes to ensure we synthesize e.g.
+  // inherited constructors.
+  if (auto archetypeTy = type->getAs<ArchetypeType>()) {
+    if (auto super = archetypeTy->getSuperclass()) {
+      type = super;
+    }
+  }
+
+  if (type->isExistentialType()) {
+    auto layout = type->getExistentialLayout();
+    if (auto super = layout.explicitSuperclass) {
+      type = super;
+    }
+  }
+
+  if (auto *current = type->getAnyNominal()) {
+    current->synthesizeSemanticMembersIfNeeded(name.getFullName());
+  }
+}
+
 /// Inspect the given type to determine which nominal type declarations it
 /// directly references, to facilitate name lookup into those types.
 void namelookup::extractDirectlyReferencedNominalTypes(
@@ -1621,8 +1876,7 @@ void namelookup::extractDirectlyReferencedNominalTypes(
   if (auto compositionTy = type->getAs<ProtocolCompositionType>()) {
     auto layout = compositionTy->getExistentialLayout();
 
-    for (auto proto : layout.getProtocols()) {
-      auto *protoDecl = proto->getDecl();
+    for (auto protoDecl : layout.getProtocols()) {
       decls.push_back(protoDecl);
     }
 
@@ -1641,7 +1895,18 @@ void namelookup::extractDirectlyReferencedNominalTypes(
     return;
   }
 
+  if (type->is<TupleType>()) {
+    decls.push_back(type->getASTContext().getBuiltinTupleDecl());
+    return;
+  }
+
   llvm_unreachable("Not a type containing nominal types?");
+}
+
+void namelookup::tryExtractDirectlyReferencedNominalTypes(
+    Type type, SmallVectorImpl<NominalTypeDecl *> &decls) {
+  if (!type->is<ModuleType>() && type->mayHaveMembers())
+    namelookup::extractDirectlyReferencedNominalTypes(type, decls);
 }
 
 bool DeclContext::lookupQualified(Type type,
@@ -1793,8 +2058,6 @@ QualifiedLookupRequest::evaluate(Evaluator &eval, const DeclContext *DC,
     // step.
     if (!wantProtocolMembers && !currentIsProtocol)
       continue;
-
-    SmallVector<ProtocolDecl *, 4> protocols;
 
     if (auto *protoDecl = dyn_cast<ProtocolDecl>(current)) {
       // If we haven't seen a class declaration yet, look into the protocol.
@@ -2063,7 +2326,8 @@ resolveTypeDeclsToNominal(Evaluator &evaluator,
 static DirectlyReferencedTypeDecls
 directReferencesForUnqualifiedTypeLookup(DeclNameRef name,
                                          SourceLoc loc, DeclContext *dc,
-                                         LookupOuterResults lookupOuter) {
+                                         LookupOuterResults lookupOuter,
+                                         bool allowUsableFromInline=false) {
   // In a protocol or protocol extension, the 'where' clause can refer to
   // associated types without 'Self' qualification:
   //
@@ -2097,6 +2361,9 @@ directReferencesForUnqualifiedTypeLookup(DeclNameRef name,
   if (lookupOuter == LookupOuterResults::Included)
     options |= UnqualifiedLookupFlags::IncludeOuterResults;
 
+  if (allowUsableFromInline)
+    options |= UnqualifiedLookupFlags::IncludeUsableFromInline;
+
   auto &ctx = dc->getASTContext();
   auto descriptor = UnqualifiedLookupDescriptor(name, dc, loc, options);
   auto lookup = evaluateOrDefault(ctx.evaluator,
@@ -2126,7 +2393,8 @@ directReferencesForQualifiedTypeLookup(Evaluator &evaluator,
                                        ASTContext &ctx,
                                        ArrayRef<TypeDecl *> baseTypes,
                                        DeclNameRef name,
-                                       DeclContext *dc) {
+                                       DeclContext *dc,
+                                       bool allowUsableFromInline=false) {
   DirectlyReferencedTypeDecls result;
   auto addResults = [&result](ArrayRef<ValueDecl *> found){
     for (auto decl : found){
@@ -2140,6 +2408,9 @@ directReferencesForQualifiedTypeLookup(Evaluator &evaluator,
     // Look into the base types.
     SmallVector<ValueDecl *, 4> members;
     auto options = NL_RemoveNonVisible | NL_OnlyTypes;
+
+    if (allowUsableFromInline)
+      options |= NL_IncludeUsableFromInline;
 
     // Look through the type declarations we were given, resolving them down
     // to nominal type declarations, module declarations, and
@@ -2171,7 +2442,7 @@ directReferencesForQualifiedTypeLookup(Evaluator &evaluator,
 static DirectlyReferencedTypeDecls
 directReferencesForIdentTypeRepr(Evaluator &evaluator,
                                  ASTContext &ctx, IdentTypeRepr *ident,
-                                 DeclContext *dc) {
+                                 DeclContext *dc, bool allowUsableFromInline) {
   DirectlyReferencedTypeDecls current;
 
   for (const auto &component : ident->getComponentRange()) {
@@ -2187,7 +2458,8 @@ directReferencesForIdentTypeRepr(Evaluator &evaluator,
         directReferencesForUnqualifiedTypeLookup(component->getNameRef(),
                                                  component->getLoc(),
                                                  dc,
-                                                 LookupOuterResults::Excluded);
+                                                 LookupOuterResults::Excluded,
+                                                 allowUsableFromInline);
 
       // If we didn't find anything, fail now.
       if (current.empty())
@@ -2199,7 +2471,8 @@ directReferencesForIdentTypeRepr(Evaluator &evaluator,
     // For subsequent components, perform qualified name lookup.
     current =
         directReferencesForQualifiedTypeLookup(evaluator, ctx, current,
-                                               component->getNameRef(), dc);
+                                               component->getNameRef(), dc,
+                                               allowUsableFromInline);
     if (current.empty())
       return current;
   }
@@ -2210,7 +2483,7 @@ directReferencesForIdentTypeRepr(Evaluator &evaluator,
 static DirectlyReferencedTypeDecls
 directReferencesForTypeRepr(Evaluator &evaluator,
                             ASTContext &ctx, TypeRepr *typeRepr,
-                            DeclContext *dc) {
+                            DeclContext *dc, bool allowUsableFromInline) {
   switch (typeRepr->getKind()) {
   case TypeReprKind::Array:
     return {1, ctx.getArrayDecl()};
@@ -2218,7 +2491,8 @@ directReferencesForTypeRepr(Evaluator &evaluator,
   case TypeReprKind::Attributed: {
     auto attributed = cast<AttributedTypeRepr>(typeRepr);
     return directReferencesForTypeRepr(evaluator, ctx,
-                                       attributed->getTypeRepr(), dc);
+                                       attributed->getTypeRepr(), dc,
+                                       allowUsableFromInline);
   }
 
   case TypeReprKind::Composition: {
@@ -2226,7 +2500,8 @@ directReferencesForTypeRepr(Evaluator &evaluator,
     auto composition = cast<CompositionTypeRepr>(typeRepr);
     for (auto component : composition->getTypes()) {
       auto componentResult =
-          directReferencesForTypeRepr(evaluator, ctx, component, dc);
+          directReferencesForTypeRepr(evaluator, ctx, component, dc,
+                                      allowUsableFromInline);
       result.insert(result.end(),
                     componentResult.begin(),
                     componentResult.end());
@@ -2238,7 +2513,8 @@ directReferencesForTypeRepr(Evaluator &evaluator,
   case TypeReprKind::GenericIdent:
   case TypeReprKind::SimpleIdent:
     return directReferencesForIdentTypeRepr(evaluator, ctx,
-                                            cast<IdentTypeRepr>(typeRepr), dc);
+                                            cast<IdentTypeRepr>(typeRepr), dc,
+                                            allowUsableFromInline);
 
   case TypeReprKind::Dictionary:
     return { 1, ctx.getDictionaryDecl()};
@@ -2247,9 +2523,17 @@ directReferencesForTypeRepr(Evaluator &evaluator,
     auto tupleRepr = cast<TupleTypeRepr>(typeRepr);
     if (tupleRepr->isParenType()) {
       return directReferencesForTypeRepr(evaluator, ctx,
-                                         tupleRepr->getElementType(0), dc);
+                                         tupleRepr->getElementType(0), dc,
+                                         allowUsableFromInline);
     }
     return { };
+  }
+
+  case TypeReprKind::PackExpansion: {
+    auto packExpansionRepr = cast<PackExpansionTypeRepr>(typeRepr);
+    return directReferencesForTypeRepr(evaluator, ctx,
+                                       packExpansionRepr->getPatternType(), dc,
+                                       allowUsableFromInline);
   }
 
   case TypeReprKind::Error:
@@ -2301,8 +2585,8 @@ static DirectlyReferencedTypeDecls directReferencesForType(Type type) {
     }
 
     // Protocols.
-    for (auto protocolTy : layout.getProtocols())
-      result.push_back(protocolTy->getDecl());
+    for (auto protoDecl : layout.getProtocols())
+      result.push_back(protoDecl);
     return result;
   }
 
@@ -2453,7 +2737,8 @@ ExtendedNominalRequest::evaluate(Evaluator &evaluator,
 
   ASTContext &ctx = ext->getASTContext();
   DirectlyReferencedTypeDecls referenced =
-    directReferencesForTypeRepr(evaluator, ctx, typeRepr, ext->getParent());
+    directReferencesForTypeRepr(evaluator, ctx, typeRepr, ext->getParent(),
+                                ext->isInSpecializeExtensionContext());
 
   // Resolve those type declarations to nominal type declarations.
   SmallVector<ModuleDecl *, 2> modulesFound;
@@ -2480,6 +2765,22 @@ static bool declsAreAssociatedTypes(ArrayRef<TypeDecl *> decls) {
   return true;
 }
 
+/// Verify there is at least one protocols in the set of declarations.
+static bool declsAreProtocols(ArrayRef<TypeDecl *> decls) {
+  if (decls.empty())
+    return false;
+  return llvm::any_of(decls, [&](const TypeDecl *decl) { return isa<ProtocolDecl>(decl); });;;
+}
+
+bool TypeRepr::isProtocol(DeclContext *dc){
+  auto &ctx = dc->getASTContext();
+  return findIf([&ctx, dc](TypeRepr *ty) {
+    return declsAreProtocols(directReferencesForTypeRepr(ctx.evaluator, ctx, ty, dc));
+
+  });
+}
+
+
 static GenericParamList *
 createExtensionGenericParams(ASTContext &ctx,
                              ExtensionDecl *ext,
@@ -2499,12 +2800,65 @@ createExtensionGenericParams(ASTContext &ctx,
   return toParams;
 }
 
+CollectedOpaqueReprs swift::collectOpaqueReturnTypeReprs(TypeRepr *r, ASTContext &ctx, DeclContext *d) {
+  class Walker : public ASTWalker {
+    CollectedOpaqueReprs &Reprs;
+    ASTContext &Ctx;
+    DeclContext *dc;
+
+  public:
+    explicit Walker(CollectedOpaqueReprs &reprs, ASTContext &ctx, DeclContext *d) : Reprs(reprs), Ctx(ctx), dc(d) {}
+
+    PreWalkAction walkToTypeReprPre(TypeRepr *repr) override {
+
+      // Don't allow variadic opaque parameter or return types.
+      if (isa<PackExpansionTypeRepr>(repr))
+        return Action::SkipChildren();
+
+      if (auto opaqueRepr = dyn_cast<OpaqueReturnTypeRepr>(repr)) {
+        Reprs.push_back(opaqueRepr);
+        if (Ctx.LangOpts.hasFeature(Feature::ImplicitSome))
+          return Action::SkipChildren();
+      }
+
+      if (!Ctx.LangOpts.hasFeature(Feature::ImplicitSome))
+        return Action::Continue();
+      
+      if (auto existential = dyn_cast<ExistentialTypeRepr>(repr)) {
+        auto meta = dyn_cast<MetatypeTypeRepr>(existential->getConstraint());
+        auto generic = dyn_cast<GenericIdentTypeRepr>(existential->getConstraint());
+        if(generic)
+          Reprs.push_back(existential);
+        return Action::VisitChildrenIf(meta || generic);
+      } else if (auto compositionRepr = dyn_cast<CompositionTypeRepr>(repr)) {
+        if (!compositionRepr->isTypeReprAny())
+          Reprs.push_back(compositionRepr);
+        return Action::SkipChildren();
+      } else if (auto generic = dyn_cast<GenericIdentTypeRepr>(repr)) {
+        // prevent any P<some P>
+        if (!Reprs.empty() && isa<ExistentialTypeRepr>(Reprs.front())){
+          Reprs.clear();
+        }
+      } else if (auto identRepr = dyn_cast<IdentTypeRepr>(repr)) {
+        if (identRepr->isProtocol(dc))
+          Reprs.push_back(identRepr);
+      }
+      return Action::Continue();
+    }
+
+  };
+
+  CollectedOpaqueReprs reprs;
+  r->walk(Walker(reprs, ctx, d));
+  return reprs;
+}
+
 /// If there are opaque parameters in the given declaration, create the
 /// generic parameters associated with them.
 static SmallVector<GenericTypeParamDecl *, 2>
-createOpaqueParameterGenericParams(
-    GenericContext *genericContext, GenericParamList *parsedGenericParams) {
+createOpaqueParameterGenericParams(GenericContext *genericContext, GenericParamList *parsedGenericParams) {
   ASTContext &ctx = genericContext->getASTContext();
+    
   auto value = dyn_cast_or_null<ValueDecl>(genericContext->getAsDecl());
   if (!value)
     return { };
@@ -2523,29 +2877,36 @@ createOpaqueParameterGenericParams(
   SmallVector<GenericTypeParamDecl *, 2> implicitGenericParams;
   auto dc = value->getInnermostDeclContext();
   for (auto param : *params) {
-    // Don't permit variadic parameters.
-    if (param->isVariadic())
-      continue;
-
     auto typeRepr = param->getTypeRepr();
     if (!typeRepr)
       continue;
 
-    auto opaqueTypeReprs = typeRepr->collectOpaqueReturnTypeReprs();
-    for (auto opaqueRepr : opaqueTypeReprs) {
+    // Plain protocols should imply 'some' with experimetal feature
+    CollectedOpaqueReprs typeReprs;
+    typeReprs = collectOpaqueReturnTypeReprs(typeRepr, ctx, dc);
+
+    for (auto repr : typeReprs) {
+   
       // Allocate a new generic parameter to represent this opaque type.
       auto gp = GenericTypeParamDecl::create(
           dc, Identifier(), SourceLoc(), /*isTypeSequence=*/false,
           GenericTypeParamDecl::InvalidDepth, index++, /*isOpaqueType=*/true,
-          opaqueRepr);
+          repr);
       gp->setImplicit();
 
       // Use the underlying constraint as the constraint on the generic parameter.
-      InheritedEntry inherited[1] = {
-        { TypeLoc(opaqueRepr->getConstraint()) }
-      };
-      gp->setInherited(ctx.AllocateCopy(inherited));
-
+      //  The underlying constraint is only present for OpaqueReturnTypeReprs
+      if (auto opaque = dyn_cast<OpaqueReturnTypeRepr>(repr)) {
+              InheritedEntry inherited[1] = {
+                  { TypeLoc(opaque->getConstraint()) }
+              };
+              gp->setInherited(ctx.AllocateCopy(inherited));
+      } else {
+            InheritedEntry inherited[1] = {
+                { TypeLoc(repr) }
+            };
+            gp->setInherited(ctx.AllocateCopy(inherited));
+      }
       implicitGenericParams.push_back(gp);
     }
   }
@@ -2555,6 +2916,19 @@ createOpaqueParameterGenericParams(
 
 GenericParamList *
 GenericParamListRequest::evaluate(Evaluator &evaluator, GenericContext *value) const {
+  if (auto *tupleDecl = dyn_cast<BuiltinTupleDecl>(value)) {
+    auto &ctx = value->getASTContext();
+
+    // Builtin.TheTupleType has a single pack generic parameter: <Elements...>
+    auto *genericParam = GenericTypeParamDecl::create(
+        tupleDecl->getDeclContext(), ctx.Id_Elements, SourceLoc(),
+        /*isTypeSequence=*/true, /*depth=*/0, /*depth=*/0,
+        /*isOpaqueType=*/false, /*opaqueTypeRepr=*/nullptr);
+
+    return GenericParamList::create(ctx, SourceLoc(), genericParam,
+                                    SourceLoc());
+  }
+
   if (auto *ext = dyn_cast<ExtensionDecl>(value)) {
     // Create the generic parameter list for the extension by cloning the
     // generic parameter lists of the nominal and any of its parent types.
@@ -2792,6 +3166,109 @@ swift::getDirectlyInheritedNominalTypeDecls(
   return result;
 }
 
+bool IsCallAsFunctionNominalRequest::evaluate(Evaluator &evaluator,
+                                              NominalTypeDecl *decl,
+                                              DeclContext *dc) const {
+  auto &ctx = dc->getASTContext();
+
+  // Do a qualified lookup for `callAsFunction`. We want to ignore access, as
+  // that will be checked when we actually try to solve with a `callAsFunction`
+  // member access.
+  SmallVector<ValueDecl *, 4> results;
+  auto opts = NL_QualifiedDefault | NL_ProtocolMembers | NL_IgnoreAccessControl;
+  dc->lookupQualified(decl, DeclNameRef(ctx.Id_callAsFunction), opts, results);
+
+  return llvm::any_of(results, [](ValueDecl *decl) -> bool {
+    if (auto *fd = dyn_cast<FuncDecl>(decl))
+      return fd->isCallAsFunctionMethod();
+    return false;
+  });
+}
+
+bool TypeBase::isCallAsFunctionType(DeclContext *dc) {
+  // We can perform the lookup at module scope to allow us to better cache the
+  // result across different contexts. Given we'll be doing a qualified lookup,
+  // this shouldn't make a difference.
+  dc = dc->getModuleScopeContext();
+
+  // Note this excludes AnyObject.
+  SmallVector<NominalTypeDecl *, 4> decls;
+  tryExtractDirectlyReferencedNominalTypes(this, decls);
+
+  auto &ctx = dc->getASTContext();
+  return llvm::any_of(decls, [&](auto *decl) {
+    IsCallAsFunctionNominalRequest req(decl, dc);
+    return evaluateOrDefault(ctx.evaluator, req, false);
+  });
+}
+
+template <class DynamicAttribute, class Req>
+static bool checkForDynamicAttribute(Evaluator &eval, NominalTypeDecl *decl) {
+  // If this type has the attribute on it, then yes!
+  if (decl->getAttrs().hasAttribute<DynamicAttribute>())
+    return true;
+
+  auto hasAttribute = [&](NominalTypeDecl *decl) -> bool {
+    return evaluateOrDefault(eval, Req{decl}, false);
+  };
+
+  if (auto *proto = dyn_cast<ProtocolDecl>(decl)) {
+    // Check inherited protocols of a protocol.
+    for (auto *otherProto : proto->getInheritedProtocols())
+      if (hasAttribute(otherProto))
+        return true;
+  } else {
+    // Check the protocols the type conforms to.
+    for (auto *otherProto : decl->getAllProtocols()) {
+      if (hasAttribute(otherProto))
+        return true;
+    }
+  }
+
+  // Check the superclass if present.
+  if (auto *classDecl = dyn_cast<ClassDecl>(decl)) {
+    if (auto *superclass = classDecl->getSuperclassDecl()) {
+      if (hasAttribute(superclass))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool HasDynamicMemberLookupAttributeRequest::evaluate(
+    Evaluator &eval, NominalTypeDecl *decl) const {
+  using Req = HasDynamicMemberLookupAttributeRequest;
+  return checkForDynamicAttribute<DynamicMemberLookupAttr, Req>(eval, decl);
+}
+
+bool TypeBase::hasDynamicMemberLookupAttribute() {
+  SmallVector<NominalTypeDecl *, 4> decls;
+  tryExtractDirectlyReferencedNominalTypes(this, decls);
+
+  auto &ctx = getASTContext();
+  return llvm::any_of(decls, [&](auto *decl) {
+    HasDynamicMemberLookupAttributeRequest req(decl);
+    return evaluateOrDefault(ctx.evaluator, req, false);
+  });
+}
+
+bool HasDynamicCallableAttributeRequest::evaluate(Evaluator &eval,
+                                                  NominalTypeDecl *decl) const {
+  using Req = HasDynamicCallableAttributeRequest;
+  return checkForDynamicAttribute<DynamicCallableAttr, Req>(eval, decl);
+}
+
+bool TypeBase::hasDynamicCallableAttribute() {
+  SmallVector<NominalTypeDecl *, 4> decls;
+  tryExtractDirectlyReferencedNominalTypes(this, decls);
+
+  auto &ctx = getASTContext();
+  return llvm::any_of(decls, [&](auto *decl) {
+    HasDynamicCallableAttributeRequest req(decl);
+    return evaluateOrDefault(ctx.evaluator, req, false);
+  });
+}
+
 void FindLocalVal::checkPattern(const Pattern *Pat, DeclVisibilityKind Reason) {
   Pat->forEachVariable([&](VarDecl *VD) { checkValueDecl(VD, Reason); });
 }
@@ -2901,7 +3378,7 @@ void FindLocalVal::visitForEachStmt(ForEachStmt *S) {
   if (!isReferencePointInRange(S->getSourceRange()))
     return;
   visit(S->getBody());
-  if (!isReferencePointInRange(S->getSequence()->getSourceRange()))
+  if (!isReferencePointInRange(S->getParsedSequence()->getSourceRange()))
     checkPattern(S->getPattern(), DeclVisibilityKind::LocalVariable);
 }
 

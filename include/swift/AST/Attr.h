@@ -287,12 +287,13 @@ public:
     /// Whether this attribute is only valid when concurrency is enabled.
     ConcurrencyOnly = 1ull << (unsigned(DeclKindIndex::Last_Decl) + 16),
 
-    /// Whether this attribute is only valid when distributed is enabled.
-    DistributedOnly = 1ull << (unsigned(DeclKindIndex::Last_Decl) + 17),
-
     /// Whether this attribute is valid on additional decls in ClangImporter.
-    OnAnyClangDecl = 1ull << (unsigned(DeclKindIndex::Last_Decl) + 18),
+    OnAnyClangDecl = 1ull << (unsigned(DeclKindIndex::Last_Decl) + 17),
   };
+
+  static_assert(
+      (unsigned(DeclKindIndex::Last_Decl) + 17) < 64,
+      "Overflow decl attr options bitfields");
 
   LLVM_READNONE
   static uint64_t getOptions(DeclAttrKind DK);
@@ -384,10 +385,6 @@ public:
 
   static bool isConcurrencyOnly(DeclAttrKind DK) {
     return getOptions(DK) & ConcurrencyOnly;
-  }
-
-  static bool isDistributedOnly(DeclAttrKind DK) {
-    return getOptions(DK) & DistributedOnly;
   }
 
   static bool isUserInaccessible(DeclAttrKind DK) {
@@ -614,6 +611,8 @@ enum class PlatformAgnosticAvailabilityKind {
   PackageDescriptionVersionSpecific,
   /// The declaration is unavailable for other reasons.
   Unavailable,
+  /// The declaration is unavailable from asynchronous contexts
+  NoAsync,
 };
 
 /// Defines the @available attribute.
@@ -701,6 +700,9 @@ public:
 
   /// Whether this is an unconditionally deprecated entity.
   bool isUnconditionallyDeprecated() const;
+
+  /// Whether this is a noasync attribute.
+  bool isNoAsync() const;
 
   /// Returns the platform-agnostic availability.
   PlatformAgnosticAvailabilityKind getPlatformAgnosticAvailability() const {
@@ -1154,6 +1156,8 @@ public:
                                       SourceRange range,
                                       ArrayRef<Identifier> spiGroups);
 
+  SPIAccessControlAttr *clone(ASTContext &C, bool implicit) const;
+
   /// Name of SPIs declared by the attribute.
   ///
   /// Note: A single SPI name per attribute is currently supported but this
@@ -1266,6 +1270,13 @@ public:
   EffectsKind getKind() const { return EffectsKind(Bits.EffectsAttr.kind); }
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_Effects;
+  }
+
+  EffectsAttr *clone(ASTContext &ctx) const {
+    if (getKind() == EffectsKind::Custom) {
+      return new (ctx) EffectsAttr(customString);
+    }
+    return new (ctx) EffectsAttr(getKind());
   }
 };
 
@@ -1385,7 +1396,7 @@ public:
 class SpecializeAttr final
     : public DeclAttribute,
       private llvm::TrailingObjects<SpecializeAttr, Identifier,
-                                    AvailableAttr *> {
+                                    AvailableAttr *, Type> {
   friend class SpecializeAttrTargetDeclRequest;
   friend TrailingObjects;
 
@@ -1405,12 +1416,15 @@ private:
   uint64_t resolverContextData;
   size_t numSPIGroups;
   size_t numAvailableAttrs;
+  size_t numTypeErasedParams;
+  bool typeErasedParamsInitialized;
 
   SpecializeAttr(SourceLoc atLoc, SourceRange Range,
                  TrailingWhereClause *clause, bool exported,
                  SpecializationKind kind, GenericSignature specializedSignature,
                  DeclNameRef targetFunctionName, ArrayRef<Identifier> spiGroups,
-                 ArrayRef<AvailableAttr *> availabilityAttrs);
+                 ArrayRef<AvailableAttr *> availabilityAttrs,
+                 size_t typeErasedParamsCount);
 
 public:
   static SpecializeAttr *
@@ -1418,6 +1432,7 @@ public:
          TrailingWhereClause *clause, bool exported, SpecializationKind kind,
          DeclNameRef targetFunctionName, ArrayRef<Identifier> spiGroups,
          ArrayRef<AvailableAttr *> availabilityAttrs,
+         size_t typeErasedParamsCount,
          GenericSignature specializedSignature = nullptr);
 
   static SpecializeAttr *create(ASTContext &ctx, bool exported,
@@ -1431,6 +1446,7 @@ public:
                                 SpecializationKind kind,
                                 ArrayRef<Identifier> spiGroups,
                                 ArrayRef<AvailableAttr *> availabilityAttrs,
+                                ArrayRef<Type> typeErasedParams,
                                 GenericSignature specializedSignature,
                                 DeclNameRef replacedFunction,
                                 LazyMemberLoader *resolver, uint64_t data);
@@ -1454,6 +1470,22 @@ public:
   ArrayRef<AvailableAttr *> getAvailableAttrs() const {
     return {this->template getTrailingObjects<AvailableAttr *>(),
             numAvailableAttrs};
+  }
+
+  ArrayRef<Type> getTypeErasedParams() const {
+    if (!typeErasedParamsInitialized)
+      return {};
+
+    return {this->template getTrailingObjects<Type>(),
+            numTypeErasedParams};
+  }
+
+  void setTypeErasedParams(const ArrayRef<Type> typeErasedParams) {
+    assert(typeErasedParams.size() == numTypeErasedParams);
+    if (!typeErasedParamsInitialized) {
+      std::uninitialized_copy(typeErasedParams.begin(), typeErasedParams.end(), getTrailingObjects<Type>());
+      typeErasedParamsInitialized = true;
+    }
   }
 
   TrailingWhereClause *getTrailingWhereClause() const;
@@ -1710,12 +1742,15 @@ public:
   }
 };
 
-/// Describe a symbol was originally defined in another module. For example, given
+/// Describes a symbol that was originally defined in another module. For
+/// example, given the following declaration:
+///
 /// \code
 /// @_originallyDefinedIn(module: "Original", OSX 10.15) var foo: Int
 /// \endcode
 ///
-/// Where variable Foo has originally defined in another module called Original prior to OSX 10.15
+/// The variable \p foo was originally defined in another module called
+/// \p Original prior to OSX 10.15
 class OriginallyDefinedInAttr: public DeclAttribute {
 public:
   OriginallyDefinedInAttr(SourceLoc AtLoc, SourceRange Range,
@@ -1727,6 +1762,8 @@ public:
       OriginalModuleName(OriginalModuleName),
       Platform(Platform),
       MovedVersion(MovedVersion) {}
+
+  OriginallyDefinedInAttr *clone(ASTContext &C, bool implicit) const;
 
   // The original module name.
   const StringRef OriginalModuleName;
@@ -1936,6 +1973,10 @@ class DerivativeAttr final
   friend TrailingObjects;
   friend class DerivativeAttrOriginalDeclRequest;
 
+  /// The declaration on which the `@derivative` attribute is declared.
+  /// May not be a valid declaration for `@derivative` attributes.
+  /// Resolved during parsing and deserialization.
+  Decl *OriginalDeclaration = nullptr;
   /// The base type for the referenced original declaration. This field is
   /// non-null only for parsed attributes that reference a qualified original
   /// declaration. This field is not serialized; type-checking uses it to
@@ -1988,6 +2029,12 @@ public:
                                 TypeRepr *baseTypeRepr,
                                 DeclNameRefWithLoc original,
                                 IndexSubset *parameterIndices);
+
+  Decl *getOriginalDeclaration() const { return OriginalDeclaration; }
+
+  /// Sets the original declaration on which this attribute is declared.
+  /// Should only be used by parsing and deserialization.
+  void setOriginalDeclaration(Decl *originalDeclaration);
 
   TypeRepr *getBaseTypeRepr() const { return BaseTypeRepr; }
   DeclNameRefWithLoc getOriginalFunctionName() const {
@@ -2195,11 +2242,52 @@ public:
   /// The earliest platform version that may use the back deployed implementation.
   const llvm::VersionTuple Version;
 
+  /// Returns true if this attribute is active given the current platform.
+  bool isActivePlatform(const ASTContext &ctx) const;
+
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_BackDeploy;
   }
 };
 
+/// Defines the `@_expose` attribute, used to expose declarations in the
+/// header used by C/C++ to interoperate with Swift.
+class ExposeAttr : public DeclAttribute {
+public:
+  ExposeAttr(StringRef Name, SourceLoc AtLoc, SourceRange Range, bool Implicit)
+      : DeclAttribute(DAK_Expose, AtLoc, Range, Implicit), Name(Name) {}
+
+  ExposeAttr(StringRef Name, bool Implicit)
+      : ExposeAttr(Name, SourceLoc(), SourceRange(), Implicit) {}
+
+  /// The exposed declaration name.
+  const StringRef Name;
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_Expose;
+  }
+};
+
+/// The `@_documentation(...)` attribute, used to override a symbol's visibility
+/// in symbol graphs, and/or adding arbitrary metadata to it.
+class DocumentationAttr: public DeclAttribute {
+public:
+  DocumentationAttr(SourceLoc AtLoc, SourceRange Range,
+                    StringRef Metadata, Optional<AccessLevel> Visibility,
+                    bool Implicit)
+  : DeclAttribute(DAK_Documentation, AtLoc, Range, Implicit),
+    Metadata(Metadata), Visibility(Visibility) {}
+
+  DocumentationAttr(StringRef Metadata, Optional<AccessLevel> Visibility, bool Implicit)
+  : DocumentationAttr(SourceLoc(), SourceRange(), Metadata, Visibility, Implicit) {}
+
+  const StringRef Metadata;
+  const Optional<AccessLevel> Visibility;
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_Documentation;
+  }
+};
 
 /// Attributes that may be applied to declarations.
 class DeclAttributes {
@@ -2261,6 +2349,11 @@ public:
   /// a declaration will be deprecated in the future, or null otherwise.
   const AvailableAttr *getSoftDeprecated(const ASTContext &ctx) const;
 
+  /// Returns the first @available attribute that indicates
+  /// a declaration is unavailable from asynchronous contexts, or null
+  /// otherwise.
+  const AvailableAttr *getNoAsync(const ASTContext &ctx) const;
+
   SWIFT_DEBUG_DUMPER(dump(const Decl *D = nullptr));
   void print(ASTPrinter &Printer, const PrintOptions &Options,
              const Decl *D = nullptr) const;
@@ -2284,6 +2377,13 @@ public:
   void add(DeclAttribute *Attr) {
     Attr->Next = DeclAttrs;
     DeclAttrs = Attr;
+  }
+
+  /// Add multiple constructed DeclAttributes to this list.
+  void add(DeclAttributes &Attrs) {
+    for (auto attr : Attrs) {
+      add(attr);
+    }
   }
 
   // Iterator interface over DeclAttribute objects.
@@ -2455,6 +2555,9 @@ public:
   // For an opened existential type, the known ID.
   Optional<UUID> OpenedID;
 
+  // For an opened existential type, the constraint type.
+  Optional<TypeRepr *> ConstraintType;
+
   // For a reference to an opaque return type, the mangled name and argument
   // index into the generic signature.
   struct OpaqueReturnTypeRef {
@@ -2543,6 +2646,9 @@ public:
   bool hasOpenedID() const { return OpenedID.hasValue(); }
   UUID getOpenedID() const { return *OpenedID; }
 
+  bool hasConstraintType() const { return ConstraintType.hasValue(); }
+  TypeRepr *getConstraintType() const { return *ConstraintType; }
+
   /// Given a name like "autoclosure", return the type attribute ID that
   /// corresponds to it.  This returns TAK_Count on failure.
   ///
@@ -2587,6 +2693,10 @@ void simple_display(llvm::raw_ostream &out, const DeclAttribute *attr);
 inline SourceLoc extractNearestSourceLoc(const DeclAttribute *attr) {
   return attr->getLocation();
 }
+
+/// Determine whether the given attribute is available, looking up the
+/// attribute by name.
+bool hasAttribute(const LangOptions &langOpts, llvm::StringRef attributeName);
 
 } // end namespace swift
 

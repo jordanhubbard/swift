@@ -79,15 +79,15 @@ static bool areCompatibleOSs(const llvm::Triple &moduleTarget,
 
 static bool isTargetTooNew(const llvm::Triple &moduleTarget,
                            const llvm::Triple &ctxTarget) {
-  unsigned major, minor, micro;
-
   if (moduleTarget.isMacOSX()) {
-    moduleTarget.getMacOSXVersion(major, minor, micro);
-    return ctxTarget.isMacOSXVersionLT(major, minor, micro);
+    llvm::VersionTuple osVersion;
+    moduleTarget.getMacOSXVersion(osVersion);
+    // TODO: Add isMacOSXVersionLT(Triple) API (or taking a VersionTuple)
+    return ctxTarget.isMacOSXVersionLT(osVersion.getMajor(),
+                                       osVersion.getMinor().getValueOr(0),
+                                       osVersion.getSubminor().getValueOr(0));
   }
-
-  moduleTarget.getOSVersion(major, minor, micro);
-  return ctxTarget.isOSVersionLT(major, minor, micro);
+  return ctxTarget.isOSVersionLT(moduleTarget);
 }
 
 ModuleFile::ModuleFile(std::shared_ptr<const ModuleFileSharedCore> core)
@@ -113,6 +113,7 @@ ModuleFile::ModuleFile(std::shared_ptr<const ModuleFileSharedCore> core)
   allocateBuffer(Types, core->Types);
   allocateBuffer(ClangTypes, core->ClangTypes);
   allocateBuffer(GenericSignatures, core->GenericSignatures);
+  allocateBuffer(GenericEnvironments, core->GenericEnvironments);
   allocateBuffer(SubstitutionMaps, core->SubstitutionMaps);
   allocateBuffer(Identifiers, core->Identifiers);
 }
@@ -154,15 +155,6 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
     status = Status::TargetTooNew;
     if (!recoverFromIncompatibility)
       return error(status);
-  }
-
-  StringRef moduleSDK = Core->SDKName;
-  StringRef clientSDK = ctx.LangOpts.SDKName;
-  if (ctx.SearchPathOpts.EnableSameSDKCheck &&
-      !moduleSDK.empty() && !clientSDK.empty() &&
-      moduleSDK != clientSDK) {
-    status = Status::SDKMismatch;
-    return error(status);
   }
 
   StringRef SDKPath = ctx.SearchPathOpts.getSDKPath();
@@ -365,7 +357,7 @@ ModuleFile::getModuleName(ASTContext &Ctx, StringRef modulePath,
   bool isFramework = false;
   serialization::ValidationInfo loadInfo = ModuleFileSharedCore::load(
       modulePath.str(), std::move(newBuf), nullptr, nullptr,
-      /*isFramework*/ isFramework, Ctx.SILOpts.EnableOSSAModules,
+      /*isFramework*/ isFramework, Ctx.SILOpts.EnableOSSAModules, Ctx.LangOpts.SDKName,
       Ctx.SearchPathOpts.DeserializedPathRecoverer,
       loadedModuleFile);
   Name = loadedModuleFile->Name.str();
@@ -622,7 +614,7 @@ void ModuleFile::loadExtensions(NominalTypeDecl *nominal) {
 }
 
 void ModuleFile::loadObjCMethods(
-       ClassDecl *classDecl,
+       NominalTypeDecl *typeDecl,
        ObjCSelector selector,
        bool isInstanceMethod,
        llvm::TinyPtrVector<AbstractFunctionDecl *> &methods) {
@@ -636,7 +628,7 @@ void ModuleFile::loadObjCMethods(
     return;
   }
 
-  std::string ownerName = Mangle::ASTMangler().mangleNominalType(classDecl);
+  std::string ownerName = Mangle::ASTMangler().mangleNominalType(typeDecl);
   auto results = *known;
   for (const auto &result : results) {
     // If the method is the wrong kind (instance vs. class), skip it.

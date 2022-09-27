@@ -129,7 +129,7 @@ public:
   }
 };
 
-/// Represents a node's position in a syntax tree, described by its overal
+/// Represents a node's position in a syntax tree, described by its overall
 /// textual offset and the position within its parent.
 class AbsoluteSyntaxPosition {
 public:
@@ -254,7 +254,7 @@ public:
   }
 };
 
-/// A \c RawSyntax node that is enrichted with information of its position
+/// A \c RawSyntax node that is enriched with information of its position
 /// within the syntax tree it lives in.
 class AbsoluteRawSyntax {
   /// OptionalStorage is a friend so it can access the \c nullptr initializer
@@ -303,7 +303,7 @@ public:
     return Info;
   }
 
-  /// Get the position at which the leading triva of this node starts.
+  /// Get the position at which the leading trivia of this node starts.
   AbsoluteSyntaxPosition getPosition() const {
     return getInfo().getPosition();
   };
@@ -395,9 +395,18 @@ public:
 
   void reset() { Storage = AbsoluteRawSyntax(nullptr); }
 
+  bool has_value() const { return !Storage.isNull(); }
   bool hasValue() const { return !Storage.isNull(); }
 
+  AbsoluteRawSyntax &value() & {
+    assert(hasValue());
+    return Storage;
+  }
   AbsoluteRawSyntax &getValue() & {
+    assert(hasValue());
+    return Storage;
+  }
+  AbsoluteRawSyntax const &value() const & {
     assert(hasValue());
     return Storage;
   }
@@ -406,6 +415,10 @@ public:
     return Storage;
   }
 #if LLVM_HAS_RVALUE_REFERENCE_THIS
+  AbsoluteRawSyntax &&value() &&noexcept {
+    assert(hasValue());
+    return std::move(Storage);
+  }
   AbsoluteRawSyntax &&getValue() &&noexcept {
     assert(hasValue());
     return std::move(Storage);

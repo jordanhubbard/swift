@@ -59,7 +59,9 @@
     BUILTIN_EXPRESSIBLE_BY_LITERAL_PROTOCOL_WITH_NAME(name, "_" #name)
 
 PROTOCOL(Actor)
+PROTOCOL(AnyActor)
 PROTOCOL(Sequence)
+PROTOCOL(Identifiable)
 PROTOCOL(IteratorProtocol)
 PROTOCOL(RawRepresentable)
 PROTOCOL(Equatable)
@@ -101,6 +103,10 @@ PROTOCOL(DistributedActorSystem)
 PROTOCOL(DistributedTargetInvocationEncoder)
 PROTOCOL(DistributedTargetInvocationDecoder)
 PROTOCOL(DistributedTargetInvocationResultHandler)
+
+// C++ Standard Library Overlay:
+PROTOCOL(CxxSequence)
+PROTOCOL(UnsafeCxxInputIterator)
 
 PROTOCOL(AsyncSequence)
 PROTOCOL(AsyncIteratorProtocol)

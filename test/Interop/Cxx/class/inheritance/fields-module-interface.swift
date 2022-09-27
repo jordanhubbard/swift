@@ -1,4 +1,4 @@
-// RUN: %target-swift-ide-test -print-module -module-to-print=Fields -I %S/Inputs -source-filename=x -enable-cxx-interop | %FileCheck %s
+// RUN: %target-swift-ide-test -print-module -module-to-print=Fields -I %S/Inputs -source-filename=x -enable-experimental-cxx-interop | %FileCheck %s
 
 // CHECK:      struct HasThreeFields {
 // CHECK-NEXT:   init()
@@ -30,6 +30,16 @@
 // CHECK-NEXT:   var a: Int32
 // CHECK-NEXT:   var b: Int32
 // CHECK-NEXT:   var c: Int32
+// CHECK-NEXT: }
+
+// CHECK-NEXT: struct OneField {
+// CHECK-NEXT:   init()
+// CHECK-NEXT:   init(value: Int32)
+// CHECK-NEXT:   var value: Int32
+// CHECK-NEXT: }
+// CHECK-NEXT: struct DerivedFromOneField {
+// CHECK-NEXT:   init()
+// CHECK-NEXT:   var value: Int32
 // CHECK-NEXT: }
 
 // CHECK-NEXT: struct NonTrivial {

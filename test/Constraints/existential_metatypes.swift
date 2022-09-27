@@ -46,8 +46,7 @@ class Dryer : WashingMachine {}
 class HairDryer {}
 
 let a: Toaster.Type.Protocol = Toaster.Type.self
-// FIXME: the existential metatype below should be spelled 'any Any.Type.Type'
-let b: Any.Type.Type = Toaster.Type.self // expected-error {{cannot convert value of type '(any Toaster.Type).Type' to specified type 'any (any Any).Type.Type'}}
+let b: Any.Type.Type = Toaster.Type.self // expected-error {{cannot convert value of type '(any Toaster.Type).Type' to specified type 'any Any.Type.Type'}}
 let c: Any.Type.Protocol = Toaster.Type.self // expected-error {{cannot convert value of type '(any Toaster.Type).Type' to specified type '(any Any.Type).Type'}}
 let d: Toaster.Type.Type = WashingMachine.Type.self
 let e: Any.Type.Type = WashingMachine.Type.self
@@ -89,4 +88,34 @@ func testP3(_ p: P3, something: Something) {
 
 func testIUOToAny(_ t: AnyObject.Type!) {
   let _: Any = t
+}
+
+protocol P4<T> {
+  associatedtype T
+}
+
+protocol Q4<T> {
+  associatedtype T
+}
+
+protocol PP4<U>: P4<Self.U.T> {
+  associatedtype U: P4<U>
+}
+
+func parameterizedExistentials() {
+  var qp: (any Q4<Int>).Type
+  var pp: (any P4<Int>).Type = qp // expected-error{{cannot convert value of type '(any Q4<Int>).Type' to specified type '(any P4<Int>).Type'}}
+
+  var qt: any Q4<Int>.Type
+  qt = qp // expected-error{{cannot assign value of type '(any Q4<Int>).Type' to type 'any Q4<Int>.Type'}}
+  qp = qt // expected-error{{cannot assign value of type 'any Q4<Int>.Type' to type '(any Q4<Int>).Type'}}
+  var pt: any P4<Int>.Type = qt // expected-error{{cannot convert value of type 'any Q4<Int>.Type' to specified type 'any P4<Int>.Type'}}
+  pt = pp // expected-error{{cannot assign value of type '(any P4<Int>).Type' to type 'any P4<Int>.Type'}}
+  pp = pt // expected-error{{cannot assign value of type 'any P4<Int>.Type' to type '(any P4<Int>).Type'}}
+
+  var ppp: (any PP4<Int>).Type
+  pp = ppp // expected-error{{cannot assign value of type '(any PP4<Int>).Type' to type '(any P4<Int>).Type'}}
+
+  var ppt: any PP4<Int>.Type
+  pt = ppt
 }

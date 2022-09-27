@@ -14,25 +14,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-#if SWIFT_STDLIB_HAS_TYPE_PRINTING
-
+#include "swift/AST/Ownership.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Demangling/Demangle.h"
-#include "swift/AST/Ownership.h"
 #include "swift/Strings.h"
 #include <cassert>
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 using namespace swift;
 using namespace Demangle;
 using llvm::StringRef;
-
-[[noreturn]]
-static void printer_unreachable(const char *Message) {
-  fprintf(stderr, "fatal error: %s\n", Message);
-  std::abort();
-}
 
 DemanglerPrinter &DemanglerPrinter::operator<<(unsigned long long n) & {
   char buffer[32];
@@ -51,6 +44,14 @@ DemanglerPrinter &DemanglerPrinter::operator<<(long long n) & {
   snprintf(buffer, sizeof(buffer), "%lld",n);
   Stream.append(buffer);
   return *this;
+}
+
+#if SWIFT_STDLIB_HAS_TYPE_PRINTING
+
+[[noreturn]]
+static void printer_unreachable(const char *Message) {
+  fprintf(stderr, "fatal error: %s\n", Message);
+  std::abort();
 }
 
 std::string Demangle::genericParameterName(uint64_t depth, uint64_t index) {
@@ -306,7 +307,9 @@ private:
     case Node::Kind::MetatypeRepresentation:
     case Node::Kind::Module:
     case Node::Kind::Tuple:
-    case Node::Kind::ParameterizedProtocol:
+    case Node::Kind::ConstrainedExistential:
+    case Node::Kind::ConstrainedExistentialRequirementList:
+    case Node::Kind::ConstrainedExistentialSelf:
     case Node::Kind::Protocol:
     case Node::Kind::ProtocolSymbolicReference:
     case Node::Kind::ReturnType:
@@ -494,6 +497,7 @@ private:
     case Node::Kind::SILBoxMutableField:
     case Node::Kind::SILBoxImmutableField:
     case Node::Kind::IsSerialized:
+    case Node::Kind::MetatypeParamsRemoved:
     case Node::Kind::SpecializationPassID:
     case Node::Kind::Static:
     case Node::Kind::Subscript:
@@ -547,6 +551,7 @@ private:
     case Node::Kind::OutlinedAssignWithCopy:
     case Node::Kind::OutlinedDestroy:
     case Node::Kind::OutlinedVariable:
+    case Node::Kind::OutlinedReadOnlyObject:
     case Node::Kind::AssocTypePath:
     case Node::Kind::ModuleDescriptor:
     case Node::Kind::AnonymousDescriptor:
@@ -594,6 +599,11 @@ private:
     case Node::Kind::AccessibleFunctionRecord:
     case Node::Kind::BackDeploymentThunk:
     case Node::Kind::BackDeploymentFallback:
+    case Node::Kind::ExtendedExistentialTypeShape:
+    case Node::Kind::Uniquable:
+    case Node::Kind::UniqueExtendedExistentialTypeShapeSymbolicReference:
+    case Node::Kind::NonUniqueExtendedExistentialTypeShapeSymbolicReference:
+    case Node::Kind::SymbolicExtendedExistentialType:
       return false;
     }
     printer_unreachable("bad node kind");
@@ -1119,7 +1129,8 @@ void NodePrinter::printSpecializationPrefix(NodePointer node,
   for (NodePointer child : *node) {
     switch (child->getKind()) {
       case Node::Kind::SpecializationPassID:
-        // We skip the SpecializationPassID since it does not contain any
+      case Node::Kind::MetatypeParamsRemoved:
+        // We skip those nodes since it does not contain any
         // information that is useful to our users.
         break;
 
@@ -1262,6 +1273,9 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     return nullptr;
   case Node::Kind::OutlinedVariable:
     Printer << "outlined variable #" << Node->getIndex() << " of ";
+    return nullptr;
+  case Node::Kind::OutlinedReadOnlyObject:
+    Printer << "outlined read-only object #" << Node->getIndex() << " of ";
     return nullptr;
   case Node::Kind::Directness:
     Printer << toString(Directness(Node->getIndex())) << " ";
@@ -1537,6 +1551,9 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     return nullptr;
   case Node::Kind::IsSerialized:
     Printer << "serialized";
+    return nullptr;
+  case Node::Kind::MetatypeParamsRemoved:
+    Printer << "metatypes-removed";
     return nullptr;
   case Node::Kind::GenericSpecializationParam:
     print(Node->getChild(0), depth + 1);
@@ -2271,8 +2288,16 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     }
     return nullptr;
   }
-  case Node::Kind::ParameterizedProtocol: {
-    printBoundGeneric(Node, depth);
+  case Node::Kind::ConstrainedExistential: {
+    Printer << "any ";
+    print(Node->getChild(0), depth + 1);
+    Printer << "<";
+    print(Node->getChild(1), depth + 1);
+    Printer << ">";
+    return nullptr;
+  }
+  case Node::Kind::ConstrainedExistentialRequirementList: {
+    printChildren(Node, depth, ", ");
     return nullptr;
   }
   case Node::Kind::ExistentialMetatype: {
@@ -2289,6 +2314,9 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
     Printer << ".Type";
     return nullptr;
   }
+  case Node::Kind::ConstrainedExistentialSelf:
+    Printer << "Self";
+    return nullptr;
   case Node::Kind::MetatypeRepresentation: {
     Printer << Node->getText();
     return nullptr;
@@ -2549,7 +2577,7 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
         if (index != 0)
           Printer << ", ";
         // Limit the number of printed generic parameters. In practice this
-        // it will never be exceeded. The limit is only imporant for malformed
+        // it will never be exceeded. The limit is only important for malformed
         // symbols where count can be really huge.
         if (index >= 128) {
           Printer << "...";
@@ -2962,6 +2990,62 @@ NodePointer NodePrinter::print(NodePointer Node, unsigned depth,
       Printer << " suspend resume partial function for ";
     }
     return nullptr;
+  case Node::Kind::Uniquable:
+    Printer << "uniquable ";
+    print(Node->getChild(0), depth + 1);
+    return nullptr;
+  case Node::Kind::ExtendedExistentialTypeShape: {
+    // Printing the requirement signature is pretty useless if we
+    // don't print `where` clauses.
+    auto savedDisplayWhereClauses = Options.DisplayWhereClauses;
+    Options.DisplayWhereClauses = true;
+
+    NodePointer genSig = nullptr, type = nullptr;
+    if (Node->getNumChildren() == 2) {
+      genSig = Node->getChild(1);
+      type = Node->getChild(2);
+    } else {
+      type = Node->getChild(1);
+    }
+
+    Printer << "existential shape for ";
+    if (genSig) {
+      print(genSig, depth + 1);
+      Printer << " ";
+    }
+    Printer << "any ";
+    print(type, depth + 1);
+
+    Options.DisplayWhereClauses = savedDisplayWhereClauses;
+    return nullptr;
+  }
+  case Node::Kind::UniqueExtendedExistentialTypeShapeSymbolicReference:
+    Printer << "unique existential shape symbolic reference 0x";
+    Printer.writeHex(Node->getIndex());
+    return nullptr;
+  case Node::Kind::NonUniqueExtendedExistentialTypeShapeSymbolicReference:
+    Printer << "non-unique existential shape symbolic reference 0x";
+    Printer.writeHex(Node->getIndex());
+    return nullptr;
+  case Node::Kind::SymbolicExtendedExistentialType: {
+    auto shape = Node->getChild(0);
+    bool isUnique =
+      (shape->getKind() ==
+         Node::Kind::UniqueExtendedExistentialTypeShapeSymbolicReference);
+    Printer << "symbolic existential type ("
+            << (isUnique ? "" : "non-")
+            << "unique) 0x";
+    Printer.writeHex(shape->getIndex());
+    Printer << " <";
+    print(Node->getChild(1), depth + 1);
+    if (Node->getNumChildren() > 2) {
+      Printer << ", ";
+      print(Node->getChild(2), depth + 1);
+    }
+    Printer << ">";
+
+    return nullptr;
+  }
   }
 
   printer_unreachable("bad node kind!");
@@ -3126,6 +3210,146 @@ void NodePrinter::printEntityType(NodePointer Entity, NodePointer type,
   } else {
     print(type, depth + 1);
   }
+}
+
+NodePointer
+matchSequenceOfKinds(NodePointer start,
+                     std::vector<std::tuple<Node::Kind, size_t>> pattern) {
+  if (start != nullptr) {
+    NodePointer current = start;
+    size_t idx = 0;
+    while (idx < pattern.size()) {
+      std::tuple<Node::Kind, size_t> next = pattern[idx];
+      idx += 1;
+      NodePointer nextChild = current->getChild(std::get<1>(next));
+      if (nextChild != nullptr && nextChild->getKind() == std::get<0>(next)) {
+        current = nextChild;
+      } else {
+        return nullptr;
+      }
+    }
+    if (idx == pattern.size()) {
+      return current;
+    } else {
+      return nullptr;
+    }
+  } else {
+    return nullptr;
+  }
+}
+
+std::string Demangle::keyPathSourceString(const char *MangledName,
+                                          size_t MangledNameLength) {
+  std::string invalid = "";
+  std::string unlabelledArg = "_: ";
+  Context ctx;
+  NodePointer root =
+      ctx.demangleSymbolAsNode(StringRef(MangledName, MangledNameLength));
+  if (!root)
+    return invalid;
+  if (root->getNumChildren() >= 1) {
+    NodePointer firstChild = root->getChild(0);
+    if (firstChild->getKind() == Node::Kind::KeyPathGetterThunkHelper) {
+      NodePointer child = firstChild->getChild(0);
+      switch (child->getKind()) {
+      case Node::Kind::Subscript: {
+        std::string subscriptText = "subscript(";
+        std::vector<std::string> argumentTypeNames;
+        // Multiple arguments case
+        NodePointer argList = matchSequenceOfKinds(
+            child, {
+                       std::make_pair(Node::Kind::Type, 2),
+                       std::make_pair(Node::Kind::FunctionType, 0),
+                       std::make_pair(Node::Kind::ArgumentTuple, 0),
+                       std::make_pair(Node::Kind::Type, 0),
+                       std::make_pair(Node::Kind::Tuple, 0),
+                   });
+        if (argList != nullptr) {
+          size_t numArgumentTypes = argList->getNumChildren();
+          size_t idx = 0;
+          while (idx < numArgumentTypes) {
+            NodePointer argumentType = argList->getChild(idx);
+            idx += 1;
+            if (argumentType->getKind() == Node::Kind::TupleElement) {
+              argumentType =
+                  argumentType->getChild(0)->getChild(0)->getChild(1);
+              if (argumentType->getKind() == Node::Kind::Identifier) {
+                argumentTypeNames.push_back(
+                    std::string(argumentType->getText()));
+                continue;
+              }
+            }
+            argumentTypeNames.push_back("<Unknown>");
+          }
+        } else {
+          // Case where there is a single argument
+          argList = matchSequenceOfKinds(
+              child, {
+                         std::make_pair(Node::Kind::Type, 2),
+                         std::make_pair(Node::Kind::FunctionType, 0),
+                         std::make_pair(Node::Kind::ArgumentTuple, 0),
+                         std::make_pair(Node::Kind::Type, 0),
+                     });
+          if (argList != nullptr) {
+            argumentTypeNames.push_back(
+                std::string(argList->getChild(0)->getChild(1)->getText()));
+          }
+        }
+        child = child->getChild(1);
+        size_t idx = 0;
+        // There is an argument label:
+        if (child != nullptr) {
+          if (child->getKind() == Node::Kind::LabelList) {
+            size_t numChildren = child->getNumChildren();
+            if (numChildren == 0) {
+              subscriptText += unlabelledArg + argumentTypeNames[0];
+            } else {
+              while (idx < numChildren) {
+                Node *argChild = child->getChild(idx);
+                idx += 1;
+                if (argChild->getKind() == Node::Kind::Identifier) {
+                  subscriptText += std::string(argChild->getText()) + ": " +
+                                   argumentTypeNames[idx - 1];
+                  if (idx != numChildren) {
+                    subscriptText += ", ";
+                  }
+                } else if (argChild->getKind() ==
+                               Node::Kind::FirstElementMarker ||
+                           argChild->getKind() == Node::Kind::VariadicMarker) {
+                  subscriptText += unlabelledArg + argumentTypeNames[idx - 1];
+                }
+              }
+            }
+          }
+        } else {
+          subscriptText += unlabelledArg + argumentTypeNames[0];
+        }
+        return subscriptText + ")";
+      }
+      case Node::Kind::Variable: {
+        child = child->getChild(1);
+        if (child == nullptr) {
+          return invalid;
+        }
+        if (child->getKind() == Node::Kind::PrivateDeclName) {
+          child = child->getChild(1);
+          if (child == nullptr) {
+            return invalid;
+          }
+          if (child->getKind() == Node::Kind::Identifier) {
+            return std::string(child->getText());
+          }
+        } else if (child->getKind() == Node::Kind::Identifier) {
+          return std::string(child->getText());
+        }
+        break;
+      }
+      default:
+        return invalid;
+      }
+    }
+  }
+  return invalid;
 }
 
 std::string Demangle::nodeToString(NodePointer root,

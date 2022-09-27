@@ -81,7 +81,7 @@ Classes use dynamic dispatch for methods and property accesses by default. Thus
 in the following code snippet, ``a.aProperty``, ``a.doSomething()`` and
 ``a.doSomethingElse()`` will all be invoked via dynamic dispatch:
 
-::
+.. code-block:: swift
 
   class A {
     var aProperty: [Int]
@@ -120,7 +120,7 @@ compiler can emit direct function calls instead of indirect calls. For instance
 in the following ``C.array1`` and ``D.array1`` will be accessed directly
 [#]_. In contrast, ``D.array2`` will be called via a vtable:
 
-::
+.. code-block:: swift
 
   final class C {
     // No declarations in class 'C' can be overridden.
@@ -134,13 +134,13 @@ in the following ``C.array1`` and ``D.array1`` will be accessed directly
   }
 
   func usingC(_ c: C) {
-     c.array1[i] = ... // Can directly access C.array without going through dynamic dispatch.
-     c.doSomething() = ... // Can directly call C.doSomething without going through virtual dispatch.
+    c.array1[i] = ... // Can directly access C.array without going through dynamic dispatch.
+    c.doSomething() = ... // Can directly call C.doSomething without going through virtual dispatch.
   }
 
   func usingD(_ d: D) {
-     d.array1[i] = ... // Can directly access D.array1 without going through dynamic dispatch.
-     d.array2[i] = ... // Will access D.array2 through dynamic dispatch.
+    d.array1[i] = ... // Can directly access D.array1 without going through dynamic dispatch.
+    d.array2[i] = ... // Will access D.array2 through dynamic dispatch.
   }
 
 Advice: Use 'private' and 'fileprivate' when declaration does not need to be accessed outside of file
@@ -155,7 +155,7 @@ and field accesses accordingly. For instance in the following,
 ``e.doSomething()`` and ``f.myPrivateVar``, will be able to be accessed directly
 assuming ``E``, ``F`` do not have any overriding declarations in the same file:
 
-::
+.. code-block:: swift
 
   private class E {
     func doSomething() { ... }
@@ -183,7 +183,7 @@ sources all together at once. This allows the optimizer to have module
 wide visibility when compiling individual declarations. Since an
 internal declaration is not visible outside of the current module, the
 optimizer can then infer `final` by automatically discovering all
-potentially overridding declarations.
+potentially overriding declarations.
 
 NOTE: Since in Swift the default access control level is ``internal``
 anyways, by enabling Whole Module Optimization, one can gain
@@ -210,7 +210,7 @@ counting if they contain, recursively, a reference type. By using value types
 without reference types, one can avoid additional retain, release traffic inside
 Array.
 
-::
+.. code-block:: swift
 
   // Don't use a class here.
   struct PhonebookEntry {
@@ -231,7 +231,7 @@ Advice: Use ContiguousArray with reference types when NSArray bridging is unnece
 If you need an array of reference types and the array does not need to be
 bridged to NSArray, use ContiguousArray instead of Array:
 
-::
+.. code-block:: swift
 
   class C { ... }
   var a: ContiguousArray<C> = [C(...), C(...), ..., C(...)]
@@ -248,7 +248,7 @@ container is mutated. For instance in the following, no copying will occur when
 ``c`` is assigned to ``d``, but when ``d`` undergoes structural mutation by
 appending ``2``, ``d`` will be copied and then ``2`` will be appended to ``d``:
 
-::
+.. code-block:: swift
 
   var c: [Int] = [ ... ]
   var d = c        // No copy will occur here.
@@ -260,7 +260,7 @@ object-reassignment in functions. In Swift, all parameters are passed in at +1,
 i.e. the parameters are retained before a callsite, and then are released at the
 end of the callee. This means that if one writes a function like the following:
 
-::
+.. code-block:: swift
 
   func append_one(_ a: [Int]) -> [Int] {
     var a = a
@@ -275,7 +275,7 @@ end of the callee. This means that if one writes a function like the following:
 has no uses after ``append_one`` due to the assignment. This can be avoided
 through the usage of ``inout`` parameters:
 
-::
+.. code-block:: swift
 
   func append_one_in_place(a: inout [Int]) {
     a.append(1)
@@ -298,7 +298,7 @@ Advice: Use wrapping integer arithmetic when you can prove that overflow cannot 
 In performance-critical code you can use wrapping arithmetic to avoid overflow
 checks if you know it is safe.
 
-::
+.. code-block:: swift
 
   a: [Int]
   b: [Int]
@@ -326,7 +326,7 @@ behavior between ``MySwiftFunc<Int>`` and ``MySwiftFunc<String>`` are accounted
 for by passing a different table of function pointers and the size abstraction
 provided by the box. An example of generics:
 
-::
+.. code-block:: swift
 
   class MySwiftFunc<T> { ... }
 
@@ -341,7 +341,7 @@ generic function specialized to the specific type. This process, called
 *specialization*, enables the removal of the overhead associated with
 generics. Some more examples of generics:
 
-::
+.. code-block:: swift
 
   class MyStack<T> {
     func push(_ element: T) { ... }
@@ -394,7 +394,7 @@ represented as values, so this example is somewhat realistic.
 .. See Protocol-Oriented-Programming:
 .. https://developer.apple.com/videos/play/wwdc2015-408/
 
-::
+.. code-block:: swift
 
   protocol P {}
   struct Node: P {
@@ -429,7 +429,7 @@ wrapping it in an array. This simple change has a major impact on the
 performance of our tree data structure, and the cost of passing the array as an
 argument drops from being O(n), depending on the size of the tree to O(1).
 
-::
+.. code-block:: swift
 
   struct Tree: P {
     var node: [P?]
@@ -461,27 +461,27 @@ construct such a data structure:
 .. More details in this blog post by Mike Ash:
 .. https://www.mikeash.com/pyblog/friday-qa-2015-04-17-lets-build-swiftarray.html
 
-::
+.. code-block:: swift
 
   final class Ref<T> {
     var val: T
-    init(_ v: T) {val = v}
+    init(_ v: T) { val = v }
   }
 
   struct Box<T> {
-      var ref: Ref<T>
-      init(_ x: T) { ref = Ref(x) }
+    var ref: Ref<T>
+    init(_ x: T) { ref = Ref(x) }
 
-      var value: T {
-          get { return ref.val }
-          set {
-            if !isKnownUniquelyReferenced(&ref) {
-              ref = Ref(newValue)
-              return
-            }
-            ref.val = newValue
-          }
+    var value: T {
+      get { return ref.val }
+      set {
+        if !isKnownUniquelyReferenced(&ref) {
+          ref = Ref(newValue)
+          return
+        }
+        ref.val = newValue
       }
+    }
   }
 
 The type ``Box`` can replace the array in the code sample above.
@@ -498,12 +498,12 @@ the reference Swift will increment the reference count of the ``next`` object
 and decrement the reference count of the previous object. These reference
 count operations are expensive and unavoidable when using Swift classes.
 
-::
+.. code-block:: swift
 
   final class Node {
-   var next: Node?
-   var data: Int
-   ...
+    var next: Node?
+    var data: Int
+    ...
   }
 
 
@@ -523,29 +523,29 @@ instance held by the ``Unmanaged`` struct instance for the duration of the use
 of ``Unmanaged`` (see `Unmanaged.swift`_ for more details) that keeps the instance
 alive.
 
-::
+.. code-block:: swift
 
-    // The call to ``withExtendedLifetime(Head)`` makes sure that the lifetime of
-    // Head is guaranteed to extend over the region of code that uses Unmanaged
-    // references. Because there exists a reference to Head for the duration
-    // of the scope and we don't modify the list of ``Node``s there also exist a
-    // reference through the chain of ``Head.next``, ``Head.next.next``, ...
-    // instances.
+  // The call to ``withExtendedLifetime(Head)`` makes sure that the lifetime of
+  // Head is guaranteed to extend over the region of code that uses Unmanaged
+  // references. Because there exists a reference to Head for the duration
+  // of the scope and we don't modify the list of ``Node``s there also exist a
+  // reference through the chain of ``Head.next``, ``Head.next.next``, ...
+  // instances.
 
-    withExtendedLifetime(Head) {
+  withExtendedLifetime(Head) {
 
-      // Create an Unmanaged reference.
-      var Ref: Unmanaged<Node> = Unmanaged.passUnretained(Head)
+    // Create an Unmanaged reference.
+    var Ref: Unmanaged<Node> = Unmanaged.passUnretained(Head)
 
-      // Use the unmanaged reference in a call/variable access. The use of
-      // _withUnsafeGuaranteedRef allows the compiler to remove the ultimate
-      // retain/release across the call/access.
+    // Use the unmanaged reference in a call/variable access. The use of
+    // _withUnsafeGuaranteedRef allows the compiler to remove the ultimate
+    // retain/release across the call/access.
 
-      while let Next = Ref._withUnsafeGuaranteedRef { $0.next } {
-        ...
-        Ref = Unmanaged.passUnretained(Next)
-      }
+    while let Next = Ref._withUnsafeGuaranteedRef { $0.next } {
+      ...
+      Ref = Unmanaged.passUnretained(Next)
     }
+  }
 
 
 .. _Unmanaged.swift: https://github.com/apple/swift/blob/main/stdlib/public/core/Unmanaged.swift
@@ -567,7 +567,7 @@ to retain or release non-trivial structures, which can be expensive.
 If it makes sense to limit the adoption of protocols to classes then mark
 protocols as class-only protocols to get better runtime performance.
 
-::
+.. code-block:: swift
 
   protocol Pingable: AnyObject { func ping() -> Int }
 
@@ -582,7 +582,7 @@ considerations. Remember that any time one creates a binding for a
 closure, one is forcing the compiler to emit an escaping closure,
 e.x.:
 
-::
+.. code-block:: swift
 
   let f: () -> () = { ... } // Escaping closure
   // Contrasted with:

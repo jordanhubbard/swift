@@ -1,6 +1,4 @@
-#!/usr/bin/env python
-
-from __future__ import print_function
+#!/usr/bin/env python3
 
 import argparse
 import io
@@ -25,7 +23,12 @@ def escapeCmdArg(arg):
 def run_command(cmd):
     if sys.version_info[0] < 3:
         cmd = list(map(lambda s: s.encode('utf-8'), cmd))
-    print(' '.join([escapeCmdArg(arg) for arg in cmd]))
+    cmdStr = ' '.join([escapeCmdArg(arg) for arg in cmd])
+    if not sys.stdout.encoding.lower().startswith('utf'):
+        # stdout doesn't support Unicode characters, encode them into an escape
+        # sequence
+        cmdStr = cmdStr.encode('utf-8')
+    print(cmdStr)
     if sys.version_info[0] < 3 or platform.system() == 'Windows':
         return subprocess.check_output(cmd, stderr=subprocess.STDOUT)
     else:
@@ -163,7 +166,7 @@ def serializeIncrParseMarkupFile(test_file, test_case, mode,
     # markup for testing incremental parsing
     # =========================================================================
 
-    # Gather command line arguments for swift-syntax-test specifiying the
+    # Gather command line arguments for swift-syntax-test specifying the
     # performed edits in this list
     incremental_edit_args = []
     reparse_args = []
@@ -234,7 +237,7 @@ def main():
         description='Utility for testing incremental syntax parsing',
         epilog='''
     This utility can parse a special markup to dedicate a pre-edit and a
-    post-edit version of a file simulateously and generate a serialized version
+    post-edit version of a file simultaneously and generate a serialized version
     of the libSyntax tree by parsing either the pre-edit file, the post-edit
     file or the edits that are required to retrieve the post-edit file from the
     pre-edit file incrementally.

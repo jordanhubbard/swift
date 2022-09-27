@@ -156,15 +156,17 @@ func anyAny() {
 
 protocol P1 {}
 protocol P2 {}
+protocol P3 {}
 do {
   // Test that we don't accidentally misparse an 'any' type as a 'some' type
   // and vice versa.
-  let _: P1 & any P2 // expected-error {{'any' should appear at the beginning of a composition}}
-  let _: any P1 & any P2 // expected-error {{'any' should appear at the beginning of a composition}}
-  let _: any P1 & some P2 // expected-error {{'some' should appear at the beginning of a composition}}
+  let _: P1 & any P2 // expected-error {{'any' should appear at the beginning of a composition}} {{15-19=}} {{10-10=any }}
+  let _: any P1 & any P2 // expected-error {{'any' should appear at the beginning of a composition}} {{19-23=}}
+  let _: any P1 & P2 & any P3 // expected-error {{'any' should appear at the beginning of a composition}} {{24-28=}}
+  let _: any P1 & some P2 // expected-error {{'some' should appear at the beginning of a composition}} {{19-24=}}
   let _: some P1 & any P2
   // expected-error@-1 {{'some' type can only be declared on a single property declaration}}
-  // expected-error@-2 {{'any' should appear at the beginning of a composition}}
+  // expected-error@-2 {{'any' should appear at the beginning of a composition}} {{20-24=}}
 }
 
 struct ConcreteComposition: P1, P2 {}
@@ -244,8 +246,8 @@ protocol Output {
   associatedtype A
 }
 
-// expected-warning@+2{{protocol 'Input' as a type must be explicitly marked as 'any'}}{{30-35=any Input}}
-// expected-warning@+1{{protocol 'Output' as a type must be explicitly marked as 'any'}}{{40-46=any Output}}
+// expected-error@+2{{use of protocol 'Input' as a type must be written 'any Input'}}{{30-35=any Input}}
+// expected-error@+1{{use of protocol 'Output' as a type must be written 'any Output'}}{{40-46=any Output}}
 typealias InvalidFunction = (Input) -> Output
 func testInvalidFunctionAlias(fn: InvalidFunction) {}
 
@@ -253,7 +255,7 @@ typealias ExistentialFunction = (any Input) -> any Output
 func testFunctionAlias(fn: ExistentialFunction) {}
 
 typealias Constraint = Input
-func testConstraintAlias(x: Constraint) {} // expected-warning{{'Constraint' (aka 'Input') as a type must be explicitly marked as 'any'}}{{29-39=any Constraint}}
+func testConstraintAlias(x: Constraint) {} // expected-error{{use of 'Constraint' (aka 'Input') as a type must be written 'any Constraint'}}{{29-39=any Constraint}}
 
 typealias Existential = any Input
 func testExistentialAlias(x: Existential, y: any Constraint) {}
@@ -287,25 +289,57 @@ func testAnyFixIt() {
     func method() -> any HasAssoc {}
   }
 
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-18=any HasAssoc}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=any HasAssoc}}
   let _: HasAssoc = ConformingType()
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{19-27=any HasAssoc}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{19-27=any HasAssoc}}
   let _: Optional<HasAssoc> = nil
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-23=any HasAssoc.Type}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-23=any HasAssoc.Type}}
   let _: HasAssoc.Type = ConformingType.self
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-25=any (HasAssoc).Type}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-25=any (HasAssoc).Type}}
   let _: (HasAssoc).Type = ConformingType.self
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-27=any ((HasAssoc)).Type}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-27=any ((HasAssoc)).Type}}
   let _: ((HasAssoc)).Type = ConformingType.self
-  // expected-warning@+2 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-18=(any HasAssoc)}}
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{30-38=(any HasAssoc)}}
+  // expected-error@+2 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=(any HasAssoc)}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{30-38=(any HasAssoc)}}
   let _: HasAssoc.Protocol = HasAssoc.self
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{11-19=any HasAssoc}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{11-19=any HasAssoc}}
   let _: (HasAssoc).Protocol = (any HasAssoc).self
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-18=(any HasAssoc)}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=(any HasAssoc)}}
   let _: HasAssoc? = ConformingType()
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-23=(any HasAssoc.Type)}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-23=(any HasAssoc.Type)}}
   let _: HasAssoc.Type? = ConformingType.self
-  // expected-warning@+1 {{'HasAssoc' as a type must be explicitly marked as 'any'}}{{10-18=(any HasAssoc)}}
+  // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}{{10-18=(any HasAssoc)}}
   let _: HasAssoc.Protocol? = (any HasAssoc).self
+
+  // expected-error@+1 {{optional 'any' type must be written '(any HasAssoc)?'}}{{10-23=(any HasAssoc)?}}
+  let _: any HasAssoc? = nil
+  // expected-error@+1 {{optional 'any' type must be written '(any HasAssoc.Type)?'}}{{10-28=(any HasAssoc.Type)?}}
+  let _: any HasAssoc.Type? = nil
 }
+
+func testNestedMetatype() {
+  let _: (any P.Type).Type = (any P.Type).self
+  let _: (any (P.Type)).Type = (any P.Type).self
+  let _: ((any (P.Type))).Type = (any P.Type).self
+}
+
+func testEnumAssociatedValue() {
+  enum E {
+    case c1((any HasAssoc) -> Void)
+    // expected-error@+1 {{use of protocol 'HasAssoc' as a type must be written 'any HasAssoc'}}
+    case c2((HasAssoc) -> Void)
+    case c3((P) -> Void)
+  }
+}
+
+// https://github.com/apple/swift/issues/58920
+typealias Iterator = any IteratorProtocol
+var example: any Iterator = 5 // expected-error{{redundant 'any' in type 'any Iterator' (aka 'any any IteratorProtocol')}} {{14-18=}}
+// expected-error@-1{{value of type 'Int' does not conform to specified type 'IteratorProtocol'}}
+var example1: any (any IteratorProtocol) = 5 // expected-error{{redundant 'any' in type 'any (any IteratorProtocol)'}} {{15-19=}}
+// expected-error@-1{{value of type 'Int' does not conform to specified type 'IteratorProtocol'}}
+
+protocol PP {}
+struct A : PP {}
+let _: any PP = A() // Ok
+let _: any (any PP) = A() // expected-error{{redundant 'any' in type 'any (any PP)'}} {{8-12=}}

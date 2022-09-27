@@ -350,6 +350,9 @@ struct SwiftStatistics {
 
 class SwiftLangSupport : public LangSupport {
   std::shared_ptr<NotificationCenter> NotificationCtr;
+  /// The path of the swift-frontend executable.
+  /// Used to find clang relative to it.
+  std::string SwiftExecutablePath;
   std::string RuntimeResourcePath;
   std::string DiagnosticDocumentationPath;
   std::shared_ptr<SwiftASTManager> ASTMgr;
@@ -522,7 +525,7 @@ public:
     std::shared_ptr<std::atomic<bool>> CancellationFlag;
   };
 
-  /// Execute \p PerformOperation sychronously with the parameters necessary to
+  /// Execute \p PerformOperation synchronously with the parameters necessary to
   /// invoke a completion-like operation on \c CompletionInstance.
   void performWithParamsToCompletionLikeOperation(
       llvm::MemoryBuffer *UnresolvedInputFile, unsigned Offset,

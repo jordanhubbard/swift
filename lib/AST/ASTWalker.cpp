@@ -94,31 +94,37 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     }
   };
 
+  LLVM_NODISCARD
   Expr *visit(Expr *E) {
     SetParentRAII SetParent(Walker, E);
     return inherited::visit(E);
   }
 
+  LLVM_NODISCARD
   Stmt *visit(Stmt *S) {
     SetParentRAII SetParent(Walker, S);
     return inherited::visit(S);
   }
-  
+
+  LLVM_NODISCARD
   Pattern *visit(Pattern *P) {
     SetParentRAII SetParent(Walker, P);
     return inherited::visit(P);
   }
 
+  LLVM_NODISCARD
   bool visit(Decl *D) {
     SetParentRAII SetParent(Walker, D);
     return inherited::visit(D);
   }
-  
+
+  LLVM_NODISCARD
   bool visit(TypeRepr *T) {
     SetParentRAII SetParent(Walker, T);
     return inherited::visit(T);
   }
-  
+
+  LLVM_NODISCARD
   bool visit(ParameterList *PL) {
     return inherited::visit(PL);
   }
@@ -127,17 +133,20 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   //                                 Decls
   //===--------------------------------------------------------------------===//
 
+  LLVM_NODISCARD
   bool visitGenericParamListIfNeeded(GenericContext *GC) {
     // Must check this first in case extensions have not been bound yet
     if (Walker.shouldWalkIntoGenericParams()) {
       if (auto *params = GC->getParsedGenericParams()) {
-        doIt(params);
+        if (doIt(params))
+          return true;
       }
       return true;
     }
     return false;
   }
 
+  LLVM_NODISCARD
   bool visitTrailingRequirements(GenericContext *GC) {
     if (const auto Where = GC->getTrailingWhereClause()) {
       for (auto &Req: Where->getRequirements())
@@ -195,18 +204,23 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
         PBD->setPattern(idx, Pat, PBD->getInitContext(idx));
       else
         return true;
-      if (PBD->getInit(idx) &&
-          !isPropertyWrapperBackingProperty &&
-          (!PBD->isInitializerSubsumed(idx) ||
-           Walker.shouldWalkIntoLazyInitializers())) {
-#ifndef NDEBUG
-        PrettyStackTraceDecl debugStack("walking into initializer for", PBD);
-#endif
-        if (Expr *E2 = doIt(PBD->getInit(idx)))
-          PBD->setInit(idx, E2);
-        else
-          return true;
+
+      if (!PBD->getInit(idx) || isPropertyWrapperBackingProperty)
+        continue;
+
+      if (PBD->isInitializerSubsumed(idx) &&
+          Walker.getLazyInitializerWalkingBehavior() !=
+              LazyInitializerWalking::InPatternBinding) {
+        break;
       }
+
+#ifndef NDEBUG
+      PrettyStackTraceDecl debugStack("walking into initializer for", PBD);
+#endif
+      if (Expr *E2 = doIt(PBD->getInit(idx)))
+        PBD->setInit(idx, E2);
+      else
+        return true;
     }
     return false;
   }
@@ -284,6 +298,9 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   }
 
   bool visitNominalTypeDecl(NominalTypeDecl *NTD) {
+#ifndef NDEBUG
+    PrettyStackTraceDecl debugStack("walking into", NTD);
+#endif
 
     bool WalkGenerics = visitGenericParamListIfNeeded(NTD);
 
@@ -360,7 +377,9 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   bool visitSubscriptDecl(SubscriptDecl *SD) {
     bool WalkGenerics = visitGenericParamListIfNeeded(SD);
 
-    visit(SD->getIndices());
+    if (visit(SD->getIndices()))
+      return true;
+
     if (auto *const TyR = SD->getElementTypeRepr())
       if (doIt(TyR))
         return true;
@@ -391,9 +410,12 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
         // accessor generics are visited from the storage decl
         !isa<AccessorDecl>(AFD) && visitGenericParamListIfNeeded(AFD);
 
-    if (auto *PD = AFD->getImplicitSelfDecl(/*createIfNeeded=*/false))
-      visit(PD);
-    visit(AFD->getParameters());
+    if (auto *PD = AFD->getImplicitSelfDecl(/*createIfNeeded=*/false)) {
+      if (visit(PD))
+        return true;
+    }
+    if (visit(AFD->getParameters()))
+      return true;
 
     if (auto *FD = dyn_cast<FuncDecl>(AFD)) {
       if (!isa<AccessorDecl>(FD))
@@ -428,7 +450,8 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
 
   bool visitEnumElementDecl(EnumElementDecl *ED) {
     if (auto *PL = ED->getParameterList()) {
-      visit(PL);
+      if (visit(PL))
+        return true;
     }
 
     if (auto *rawLiteralExpr = ED->getRawValueUnchecked()) {
@@ -840,8 +863,8 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
       }
     }
 
-    ClosureExpr *body = expr->getClosureBody();
-    if ((body = cast_or_null<ClosureExpr>(doIt(body))))
+    AbstractClosureExpr *body = expr->getClosureBody();
+    if ((body = cast_or_null<AbstractClosureExpr>(doIt(body))))
       expr->setClosureBody(body);
     else
       return nullptr;
@@ -849,7 +872,8 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   }
 
   Expr *visitClosureExpr(ClosureExpr *expr) {
-    visit(expr->getParameters());
+    if (visit(expr->getParameters()))
+      return nullptr;
 
     if (expr->hasExplicitResultType()) {
       if (doIt(expr->getExplicitResultTypeRepr()))
@@ -1070,7 +1094,17 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
   }
 
   Expr *visitLazyInitializerExpr(LazyInitializerExpr *E) {
-    // Initializer is totally opaque for most visitation purposes.
+    // The initializer is opaque unless we specifically want to visit it as part
+    // of the accessor body.
+    if (Walker.getLazyInitializerWalkingBehavior() !=
+        LazyInitializerWalking::InAccessor) {
+      return E;
+    }
+    auto *sub = doIt(E->getSubExpr());
+    if (!sub)
+      return nullptr;
+
+    E->setSubExpr(sub);
     return E;
   }
 
@@ -1188,6 +1222,25 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
     return E;
   }
 
+  Expr *visitTypeJoinExpr(TypeJoinExpr *E) {
+    if (auto *newVar = dyn_cast<DeclRefExpr>(doIt(E->getVar()))) {
+      E->setVar(newVar);
+    } else {
+      return nullptr;
+    }
+
+    for (unsigned i = 0, e = E->getNumElements(); i != e; ++i) {
+      if (auto *origElt = E->getElement(i)) {
+        if (Expr *Elt = doIt(origElt))
+          E->setElement(i, Elt);
+        else
+          return nullptr;
+      }
+    }
+
+    return E;
+  }
+
   //===--------------------------------------------------------------------===//
   //                           Everything Else
   //===--------------------------------------------------------------------===//
@@ -1200,53 +1253,102 @@ class Traversal : public ASTVisitor<Traversal, Expr*, Stmt*,
 
 #define TYPEREPR(Id, Parent) bool visit##Id##TypeRepr(Id##TypeRepr *T);
 #include "swift/AST/TypeReprNodes.def"
-  
-  bool visitParameterList(ParameterList *PL) {
-    if (!Walker.walkToParameterListPre(PL))
-      return false;
-    
-    for (auto P : *PL) {
-      // Walk each parameter's decl and typeloc and default value.
-      if (doIt(P))
-        return true;
-    }
 
-    return Walker.walkToParameterListPost(PL);
+  using Action = ASTWalker::Action;
+
+  using PreWalkAction = ASTWalker::PreWalkAction;
+  using PostWalkAction = ASTWalker::PostWalkAction;
+
+  template <typename T>
+  using PreWalkResult = ASTWalker::PreWalkResult<T>;
+
+  template <typename T>
+  using PostWalkResult = ASTWalker::PostWalkResult<T>;
+
+  LLVM_NODISCARD
+  bool traverse(PreWalkAction Pre, llvm::function_ref<bool(void)> VisitChildren,
+                llvm::function_ref<PostWalkAction(void)> WalkPost) {
+    switch (Pre.Action) {
+    case PreWalkAction::Stop:
+      return true;
+    case PreWalkAction::SkipChildren:
+      return false;
+    case PreWalkAction::Continue:
+      break;
+    }
+    if (VisitChildren())
+      return true;
+    switch (WalkPost().Action) {
+    case PostWalkAction::Stop:
+      return true;
+    case PostWalkAction::Continue:
+      return false;
+    }
+    llvm_unreachable("Unhandled case in switch!");
   }
-  
+
+  template <typename T>
+  LLVM_NODISCARD
+  T *traverse(PreWalkResult<T *> Pre,
+              llvm::function_ref<T *(T *)> VisitChildren,
+              llvm::function_ref<PostWalkResult<T *>(T *)> WalkPost) {
+    switch (Pre.Action.Action) {
+    case PreWalkAction::Stop:
+      return nullptr;
+    case PreWalkAction::SkipChildren:
+      assert(*Pre.Value && "Use Action::Stop instead of returning nullptr");
+      return *Pre.Value;
+    case PreWalkAction::Continue:
+      break;
+    }
+    assert(*Pre.Value && "Use Action::Stop instead of returning nullptr");
+    auto Value = VisitChildren(*Pre.Value);
+    if (!Value)
+      return nullptr;
+
+    auto Post = WalkPost(Value);
+    switch (Post.Action.Action) {
+    case PostWalkAction::Stop:
+      return nullptr;
+    case PostWalkAction::Continue:
+      assert(*Post.Value && "Use Action::Stop instead of returning nullptr");
+      return *Post.Value;
+    }
+    llvm_unreachable("Unhandled case in switch!");
+  }
+
+  LLVM_NODISCARD
+  bool visitParameterList(ParameterList *PL) {
+    return traverse(
+        Walker.walkToParameterListPre(PL),
+        [&]() {
+          for (auto P : *PL) {
+            // Walk each parameter's decl and typeloc and default value.
+            if (doIt(P))
+              return true;
+          }
+          return false;
+        },
+        [&]() { return Walker.walkToParameterListPost(PL); });
+  }
+
 public:
   Traversal(ASTWalker &walker) : Walker(walker) {}
 
+  LLVM_NODISCARD
   Expr *doIt(Expr *E) {
-    // Do the pre-order visitation.  If it returns false, we just
-    // skip entering subnodes of this tree.
-    auto Pre = Walker.walkToExprPre(E);
-    if (!Pre.first || !Pre.second)
-      return Pre.second;
-
-    // Otherwise, visit the children.
-    E = visit(Pre.second);
-
-    // If we didn't bail out, do post-order visitation.
-    if (E) E = Walker.walkToExprPost(E);
-
-    return E;
+    return traverse<Expr>(
+        Walker.walkToExprPre(E),
+        [&](Expr *E) { return visit(E); },
+        [&](Expr *E) { return Walker.walkToExprPost(E); });
   }
 
+  LLVM_NODISCARD
   Stmt *doIt(Stmt *S) {
-    // Do the pre-order visitation.  If it returns false, we just
-    // skip entering subnodes of this tree.
-    auto Pre = Walker.walkToStmtPre(S);
-    if (!Pre.first || !Pre.second)
-      return Pre.second;
-
-    // Otherwise, visit the children.
-    S = visit(S);
-
-    // If we didn't bail out, do post-order visitation.
-    if (S) S = Walker.walkToStmtPost(S);
-
-    return S;
+    return traverse<Stmt>(
+        Walker.walkToStmtPre(S),
+        [&](Stmt *S) { return visit(S); },
+        [&](Stmt *S) { return Walker.walkToStmtPost(S); });
   }
   
   bool shouldSkip(Decl *D) {
@@ -1269,41 +1371,32 @@ public:
   }
 
   /// Returns true on failure.
+  LLVM_NODISCARD
   bool doIt(Decl *D) {
     if (shouldSkip(D))
       return false;
 
-    // Do the pre-order visitation.  If it returns false, we just
-    // skip entering subnodes of this tree.
-    if (!Walker.walkToDeclPre(D))
-      return false;
-
-    if (visit(D))
-      return true;
-
-    return !Walker.walkToDeclPost(D);
+    return traverse(
+        Walker.walkToDeclPre(D),
+        [&]() { return visit(D); },
+        [&]() { return Walker.walkToDeclPost(D); });
   }
-  
+
+  LLVM_NODISCARD
   Pattern *doIt(Pattern *P) {
-    // Do the pre-order visitation.  If it returns false, we just
-    // skip entering subnodes of this tree.
-    auto Pre = Walker.walkToPatternPre(P);
-    if (!Pre.first || !Pre.second)
-      return Pre.second;
-
-    // Otherwise, visit the children.
-    P = visit(P);
-
-    // If we didn't bail out, do post-order visitation.
-    if (P) P = Walker.walkToPatternPost(P);
-
-    return P;
+    return traverse<Pattern>(
+        Walker.walkToPatternPre(P),
+        [&](Pattern *P) { return visit(P); },
+        [&](Pattern *P) { return Walker.walkToPatternPost(P); });
   }
 
+  LLVM_NODISCARD
   bool doIt(const StmtCondition &C) {
     for (auto &elt : C) {
       switch (elt.getKind()) {
-      case StmtConditionElement::CK_Availability: break;
+      case StmtConditionElement::CK_Availability:
+      case StmtConditionElement::CK_HasSymbol:
+        break;
       case StmtConditionElement::CK_Boolean: {
         auto E = elt.getBoolean();
         // Walk an expression condition normally.
@@ -1329,20 +1422,15 @@ public:
   }
 
   /// Returns true on failure.
+  LLVM_NODISCARD
   bool doIt(TypeRepr *T) {
-    // Do the pre-order visitation.  If it returns false, we just
-    // skip entering subnodes of this tree.
-    if (!Walker.walkToTypeReprPre(T))
-      return false;
-
-    // Otherwise, visit the children.
-    if (visit(T))
-      return true;
-
-    // If we didn't bail out, do post-order visitation.
-    return !Walker.walkToTypeReprPost(T);
+    return traverse(
+        Walker.walkToTypeReprPre(T),
+        [&]() { return visit(T); },
+        [&]() { return Walker.walkToTypeReprPost(T); });
   }
-  
+
+  LLVM_NODISCARD
   bool doIt(RequirementRepr &Req) {
     switch (Req.getKind()) {
     case RequirementReprKind::SameType:
@@ -1361,6 +1449,7 @@ public:
     return false;
   }
 
+  LLVM_NODISCARD
   bool doIt(GenericParamList *GPL) {
     // Visit generic params
     for (auto &P : GPL->getParams()) {
@@ -1377,18 +1466,24 @@ public:
     return false;
   }
 
-  ArgumentList *doIt(ArgumentList *ArgList) {
-    bool WalkChildren;
-    std::tie(WalkChildren, ArgList) = Walker.walkToArgumentListPre(ArgList);
-    if (!WalkChildren || !ArgList)
-      return ArgList;
-
+  LLVM_NODISCARD
+  ArgumentList *visit(ArgumentList *ArgList) {
     for (auto Idx : indices(*ArgList)) {
       auto *E = doIt(ArgList->getExpr(Idx));
       if (!E) return nullptr;
       ArgList->setExpr(Idx, E);
     }
-    return Walker.walkToArgumentListPost(ArgList);
+    return ArgList;
+  }
+
+  LLVM_NODISCARD
+  ArgumentList *doIt(ArgumentList *ArgList) {
+    return traverse<ArgumentList>(
+        Walker.walkToArgumentListPre(ArgList),
+        [&](ArgumentList *ArgList) { return visit(ArgList); },
+        [&](ArgumentList *ArgList) {
+          return Walker.walkToArgumentListPost(ArgList);
+        });
   }
 };
 
@@ -1590,11 +1685,28 @@ Stmt *Traversal::visitForEachStmt(ForEachStmt *S) {
 
   // The iterator decl is built directly on top of the sequence
   // expression, so don't visit both.
-  if (Expr *Sequence = S->getSequence()) {
-    if ((Sequence = doIt(Sequence)))
-      S->setSequence(Sequence);
-    else
-      return nullptr;
+  //
+  // If for-in is already type-checked, the type-checked version
+  // of the sequence is going to be visited as part of `iteratorVar`.
+  if (S->getTypeCheckedSequence()) {
+    if (auto IteratorVar = S->getIteratorVar()) {
+      if (doIt(IteratorVar))
+        return nullptr;
+    }
+
+    if (auto NextCall = S->getNextCall()) {
+      if ((NextCall = doIt(NextCall)))
+        S->setNextCall(NextCall);
+      else
+        return nullptr;
+    }
+  } else {
+    if (Expr *Sequence = S->getParsedSequence()) {
+      if ((Sequence = doIt(Sequence)))
+        S->setParsedSequence(Sequence);
+      else
+        return nullptr;
+    }
   }
 
   if (Expr *Where = S->getWhere()) {
@@ -1607,18 +1719,6 @@ Stmt *Traversal::visitForEachStmt(ForEachStmt *S) {
   if (auto IteratorNext = S->getConvertElementExpr()) {
     if ((IteratorNext = doIt(IteratorNext)))
       S->setConvertElementExpr(IteratorNext);
-    else
-      return nullptr;
-  }
-
-  if (auto IteratorVar = S->getIteratorVar()) {
-    if (doIt(IteratorVar))
-      return nullptr;
-  }
-
-  if (auto IteratorVarRef = S->getIteratorVarRef()) {
-    if ((IteratorVarRef = doIt(IteratorVarRef)))
-      S->setIteratorVarRef(IteratorVarRef);
     else
       return nullptr;
   }
@@ -1837,6 +1937,9 @@ bool Traversal::visitOptionalTypeRepr(OptionalTypeRepr *T) {
 bool Traversal::visitImplicitlyUnwrappedOptionalTypeRepr(ImplicitlyUnwrappedOptionalTypeRepr *T) {
   return doIt(T->getBase());
 }
+bool Traversal::visitPackExpansionTypeRepr(PackExpansionTypeRepr *T) {
+  return doIt(T->getPatternType());
+}
 
 bool Traversal::visitTupleTypeRepr(TupleTypeRepr *T) {
   for (auto &elem : T->getElements()) {
@@ -1927,12 +2030,12 @@ Pattern *Pattern::walk(ASTWalker &walker) {
 }
 
 TypeRepr *TypeRepr::walk(ASTWalker &walker) {
-  Traversal(walker).doIt(this);
+  (void)Traversal(walker).doIt(this);
   return this;
 }
 
 StmtConditionElement *StmtConditionElement::walk(ASTWalker &walker) {
-  Traversal(walker).doIt(*this);
+  (void)Traversal(walker).doIt(*this);
   return this;
 }
 

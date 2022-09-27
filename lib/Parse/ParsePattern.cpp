@@ -457,10 +457,12 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
       }
     }
 
-    // '...'?
+    // If this parameter had an ellipsis, check it has a TypeRepr.
     if (Tok.isEllipsis()) {
-      Tok.setKind(tok::ellipsis);
-      param.EllipsisLoc = consumeToken();
+      if (param.Type == nullptr && !param.isInvalid) {
+        diagnose(Tok, diag::untyped_pattern_ellipsis);
+        consumeToken();
+      }
     }
 
     // ('=' expr) or ('==' expr)?
@@ -477,19 +479,6 @@ Parser::parseParameterClause(SourceLoc &leftParenLoc,
       status |= parseDefaultArgument(
           *this, defaultArgs, defaultArgIndex, param.DefaultArg,
           param.hasInheritedDefaultArg, paramContext);
-
-      if (param.EllipsisLoc.isValid() && param.DefaultArg) {
-        // The range of the complete default argument.
-        SourceRange defaultArgRange;
-        if (auto init = param.DefaultArg)
-          defaultArgRange = SourceRange(param.EllipsisLoc, init->getEndLoc());
-
-        diagnose(EqualLoc, diag::parameter_vararg_default)
-          .highlight(param.EllipsisLoc)
-          .fixItRemove(defaultArgRange);
-        param.isInvalid = true;
-        param.DefaultArg = nullptr;
-      }
     }
 
     // If we haven't made progress, don't add the parameter.
@@ -626,7 +615,7 @@ mapParsedParameters(Parser &parser,
             if (isa<IsolatedTypeRepr>(STR))
               param->setIsolated(true);
             unwrappedType = STR->getBase();
-            continue;;
+            continue;
           }
 
           if (auto *CTR = dyn_cast<CompileTimeConstTypeRepr>(unwrappedType)) {
@@ -717,31 +706,6 @@ mapParsedParameters(Parser &parser,
 
       result = createParam(param, argName, SourceLoc(),
                            param.FirstName, param.FirstNameLoc);
-    }
-
-    // Warn when an unlabeled parameter follows a variadic parameter
-    if (!elements.empty() && elements.back()->isVariadic() && argName.empty()) {
-      // Closure parameters can't have external labels, so use a more specific
-      // diagnostic.
-      if (paramContext == Parser::ParameterContextKind::Closure)
-        parser.diagnose(
-            param.FirstNameLoc,
-            diag::closure_unlabeled_parameter_following_variadic_parameter);
-      else
-        parser.diagnose(param.FirstNameLoc,
-                        diag::unlabeled_parameter_following_variadic_parameter);
-    }
-
-    // If this parameter had an ellipsis, check it has a TypeRepr.
-    if (param.EllipsisLoc.isValid()) {
-      if (!result->getTypeRepr()) {
-        parser.diagnose(param.EllipsisLoc, diag::untyped_pattern_ellipsis)
-          .highlight(result->getSourceRange());
-
-        param.EllipsisLoc = SourceLoc();
-      } else {
-        result->setVariadic();
-      }
     }
 
     assert (((!param.DefaultArg &&
@@ -846,7 +810,7 @@ Parser::parseFunctionArguments(SmallVectorImpl<Identifier> &NamePieces,
     status |= CurriedParameterClause;
   }
 
-  // If the decl uses currying syntax, complain that that syntax has gone away.
+  // If the decl uses currying syntax, complain that syntax has gone away.
   if (MultipleParameterLists) {
     diagnose(BodyParams->getStartLoc(),
              diag::parameter_curry_syntax_removed);
@@ -863,7 +827,7 @@ Parser::parseFunctionArguments(SmallVectorImpl<Identifier> &NamePieces,
 ///
 /// Note that this leaves retType as null if unspecified.
 ParserStatus
-Parser::parseFunctionSignature(Identifier SimpleName,
+Parser::parseFunctionSignature(DeclBaseName SimpleName,
                                DeclName &FullName,
                                ParameterList *&bodyParams,
                                DefaultArgumentInfo &defaultArgs,
@@ -876,8 +840,11 @@ Parser::parseFunctionSignature(Identifier SimpleName,
   SmallVector<Identifier, 4> NamePieces;
   ParserStatus Status;
 
-  ParameterContextKind paramContext = SimpleName.isOperator() ?
-    ParameterContextKind::Operator : ParameterContextKind::Function;
+  ParameterContextKind paramContext = SimpleName.isOperator()
+    ? ParameterContextKind::Operator
+    : (SimpleName == DeclBaseName::createConstructor()
+         ? ParameterContextKind::Initializer
+         : ParameterContextKind::Function);
   Status |= parseFunctionArguments(NamePieces, bodyParams, paramContext,
                                    defaultArgs);
   FullName = DeclName(Context, SimpleName, NamePieces);
@@ -978,6 +945,7 @@ ParserStatus Parser::parseEffectsSpecifiers(SourceLoc existingArrowLoc,
             .fixItInsert(throwsLoc, isReasync ? "reasync " : "async ");
       }
       if (asyncLoc.isInvalid()) {
+        Tok.setKind(tok::contextual_keyword);
         if (reasync)
           *reasync = isReasync;
         asyncLoc = Tok.getLoc();
@@ -1119,8 +1087,8 @@ ParserResult<Pattern> Parser::parsePattern() {
   switch (Tok.getKind()) {
   case tok::l_paren:
     return parsePatternTuple();
-    
-  case tok::kw__:
+
+  case tok::kw__: {
     // Normally, '_' is invalid in type context for patterns, but they show up
     // in interface files as the name for type members that are non-public.
     // Treat them as an implicitly synthesized NamedPattern with a nameless
@@ -1134,13 +1102,18 @@ ParserResult<Pattern> Parser::parsePattern() {
       return makeParserResult(NamedPattern::createImplicit(Context, VD));
     }
     PatternCtx.setCreateSyntax(SyntaxKind::WildcardPattern);
-    return makeParserResult(new (Context) AnyPattern(consumeToken(tok::kw__)));
-    
+
+    const auto isAsyncLet =
+        InPatternWithAsyncAttribute && introducer == VarDecl::Introducer::Let;
+    return makeParserResult(
+        new (Context) AnyPattern(consumeToken(tok::kw__), isAsyncLet));
+  }
   case tok::identifier: {
     PatternCtx.setCreateSyntax(SyntaxKind::IdentifierPattern);
     Identifier name;
     SourceLoc loc = consumeIdentifier(name, /*diagnoseDollarPrefix=*/true);
-    if (Tok.isIdentifierOrUnderscore() && !Tok.isContextualDeclKeyword())
+    if (Tok.isIdentifierOrUnderscore() && !Tok.isContextualDeclKeyword() &&
+        !Tok.isAtStartOfLine())
       diagnoseConsecutiveIDs(name.str(), loc,
                              introducer == VarDecl::Introducer::Let
                              ? "constant" : "variable");
@@ -1174,7 +1147,10 @@ ParserResult<Pattern> Parser::parsePattern() {
     // In our recursive parse, remember that we're in a var/let pattern.
     llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
     T(InVarOrLetPattern, isLet ? IVOLP_InLet : IVOLP_InVar);
-    
+
+    // Reset async attribute in parser context.
+    llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
+
     ParserResult<Pattern> subPattern = parsePattern();
     if (subPattern.hasCodeCompletion())
       return makeParserCodeCompletionResult<Pattern>();
@@ -1383,6 +1359,9 @@ ParserResult<Pattern> Parser::parseMatchingPatternAsLetOrVar(bool isLet,
   // In our recursive parse, remember that we're in a var/let pattern.
   llvm::SaveAndRestore<decltype(InVarOrLetPattern)>
     T(InVarOrLetPattern, isLet ? IVOLP_InLet : IVOLP_InVar);
+
+  // Reset async attribute in parser context.
+  llvm::SaveAndRestore<bool> AsyncAttr(InPatternWithAsyncAttribute, false);
 
   ParserResult<Pattern> subPattern = parseMatchingPattern(isExprBasic);
   if (subPattern.isNull())

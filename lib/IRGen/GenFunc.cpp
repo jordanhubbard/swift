@@ -725,9 +725,9 @@ static unsigned findSinglePartiallyAppliedParameterIndexIgnoringEmptyTypes(
     IRGenFunction &IGF, CanSILFunctionType substType,
     CanSILFunctionType outType) {
   auto substParameters = substType->getParameters();
-  auto outParamters = outType->getParameters();
+  auto outParameters = outType->getParameters();
   unsigned firstNonEmpty = -1U;
-  for (unsigned paramIdx = outParamters.size() ; paramIdx != substParameters.size(); ++paramIdx) {
+  for (unsigned paramIdx = outParameters.size() ; paramIdx != substParameters.size(); ++paramIdx) {
     bool isEmpty =
         isABIIgnoredParameterWithoutStorage(IGF.IGM, IGF, substType, paramIdx);
     assert((isEmpty || firstNonEmpty == -1U) && "Expect at most one partially "
@@ -1263,7 +1263,7 @@ static llvm::Value *emitPartialApplicationForwarder(IRGenModule &IGM,
 
   fwd->setAttributes(outAttrs);
   // Merge initial attributes with outAttrs.
-  llvm::AttrBuilder b;
+  llvm::AttrBuilder b(IGM.getLLVMContext());
   IGM.constructInitialFnAttributes(b);
   fwd->addFnAttrs(b);
 
@@ -2434,7 +2434,9 @@ llvm::Function *IRGenFunction::getOrCreateResumeFromSuspensionFn() {
 }
 
 llvm::Function *IRGenFunction::createAsyncSuspendFn() {
-  StringRef name = "__swift_suspend_point";
+  llvm::SmallString<40> nameBuffer;
+  llvm::raw_svector_ostream(nameBuffer) << CurFn->getName() << ".1";
+  StringRef name(nameBuffer);
   if (llvm::GlobalValue *F = IGM.Module.getNamedValue(name))
     return cast<llvm::Function>(F);
 
@@ -2455,7 +2457,8 @@ llvm::Function *IRGenFunction::createAsyncSuspendFn() {
   suspendFn->setDoesNotThrow();
   IRGenFunction suspendIGF(IGM, suspendFn);
   if (IGM.DebugInfo)
-    IGM.DebugInfo->emitArtificialFunction(suspendIGF, suspendFn);
+    IGM.DebugInfo->emitOutlinedFunction(suspendIGF, suspendFn,
+                                        CurFn->getName());
   auto &Builder = suspendIGF.Builder;
 
   llvm::Value *resumeFunction = suspendFn->getArg(0);
@@ -2466,8 +2469,10 @@ llvm::Function *IRGenFunction::createAsyncSuspendFn() {
 
   // Sign the task resume function with the C function pointer schema.
   if (auto schema = IGM.getOptions().PointerAuth.FunctionPointers) {
-    // TODO: use the Clang type for TaskContinuationFunction*
+    // Use the Clang type for TaskContinuationFunction*
     // to make this work with type diversity.
+    if (schema.hasOtherDiscrimination())
+      schema = IGM.getOptions().PointerAuth.ClangTypeTaskContinuationFunction;
     auto authInfo = PointerAuthInfo::emit(suspendIGF, schema, nullptr,
                                           PointerAuthEntity());
     resumeFunction = emitPointerAuthSign(suspendIGF, resumeFunction, authInfo);

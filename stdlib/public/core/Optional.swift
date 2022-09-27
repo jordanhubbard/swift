@@ -10,8 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-/// A type that represents either a wrapped value or `nil`, the absence of a
-/// value.
+/// A type that represents either a wrapped value or the absence of a value.
 ///
 /// You use the `Optional` type whenever you use optional values, even if you
 /// never type the word `Optional`. Swift's type system usually shows the
@@ -375,9 +374,9 @@ extension Optional: Equatable where Wrapped: Equatable {
   /// `numberToMatch` constant is wrapped as an optional before comparing to the
   /// optional `numberFromString`:
   ///
-  ///     let numberToFind: Int = 23
+  ///     let numberToMatch: Int = 23
   ///     let numberFromString: Int? = Int("23")      // Optional(23)
-  ///     if numberToFind == numberFromString {
+  ///     if numberToMatch == numberFromString {
   ///         print("It's a match!")
   ///     }
   ///     // Prints "It's a match!"
@@ -396,7 +395,7 @@ extension Optional: Equatable where Wrapped: Equatable {
   /// - Parameters:
   ///   - lhs: An optional value to compare.
   ///   - rhs: Another optional value to compare.
-  @inlinable
+  @_transparent
   public static func ==(lhs: Wrapped?, rhs: Wrapped?) -> Bool {
     switch (lhs, rhs) {
     case let (l?, r?):

@@ -56,6 +56,9 @@ class ModuleFile
   friend class TypeDeserializer;
   friend class SILDeserializer;
   friend class ProtocolConformanceDeserializer;
+  template <serialization::decls_block::detail::TypeRecords TypeRecord>
+  friend class serialization::decls_block::detail::TypeRecordDispatch;
+  friend struct serialization::decls_block::detail::function_deserializer;
   using Status = serialization::Status;
   using TypeID = serialization::TypeID;
   using ProtocolConformanceID = serialization::ProtocolConformanceID;
@@ -256,6 +259,9 @@ private:
   /// Generic signatures referenced by this module.
   MutableArrayRef<Serialized<GenericSignature>> GenericSignatures;
 
+  /// Generic environments referenced by this module.
+  MutableArrayRef<Serialized<GenericEnvironment *>> GenericEnvironments;
+
   /// Substitution maps referenced by this module.
   MutableArrayRef<Serialized<SubstitutionMap>> SubstitutionMaps;
 
@@ -414,8 +420,14 @@ private:
                                 llvm::BitstreamCursor &Cursor);
 
   /// Read a list of associated type declarations in a protocol.
-  void readAssociatedTypes(SmallVectorImpl<AssociatedTypeDecl *> &assocTypes,
-                           llvm::BitstreamCursor &Cursor);
+  void readAssociatedTypes(
+      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes,
+      llvm::BitstreamCursor &Cursor);
+
+  /// Read a list of primary associated type declarations in a protocol.
+  void readPrimaryAssociatedTypes(
+      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes,
+      llvm::BitstreamCursor &Cursor);
 
   /// Populates the protocol's default witness table.
   ///
@@ -611,11 +623,11 @@ public:
   /// Note that this may cause other decls to load as well.
   void loadExtensions(NominalTypeDecl *nominal);
 
-  /// Load the methods within the given class that produce
+  /// Load the methods within the given nominal type that produce
   /// Objective-C class or instance methods with the given selector.
   ///
-  /// \param classDecl The class in which we are searching for @objc methods.
-  /// The search only considers this class and its extensions; not any
+  /// \param typeDecl The nominal in which we are searching for @objc methods.
+  /// The search only considers this type and its extensions; not any
   /// superclasses.
   ///
   /// \param selector The selector to search for.
@@ -625,7 +637,7 @@ public:
   ///
   /// \param methods The list of @objc methods in this class that have this
   /// selector and are instance/class methods as requested.
-  void loadObjCMethods(ClassDecl *classDecl,
+  void loadObjCMethods(NominalTypeDecl *typeDecl,
                        ObjCSelector selector,
                        bool isInstanceMethod,
                        llvm::TinyPtrVector<AbstractFunctionDecl *> &methods);
@@ -747,8 +759,14 @@ public:
                            SmallVectorImpl<ProtocolTypeAlias> &typeAliases) override;
 
   void
-  loadAssociatedTypes(const ProtocolDecl *proto, uint64_t contextData,
-                      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override;
+  loadAssociatedTypes(
+      const ProtocolDecl *proto, uint64_t contextData,
+      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override;
+
+  void
+  loadPrimaryAssociatedTypes(
+      const ProtocolDecl *proto, uint64_t contextData,
+      SmallVectorImpl<AssociatedTypeDecl *> &assocTypes) override;
 
   Optional<StringRef> getGroupNameById(unsigned Id) const;
   Optional<StringRef> getSourceFileNameById(unsigned Id) const;
@@ -846,6 +864,10 @@ public:
   /// Returns the generic signature for the given ID or the first error.
   llvm::Expected<GenericSignature>
   getGenericSignatureChecked(serialization::GenericSignatureID ID);
+
+  /// Returns the generic environment for the given ID or the first error.
+  llvm::Expected<GenericEnvironment *>
+  getGenericEnvironmentChecked(serialization::GenericEnvironmentID ID);
 
   /// Returns the substitution map for the given ID, deserializing it if
   /// needed.

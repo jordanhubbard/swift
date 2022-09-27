@@ -18,7 +18,6 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
-#include "swift/AST/DiagnosticsParse.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
 
@@ -64,170 +63,6 @@ static void printFullRevisionString(raw_ostream &out) {
 
 #if defined(SWIFT_REVISION)
   out << "Swift " << StringRef(SWIFT_REVISION).slice(0, 15);
-#endif
-}
-
-static void splitVersionComponents(
-  SmallVectorImpl<std::pair<StringRef, SourceRange>> &SplitComponents,
-                            StringRef &VersionString, SourceLoc Loc,
-                            bool skipQuote = false) {
-  SourceLoc Start = (Loc.isValid() && skipQuote) ? Loc.getAdvancedLoc(1) : Loc;
-  SourceLoc End = Start;
-
-  // Split the version string into tokens separated by the '.' character.
-  while (!VersionString.empty()) {
-    StringRef SplitComponent, Rest;
-    std::tie(SplitComponent, Rest) = VersionString.split('.');
-
-    if (Loc.isValid()) {
-      End = End.getAdvancedLoc(SplitComponent.size());
-    }
-    auto Range = Loc.isValid() ? SourceRange(Start, End) : SourceRange();
-    if (Loc.isValid())
-      End = End.getAdvancedLoc(1);
-    Start = End;
-    SplitComponents.push_back({SplitComponent, Range});
-    VersionString = Rest;
-  }
-}
-
-Optional<Version> Version::parseCompilerVersionString(
-  StringRef VersionString, SourceLoc Loc, DiagnosticEngine *Diags) {
-
-  Version CV;
-  SmallString<16> digits;
-  llvm::raw_svector_ostream OS(digits);
-  SmallVector<std::pair<StringRef, SourceRange>, 5> SplitComponents;
-
-  splitVersionComponents(SplitComponents, VersionString, Loc,
-                         /*skipQuote=*/true);
-
-  uint64_t ComponentNumber;
-  bool isValidVersion = true;
-
-  auto checkVersionComponent = [&](unsigned Component, SourceRange Range) {
-    unsigned limit = CV.Components.empty() ? 9223371 : 999;
-
-    if (Component > limit) {
-      if (Diags)
-        Diags->diagnose(Range.Start,
-                        diag::compiler_version_component_out_of_range, limit);
-      isValidVersion = false;
-    }
-  };
-
-  for (size_t i = 0; i < SplitComponents.size(); ++i) {
-    StringRef SplitComponent;
-    SourceRange Range;
-    std::tie(SplitComponent, Range) = SplitComponents[i];
-
-    // Version components can't be empty.
-    if (SplitComponent.empty()) {
-      if (Diags)
-        Diags->diagnose(Range.Start, diag::empty_version_component);
-      isValidVersion = false;
-      continue;
-    }
-
-    // The second version component isn't used for comparison.
-    if (i == 1) {
-      if (!SplitComponent.equals("*")) {
-        if (Diags)
-          Diags->diagnose(Range.Start, diag::unused_compiler_version_component)
-          .fixItReplaceChars(Range.Start, Range.End, "*");
-      }
-
-      CV.Components.push_back(0);
-      continue;
-    }
-
-    // All other version components must be numbers.
-    if (!SplitComponent.getAsInteger(10, ComponentNumber)) {
-      checkVersionComponent(ComponentNumber, Range);
-      CV.Components.push_back(ComponentNumber);
-      continue;
-    } else {
-      if (Diags)
-        Diags->diagnose(Range.Start, diag::version_component_not_number);
-      isValidVersion = false;
-    }
-  }
-
-  if (CV.Components.size() > 5) {
-    if (Diags)
-      Diags->diagnose(Loc, diag::compiler_version_too_many_components);
-    isValidVersion = false;
-  }
-
-  return isValidVersion ? Optional<Version>(CV) : None;
-}
-
-Optional<Version> Version::parseVersionString(StringRef VersionString,
-                                              SourceLoc Loc,
-                                              DiagnosticEngine *Diags) {
-  Version TheVersion;
-  SmallString<16> digits;
-  llvm::raw_svector_ostream OS(digits);
-  SmallVector<std::pair<StringRef, SourceRange>, 5> SplitComponents;
-  // Skip over quote character in string literal.
-
-  if (VersionString.empty()) {
-    if (Diags)
-      Diags->diagnose(Loc, diag::empty_version_string);
-    return None;
-  }
-
-  splitVersionComponents(SplitComponents, VersionString, Loc, Diags);
-
-  uint64_t ComponentNumber;
-  bool isValidVersion = true;
-
-  for (size_t i = 0; i < SplitComponents.size(); ++i) {
-    StringRef SplitComponent;
-    SourceRange Range;
-    std::tie(SplitComponent, Range) = SplitComponents[i];
-
-    // Version components can't be empty.
-    if (SplitComponent.empty()) {
-      if (Diags)
-        Diags->diagnose(Range.Start, diag::empty_version_component);
-
-      isValidVersion = false;
-      continue;
-    }
-
-    // All other version components must be numbers.
-    if (!SplitComponent.getAsInteger(10, ComponentNumber)) {
-      TheVersion.Components.push_back(ComponentNumber);
-      continue;
-    } else {
-      if (Diags)
-        Diags->diagnose(Range.Start,
-                        diag::version_component_not_number);
-      isValidVersion = false;
-    }
-  }
-
-  return isValidVersion ? Optional<Version>(TheVersion) : None;
-}
-
-Version::Version(StringRef VersionString,
-                 SourceLoc Loc,
-                 DiagnosticEngine *Diags)
-  : Version(*parseVersionString(VersionString, Loc, Diags))
-{}
-
-Version Version::getCurrentCompilerVersion() {
-#ifdef SWIFT_COMPILER_VERSION
-  auto currentVersion = Version::parseVersionString(
-    SWIFT_COMPILER_VERSION, SourceLoc(), nullptr);
-  assert(currentVersion.hasValue() &&
-         "Embedded Swift language version couldn't be parsed: '"
-         SWIFT_COMPILER_VERSION
-         "'");
-  return currentVersion.getValue();
-#else
-  return Version();
 #endif
 }
 
@@ -443,6 +278,22 @@ StringRef getSwiftRevision() {
   return SWIFT_REVISION;
 #else
   return "";
+#endif
+}
+
+bool isCurrentCompilerTagged() {
+#ifdef SWIFT_COMPILER_VERSION
+  return true;
+#else
+  return false;
+#endif
+}
+
+StringRef getCurrentCompilerTag() {
+#ifdef SWIFT_COMPILER_VERSION
+  return SWIFT_COMPILER_VERSION;
+#else
+  return StringRef();
 #endif
 }
 

@@ -272,6 +272,7 @@ configureCompletionInstance(std::shared_ptr<CompletionInstance> CompletionInst,
 
 SwiftLangSupport::SwiftLangSupport(SourceKit::Context &SKCtx)
     : NotificationCtr(SKCtx.getNotificationCenter()),
+      SwiftExecutablePath(SKCtx.getSwiftExecutablePath()),
       ReqTracker(SKCtx.getRequestTracker()), CCCache(new SwiftCompletionCache),
       CompileManager(RuntimeResourcePath, DiagnosticDocumentationPath) {
   llvm::SmallString<128> LibPath(SKCtx.getRuntimeLibPath());
@@ -283,7 +284,7 @@ SwiftLangSupport::SwiftLangSupport(SourceKit::Context &SKCtx)
   EditorDocuments = std::make_shared<SwiftEditorDocumentFileMap>();
   ASTMgr = std::make_shared<SwiftASTManager>(
       EditorDocuments, SKCtx.getGlobalConfiguration(), Stats, ReqTracker,
-      RuntimeResourcePath, DiagnosticDocumentationPath);
+      SwiftExecutablePath, RuntimeResourcePath, DiagnosticDocumentationPath);
 
   CompletionInst = std::make_shared<CompletionInstance>();
 
@@ -451,6 +452,8 @@ UIdent SwiftLangSupport::getUIDForSyntaxNodeKind(SyntaxNodeKind SC) {
   case SyntaxNodeKind::Identifier:
   case SyntaxNodeKind::DollarIdent:
     return KindIdentifier;
+  case SyntaxNodeKind::Operator:
+    return KindOperator;
   case SyntaxNodeKind::Integer:
   case SyntaxNodeKind::Floating:
     return KindNumber;

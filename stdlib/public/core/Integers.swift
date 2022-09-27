@@ -1878,7 +1878,7 @@ extension BinaryInteger {
 ///     print(Int16.max.binaryString)
 ///     // Prints "0b01111111_11111111"
 ///     print((101 as UInt8).binaryString)
-///     // Prints "0b11001001"
+///     // Prints "0b01100101"
 ///
 /// The `binaryString` implementation uses the static `bitWidth` property and
 /// the right shift operator (`>>`), both of which are available to any type
@@ -2036,7 +2036,7 @@ where Magnitude: FixedWidthInteger & UnsignedInteger,
   ///     // result.low  == 128
   ///
   /// The product of `x` and `y` is `-1920`, which is too large to represent in
-  /// an `Int8` instance. The `high` and `low` compnents of the `result` value
+  /// an `Int8` instance. The `high` and `low` components of the `result` value
   /// represent `-1920` when concatenated to form a double-width integer; that
   /// is, using `result.high` as the high byte and `result.low` as the low byte
   /// of an `Int16` instance.

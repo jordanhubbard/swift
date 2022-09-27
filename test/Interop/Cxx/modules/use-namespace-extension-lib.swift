@@ -1,7 +1,7 @@
 // RUN: %empty-directory(%t)
 // RUN: cd %t
-// RUN: %target-build-swift    -I %S/Inputs -Xfrontend -enable-cxx-interop %S/Inputs/namespace-extension-lib.swift -emit-module -emit-library -static -module-name NamespaceExtensionLib
-// RUN: %target-build-swift %s -I %S/Inputs -Xfrontend -enable-cxx-interop -o %t/run -I %t/ -L %t/ -lNamespaceExtensionLib
+// RUN: %target-build-swift    -I %S/Inputs -Xfrontend -enable-experimental-cxx-interop %S/Inputs/namespace-extension-lib.swift -emit-module -emit-library -static -module-name NamespaceExtensionLib
+// RUN: %target-build-swift %s -I %S/Inputs -Xfrontend -enable-experimental-cxx-interop -o %t/run -I %t/ -L %t/ -lNamespaceExtensionLib
 // RUN: %target-codesign %t/run
 // RUN: %target-run %t/run
 //
@@ -9,7 +9,7 @@
 // XFAIL: OS=windows-msvc
 
 import StdlibUnittest
-import Namespace
+import Namespaces
 import NamespaceExtensionLib
 
 var NamespacesTestSuite = TestSuite("Extension in library on namespace")

@@ -159,8 +159,8 @@ func testInOut(_ arg: inout Int) {
 }
 
 // Don't infer inout types.
-var ir = &i // expected-error {{use of extraneous '&'}}
-var ir2 = ((&i)) // expected-error {{use of extraneous '&'}}
+var ir = &i // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+var ir2 = ((&i)) // expected-error {{'&' may only be used to pass an argument to inout parameter}}
 
 // <rdar://problem/17133089>
 func takeArrayRef(_ x: inout Array<String>) { }
@@ -200,9 +200,9 @@ func testImmutableUnsafePointer(_ p: UnsafePointer<Int>) {
   p[0] = 1 // expected-error {{cannot assign through subscript: subscript is get-only}}
 }
 
-// <https://bugs.swift.org/browse/SR-7> Inferring closure param type to 
-// inout crashes compiler
-let g = { x in f0(x) } // expected-error{{passing value of type 'Int' to an inout parameter requires explicit '&'}} {{19-19=&}}
+/// https://github.com/apple/swift/issues/42633
+/// Inferring closure param type to `inout` crashes compiler
+let _ = { x in f0(x) } // expected-error{{passing value of type 'Int' to an inout parameter requires explicit '&'}} {{19-19=&}}
 
 // <rdar://problem/17245353> Crash with optional closure taking inout
 func rdar17245353() {
@@ -242,7 +242,8 @@ func wump<T>(to: T, _ body: (G<T>) -> ()) {}
 wump(to: 0, { $0[] = 0 })
 // expected-error@-1 {{missing argument for parameter #1 in call}}
 
-// SR-13732
+// https://github.com/apple/swift/issues/56129
+
 extension MutableCollection {
   public mutating func writePrefix<I: IteratorProtocol>(from source: inout I)
     -> (writtenCount: Int, afterLastWritten: Index)
@@ -279,10 +280,25 @@ func look_through_parens_when_checking_inout() {
   func modifyPoint(source: inout Point) {}
 
   var point = Point(x: 0, y: 0)
-  modifyPoint((&point)) // expected-error {{use of extraneous '&}} {{16-17=(}} {{15-16=&}}
-  modifyPoint(((&point))) // expected-error {{use of extraneous '&}} {{17-18=(}} {{15-16=&}}
-  modifyPoint(source: (&point)) // expected-error {{use of extraneous '&}} {{24-25=(}} {{23-24=&}}
-  modifyPoint(source: ((&point))) // expected-error {{use of extraneous '&}} {{25-26=(}} {{23-24=&}}
-  modifyPoint((&point), 0) // expected-error {{use of extraneous '&}} {{16-17=(}} {{15-16=&}}
-  modifyPoint((&point), msg: "") // expected-error {{use of extraneous '&}} {{16-17=(}} {{15-16=&}}
+  modifyPoint((&point)) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{16-17=(}} {{15-16=&}}
+  modifyPoint(((&point))) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{17-18=(}} {{15-16=&}}
+  modifyPoint(source: (&point)) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{24-25=(}} {{23-24=&}}
+  modifyPoint(source: ((&point))) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{25-26=(}} {{23-24=&}}
+  modifyPoint((&point), 0) // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{16-17=(}} {{15-16=&}}
+  modifyPoint((&point), msg: "") // expected-error {{'&' may only be used to pass an argument to inout parameter}} {{16-17=(}} {{15-16=&}}
+}
+
+// rdar://96631324 - compiler crash while producing diagnostics
+func test_incorrect_inout_at_assignment_source() {
+  class S {
+    var prop: String = ""
+  }
+
+  func test(s: S) {
+    let str: String = ""
+    let val: Int = 0
+
+    s.prop = &str // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+    s.prop = &val // expected-error {{'&' may only be used to pass an argument to inout parameter}}
+  }
 }

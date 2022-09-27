@@ -778,8 +778,7 @@ public:
   llvm::raw_ostream &printPretty(llvm::raw_ostream &os) const;
 
   /// Dump this name to standard error.
-  LLVM_ATTRIBUTE_DEPRECATED(void dump() const LLVM_ATTRIBUTE_USED,
-                            "only for use within the debugger");
+  SWIFT_DEBUG_DUMP;
 };
 
 inline DeclNameRef DeclNameRef::getFromOpaqueValue(void *p) {
@@ -836,7 +835,7 @@ public:
   /// Split \p string into selector pieces on colons to create an ObjCSelector.
   ///
   /// This should not be used to parse selectors written directly in Swift
-  /// source source code (e.g. the argument of an @objc attribute). Use the
+  /// source code (e.g. the argument of an @objc attribute). Use the
   /// parser for that.
   static llvm::Optional<ObjCSelector> parse(ASTContext &ctx, StringRef string);
 

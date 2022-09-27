@@ -27,20 +27,12 @@
 #include "swift/Runtime/Error.h"
 #include "swift/Runtime/Exclusivity.h"
 #include "swift/Runtime/HeapObject.h"
+#include "swift/Threading/Thread.h"
 #include <atomic>
+#include <new>
 
 #define SWIFT_FATAL_ERROR swift_Concurrency_fatalError
 #include "../runtime/StackAllocator.h"
-
-#if HAVE_PTHREAD_H
-#include <pthread.h>
-#endif
-#if defined(_WIN32)
-#define WIN32_LEAN_AND_MEAN
-#define VC_EXTRA_LEAN
-#define NOMINMAX
-#include <Windows.h>
-#endif
 
 namespace swift {
 
@@ -48,25 +40,9 @@ namespace swift {
 // If this is enabled, tests with `swift_task_debug_log` requirement can run.
 #if 0
 #define SWIFT_TASK_DEBUG_LOG(fmt, ...)                                         \
-  fprintf(stderr, "[%lu] [%s:%d](%s) " fmt "\n",                               \
-          (unsigned long)_swift_get_thread_id(),                               \
-          __FILE__, __LINE__, __FUNCTION__,                                    \
-          __VA_ARGS__)
-
-#if defined(_WIN32)
-using ThreadID = decltype(GetCurrentThreadId());
-#else
-using ThreadID = decltype(pthread_self());
-#endif
-
-inline ThreadID _swift_get_thread_id() {
-#if defined(_WIN32)
-  return GetCurrentThreadId();
-#else
-  return pthread_self();
-#endif
-}
-
+  fprintf(stderr, "[%#lx] [%s:%d](%s) " fmt "\n",                              \
+          (unsigned long)Thread::current().platformThreadId(), __FILE__,       \
+          __LINE__, __FUNCTION__, __VA_ARGS__)
 #else
 #define SWIFT_TASK_DEBUG_LOG(fmt, ...) (void)0
 #endif
@@ -103,6 +79,8 @@ void asyncLet_addImpl(AsyncTask *task, AsyncLet *asyncLet,
 
 /// Clear the active task reference for the current thread.
 AsyncTask *_swift_task_clearCurrent();
+/// Set the active task reference for the current thread.
+AsyncTask *_swift_task_setCurrent(AsyncTask *newTask);
 
 /// release() establishes a happens-before relation with a preceding acquire()
 /// on the same address.
@@ -113,7 +91,7 @@ void _swift_tsan_release(void *addr);
 /// executors.
 #define DISPATCH_QUEUE_GLOBAL_EXECUTOR (void *)1
 
-#if !defined(SWIFT_STDLIB_SINGLE_THREADED_RUNTIME)
+#if SWIFT_CONCURRENCY_ENABLE_DISPATCH
 inline SerialExecutorWitnessTable *
 _swift_task_getDispatchQueueSerialExecutorWitnessTable() {
   extern SerialExecutorWitnessTable wtable
@@ -210,7 +188,7 @@ public:
 ///
 /// 32 bit systems with SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION=1
 ///
-///          Flags               Exeuction Lock           Unused           TaskStatusRecord *
+///          Flags               Execution Lock           Unused           TaskStatusRecord *
 /// |----------------------|----------------------|----------------------|-------------------|
 ///          32 bits                32 bits                32 bits              32 bits
 ///
@@ -295,6 +273,10 @@ class alignas(2 * sizeof(void*)) ActiveTaskStatus {
 #endif
   };
 
+  // Note: this structure is mirrored by ActiveTaskStatusWithEscalation and
+  // ActiveTaskStatusWithoutEscalation in
+  // include/swift/Reflection/RuntimeInternals.h. Any changes to the layout here
+  // must also be made there.
 #if SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION && SWIFT_POINTER_IS_4_BYTES
   uint32_t Flags;
   dispatch_lock_t ExecutionLock;
@@ -507,7 +489,9 @@ public:
   }
 
   void traceStatusChanged(AsyncTask *task) {
-    concurrency::trace::task_status_changed(task, Flags);
+    concurrency::trace::task_status_changed(
+        task, static_cast<uint8_t>(getStoredPriority()), isCancelled(),
+        isStoredPriorityEscalated(), isRunning(), isEnqueued());
   }
 };
 
@@ -539,7 +523,7 @@ struct AsyncTask::PrivateStorage {
 
   /// Storage for the ActiveTaskStatus. See doc for ActiveTaskStatus for size
   /// and alignment requirements.
-  alignas(2 * sizeof(void *)) char StatusStorage[sizeof(ActiveTaskStatus)];
+  alignas(ActiveTaskStatus) char StatusStorage[sizeof(ActiveTaskStatus)];
 
   /// The allocator for the task stack.
   /// Currently 2 words + 8 bytes.
@@ -642,11 +626,11 @@ AsyncTask::OpaquePrivateStorage::get() const {
   return reinterpret_cast<const PrivateStorage &>(*this);
 }
 inline void AsyncTask::OpaquePrivateStorage::initialize(JobPriority basePri) {
-  new (this) PrivateStorage(basePri);
+  ::new (this) PrivateStorage(basePri);
 }
 inline void AsyncTask::OpaquePrivateStorage::initializeWithSlab(
     JobPriority basePri, void *slab, size_t slabCapacity) {
-  new (this) PrivateStorage(basePri, slab, slabCapacity);
+  ::new (this) PrivateStorage(basePri, slab, slabCapacity);
 }
 inline void AsyncTask::OpaquePrivateStorage::complete(AsyncTask *task) {
   get().complete(task);
@@ -718,7 +702,7 @@ retry:;
 /// task. Otherwise, if we reset the voucher and priority escalation too early, the
 /// thread may be preempted immediately before we can finish the enqueue of the
 /// high priority task to the next location. We will then have a priority inversion
-/// of waiting for a low priority thread to enqueue a high priorty task.
+/// of waiting for a low priority thread to enqueue a high priority task.
 ///
 /// In order to do this correctly, we need enqueue-ing of a task to the next
 /// executor, to have a "hand-over-hand locking" type of behaviour - until the
@@ -730,7 +714,9 @@ retry:;
 ///
 /// rdar://88366470 (Direct handoff behaviour when tasks switch executors)
 inline void AsyncTask::flagAsAndEnqueueOnExecutor(ExecutorRef newExecutor) {
-
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  assert(false && "Should not enqueue any tasks to execute in task-to-thread model");
+#else
   SWIFT_TASK_DEBUG_LOG("%p->flagAsAndEnqueueOnExecutor()", this);
   auto oldStatus = _private()._status().load(std::memory_order_relaxed);
   auto newStatus = oldStatus;
@@ -764,16 +750,20 @@ inline void AsyncTask::flagAsAndEnqueueOnExecutor(ExecutorRef newExecutor) {
         oldStatus.getStoredPriority(), this);
       swift_dispatch_lock_override_end((qos_class_t) oldStatus.getStoredPriority());
     }
-#endif
+#endif /* SWIFT_CONCURRENCY_ENABLE_PRIORITY_ESCALATION */
     swift_task_exitThreadLocalContext((char *)&_private().ExclusivityAccessSet[0]);
     restoreTaskVoucher(this);
   }
 
   // Set up task for enqueue to next location by setting the Job priority field
   Flags.setPriority(newStatus.getStoredPriority());
-  concurrency::trace::task_flags_changed(this, Flags.getOpaqueValue());
+  concurrency::trace::task_flags_changed(
+      this, static_cast<uint8_t>(Flags.getPriority()), Flags.task_isChildTask(),
+      Flags.task_isFuture(), Flags.task_isGroupChildTask(),
+      Flags.task_isAsyncLetTask());
 
   swift_task_enqueue(this, newExecutor);
+#endif /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
 }
 
 inline void AsyncTask::flagAsSuspended() {

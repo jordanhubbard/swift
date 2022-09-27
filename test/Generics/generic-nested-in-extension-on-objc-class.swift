@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: cp %s %t/main.swift
-// RUN: %target-build-swift -module-name test %t/main.swift %S/inputs/generic-nested-in-extension-on-objc-class.swift -o %t/a.out
+// RUN: %target-build-swift -module-name test %t/main.swift %S/Inputs/generic-nested-in-extension-on-objc-class.swift -o %t/a.out
 // RUN: %target-codesign %t/a.out
 // RUN: %target-run %t/a.out | %FileCheck %s
 
@@ -9,9 +9,10 @@
 
 import Foundation
 
+// https://github.com/apple/swift/issues/53775
+//
 // Test the fix for a crash when instantiating the metadata for a generic type
 // nested in an extension on an ObjC class in a different file.
-// https://bugs.swift.org/browse/SR-11374
 
 extension NSString {
   class _Inner2<T> where T: NSObject {}

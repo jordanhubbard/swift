@@ -2,8 +2,10 @@
 
 // Build modules imported by this file.
 // RUN: %empty-directory(%t/lib)
-// RUN: %target-swift-frontend -typecheck -parse-stdlib -module-cache-path %t/mcp -emit-module-interface-path %t/lib/ShadowyHorror.swiftinterface %S/Inputs/ShadowyHorror.swift -enable-library-evolution -module-name ShadowyHorror -swift-version 5
-// RUN: %target-swift-frontend -typecheck -parse-stdlib -emit-module-interface-path %t/lib/TestModule.swiftinterface %S/Inputs/TestModule.swift -enable-library-evolution -module-name TestModule -swift-version 5
+// RUN: %target-swift-emit-module-interface(%t/lib/ShadowyHorror.swiftinterface) %S/Inputs/ShadowyHorror.swift -parse-stdlib -module-cache-path %t/mcp -module-name ShadowyHorror
+// RUN: %target-swift-typecheck-module-from-interface(%t/lib/ShadowyHorror.swiftinterface) -module-name ShadowyHorror
+// RUN: %target-swift-emit-module-interface(%t/lib/TestModule.swiftinterface) %S/Inputs/TestModule.swift -parse-stdlib -module-name TestModule
+// RUN: %target-swift-typecheck-module-from-interface(%t/lib/TestModule.swiftinterface) -module-name TestModule
 
 // Build this file as a module and check that it emits the expected warnings.
 // RUN: %empty-directory(%t/subtest-1)
@@ -17,7 +19,8 @@
 // RUN: %empty-directory(%t/subtest-3)
 // RUN: %target-swift-frontend -typecheck -parse-stdlib -module-cache-path %t/mcp -emit-module-interface-path %t/subtest-3/ShadowyHorror.swiftinterface %s -enable-library-evolution -module-name ShadowyHorror -DSELF_SHADOW -swift-version 5 2>&1 | %FileCheck --check-prefix SELF --implicit-check-not TestModule %s
 
-// Verify that the module-shadowing bugs we're trying to address haven't been fixed. (SR-898)
+// FIXME: Verify that the module-shadowing bugs we're trying to address haven't
+// been fixed (https://github.com/apple/swift/issues/43510).
 // RUN: not %target-swift-frontend -typecheck-module-from-interface %t/subtest-1/module_shadowing.swiftinterface -module-cache-path %t/mcp -I %t/lib -module-name module_shadowing 2>&1 | %FileCheck --check-prefix VERIFICATION %s
 // RUN: %target-swift-frontend -typecheck-module-from-interface %t/subtest-2/module_shadowing.swiftinterface -module-cache-path %t/mcp -I %t/lib -module-name module_shadowing
 // RUN: not %target-swift-frontend -typecheck-module-from-interface %t/subtest-3/ShadowyHorror.swiftinterface -module-cache-path %t/mcp -I %t/lib -module-name ShadowyHorror 2>&1 | %FileCheck --check-prefix VERIFICATION %s

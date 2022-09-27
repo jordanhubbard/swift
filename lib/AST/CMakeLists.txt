@@ -48,6 +48,7 @@ add_swift_host_library(swiftAST STATIC
   DocComment.cpp
   Effects.cpp
   Evaluator.cpp
+  ExistentialGeneralization.cpp
   Expr.cpp
   ExtInfo.cpp
   FineGrainedDependencies.cpp
@@ -56,7 +57,6 @@ add_swift_host_library(swiftAST STATIC
   GenericEnvironment.cpp
   GenericParamList.cpp
   GenericSignature.cpp
-  GenericSignatureBuilder.cpp
   Identifier.cpp
   ImportCache.cpp
   IndexSubset.cpp
@@ -69,30 +69,37 @@ add_swift_host_library(swiftAST STATIC
   NameLookup.cpp
   NameLookupRequests.cpp
   OperatorNameLookup.cpp
+  PackConformance.cpp
   Parameter.cpp
   Pattern.cpp
   PlatformKind.cpp
   PrettyStackTrace.cpp
   ProtocolConformance.cpp
+  ProtocolConformanceRef.cpp
   RawComment.cpp
   RequirementEnvironment.cpp
   RequirementMachine/ConcreteContraction.cpp
   RequirementMachine/ConcreteTypeWitness.cpp
+  RequirementMachine/Diagnostics.cpp
   RequirementMachine/GenericSignatureQueries.cpp
   RequirementMachine/HomotopyReduction.cpp
   RequirementMachine/InterfaceType.cpp
   RequirementMachine/KnuthBendix.cpp
   RequirementMachine/MinimalConformances.cpp
+  RequirementMachine/NameLookup.cpp
   RequirementMachine/NormalizeRewritePath.cpp
   RequirementMachine/PropertyMap.cpp
   RequirementMachine/PropertyRelations.cpp
   RequirementMachine/PropertyUnification.cpp
+  RequirementMachine/RequirementBuilder.cpp
   RequirementMachine/RequirementLowering.cpp
   RequirementMachine/RequirementMachine.cpp
   RequirementMachine/RequirementMachineRequests.cpp
   RequirementMachine/RewriteContext.cpp
   RequirementMachine/RewriteLoop.cpp
   RequirementMachine/RewriteSystem.cpp
+  RequirementMachine/Rule.cpp
+  RequirementMachine/RuleBuilder.cpp
   RequirementMachine/SimplifySubstitutions.cpp
   RequirementMachine/Symbol.cpp
   RequirementMachine/Term.cpp
@@ -130,6 +137,7 @@ if(NOT SWIFT_BUILD_ONLY_SYNTAXPARSERLIB)
     clangFormat
     clangToolingCore
     clangFrontendTool
+    clangDependencyScanning
     clangFrontend
     clangDriver
     clangSerialization
@@ -169,5 +177,6 @@ endif()
 # headers.
 # For more information see the comment at the top of lib/CMakeLists.txt.
 add_dependencies(swiftAST intrinsics_gen clang-tablegen-targets)
+add_dependencies(swiftAST swift-ast-generated-headers)
 
 set_swift_llvm_is_available(swiftAST)

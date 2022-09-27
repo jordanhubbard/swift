@@ -15,12 +15,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-try:
-    # py2
-    from StringIO import StringIO
-except ImportError:
-    # py3
-    from io import StringIO
+from io import StringIO
 
 from swift_build_support import shell
 from swift_build_support.products import Swift
@@ -61,6 +56,7 @@ class SwiftTestCase(unittest.TestCase):
             enable_experimental_differentiable_programming=False,
             enable_experimental_concurrency=False,
             enable_experimental_distributed=False,
+            build_early_swiftsyntax=False,
             build_swift_stdlib_static_print=False,
             build_swift_stdlib_unicode_data=True,
             swift_freestanding_is_darwin=False,

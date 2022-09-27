@@ -259,11 +259,11 @@ bb0(%0 : $UInt8):
 
 // CHECK-LABEL:  @tryapply_allocstack_and_copyaddr
 // CHECK:        PAIR #2.
-// CHECK-NEXT:       try_apply %3(%0) : $@convention(thin) (@in Int32) -> (Int32, @error Error), normal bb1, error bb2
+// CHECK-NEXT:       try_apply %3(%0) : $@convention(thin) (@in Int32) -> (Int32, @error any Error), normal bb1, error bb2
 // CHECK-NEXT:     %0 = argument of bb0 : $*Int32
 // CHECK-NEXT:     r=1,w=1
 // CHECK:        PAIR #3.
-// CHECK-NEXT:       try_apply %3(%0) : $@convention(thin) (@in Int32) -> (Int32, @error Error), normal bb1, error bb2
+// CHECK-NEXT:       try_apply %3(%0) : $@convention(thin) (@in Int32) -> (Int32, @error any Error), normal bb1, error bb2
 // CHECK-NEXT:       %1 = alloc_stack $Int32
 // CHECK-NEXT:     r=0,w=0
 sil @tryapply_allocstack_and_copyaddr : $@convention(thin) (@in Int32) -> Int32 {
@@ -697,6 +697,28 @@ bb3:
 bb4:
   destroy_value %0 : $X
   return %5 : $Int32
+}
+
+// CHECK-LABEL: @dontCrashWithOptionalNone
+// CHECK:       PAIR #0.
+// CHECK-NEXT:      %6 = apply %5() : $@convention(thin) () -> ()
+// CHECK-NEXT:      %4 = ref_element_addr [immutable] %3 : $X, #X.a
+// CHECK-NEXT:   r=1,w=1
+sil @dontCrashWithOptionalNone : $@convention(thin) () -> () {
+bb0:
+  %26 = enum $Optional<X>, #Optional.none!enumelt
+  switch_enum %26 : $Optional<X>, case #Optional.none!enumelt: bb1, case #Optional.some!enumelt: bb2
+bb1:
+  br bb3
+bb2:
+  %68 = unchecked_enum_data %26 : $Optional<X>, #Optional.some!enumelt
+  %1 = ref_element_addr [immutable] %68 : $X, #X.a
+  %5 = function_ref @nouser_func : $@convention(thin) () -> ()
+  %6 = apply %5() : $@convention(thin) () -> ()
+  br bb3
+bb3:
+  %r = tuple ()
+  return %r : $()
 }
 
 // CHECK-LABEL: @testLoadTake

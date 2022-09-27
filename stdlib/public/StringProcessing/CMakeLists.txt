@@ -12,7 +12,14 @@
 
 set(swift_string_processing_link_libraries
   swiftCore
-  swift_MatchingEngine)
+  swift_RegexParser)
+
+set(swift_string_processing_compile_flags)
+if(SWIFT_BUILD_STATIC_STDLIB)
+  # Explicitly autolink swift_RegexParser because it's imported with @_implementationOnly
+  list(APPEND swift_string_processing_compile_flags
+    "-Xfrontend" "-public-autolink-library" "-Xfrontend" "swift_RegexParser")
+endif()
 
 file(GLOB_RECURSE _STRING_PROCESSING_SOURCES
   "${EXPERIMENTAL_STRING_PROCESSING_SOURCE_DIR}/Sources/_StringProcessing/*.swift"
@@ -40,9 +47,10 @@ add_swift_target_library(swift_StringProcessing ${SWIFT_STDLIB_LIBRARY_BUILD_TYP
   C_COMPILE_FLAGS
     -Dswift_StringProcessing_EXPORTS
   SWIFT_COMPILE_FLAGS
+    ${swift_string_processing_compile_flags}
     ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
   LINK_FLAGS "${SWIFT_RUNTIME_SWIFT_LINK_FLAGS}"
 
-  SWIFT_MODULE_DEPENDS _MatchingEngine
+  SWIFT_MODULE_DEPENDS _RegexParser
   INSTALL_IN_COMPONENT stdlib
 )

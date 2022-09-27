@@ -27,6 +27,7 @@
 #include "swift/SIL/LinearLifetimeChecker.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
+#include "swift/SIL/PrunedLiveness.h"
 #include "swift/SIL/Projection.h"
 #include "swift/SIL/SILInstruction.h"
 #include "llvm/Support/Debug.h"
@@ -93,6 +94,7 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::SelectEnumAddrInst:
   case SILInstructionKind::SwitchEnumAddrInst:
   case SILInstructionKind::DeallocStackInst:
+  case SILInstructionKind::DeallocStackRefInst:
   case SILInstructionKind::DeallocBoxInst:
   case SILInstructionKind::WitnessMethodInst:
   case SILInstructionKind::ExistentialMetatypeInst:
@@ -107,6 +109,7 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
   case SILInstructionKind::DestroyValueInst:
   case SILInstructionKind::InjectEnumAddrInst:
   case SILInstructionKind::StoreInst:
+  case SILInstructionKind::StoreBorrowInst:
   case SILInstructionKind::AssignInst:
   case SILInstructionKind::UncheckedTakeEnumDataAddrInst:
   case SILInstructionKind::MarkFunctionEscapeInst:
@@ -129,10 +132,6 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
 #include "swift/AST/ReferenceStorage.def"
 
   // Ignored pointer uses...
-
-  // Allow store_borrow within the load_borrow scope.
-  // FIXME: explain why.
-  case SILInstructionKind::StoreBorrowInst:
   // Returns are never in scope.
   case SILInstructionKind::ReturnInst:
     return true;
@@ -166,6 +165,17 @@ bool GatherWritesVisitor::visitUse(Operand *op, AccessUseType useTy) {
     }
     // This operand is the copy source. Check if it is taken.
     if (cast<CopyAddrInst>(user)->isTakeOfSrc()) {
+      writeAccumulator.push_back(op);
+    }
+    return true;
+
+  case SILInstructionKind::ExplicitCopyAddrInst:
+    if (cast<ExplicitCopyAddrInst>(user)->getDest() == op->get()) {
+      writeAccumulator.push_back(op);
+      return true;
+    }
+    // This operand is the copy source. Check if it is taken.
+    if (cast<ExplicitCopyAddrInst>(user)->isTakeOfSrc()) {
       writeAccumulator.push_back(op);
     }
     return true;
@@ -302,7 +312,7 @@ LoadBorrowImmutabilityAnalysis::LoadBorrowImmutabilityAnalysis(
 
 // \p address may be an address, pointer, or box type.
 bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
-    LoadBorrowInst *lbi, ArrayRef<Operand *> endBorrowUses,
+    LoadBorrowInst *lbi,
     AccessPathWithBase accessPathWithBase) {
   auto accessPath = accessPathWithBase.accessPath;
   LinearLifetimeChecker checker(deadEndBlocks);
@@ -317,25 +327,29 @@ bool LoadBorrowImmutabilityAnalysis::isImmutableInScope(
   auto ownershipRoot = accessPath.getStorage().isReference()
                            ? findOwnershipReferenceRoot(accessPathWithBase.base)
                            : SILValue();
+
+  BorrowedValue borrowedValue(lbi);
+  PrunedLiveness borrowLiveness;
+  borrowedValue.computeLiveness(borrowLiveness);
+
   // Then for each write...
   for (auto *op : *writes) {
+    auto *write = op->getUser();
     // First see if the write is a dead end block. In such a case, just skip it.
-    if (deadEndBlocks.isDeadEnd(op->getUser()->getParent())) {
+    if (deadEndBlocks.isDeadEnd(write->getParent())) {
       continue;
     }
     // A destroy_value will be a definite write only when the destroy is on the
     // ownershipRoot
-    if (isa<DestroyValueInst>(op->getUser())) {
+    if (isa<DestroyValueInst>(write)) {
       if (op->get() != ownershipRoot)
         continue;
     }
-    // See if the write is within the load borrow's lifetime. If it isn't, we
-    // don't have to worry about it.
-    if (!checker.validateLifetime(lbi, endBorrowUses, op)) {
-      continue;
+
+    if (borrowLiveness.isWithinBoundaryOfDef(write, lbi)) {
+      llvm::errs() << "Write: " << *write;
+      return false;
     }
-    llvm::errs() << "Write: " << *op->getUser();
-    return false;
   }
   // Ok, we are good.
   return true;
@@ -359,13 +373,6 @@ bool LoadBorrowImmutabilityAnalysis::isImmutable(LoadBorrowInst *lbi) {
   if (accessPath.getStorage().isLetAccess()) {
     return true;
   }
-  // At this point, we know that we /may/ have writes. Now we go through various
-  // cases to try and exhaustively identify if those writes overlap with our
-  // load_borrow.
-  SmallVector<Operand *, 8> endBorrowUses;
-  transform(lbi->getUsersOfType<EndBorrowInst>(),
-            std::back_inserter(endBorrowUses),
-            [](EndBorrowInst *ebi) { return &ebi->getAllOperands()[0]; });
 
   switch (accessPath.getStorage().getKind()) {
   case AccessStorage::Nested: {
@@ -380,7 +387,7 @@ bool LoadBorrowImmutabilityAnalysis::isImmutable(LoadBorrowInst *lbi) {
     //
     // TODO: As a separate analysis, verify that the load_borrow scope is always
     // nested within the begin_access scope (to ensure no aliasing access).
-    return isImmutableInScope(lbi, endBorrowUses, accessPathWithBase);
+    return isImmutableInScope(lbi, accessPathWithBase);
   }
   case AccessStorage::Argument: {
     auto *arg =
@@ -388,7 +395,7 @@ bool LoadBorrowImmutabilityAnalysis::isImmutable(LoadBorrowInst *lbi) {
     if (arg->hasConvention(SILArgumentConvention::Indirect_In_Guaranteed)) {
       return true;
     }
-    return isImmutableInScope(lbi, endBorrowUses, accessPathWithBase);
+    return isImmutableInScope(lbi, accessPathWithBase);
   }
   // FIXME: A yielded address could overlap with another in this function.
   case AccessStorage::Yield:
@@ -398,7 +405,7 @@ bool LoadBorrowImmutabilityAnalysis::isImmutable(LoadBorrowInst *lbi) {
   case AccessStorage::Tail:
   case AccessStorage::Global:
   case AccessStorage::Unidentified:
-    return isImmutableInScope(lbi, endBorrowUses, accessPathWithBase);
+    return isImmutableInScope(lbi, accessPathWithBase);
   }
   llvm_unreachable("Covered switch isn't covered?!");
 }

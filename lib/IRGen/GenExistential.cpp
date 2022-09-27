@@ -1184,7 +1184,7 @@ public:
       spareBits.append(TC.IGM.getWitnessTablePtrSpareBits()); \
     } \
     auto storageTy = buildReferenceStorageType(TC.IGM, \
-                              TC.IGM.Name##ReferencePtrTy->getElementType()); \
+                              TC.IGM.Name##ReferencePtrTy->getPointerElementType()); \
     return AddressOnly##Name##ClassExistentialTypeInfo::create( \
                                                  getStoredProtocols(), \
                                                  storageTy, \
@@ -1209,7 +1209,7 @@ public:
       spareBits.append(TC.IGM.getWitnessTablePtrSpareBits()); \
     } \
     auto storageTy = buildReferenceStorageType(TC.IGM, \
-                              TC.IGM.Name##ReferencePtrTy->getElementType()); \
+                              TC.IGM.Name##ReferencePtrTy->getPointerElementType()); \
     if (TC.IGM.isLoadableReferenceAddressOnly(Refcounting)) { \
       return AddressOnly##Name##ClassExistentialTypeInfo::create( \
                                                    getStoredProtocols(), \
@@ -1384,7 +1384,7 @@ createErrorExistentialTypeInfo(IRGenModule &IGM,
   // The Error existential has a special boxed representation. It has
   // space only for witnesses to the Error protocol.
   assert(layout.isErrorExistential());
-  auto *protocol = layout.getProtocols()[0]->getDecl();
+  auto *protocol = layout.getProtocols()[0];
 
   auto refcounting = (!IGM.ObjCInterop
                       ? ReferenceCounting::Native
@@ -1440,16 +1440,23 @@ static const TypeInfo *createExistentialTypeInfo(IRGenModule &IGM, CanType T) {
     return createErrorExistentialTypeInfo(IGM, layout);
   }
 
-  // Note: Protocol composition types are not nominal, but we name them anyway.
-  if (auto existential = T->getAs<ExistentialType>()) {
-    T = existential->getConstraintType()->getCanonicalType();
-  }
   llvm::StructType *type;
-  if (isa<ProtocolType>(T) || isa<ParameterizedProtocolType>(T))
+  if (T->hasParameterizedExistential()) {
     type = IGM.createNominalType(T);
-  else
-    type = IGM.createNominalType(cast<ProtocolCompositionType>(T.getPointer()));
-    
+  } else {
+    // Note: Protocol composition types are not nominal, but we name them
+    // anyway.
+    if (auto existential = T->getAs<ExistentialType>()) {
+      T = existential->getConstraintType()->getCanonicalType();
+    }
+
+    if (isa<ProtocolType>(T))
+      type = IGM.createNominalType(T);
+    else
+      type =
+          IGM.createNominalType(cast<ProtocolCompositionType>(T.getPointer()));
+  }
+
   assert(type->isOpaque() && "creating existential type in concrete struct");
 
   // In an opaque metadata, the first two fields are the fixed buffer
@@ -1464,9 +1471,7 @@ static const TypeInfo *createExistentialTypeInfo(IRGenModule &IGM, CanType T) {
   // constraints are.
   bool allowsTaggedPointers = true;
 
-  for (auto protoTy : layout.getProtocols()) {
-    auto *protoDecl = protoTy->getDecl();
-
+  for (auto protoDecl : layout.getProtocols()) {
     if (protoDecl->getAttrs().hasAttribute<UnsafeNoObjCTaggedPointerAttr>())
       allowsTaggedPointers = false;
 
@@ -1588,9 +1593,7 @@ TypeConverter::convertExistentialMetatypeType(ExistentialMetatypeType *T) {
   auto spareBits = BitPatternBuilder(IGM.Triple.isLittleEndian());
   spareBits.append(baseTI.getSpareBits());
 
-  for (auto protoTy : layout.getProtocols()) {
-    auto *protoDecl = protoTy->getDecl();
-
+  for (auto protoDecl : layout.getProtocols()) {
     if (!Lowering::TypeConverter::protocolRequiresWitnessTable(protoDecl))
       continue;
 
@@ -1625,7 +1628,7 @@ static void forEachProtocolWitnessTable(
   assert(destProtocols.size() == conformances.size() &&
          "mismatched protocol conformances");
   for (unsigned i = 0, size = destProtocols.size(); i < size; ++i) {
-    auto destProtocol = destProtocols[i]->getDecl();
+    auto destProtocol = destProtocols[i];
     if (Lowering::TypeConverter::protocolRequiresWitnessTable(destProtocol))
       witnessConformances.push_back(conformances[i]);
   }

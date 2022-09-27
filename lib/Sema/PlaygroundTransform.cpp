@@ -576,12 +576,14 @@ public:
       } else if (auto *D = Element.dyn_cast<Decl *>()) {
         D->walk(CF);
         if (auto *PBD = dyn_cast<PatternBindingDecl>(D)) {
-          if (VarDecl *VD = PBD->getSingleVar()) {
-            if (VD->getParentInitializer()) {
-              Added<Stmt *> Log = logVarDecl(VD);
-              if (*Log) {
-                Elements.insert(Elements.begin() + (EI + 1), *Log);
-                ++EI;
+          if (!PBD->isAsyncLet()) {
+            if (VarDecl *VD = PBD->getSingleVar()) {
+              if (VD->getParentInitializer()) {
+                Added<Stmt *> Log = logVarDecl(VD);
+                if (*Log) {
+                  Elements.insert(Elements.begin() + (EI + 1), *Log);
+                  ++EI;
+                }
               }
             }
           }
@@ -591,7 +593,7 @@ public:
       }
     }
 
-    if (!TopLevel && !HighPerformance) {
+    if (!TopLevel && !HighPerformance && !BS->isImplicit()) {
       Elements.insert(Elements.begin(), *buildScopeEntry(BS->getSourceRange()));
       Elements.insert(Elements.end(), *buildScopeExit(BS->getSourceRange()));
     }
@@ -859,7 +861,7 @@ void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
     // FIXME: Remove this
     bool shouldWalkAccessorsTheOldWay() override { return true; }
 
-    bool walkToDeclPre(Decl *D) override {
+    PreWalkAction walkToDeclPre(Decl *D) override {
       if (auto *FD = dyn_cast<AbstractFunctionDecl>(D)) {
         if (!FD->isImplicit()) {
           if (BraceStmt *Body = FD->getBody()) {
@@ -869,7 +871,7 @@ void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
               FD->setBody(NewBody, AbstractFunctionDecl::BodyKind::TypeChecked);
               TypeChecker::checkFunctionEffects(FD);
             }
-            return false;
+            return Action::SkipChildren();
           }
         }
       } else if (auto *TLCD = dyn_cast<TopLevelCodeDecl>(D)) {
@@ -881,11 +883,11 @@ void swift::performPlaygroundTransform(SourceFile &SF, bool HighPerformance) {
               TLCD->setBody(NewBody);
               TypeChecker::checkTopLevelEffects(TLCD);
             }
-            return false;
+            return Action::SkipChildren();
           }
         }
       }
-      return true;
+      return Action::Continue();
     }
   };
 

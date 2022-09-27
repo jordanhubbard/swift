@@ -80,15 +80,24 @@ bool swift::triplesAreValidForZippering(const llvm::Triple &target,
 }
 
 const Optional<llvm::VersionTuple>
-swift::minimumABIStableOSVersionForTriple(const llvm::Triple &triple) {
+swift::minimumAvailableOSVersionForTriple(const llvm::Triple &triple) {
   if (triple.isMacOSX())
-    return llvm::VersionTuple(10, 14, 4);
+    return llvm::VersionTuple(10, 10, 0);
 
-  if (triple.isiOS() /* including tvOS */)
-    return llvm::VersionTuple(12, 2);
+  // Mac Catalyst was introduced with an iOS deployment target of 13.1.
+  if (tripleIsMacCatalystEnvironment(triple))
+    return llvm::VersionTuple(13, 1);
+  
+  // Note: this must come before checking iOS since that returns true for
+  // both iOS and tvOS.
+  if (triple.isTvOS())
+    return llvm::VersionTuple(9, 0);
+
+  if (triple.isiOS())
+    return llvm::VersionTuple(8, 0);
 
   if (triple.isWatchOS())
-    return llvm::VersionTuple(5, 2);
+    return llvm::VersionTuple(2, 0);
 
   return None;
 }
@@ -128,6 +137,7 @@ DarwinPlatformKind swift::getDarwinPlatformKind(const llvm::Triple &triple) {
 
     if (tripleIsiOSSimulator(triple))
       return DarwinPlatformKind::IPhoneOSSimulator;
+
     return DarwinPlatformKind::IPhoneOS;
   }
 
@@ -171,11 +181,14 @@ StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
   case llvm::Triple::Ananas:
   case llvm::Triple::CloudABI:
   case llvm::Triple::DragonFly:
+  case llvm::Triple::DriverKit:
   case llvm::Triple::Emscripten:
   case llvm::Triple::Fuchsia:
   case llvm::Triple::KFreeBSD:
   case llvm::Triple::Lv2:
   case llvm::Triple::NetBSD:
+  case llvm::Triple::PS5:
+  case llvm::Triple::ShaderModel:
   case llvm::Triple::Solaris:
   case llvm::Triple::Minix:
   case llvm::Triple::RTEMS:
@@ -385,11 +398,13 @@ llvm::Triple swift::getUnversionedTriple(const llvm::Triple &triple) {
 Optional<llvm::VersionTuple>
 swift::getSwiftRuntimeCompatibilityVersionForTarget(
     const llvm::Triple &Triple) {
-  unsigned Major, Minor, Micro;
   #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
   if (Triple.isMacOSX()) {
-    Triple.getMacOSXVersion(Major, Minor, Micro);
+    llvm::VersionTuple OSVersion;
+    Triple.getMacOSXVersion(OSVersion);
+    unsigned Major = OSVersion.getMajor();
+    unsigned Minor = OSVersion.getMinor().getValueOr(0);
 
     auto floorFor64 = [&Triple](llvm::VersionTuple v) {
       if (!Triple.isAArch64()) return v;
@@ -404,22 +419,27 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
       if (Minor <= 14) {
         return floorFor64(llvm::VersionTuple(5, 0));
       } else if (Minor <= 15) {
-        if (Micro <= 3) {
+        if (OSVersion.getSubminor().getValueOr(0) <= 3) {
           return floorFor64(llvm::VersionTuple(5, 1));
         } else {
           return floorFor64(llvm::VersionTuple(5, 2));
         }
       }
     } else if (Major == 11) {
-      if (Minor <= 3)
+      if (Minor <= 2)
         return floorFor64(llvm::VersionTuple(5, 3));
-
       return floorFor64(llvm::VersionTuple(5, 4));
     } else if (Major == 12) {
-      return floorFor64(llvm::VersionTuple(5, 5));
+      if (Minor <= 2)
+        return floorFor64(llvm::VersionTuple(5, 5));
+      return floorFor64(llvm::VersionTuple(5, 6));
+    } else if (Major == 13) {
+      return floorFor64(llvm::VersionTuple(5, 7));
     }
   } else if (Triple.isiOS()) { // includes tvOS
-    Triple.getiOSVersion(Major, Minor, Micro);
+    llvm::VersionTuple OSVersion = Triple.getiOSVersion();
+    unsigned Major = OSVersion.getMajor();
+    unsigned Minor = OSVersion.getMinor().getValueOr(0);
 
     auto floorForArchitecture = [&Triple, Major](llvm::VersionTuple v) {
       // arm64 simulators and macCatalyst are introduced in iOS 14.0/tvOS 14.0
@@ -450,16 +470,23 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
 
       return floorForArchitecture(llvm::VersionTuple(5, 4));
     } else if (Major <= 15) {
-      return floorForArchitecture(llvm::VersionTuple(5, 5));
+      if (Minor <= 3)
+        return floorForArchitecture(llvm::VersionTuple(5, 5));
+      return floorForArchitecture(llvm::VersionTuple(5, 6));
+    } else if (Major <= 16) {
+      return floorForArchitecture(llvm::VersionTuple(5, 7));
     }
   } else if (Triple.isWatchOS()) {
+    llvm::VersionTuple OSVersion = Triple.getWatchOSVersion();
+    unsigned Major = OSVersion.getMajor();
+    unsigned Minor = OSVersion.getMinor().getValueOr(0);
+
     auto floorFor64bits = [&Triple](llvm::VersionTuple v) {
       if (!Triple.isArch64Bit()) return v;
       // 64-bit watchOS was introduced with Swift 5.3
       return MAX(v, llvm::VersionTuple(5, 3));
     };
 
-    Triple.getWatchOSVersion(Major, Minor, Micro);
     if (Major <= 5) {
       return floorFor64bits(llvm::VersionTuple(5, 0));
     } else if (Major <= 6) {
@@ -469,12 +496,16 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
         return floorFor64bits(llvm::VersionTuple(5, 2));
       }
     } else if (Major <= 7) {
-      if (Minor <= 4)
+      if (Minor <= 3)
         return floorFor64bits(llvm::VersionTuple(5, 3));
 
       return floorFor64bits(llvm::VersionTuple(5, 4));
     } else if (Major <= 8) {
-      return floorFor64bits(llvm::VersionTuple(5, 5));
+      if (Minor <= 4)
+        return floorFor64bits(llvm::VersionTuple(5, 5));
+      return floorFor64bits(llvm::VersionTuple(5, 6));
+    } else if (Major <= 9) {
+      return floorFor64bits(llvm::VersionTuple(5, 7));
     }
   }
 

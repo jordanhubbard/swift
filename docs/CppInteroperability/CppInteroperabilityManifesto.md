@@ -500,7 +500,7 @@ accepts an address.
 
 C++ has complex overload resolution rules, in part to support certain API design
 patterns. Some API design patterns appeared as a consequence of overload
-resolution rules. Therefore, in C++ an "API atom" is an an overload set, not an
+resolution rules. Therefore, in C++ an "API atom" is an overload set, not an
 individual function ([CppCon 2018: Titus Winters "Modern C++ Design (part 1 of
 2)"](https://www.youtube.com/watch?v=xTdeZ4MxbKo)). The same is also the case in
 Swift, so, fundamentally, there is no impedance mismatch here.
@@ -938,7 +938,7 @@ be handled in Swift.
 
 While it is possible to [propagate C++ exceptions](#exceptions) thrown by normal
 member functions to Swift code, special member functions are different as they
-used used to implement value witnesses, which are called by the compiler
+used to implement value witnesses, which are called by the compiler
 implicitly. Therefore, either such exceptions have to be mapped to fatal errors
 (as we do for other unhandled C++ exceptions), or calls to such special member
 functions must be prevented statically.
@@ -1625,7 +1625,7 @@ is ergonomics.
 
 While Swift structs are a bad match for non-movable C++ classes, Swift classes
 match semantics better. For example, instances of Swift classes, once allocated,
-stay at the same address until `deinit`. Instances of Swift clasess are always
+stay at the same address until `deinit`. Instances of Swift classes are always
 worked with indirectly, eliminating the need to move them around in memory.
 
 Although user-defined Swift classes have a certain memory layout determined by
@@ -2337,7 +2337,7 @@ different APIs across specializations of the same class. All instantiations of a
 generic type in Swift have the API described in the generic declaration (with
 type parameters substituted), plus applicable conditional extensions.
 
-C++ templates support non-type template parameters, template template
+C++ templates support non-type template parameters, template
 parameters, and parameter packs (variadic generics), all of which are not
 supported in Swift.
 
@@ -2524,7 +2524,7 @@ there the Swift compiler infers the attribute for all users.
 This analysis relies on over-approximating the dynamic callgraph with the static
 callgraph. The static callgraph is feasible to compute in most cases, since
 Swift has very limited ways to abstract over an unspecialized generic function.
-Speicifically, Swift does not have generic closures. Swift does allow protocols
+Specifically, Swift does not have generic closures. Swift does allow protocols
 to have requirements for generic functions though.
 
 ### Function templates: importing as real generic functions
@@ -2963,7 +2963,7 @@ This brief sketch obviously leaves many questions unanswered on the detailed
 semantics that a `throws!` feature would have, for example whether user-written
 Swift code should be allowed to use `throws!` -- see also [this forum
 discussion](https://forums.swift.org/t/handling-c-exceptions/34823). Before we
-take any steps towards implementing C++ exception proagation, we will submit a
+take any steps towards implementing C++ exception propagation, we will submit a
 formal Swift Evolution proposal for the `throws!` feature.
 
 The other question to answer is how we would map the C++ exception to a
