@@ -1,47 +1,97 @@
-// RUN: %target-typecheck-verify-swift -enable-experimental-variadic-generics
+// RUN: %target-typecheck-verify-swift -enable-experimental-feature VariadicGenerics
 
-func f1<@_typeSequence T>() -> T... {}
-// expected-error@-1 {{variadic expansion 'T' cannot appear outside of a function parameter list, function result, tuple element or generic argument list}}
+// REQUIRES: asserts
 
-func f2<@_typeSequence T>() -> (T...) {}
+func f1<each T>() -> repeat each T {}
+// expected-error@-1 {{pack expansion 'repeat each T' can only appear in a function parameter list, tuple element, or generic argument list}}
+
+func f2<each T>() -> (repeat each T) {}
 // okay
 
-struct G<@_typeSequence T> {}
+struct G<each T> {}
 
-func f3<@_typeSequence T>() -> G<T... > {}
+func f3<each T>() -> G<repeat each T> {}
 
 protocol P<T> {
   associatedtype T
 }
 
-func f4<@_typeSequence T>() -> any P<T... > {}
+func f4<each T>() -> any P<repeat each T> {}
 
-typealias T1<@_typeSequence T> = T...
-// expected-error@-1 {{variadic expansion 'T' cannot appear outside of a function parameter list, function result, tuple element or generic argument list}}
+typealias T1<each T> = repeat each T
+// expected-error@-1 {{pack expansion 'repeat each T' can only appear in a function parameter list, tuple element, or generic argument list}}
 
-typealias T2<@_typeSequence T> = (T...)
+typealias T2<each T> = (repeat each T)
 
-func f4<@_typeSequence T>() -> () -> T... {}
-// expected-error@-1 {{variadic expansion '() -> T' cannot appear outside of a function parameter list, function result, tuple element or generic argument list}}
+func f4<each T>() -> repeat () -> each T {}
+// expected-error@-1 {{pack expansion 'repeat () -> each T' can only appear in a function parameter list, tuple element, or generic argument list}}
 
-func f5<@_typeSequence T>() -> () -> (T...) {}
+func f5<each T>() -> () -> (repeat each T) {}
 
-func f6<@_typeSequence T>() -> (T...) -> () {}
+func f6<each T>() -> (repeat each T) -> () {}
 
-enum E<@_typeSequence T> {
-  case f1(_: T...)
+enum E<each T> {
+  case f1(_: repeat each T)
 
-  case f2(_: G<T... >)
+  case f2(_: G<repeat each T>)
 
-  var x: T... { fatalError() }
-  // expected-error@-1 {{variadic expansion 'T' cannot appear outside of a function parameter list, function result, tuple element or generic argument list}}
+  var x: repeat each T { fatalError() }
+  // expected-error@-1 {{pack expansion 'repeat each T' can only appear in a function parameter list, tuple element, or generic argument list}}
 
-  var x: (T...) { fatalError() }
+  var x: (repeat each T) { fatalError() }
 
-  subscript(_: T...) -> Int { fatalError() }
+  subscript(_: repeat each T) -> Int { fatalError() }
 
-  subscript() -> T... { fatalError() }
-  // expected-error@-1 {{variadic expansion 'T' cannot appear outside of a function parameter list, function result, tuple element or generic argument list}}
+  subscript() -> repeat each T { fatalError() }
+  // expected-error@-1 {{pack expansion 'repeat each T' can only appear in a function parameter list, tuple element, or generic argument list}}
 
-  subscript() -> (T...) { fatalError() }
+  subscript() -> (repeat each T) { fatalError() }
+}
+
+func withWhereClause<each T>(_ x: repeat each T) where repeat each T: P {}
+// expected-error@-1 {{pack expansion 'repeat each T' can only appear in a function parameter list, tuple element, or generic argument list}}
+
+struct Outer<each T> {
+  struct Bad<each U> {
+    typealias Value = (repeat (each T, each U)) // expected-error {{pack expansion 'repeat (each T, each U)' requires that 'T' and 'U' have the same shape}}
+  }
+
+  struct Good<each U> where (repeat (each T, each U)): Any {
+    typealias Value = (repeat (each T, each U))
+  }
+
+  struct AlsoGood<each U> {
+    typealias Value = (repeat (each T, E<repeat each U>))
+  }
+}
+
+func packRef<each T>(_: repeat each T) where each T: P {}
+
+func packMemberRef<each T>(_: repeat each T.T) where each T: P {}
+
+// expected-error@+1 {{'each' cannot be applied to non-pack type 'Int'}}
+func invalidPackRefEachInt(_: each Int) {}
+
+// expected-error@+1 {{pack expansion 'Int' must contain at least one pack reference}}
+func invalidPackRefRepeatInt(_: repeat Int) {}
+
+// expected-error@+1 {{pack reference 'T' requires expansion using keyword 'repeat'}}
+func packRefOutsideExpansion<each T>(_: each T) {}
+
+// expected-error@+1 {{pack reference 'T' requires expansion using keyword 'repeat'}}
+func packRefOutsideExpansion<each T>(_: Array<each T>) {}
+
+// expected-error@+1 {{pack reference 'T' requires expansion using keyword 'repeat'}}
+func packRefOutsideExpansion<each T>(_: Array<(each T) -> ()>) {}
+
+// expected-error@+1 {{pack reference 'T' requires expansion using keyword 'repeat'}}
+func packRefOutsideExpansion<each T>(_: (each T)) {}
+
+// expected-error@+1 {{pack reference 'T' requires expansion using keyword 'repeat'}}
+func packRefOutsideExpansion<each T>(_: each T.Type) {}
+
+// coverage to ensure a 'repeat each' type is considered Copyable
+func golden<Z>(_ z: Z) {}
+func hour<each T>(_ t: repeat each T)  {
+  _ = (repeat golden(each t))
 }

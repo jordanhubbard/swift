@@ -252,6 +252,11 @@ bool ObjectOutliner::getObjectInitVals(SILValue Val,
       if (!getObjectInitVals(UC, MemberStores, TailStores, NumTailTupleElements,
                              toIgnore))
         return false;
+    } else if (auto *mvi = dyn_cast<MoveValueInst>(User)) {
+      // move_value is transparent.
+      if (!getObjectInitVals(mvi, MemberStores, TailStores,
+                             NumTailTupleElements, toIgnore))
+        return false;
     } else if (auto *REA = dyn_cast<RefElementAddrInst>(User)) {
       // The address of a stored property.
       for (Operand *ElemAddrUse : REA->getUses()) {
@@ -271,7 +276,7 @@ bool ObjectOutliner::getObjectInitVals(SILValue Val,
         if (auto *IA = dyn_cast<IndexAddrInst>(TailUser)) {
           // An index_addr yields the address of any tail element. Only if the
           // second operand (the index) is an integer literal we can figure out
-          // which tail element is refereneced.
+          // which tail element is referenced.
           int TailIdx = -1;
           if (auto *Index = dyn_cast<IntegerLiteralInst>(IA->getIndex()))
             TailIdx = Index->getValue().getZExtValue();
@@ -315,6 +320,9 @@ static EndCOWMutationInst *getEndCOWMutation(SILValue object) {
     if (auto *upCast = dyn_cast<UpcastInst>(user)) {
       // Look through upcast instructions.
       if (EndCOWMutationInst *ecm = getEndCOWMutation(upCast))
+        return ecm;
+    } else if (auto *mvi = dyn_cast<MoveValueInst>(user)) {
+      if (auto *ecm = getEndCOWMutation(mvi))
         return ecm;
     } else if (auto *ecm = dyn_cast<EndCOWMutationInst>(use->getUser())) {
       return ecm;

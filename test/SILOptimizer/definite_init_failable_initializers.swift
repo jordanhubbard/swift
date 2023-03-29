@@ -1,5 +1,7 @@
 // RUN: %target-swift-frontend -emit-sil -enable-copy-propagation=false %s | %FileCheck %s
 
+// REQUIRES: swift_in_compiler
+
 // Using -enable-copy-propagation=false to pattern match against older SIL
 // output. At least until -enable-copy-propagation has been around
 // long enough in the same form to be worth rewriting CHECK lines.
@@ -209,7 +211,7 @@ struct FailableAddrOnlyStruct<T : Pachyderm> {
 // CHECK-NEXT:    apply [[T_INIT_FN]]<T>([[X_BOX]], [[T_TYPE]])
 // CHECK-NEXT:    [[WRITE:%.*]] = begin_access [modify] [static] [[SELF_BOX]] : $*FailableAddrOnlyStruct<T>
 // CHECK-NEXT:    [[X_ADDR:%.*]] = struct_element_addr [[WRITE]]
-// CHECK-NEXT:    copy_addr [take] [[X_BOX]] to [initialization] [[X_ADDR]]
+// CHECK-NEXT:    copy_addr [take] [[X_BOX]] to [init] [[X_ADDR]]
 // CHECK-NEXT:    end_access [[WRITE]] : $*FailableAddrOnlyStruct<T>
 // CHECK-NEXT:    dealloc_stack [[X_BOX]]
 // CHECK-NEXT:    [[X_ADDR:%.*]] = struct_element_addr [[SELF_BOX]]
@@ -231,7 +233,7 @@ struct FailableAddrOnlyStruct<T : Pachyderm> {
 // CHECK-NEXT:    apply [[T_INIT_FN]]<T>([[X_BOX]], [[T_TYPE]])
 // CHECK-NEXT:    [[WRITE:%.*]] = begin_access [modify] [static] [[SELF_BOX]] : $*FailableAddrOnlyStruct<T>
 // CHECK-NEXT:    [[X_ADDR:%.*]] = struct_element_addr [[WRITE]]
-// CHECK-NEXT:    copy_addr [take] [[X_BOX]] to [initialization] [[X_ADDR]]
+// CHECK-NEXT:    copy_addr [take] [[X_BOX]] to [init] [[X_ADDR]]
 // CHECK-NEXT:    end_access [[WRITE]] : $*FailableAddrOnlyStruct<T>
 // CHECK-NEXT:    dealloc_stack [[X_BOX]]
 // CHECK-NEXT:    [[Y_BOX:%.*]] = alloc_stack $T
@@ -240,7 +242,7 @@ struct FailableAddrOnlyStruct<T : Pachyderm> {
 // CHECK-NEXT:    apply [[T_INIT_FN]]<T>([[Y_BOX]], [[T_TYPE]])
 // CHECK-NEXT:    [[WRITE:%.*]] = begin_access [modify] [static] [[SELF_BOX]] : $*FailableAddrOnlyStruct<T>
 // CHECK-NEXT:    [[Y_ADDR:%.*]] = struct_element_addr [[WRITE]]
-// CHECK-NEXT:    copy_addr [take] [[Y_BOX]] to [initialization] [[Y_ADDR]]
+// CHECK-NEXT:    copy_addr [take] [[Y_BOX]] to [init] [[Y_ADDR]]
 // CHECK-NEXT:    end_access [[WRITE]] : $*FailableAddrOnlyStruct<T>
 // CHECK-NEXT:    dealloc_stack [[Y_BOX]]
 // CHECK-NEXT:    destroy_addr [[SELF_BOX]]
@@ -779,7 +781,9 @@ class FailableBaseClass {
 //
 // CHECK:       [[FAIL_BB]]:
 // CHECK:         release_value [[SELF_OPTIONAL]]
-// CHECK:         br [[FAIL_TRAMPOLINE_BB:bb[0-9]+]]
+// CHECK:         dealloc_stack [[SELF_BOX]]
+// CHECK:         [[NEW_SELF:%.*]] = enum $Optional<FailableBaseClass>, #Optional.none!enumelt
+// CHECK-NEXT:    br [[EPILOG_BB:bb[0-9]+]]([[NEW_SELF]] : $Optional<FailableBaseClass>)
 //
 // CHECK:       [[SUCC_BB]]:
 // CHECK-NEXT:    [[SELF_VALUE:%.*]] = unchecked_enum_data [[SELF_OPTIONAL]]
@@ -788,11 +792,6 @@ class FailableBaseClass {
 // CHECK-NEXT:    [[NEW_SELF:%.*]] = enum $Optional<FailableBaseClass>, #Optional.some!enumelt, [[SELF_VALUE]]
 // CHECK-NEXT:    destroy_addr [[SELF_BOX]]
 // CHECK-NEXT:    dealloc_stack [[SELF_BOX]]
-// CHECK-NEXT:    br [[EPILOG_BB:bb[0-9]+]]([[NEW_SELF]] : $Optional<FailableBaseClass>)
-//
-// CHECK:       [[FAIL_TRAMPOLINE_BB]]:
-// CHECK:         dealloc_stack [[SELF_BOX]]
-// CHECK:         [[NEW_SELF:%.*]] = enum $Optional<FailableBaseClass>, #Optional.none!enumelt
 // CHECK-NEXT:    br [[EPILOG_BB]]([[NEW_SELF]] : $Optional<FailableBaseClass>)
 //
 // CHECK:       [[EPILOG_BB]]([[NEW_SELF:%.*]] : $Optional<FailableBaseClass>):

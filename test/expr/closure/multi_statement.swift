@@ -1,4 +1,3 @@
-
 // RUN: %target-typecheck-verify-swift -swift-version 5 -enable-experimental-static-assert
 
 func isInt<T>(_ value: T) -> Bool {
@@ -623,6 +622,74 @@ do {
     let bad2: () -> Void = {
       @Wrapper(wrappedValue: 42, argument: Baz.someCase.rawValue) var wrapped = 0
       // expected-error@-1 {{extra argument 'wrappedValue' in call}}
+    }
+  }
+}
+
+// Test to make sure that type-checker doesn't attempt the closure passed to
+// `.filter` before the one from `.init`, otherwise it would mean that generic
+// parameter of `.filter` wouldn't be inferred since it depends on result of
+// `.init` closure.
+func test_that_closures_are_attempted_in_order() {
+  struct Test<T> {
+    init(_: ([Int]) -> T) {}
+    init(_: String) {}
+    init(_: Int, _: String = "") {}
+
+    func filter(_: (T) -> Bool) {}
+  }
+
+  Test {
+    _ = 42
+    return $0.map { Optional(Float($0)) }
+  }
+  .filter {
+    if $0.isEmpty { // Ok
+      return true
+    }
+    return false
+  }
+}
+
+func test_use_of_concrete_params_in_for_condition() {
+  struct S {
+    var cond: Bool
+  }
+
+  func test(_: (S) -> Void) {}
+
+  test { data in
+    for i in 0...10 where !data.cond { // Ok
+      print(i)
+    }
+  }
+}
+
+// https://github.com/apple/swift/issues/63455
+func test_recursive_var_reference_in_multistatement_closure() {
+  struct MyStruct {
+    func someMethod() {}
+  }
+
+  func takeClosure(_ x: () -> Void) {}
+
+  func test(optionalInt: Int?, themes: MyStruct?) {
+    takeClosure {
+      let int = optionalInt { // expected-error {{cannot call value of non-function type 'Int?'}}
+        print(int)
+      }
+    }
+
+    takeClosure {
+      let theme = themes?.someMethod() { // expected-error {{extra trailing closure passed in call}}
+        _ = theme
+      }
+    }
+
+    takeClosure {
+      let theme = themes?.filter({ $0 }) { // expected-error {{value of type 'MyStruct' has no member 'filter'}}
+        _ = theme
+      }
     }
   }
 }

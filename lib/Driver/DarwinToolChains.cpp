@@ -216,30 +216,9 @@ static void addVersionString(const ArgList &inputArgs, ArgStringList &arguments,
                              llvm::VersionTuple version) {
   llvm::SmallString<8> buf;
   llvm::raw_svector_ostream os{buf};
-  os << version.getMajor() << '.' << version.getMinor().getValueOr(0) << '.'
-     << version.getSubminor().getValueOr(0);
+  os << version.getMajor() << '.' << version.getMinor().value_or(0) << '.'
+     << version.getSubminor().value_or(0);
   arguments.push_back(inputArgs.MakeArgString(os.str()));
-}
-
-/// Returns true if the compiler depends on features provided by the ObjC
-/// runtime that are not present on the deployment target indicated by
-/// \p triple.
-static bool wantsObjCRuntime(const llvm::Triple &triple) {
-  assert((!triple.isTvOS() || triple.isiOS()) &&
-         "tvOS is considered a kind of iOS");
-
-  // When updating the versions listed here, please record the most recent
-  // feature being depended on and when it was introduced:
-  //
-  // - Make assigning 'nil' to an NSMutableDictionary subscript delete the
-  //   entry, like it does for Swift.Dictionary, rather than trap.
-  if (triple.isiOS())
-    return triple.isOSVersionLT(9);
-  if (triple.isMacOSX())
-    return triple.isMacOSXVersionLT(10, 11);
-  if (triple.isWatchOS())
-    return false;
-  llvm_unreachable("unknown Darwin OS");
 }
 
 void
@@ -276,48 +255,6 @@ toolchains::Darwin::addLinkerInputArgs(InvocationInfo &II,
   // "-add_ast_path" linker option.
   addInputsOfType(Arguments, context.InputActions,
                   file_types::TY_SwiftModuleFile, "-add_ast_path");
-}
-
-static void findARCLiteLibPath(const toolchains::Darwin &TC,
-                               llvm::SmallVectorImpl<char> &ARCLiteLib) {
-  auto& D = TC.getDriver();
-  llvm::sys::path::append(ARCLiteLib, D.getSwiftProgramPath());
-  
-  llvm::sys::path::remove_filename(ARCLiteLib); // 'swift'
-  llvm::sys::path::remove_filename(ARCLiteLib); // 'bin'
-  llvm::sys::path::append(ARCLiteLib, "lib", "arc");
-
-  if (!llvm::sys::fs::is_directory(ARCLiteLib)) {
-    // If we don't have a 'lib/arc/' directory, find the "arclite" library
-    // relative to the Clang in the active Xcode.
-    ARCLiteLib.clear();
-    findXcodeClangLibPath("arc", ARCLiteLib);
-  }
-}
-
-void
-toolchains::Darwin::addArgsToLinkARCLite(ArgStringList &Arguments,
-                                         const JobContext &context) const {
-  if (!context.Args.hasFlag(options::OPT_link_objc_runtime,
-                            options::OPT_no_link_objc_runtime,
-                            /*Default=*/wantsObjCRuntime(getTriple())))
-    return;
-
-  llvm::SmallString<128> ARCLiteLib;
-  findARCLiteLibPath(*this, ARCLiteLib);
-
-  if (!ARCLiteLib.empty()) {
-    llvm::sys::path::append(ARCLiteLib, "libarclite_");
-    ARCLiteLib += getPlatformNameForTriple(getTriple());
-    ARCLiteLib += ".a";
-
-    Arguments.push_back("-force_load");
-    Arguments.push_back(context.Args.MakeArgString(ARCLiteLib));
-
-    // Arclite depends on CoreFoundation.
-    Arguments.push_back("-framework");
-    Arguments.push_back("CoreFoundation");
-  }
 }
 
 void toolchains::Darwin::addLTOLibArgs(ArgStringList &Arguments,
@@ -466,10 +403,11 @@ toolchains::Darwin::addArgsToLinkStdlib(ArgStringList &Arguments,
     // If the user has explicitly asked for a toolchain stdlib, we should
     // provide one using -rpath. This used to be the default behaviour but it
     // was considered annoying in at least the SwiftPM scenario (see
-    // https://bugs.swift.org/browse/SR-1967) and is obsolete in all scenarios
-    // of deploying for Swift-in-the-OS. We keep it here as an optional
-    // behaviour so that people downloading snapshot toolchains for testing new
-    // stdlibs will be able to link to the stdlib bundled in that toolchain.
+    // https://github.com/apple/swift/issues/44576) and is obsolete in all
+    // scenarios of deploying for Swift-in-the-OS. We keep it here as an
+    // optional behaviour so that people downloading snapshot toolchains for
+    // testing new stdlibs will be able to link to the stdlib bundled in
+    // that toolchain.
     for (auto path : RuntimeLibPaths) {
       Arguments.push_back("-rpath");
       Arguments.push_back(context.Args.MakeArgString(path));
@@ -611,7 +549,7 @@ toolchains::Darwin::addDeploymentTargetArgs(ArgStringList &Arguments,
 
         // The first deployment of arm64 for macOS is version 10.16;
         if (triple.isAArch64() && osVersion.getMajor() <= 10 &&
-            osVersion.getMinor().getValueOr(0) < 16) {
+            osVersion.getMinor().value_or(0) < 16) {
           osVersion = llvm::VersionTuple(/*Major=*/10, /*Minor=*/16);
           osVersion = canonicalizePlatformVersion(PlatformKind::macOS,
                                                   osVersion);
@@ -641,7 +579,7 @@ toolchains::Darwin::addDeploymentTargetArgs(ArgStringList &Arguments,
 
     // Compute the SDK version.
     auto sdkVersion = getTargetSDKVersion(triple)
-        .getValueOr(llvm::VersionTuple());
+        .value_or(llvm::VersionTuple());
 
     Arguments.push_back("-platform_version");
     Arguments.push_back(platformName);
@@ -739,8 +677,6 @@ toolchains::Darwin::constructInvocation(const DynamicLinkJobAction &job,
         ".a");
   if (llvm::sys::fs::exists(CompilerRTPath))
     Arguments.push_back(context.Args.MakeArgString(CompilerRTPath));
-
-  addArgsToLinkARCLite(Arguments, context);
 
   if (job.shouldPerformLTO()) {
     addLTOLibArgs(Arguments, context);
@@ -856,23 +792,6 @@ std::string toolchains::Darwin::getGlobalDebugPathRemapping() const {
   return {};
 }
 
-static void validateLinkObjcRuntimeARCLiteLib(const toolchains::Darwin &TC,
-                                              DiagnosticEngine &diags,
-                                              const llvm::opt::ArgList &args) {
-  auto Triple = TC.getTriple();
-  if (args.hasFlag(options::OPT_link_objc_runtime,
-                   options::OPT_no_link_objc_runtime,
-                   /*Default=*/wantsObjCRuntime(Triple))) {
-    llvm::SmallString<128> ARCLiteLib;
-    findARCLiteLibPath(TC, ARCLiteLib);
-    
-    if (ARCLiteLib.empty()) {
-      diags.diagnose(SourceLoc(),
-                     diag::warn_arclite_not_found_when_link_objc_runtime);
-    }
-  }
-}
-
 static void validateDeploymentTarget(const toolchains::Darwin &TC,
                                      DiagnosticEngine &diags,
                                      const llvm::opt::ArgList &args) {
@@ -910,7 +829,7 @@ static void validateTargetVariant(const toolchains::Darwin &TC,
                                   DiagnosticEngine &diags,
                                   const llvm::opt::ArgList &args,
                                   StringRef defaultTarget) {
-  if (TC.getTargetVariant().hasValue()) {
+  if (TC.getTargetVariant().has_value()) {
     auto target = TC.getTriple();
     auto variant = *TC.getTargetVariant();
 
@@ -926,15 +845,6 @@ void
 toolchains::Darwin::validateArguments(DiagnosticEngine &diags,
                                       const llvm::opt::ArgList &args,
                                       StringRef defaultTarget) const {
-  if (!getDriver().isDummyDriverForFrontendInvocation()) {
-    // Validating arclite library path when link-objc-runtime.
-    // If the driver is just set up to retrieve the swift-frontend invocation,
-    // we don't care about link-time, so we can skip this step, which may be
-    // expensive since it might call to `xcrun` to find `clang` and `arclite`
-    // relative to `clang`.
-    validateLinkObjcRuntimeARCLiteLib(*this, diags, args);
-  }
-
   // Validating apple platforms deployment targets.
   validateDeploymentTarget(*this, diags, args);
   validateTargetVariant(*this, diags, args, defaultTarget);
@@ -942,6 +852,12 @@ toolchains::Darwin::validateArguments(DiagnosticEngine &diags,
   // Validating darwin unsupported -static-stdlib argument.
   if (args.hasArg(options::OPT_static_stdlib)) {
     diags.diagnose(SourceLoc(), diag::error_darwin_static_stdlib_not_supported);
+  }
+
+  // Validating darwin deprecated -link-objc-runtime.
+  if (args.hasArg(options::OPT_link_objc_runtime,
+		  options::OPT_no_link_objc_runtime)) {
+    diags.diagnose(SourceLoc(), diag::warn_darwin_link_objc_deprecated);
   }
 
   // If a C++ standard library is specified, it has to be libc++.

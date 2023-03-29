@@ -876,11 +876,36 @@ FUNCTION(AllocateGenericClassMetadata, swift_allocateGenericClassMetadata,
          ATTRS(NoUnwind),
          EFFECT(MetaData))
 
+// Metadata *swift_allocateGenericClassMetadataWithLayoutString(
+//     ClassDescriptor *type,
+//     const void * const *arguments,
+//     const void *template);
+FUNCTION(AllocateGenericClassMetadataWithLayoutString,
+         swift_allocateGenericClassMetadataWithLayoutString,
+         C_CC, AlwaysAvailable,
+         RETURNS(TypeMetadataPtrTy),
+         ARGS(TypeContextDescriptorPtrTy, Int8PtrPtrTy, Int8PtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(MetaData))
+
 // Metadata *swift_allocateGenericValueMetadata(ValueTypeDescriptor *type,
 //                                              const void * const *arguments,
 //                                              const void *template,
 //                                              size_t extraSize);
 FUNCTION(AllocateGenericValueMetadata, swift_allocateGenericValueMetadata,
+         C_CC, AlwaysAvailable,
+         RETURNS(TypeMetadataPtrTy),
+         ARGS(TypeContextDescriptorPtrTy, Int8PtrPtrTy, Int8PtrTy, SizeTy),
+         ATTRS(NoUnwind),
+         EFFECT(MetaData))
+
+// Metadata *swift_allocateGenericValueMetadataWithLayoutString(
+//     ValueTypeDescriptor *type,
+//     const void * const *arguments,
+//     const void *template,
+//     size_t extraSize);
+FUNCTION(AllocateGenericValueMetadataWithLayoutString,
+         swift_allocateGenericValueMetadataWithLayoutString,
          C_CC, AlwaysAvailable,
          RETURNS(TypeMetadataPtrTy),
          ARGS(TypeContextDescriptorPtrTy, Int8PtrPtrTy, Int8PtrTy, SizeTy),
@@ -907,6 +932,13 @@ FUNCTION(GetWitnessTable, swift_getWitnessTable, C_CC, AlwaysAvailable,
               WitnessTablePtrPtrTy),
          ATTRS(NoUnwind, ReadOnly),
          EFFECT(MetaData)) // ?
+FUNCTION(GetWitnessTableRelative, swift_getWitnessTableRelative, C_CC, AlwaysAvailable,
+         RETURNS(WitnessTablePtrTy),
+         ARGS(ProtocolConformanceDescriptorPtrTy,
+              TypeMetadataPtrTy,
+              WitnessTablePtrPtrTy),
+         ATTRS(NoUnwind, ReadOnly),
+         EFFECT(MetaData)) // ?
 
 // MetadataResponse swift_getAssociatedTypeWitness(
 //                                            MetadataRequest request,
@@ -915,6 +947,16 @@ FUNCTION(GetWitnessTable, swift_getWitnessTable, C_CC, AlwaysAvailable,
 //                                            ProtocolRequirement *reqBase,
 //                                            ProtocolRequirement *assocType);
 FUNCTION(GetAssociatedTypeWitness, swift_getAssociatedTypeWitness,
+         SwiftCC, AlwaysAvailable,
+         RETURNS(TypeMetadataResponseTy),
+         ARGS(SizeTy,
+              WitnessTablePtrTy,
+              TypeMetadataPtrTy,
+              ProtocolRequirementStructTy->getPointerTo(),
+              ProtocolRequirementStructTy->getPointerTo()),
+         ATTRS(NoUnwind, ReadNone, WillReturn),
+         EFFECT(MetaData)) // ?
+FUNCTION(GetAssociatedTypeWitnessRelative, swift_getAssociatedTypeWitnessRelative,
          SwiftCC, AlwaysAvailable,
          RETURNS(TypeMetadataResponseTy),
          ARGS(SizeTy,
@@ -934,6 +976,16 @@ FUNCTION(GetAssociatedTypeWitness, swift_getAssociatedTypeWitness,
 //                                 const ProtocolRequirement *assocConformance);
 FUNCTION(GetAssociatedConformanceWitness,
          swift_getAssociatedConformanceWitness, SwiftCC, AlwaysAvailable,
+         RETURNS(WitnessTablePtrTy),
+         ARGS(WitnessTablePtrTy,
+              TypeMetadataPtrTy,
+              TypeMetadataPtrTy,
+              ProtocolRequirementStructTy->getPointerTo(),
+              ProtocolRequirementStructTy->getPointerTo()),
+         ATTRS(NoUnwind, ReadNone, WillReturn),
+         EFFECT(MetaData)) // ?
+FUNCTION(GetAssociatedConformanceWitnessRelative,
+         swift_getAssociatedConformanceWitnessRelative, SwiftCC, AlwaysAvailable,
          RETURNS(WitnessTablePtrTy),
          ARGS(WitnessTablePtrTy,
               TypeMetadataPtrTy,
@@ -1195,6 +1247,21 @@ FUNCTION(InitStructMetadata,
          RETURNS(VoidTy),
          ARGS(TypeMetadataPtrTy, SizeTy, SizeTy,
               Int8PtrPtrTy->getPointerTo(0),
+              Int32Ty->getPointerTo()),
+         ATTRS(NoUnwind),
+         EFFECT(MetaData))
+
+// void swift_initStructMetadataWithLayoutString(Metadata *structType,
+//                                               StructLayoutFlags flags,
+//                                               size_t numFields,
+//                                               Metadata * const *fieldTypes,
+//                                               uint32_t *fieldOffsets);
+FUNCTION(InitStructMetadataWithLayoutString,
+         swift_initStructMetadataWithLayoutString, C_CC, AlwaysAvailable,
+         RETURNS(VoidTy),
+         ARGS(TypeMetadataPtrTy, SizeTy, SizeTy,
+              Int8PtrPtrTy->getPointerTo(0),
+              Int8PtrTy,
               Int32Ty->getPointerTo()),
          ATTRS(NoUnwind),
          EFFECT(MetaData))
@@ -1971,6 +2038,15 @@ FUNCTION(DefaultActorDeallocateResilient,
          ATTRS(NoUnwind),
          EFFECT(Concurrency))
 
+// void swift_nonDefaultDistributedActor_initialize(NonDefaultDistributedActor *actor);
+FUNCTION(NonDefaultDistributedActorInitialize,
+         swift_nonDefaultDistributedActor_initialize, SwiftCC,
+         ConcurrencyAvailability,
+         RETURNS(VoidTy),
+         ARGS(RefCountedPtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(Concurrency))
+
 // OpaqueValue* swift_distributedActor_remote_initialize(
 //    const Metadata *actorType
 // );
@@ -2060,6 +2136,18 @@ FUNCTION(TaskGroupInitialize,
          ATTRS(NoUnwind),
          EFFECT(Concurrency))
 
+// void swift_taskGroup_initializeWithFlags(size_t flags, TaskGroup *group);
+FUNCTION(TaskGroupInitializeWithFlags,
+         swift_taskGroup_initializeWithFlags, SwiftCC,
+         ConcurrencyAvailability,
+         RETURNS(VoidTy),
+         ARGS(SizeTy,           // flags
+              Int8PtrTy,        // group
+              TypeMetadataPtrTy // T.Type
+         ),
+         ATTRS(NoUnwind),
+         EFFECT(Concurrency))
+
 // void swift_taskGroup_destroy(TaskGroup *group);
 FUNCTION(TaskGroupDestroy,
          swift_taskGroup_destroy, SwiftCC,
@@ -2120,6 +2208,61 @@ FUNCTION(StoreMultiPayloadEnumTagSinglePayload,
          ARGS(OpaquePtrTy, Int32Ty, Int32Ty, TypeMetadataPtrTy),
          ATTRS(NoUnwind),
          EFFECT(NoEffect))
+
+// void swift_generic_destroy(opaque*, const Metadata* type);
+FUNCTION(GenericDestroy,
+         swift_generic_destroy,
+         C_CC, AlwaysAvailable,
+         RETURNS(VoidTy),
+         ARGS(Int8PtrTy, TypeMetadataPtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(Deallocating))
+
+
+// void *swift_generic_assignWithCopy(opaque* dest, opaque* src, const Metadata* type);
+FUNCTION(GenericAssignWithCopy,
+         swift_generic_assignWithCopy,
+         C_CC, AlwaysAvailable,
+         RETURNS(Int8PtrTy),
+         ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(Refcounting, Deallocating))
+
+// void *swift_generic_assignWithTake(opaque* dest, opaque* src, const Metadata* type);
+FUNCTION(GenericAssignWithTake,
+         swift_generic_assignWithTake,
+         C_CC, AlwaysAvailable,
+         RETURNS(Int8PtrTy),
+         ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(Refcounting, Deallocating))
+
+// void *swift_generic_initWithCopy(opaque* dest, opaque* src, const Metadata* type);
+FUNCTION(GenericInitWithCopy,
+         swift_generic_initWithCopy,
+         C_CC, AlwaysAvailable,
+         RETURNS(Int8PtrTy),
+         ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(Refcounting))
+
+// void *swift_generic_initWithTake(opaque* dest, opaque* src, const Metadata* type);
+FUNCTION(GenericInitWithTake,
+         swift_generic_initWithTake,
+         C_CC, AlwaysAvailable,
+         RETURNS(Int8PtrTy),
+         ARGS(Int8PtrTy, Int8PtrTy, TypeMetadataPtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(Refcounting))
+
+// void swift_generic_instantiateLayoutString(const uint8_t* layoutStr, Metadata* type);
+FUNCTION(GenericInstantiateLayoutString,
+         swift_generic_instantiateLayoutString,
+         C_CC, AlwaysAvailable,
+         RETURNS(VoidTy),
+         ARGS(Int8PtrTy, TypeMetadataPtrTy),
+         ATTRS(NoUnwind),
+         EFFECT(MetaData))
 
 #undef RETURNS
 #undef ARGS

@@ -25,6 +25,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/ProtocolConformanceRef.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "llvm/Support/SaveAndRestore.h"
 
 using namespace swift;
@@ -280,6 +281,11 @@ void ConformanceLookupTable::updateLookupTable(NominalTypeDecl *nominal,
         [&](NominalTypeDecl *nominal) {
           addInheritedProtocols(nominal,
                                 ConformanceSource::forExplicit(nominal));
+
+          // Expand conformance macros.
+          ASTContext &ctx = nominal->getASTContext();
+          (void)evaluateOrDefault(
+              ctx.evaluator, ExpandConformanceMacros{nominal}, { });
         },
         [&](ExtensionDecl *ext,
             ArrayRef<ConformanceConstructionInfo> protos) {
@@ -920,7 +926,7 @@ ConformanceLookupTable::getConformance(NominalTypeDecl *nominal,
       // Find a SynthesizedProtocolAttr corresponding to the protocol.
       for (auto attr : conformingNominal->getAttrs()
              .getAttributes<SynthesizedProtocolAttr>()) {
-        auto otherProto = ctx.getProtocol(attr->getProtocolKind());
+        auto otherProto = attr->getProtocol();
         if (otherProto == impliedProto) {
           // Set the conformance loader to the loader stashed inside
           // the attribute.

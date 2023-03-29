@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 #include "swift/Sema/CSBindings.h"
 #include "TypeChecker.h"
+#include "swift/AST/GenericEnvironment.h"
 #include "swift/Sema/ConstraintGraph.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/SetVector.h"
@@ -498,9 +499,21 @@ void BindingSet::finalize(
       if (!hasViableBindings()) {
         inferTransitiveProtocolRequirements(inferredBindings);
 
-        if (TransitiveProtocols.hasValue()) {
+        if (TransitiveProtocols.has_value()) {
           for (auto *constraint : *TransitiveProtocols) {
-            auto protocolTy = constraint->getSecondType();
+            Type protocolTy = constraint->getSecondType();
+
+            // The Copyable protocol can't have members, yet will be a
+            // constraint of basically all type variables, so don't suggest it.
+            //
+            // NOTE: worth considering for all marker protocols, but keep in
+            // mind that you're allowed to extend them with members!
+            if (auto p = protocolTy->getAs<ProtocolType>()) {
+              if (ProtocolDecl *decl = p->getDecl())
+                if (decl->isSpecificProtocol(KnownProtocolKind::Copyable))
+                  continue;
+            }
+
             addBinding({protocolTy, AllowedBindingKind::Exact, constraint});
           }
         }
@@ -1065,6 +1078,69 @@ bool BindingSet::favoredOverDisjunction(Constraint *disjunction) const {
   return !involvesTypeVariables();
 }
 
+bool BindingSet::favoredOverConjunction(Constraint *conjunction) const {
+  if (CS.shouldAttemptFixes() && isHole()) {
+    if (forClosureResult() || forGenericParameter())
+      return false;
+  }
+
+  auto *locator = conjunction->getLocator();
+  if (locator->directlyAt<ClosureExpr>()) {
+    auto *closure = castToExpr<ClosureExpr>(locator->getAnchor());
+
+    if (auto transform = CS.getAppliedResultBuilderTransform(closure)) {
+      // Conjunctions that represent closures with result builder transformed
+      // bodies could be attempted right after their resolution if they meet
+      // all of the following criteria:
+      //
+      // - Builder type doesn't have any unresolved generic parameters;
+      // - Closure doesn't have any parameters;
+      // - The contextual result type is either concrete or opaque type.
+      auto contextualType = transform->contextualType;
+      if (!(contextualType && contextualType->is<FunctionType>()))
+        return true;
+
+      auto *contextualFnType =
+          CS.simplifyType(contextualType)->castTo<FunctionType>();
+      {
+        auto resultType = contextualFnType->getResult();
+        if (resultType->hasTypeVariable()) {
+          auto *typeVar = resultType->getAs<TypeVariableType>();
+          // If contextual result type is represented by an opaque type,
+          // it's a strong indication that body is self-contained, otherwise
+          // closure might rely on external types flowing into the body for
+          // disambiguation of `build{Partial}Block` or `buildFinalResult`
+          // calls.
+          if (!(typeVar && typeVar->getImpl().isOpaqueType()))
+            return true;
+        }
+      }
+
+      // If some of the closure parameters are unresolved, the conjunction
+      // has to be delayed to give them a chance to be inferred.
+      if (llvm::any_of(contextualFnType->getParams(), [](const auto &param) {
+            return param.getPlainType()->hasTypeVariable();
+          }))
+        return true;
+
+      // Check whether conjunction has any unresolved type variables
+      // besides the variable that represents the closure.
+      //
+      // Conjunction could refer to declarations from outer context
+      // (i.e. a variable declared in the outer closure) or generic
+      // parameters of the builder type), if any of such references
+      // are not yet inferred the conjunction has to be delayed.
+      auto *closureType = CS.getType(closure)->castTo<TypeVariableType>();
+      return llvm::any_of(
+          conjunction->getTypeVariables(), [&](TypeVariableType *typeVar) {
+            return !(typeVar == closureType || CS.getFixedType(typeVar));
+          });
+    }
+  }
+
+  return true;
+}
+
 BindingSet ConstraintSystem::getBindingsFor(TypeVariableType *typeVar,
                                             bool finalize) {
   assert(typeVar->getImpl().getRepresentative(nullptr) == typeVar &&
@@ -1281,6 +1357,7 @@ PotentialBindings::inferFromRelational(Constraint *constraint) {
 
     switch (constraint->getKind()) {
     case ConstraintKind::Subtype:
+    case ConstraintKind::SubclassOf:
     case ConstraintKind::Conversion:
     case ConstraintKind::ArgumentConversion:
     case ConstraintKind::OperatorArgumentConversion: {
@@ -1358,6 +1435,7 @@ void PotentialBindings::infer(Constraint *constraint) {
   case ConstraintKind::BindParam:
   case ConstraintKind::BindToPointerType:
   case ConstraintKind::Subtype:
+  case ConstraintKind::SubclassOf:
   case ConstraintKind::Conversion:
   case ConstraintKind::ArgumentConversion:
   case ConstraintKind::OperatorArgumentConversion:
@@ -1394,8 +1472,57 @@ void PotentialBindings::infer(Constraint *constraint) {
   case ConstraintKind::SyntacticElement:
   case ConstraintKind::Conjunction:
   case ConstraintKind::BindTupleOfFunctionParams:
+  case ConstraintKind::ShapeOf:
+  case ConstraintKind::ExplicitGenericArguments:
     // Constraints from which we can't do anything.
     break;
+
+  case ConstraintKind::PackElementOf: {
+    auto elementType = CS.simplifyType(constraint->getFirstType());
+    auto packType = CS.simplifyType(constraint->getSecondType());
+
+    if (elementType->isTypeVariableOrMember() && packType->isTypeVariableOrMember())
+      break;
+
+    auto *elementVar = elementType->getAs<TypeVariableType>();
+    auto *packVar = packType->getAs<TypeVariableType>();
+
+    if (elementVar == TypeVar && !packVar) {
+      // Produce a potential binding to the opened element archetype corresponding
+      // to the pack type.
+      auto shapeClass = packType->getReducedShape();
+      packType = packType->mapTypeOutOfContext();
+      auto *elementEnv = CS.getPackElementEnvironment(constraint->getLocator(),
+                                                      shapeClass);
+
+      // Without an opened element environment, we cannot derive the
+      // element binding.
+      if (!elementEnv)
+        break;
+
+      auto elementType = elementEnv->mapPackTypeIntoElementContext(packType);
+      assert(!elementType->is<PackType>());
+      addPotentialBinding({elementType, AllowedBindingKind::Exact, constraint});
+
+      break;
+    } else if (packVar == TypeVar && !elementVar) {
+      // Produce a potential binding to the pack archetype corresponding to
+      // the opened element type.
+      Type patternType;
+      auto *packEnv = CS.DC->getGenericEnvironmentOfContext();
+      if (!elementType->hasElementArchetype()) {
+        patternType = elementType;
+      } else {
+        patternType = packEnv->mapElementTypeIntoPackContext(elementType);
+      }
+
+      addPotentialBinding({patternType, AllowedBindingKind::Exact, constraint});
+
+      break;
+    }
+
+    break;
+  }
 
   // For now let's avoid inferring protocol requirements from
   // this constraint, but in the future we could do that to
@@ -1804,12 +1931,15 @@ void BindingSet::dump(llvm::raw_ostream &out, unsigned indent) const {
 
   if (!Defaults.empty()) {
     out << " [defaults: ";
-    for (const auto &entry : Defaults) {
-      auto *constraint = entry.second;
-      auto defaultBinding =
-          PrintableBinding::exact(constraint->getSecondType());
-      defaultBinding.print(out, PO);
-    }
+    interleave(
+        Defaults,
+        [&](const auto &entry) {
+          auto *constraint = entry.second;
+          auto defaultBinding =
+              PrintableBinding::exact(constraint->getSecondType());
+          defaultBinding.print(out, PO);
+        },
+        [&] { out << ", "; });
     out << "]";
   }
   
@@ -2094,6 +2224,14 @@ TypeVariableBinding::fixForHole(ConstraintSystem &cs) const {
   }
 
   if (srcLocator->isLastElement<LocatorPathElt::PlaceholderType>()) {
+    // When a 'nil' has a placeholder as contextual type there is not enough
+    // information to resolve it, so let's record a specify contextual type for
+    // nil fix.
+    if (isExpr<NilLiteralExpr>(srcLocator->getAnchor())) {
+      ConstraintFix *fix = SpecifyContextualTypeForNil::create(cs, dstLocator);
+      return std::make_pair(fix, /*impact=*/(unsigned)10);
+    }
+
     ConstraintFix *fix = SpecifyTypeForPlaceholder::create(cs, srcLocator);
     return std::make_pair(fix, defaultImpact);
   }
@@ -2204,8 +2342,9 @@ bool TypeVariableBinding::attempt(ConstraintSystem &cs) const {
   if (Binding.isDefaultableBinding()) {
     cs.DefaultedConstraints.insert(srcLocator);
 
+    // Fail if hole reporting fails.
     if (type->isPlaceholder() && reportHole())
-      return true;
+      return false;
   }
 
   if (cs.simplify())

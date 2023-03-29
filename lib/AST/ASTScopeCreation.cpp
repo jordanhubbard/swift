@@ -141,6 +141,10 @@ public:
       PreWalkAction walkToParameterListPre(ParameterList *PL) override {
         return Action::SkipChildren();
       }
+
+      MacroWalking getMacroWalkingBehavior() const override {
+        return MacroWalking::ArgumentsAndExpansion;
+      }
     };
 
     expr->walk(ClosureFinder(*this, parent));
@@ -246,7 +250,37 @@ void ASTSourceFileScope::expandFunctionBody(AbstractFunctionDecl *AFD) {
 
 ASTSourceFileScope::ASTSourceFileScope(SourceFile *SF,
                                        ScopeCreator *scopeCreator)
-    : SF(SF), scopeCreator(scopeCreator) {}
+    : SF(SF), scopeCreator(scopeCreator) {
+  if (auto enclosingSF = SF->getEnclosingSourceFile()) {
+    SourceLoc parentLoc;
+    auto macroRole = SF->getFulfilledMacroRole();
+    auto expansion = SF->getMacroExpansion();
+
+    // Determine the parent source location based on the macro role.
+    switch (*macroRole) {
+    case MacroRole::Expression:
+    case MacroRole::Declaration:
+    case MacroRole::Accessor:
+    case MacroRole::MemberAttribute:
+    case MacroRole::Peer:
+    case MacroRole::Conformance:
+      parentLoc = expansion.getStartLoc();
+      break;
+    case MacroRole::Member: {
+      // For synthesized member macros, take the end loc of the
+      // enclosing declaration (before the closing brace), because
+      // the macro expansion is inside this scope.
+      auto *decl = expansion.getAsDeclContext()->getAsDecl();
+      parentLoc = decl->getEndLoc();
+      break;
+    }
+    }
+
+    if (auto parentScope = findStartingScopeForLookup(enclosingSF, parentLoc)) {
+      parentAndWasExpanded.setPointer(const_cast<ASTScopeImpl *>(parentScope));
+    }
+  }
+}
 
 #pragma mark NodeAdder
 
@@ -281,7 +315,9 @@ public:
   VISIT_AND_IGNORE(ModuleDecl)
   VISIT_AND_IGNORE(ParamDecl)
   VISIT_AND_IGNORE(PoundDiagnosticDecl)
+  VISIT_AND_IGNORE(MissingDecl)
   VISIT_AND_IGNORE(MissingMemberDecl)
+  VISIT_AND_IGNORE(MacroExpansionDecl)
 
   // Only members of the active clause are in scope, and those
   // are visited separately.
@@ -316,6 +352,7 @@ public:
   VISIT_AND_CREATE(ForEachStmt, ForEachStmtScope)
   VISIT_AND_CREATE(CaseStmt, CaseStmtScope)
   VISIT_AND_CREATE(AbstractFunctionDecl, AbstractFunctionDeclScope)
+  VISIT_AND_CREATE(MacroDecl, MacroDeclScope)
 
 #undef VISIT_AND_CREATE
 
@@ -356,14 +393,14 @@ public:
   // the deferred nodes.
   ASTScopeImpl *visitGuardStmt(GuardStmt *e, ASTScopeImpl *p,
                                ScopeCreator &scopeCreator) {
-    ASTScopeAssert(endLoc.hasValue(), "GuardStmt outside of a BraceStmt?");
+    ASTScopeAssert(endLoc.has_value(), "GuardStmt outside of a BraceStmt?");
     return scopeCreator.constructExpandAndInsert<GuardStmtScope>(
       p, e, *endLoc);
   }
   ASTScopeImpl *visitTopLevelCodeDecl(TopLevelCodeDecl *d,
                                       ASTScopeImpl *p,
                                       ScopeCreator &scopeCreator) {
-    ASTScopeAssert(endLoc.hasValue(), "TopLevelCodeDecl in wrong place?");
+    ASTScopeAssert(endLoc.has_value(), "TopLevelCodeDecl in wrong place?");
     return scopeCreator.constructExpandAndInsert<TopLevelCodeScope>(
         p, d, *endLoc);
   }
@@ -411,7 +448,7 @@ public:
     }
 
     SourceLoc endLocForBraceStmt = bs->getEndLoc();
-    if (endLoc.hasValue())
+    if (endLoc.has_value())
       endLocForBraceStmt = *endLoc;
 
     ASTContext &ctx = scopeCreator.getASTContext();
@@ -452,6 +489,12 @@ public:
     return p;
   }
 
+  ASTScopeImpl *visitForgetStmt(ForgetStmt *fs, ASTScopeImpl *p,
+                               ScopeCreator &scopeCreator) {
+    visitExpr(fs->getSubExpr(), p, scopeCreator);
+    return p;
+  }
+
   ASTScopeImpl *visitPoundAssertStmt(PoundAssertStmt *pas,
                                      ASTScopeImpl *p,
                                      ScopeCreator &scopeCreator) {
@@ -461,9 +504,15 @@ public:
 
   ASTScopeImpl *visitExpr(Expr *expr, ASTScopeImpl *p,
                           ScopeCreator &scopeCreator) {
-    if (expr)
-      scopeCreator.addExprToScopeTree(expr, p);
+    if (!expr)
+      return p;
 
+    // If we have a single value statement expression, we expand scopes based
+    // on the underlying statement.
+    if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr))
+      return visit(SVE->getStmt(), p, scopeCreator);
+
+    scopeCreator.addExprToScopeTree(expr, p);
     return p;
   }
 };
@@ -566,7 +615,7 @@ ScopeCreator::addPatternBindingToScopeTree(PatternBindingDecl *patternBinding,
     Optional<SourceLoc> endLocForBinding = None;
     if (isLocalBinding) {
       endLocForBinding = endLoc;
-      ASTScopeAssert(endLoc.hasValue() && endLoc->isValid(),
+      ASTScopeAssert(endLoc.has_value() && endLoc->isValid(),
                      "PatternBindingDecl in local context outside of BraceStmt?");
     }
 
@@ -590,7 +639,7 @@ void ASTScopeImpl::addChild(ASTScopeImpl *child, ASTContext &ctx) {
   child->parentAndWasExpanded.setPointer(this);
 
 #ifndef NDEBUG
-  checkSourceRangeBeforeAddingChild(child, ctx);
+  // checkSourceRangeBeforeAddingChild(child, ctx);
 #endif
 
   // If this is the first time we've added children, notify the ASTContext
@@ -673,6 +722,7 @@ NO_NEW_INSERTION_POINT(ForEachStmtScope)
 NO_NEW_INSERTION_POINT(IfStmtScope)
 NO_NEW_INSERTION_POINT(RepeatWhileScope)
 NO_NEW_INSERTION_POINT(SubscriptDeclScope)
+NO_NEW_INSERTION_POINT(MacroDeclScope)
 NO_NEW_INSERTION_POINT(SwitchStmtScope)
 NO_NEW_INSERTION_POINT(WhileStmtScope)
 
@@ -691,9 +741,9 @@ ASTSourceFileScope::expandAScopeThatCreatesANewInsertionPoint(
   SourceLoc endLoc = getSourceRangeOfThisASTNode().End;
 
   ASTScopeImpl *insertionPoint = this;
-  for (auto *d : SF->getTopLevelDecls()) {
+  for (auto node : SF->getTopLevelItems()) {
     insertionPoint = scopeCreator.addToScopeTreeAndReturnInsertionPoint(
-      ASTNode(d), insertionPoint, endLoc);
+      node, insertionPoint, endLoc);
   }
 
   return {insertionPoint, "Next time decls are added they go here."};
@@ -884,13 +934,13 @@ namespace {
   /// Retrieve the opaque generic parameter list if present, otherwise the normal generic parameter list.
   template<typename T>
   GenericParamList *getPotentiallyOpaqueGenericParams(T *decl) {
-    if (auto opaqueRepr = decl->getOpaqueResultTypeRepr()) {
+    if (auto opaqueRepr = decl->getResultTypeRepr()) {
       if (auto namedOpaque = dyn_cast<NamedOpaqueReturnTypeRepr>(opaqueRepr)) {
         return namedOpaque->getGenericParams();
       }
     }
 
-    return decl->getGenericParams();
+    return decl->getParsedGenericParams();
   }
 }
 
@@ -1057,6 +1107,17 @@ void SubscriptDeclScope::expandAScopeThatDoesNotCreateANewInsertionPoint(
   scopeCreator.constructExpandAndInsert<ParameterListScope>(
       leaf, decl->getIndices(), decl->getAccessor(AccessorKind::Get));
   scopeCreator.addChildrenForParsedAccessors(decl, leaf);
+}
+
+void MacroDeclScope::expandAScopeThatDoesNotCreateANewInsertionPoint(
+    ScopeCreator &scopeCreator) {
+  scopeCreator.addChildrenForKnownAttributes(decl, this);
+  auto *leaf = scopeCreator.addNestedGenericParamScopesToTree(
+      decl, getPotentiallyOpaqueGenericParams(decl), this);
+  if (decl->parameterList) {
+    scopeCreator.constructExpandAndInsert<ParameterListScope>(
+        leaf, decl->parameterList, nullptr);
+  }
 }
 
 void CaptureListScope::expandAScopeThatDoesNotCreateANewInsertionPoint(

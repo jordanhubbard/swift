@@ -55,21 +55,9 @@ static bool checkNoEscapePartialApplyUse(Operand *oper, FollowUse followUses) {
       isa<CopyBlockWithoutEscapingInst>(user))
     return false;
 
-  // Ignore uses that are totally uninteresting. partial_apply [stack] is
-  // terminated by a dealloc_stack instruction.
-  if (isIncidentalUse(user) || onlyAffectsRefCount(user) ||
-      isa<DeallocStackInst>(user))
-    return false;
-
-  // Before checking conversions in general below (getSingleValueCopyOrCast),
-  // check for convert_function to [without_actually_escaping]. Assume such
-  // conversion are not actually escaping without following their uses.
-  if (auto *CFI = dyn_cast<ConvertFunctionInst>(user)) {
-    if (CFI->withoutActuallyEscaping())
-      return false;
-  }
-
   // Look through copies, borrows, and conversions.
+  // getSingleValueCopyOrCast handles all result producing instructions for
+  // which onlyAffectsRefCount returns true.
   if (SingleValueInstruction *copy = getSingleValueCopyOrCast(user)) {
     // Only follow the copied operand. Other operands are incidental,
     // as in the second operand of mark_dependence.
@@ -77,6 +65,22 @@ static bool checkNoEscapePartialApplyUse(Operand *oper, FollowUse followUses) {
       followUses(copy);
 
     return false;
+  }
+
+  // Ignore uses that are totally uninteresting. partial_apply [stack] is
+  // terminated by a dealloc_stack instruction.
+  if (isIncidentalUse(user) || onlyAffectsRefCount(user) ||
+      isa<DeallocStackInst>(user)) {
+    assert(user->getNumResults() == 0);
+    return false;
+  }
+
+  // Before checking conversions in general below (getSingleValueCopyOrCast),
+  // check for convert_function to [without_actually_escaping]. Assume such
+  // conversion are not actually escaping without following their uses.
+  if (auto *CFI = dyn_cast<ConvertFunctionInst>(user)) {
+    if (CFI->withoutActuallyEscaping())
+      return false;
   }
 
   // Look through `differentiable_function`.
@@ -148,9 +152,17 @@ static bool checkNoEscapePartialApplyUse(Operand *oper, FollowUse followUses) {
 }
 
 const ParamDecl *getParamDeclFromOperand(SILValue value) {
-  // Look through mark must check.
-  if (auto *mmci = dyn_cast<MarkMustCheckInst>(value))
-    value = mmci->getOperand();
+  while (true) {
+    // Look through mark must check.
+    if (auto *mmci = dyn_cast<MarkMustCheckInst>(value)) {
+      value = mmci->getOperand();
+    // Look through copies.
+    } else if (auto *ci = dyn_cast<CopyValueInst>(value)) {
+      value = ci->getOperand();
+    } else {
+      break;
+    }
+  }
 
   if (auto *arg = dyn_cast<SILArgument>(value))
     if (auto *decl = dyn_cast_or_null<ParamDecl>(arg->getDecl()))
@@ -263,6 +275,14 @@ static void diagnoseCaptureLoc(ASTContext &Context, DeclContext *DC,
   while (!uses.empty()) {
     Operand *oper = uses.pop_back_val();
     SILInstruction *user = oper->getUser();
+
+    // Look through copy_value.
+    if (auto *ci = dyn_cast<CopyValueInst>(user)) {
+      for (auto *use : ci->getUses()) {
+        uselistInsert(use);
+      }
+      continue;
+    }
 
     if (isIncidentalUse(user) || onlyAffectsRefCount(user))
       continue;
@@ -402,7 +422,7 @@ static void checkPartialApply(ASTContext &Context, DeclContext *DC,
     // For an autoclosure capture, present a way to fix the problem.
     if (paramName)
       diagnose(Context, PAI->getLoc(), diag::copy_inout_captured_by_autoclosure,
-               paramName.getValue());
+               paramName.value());
     else
       diagnose(Context, PAI->getLoc(), diag::copy_self_captured_by_autoclosure);
   }
@@ -478,6 +498,10 @@ static void checkApply(ASTContext &Context, FullApplySite site) {
     if (auto *CI = dyn_cast<ConversionInst>(arg)) {
       arglistInsert(CI->getConverted(), /*capture=*/false);
       continue;
+    }
+    
+    if (auto *Copy = dyn_cast<CopyValueInst>(arg)) {
+      arglistInsert(Copy->getOperand(), capture);
     }
 
     // If one of our call arguments is a noescape parameter, diagnose the

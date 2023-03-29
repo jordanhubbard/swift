@@ -24,7 +24,9 @@ class ArgumentList;
 class Decl;
 class Expr;
 class ClosureExpr;
+class CustomAttr;
 class ModuleDecl;
+class PackageUnit;
 class Stmt;
 class Pattern;
 class TypeRepr;
@@ -46,9 +48,17 @@ struct ReferenceMetaData {
   SemaReferenceKind Kind;
   llvm::Optional<AccessKind> AccKind;
   bool isImplicit = false;
-  ReferenceMetaData(SemaReferenceKind Kind, llvm::Optional<AccessKind> AccKind,
-                    bool isImplicit = false)
-      : Kind(Kind), AccKind(AccKind), isImplicit(isImplicit) {}
+
+  /// When non-none, this is a custom attribute reference.
+  Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef;
+
+  ReferenceMetaData(
+      SemaReferenceKind Kind, llvm::Optional<AccessKind> AccKind,
+      bool isImplicit = false,
+      Optional<std::pair<const CustomAttr *, Decl *>> customAttrRef
+        = None
+  ) : Kind(Kind), AccKind(AccKind), isImplicit(isImplicit),
+      CustomAttrRef(customAttrRef) {}
 };
 
 /// Specifies how the initialization expression of a \c lazy variable should be
@@ -70,11 +80,32 @@ enum class LazyInitializerWalking {
   InAccessor
 };
 
+/// Specifies the behavior for walking a macro expansion, whether we want to
+/// see the macro arguments, the expansion, or both.
+enum class MacroWalking {
+  /// Walk into the expansion of the macro, to see the semantic effect of
+  /// the macro expansion.
+  Expansion,
+
+  /// Walk into the arguments of the macro as written in the source code.
+  ///
+  /// The actual arguments walked may not make it into the program itself,
+  /// because they can be translated by the macro in arbitrary ways.
+  Arguments,
+
+  /// Walk into both the arguments of the macro as written in the source code
+  /// and also the macro expansion.
+  ArgumentsAndExpansion,
+
+  /// Don't walk into macros.
+  None
+};
+
 /// An abstract class used to traverse an AST.
 class ASTWalker {
 public:
   enum class ParentKind {
-    Module, Decl, Stmt, Expr, Pattern, TypeRepr
+    Package, Module, Decl, Stmt, Expr, Pattern, TypeRepr
   };
 
   class ParentTy {
@@ -82,6 +113,7 @@ public:
     void *Ptr = nullptr;
 
   public:
+    ParentTy(PackageUnit *Pkg) : Kind(ParentKind::Package), Ptr(Pkg) {}
     ParentTy(ModuleDecl *Mod) : Kind(ParentKind::Module), Ptr(Mod) {}
     ParentTy(Decl *D) : Kind(ParentKind::Decl), Ptr(D) {}
     ParentTy(Stmt *S) : Kind(ParentKind::Stmt), Ptr(S) {}
@@ -96,6 +128,10 @@ public:
       return Kind;
     }
 
+    PackageUnit *getAsPackage() const {
+      return Kind == ParentKind::Package ? static_cast<PackageUnit*>(Ptr)
+                                        : nullptr;
+    }
     ModuleDecl *getAsModule() const {
       return Kind == ParentKind::Module ? static_cast<ModuleDecl*>(Ptr)
                                         : nullptr;
@@ -493,6 +529,29 @@ public:
   /// of the synthesized getter, or should not be visited at all.
   virtual LazyInitializerWalking getLazyInitializerWalkingBehavior() {
     return LazyInitializerWalking::InPatternBinding;
+  }
+
+  /// This method configures how the walker should walk into uses of macros.
+  virtual MacroWalking getMacroWalkingBehavior() const {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
+  /// Determine whether we should walk macro arguments (as they appear in
+  /// source) and the expansion (which is semantically part of the program).
+  std::pair<bool, bool> shouldWalkMacroArgumentsAndExpansion() const {
+    switch (getMacroWalkingBehavior()) {
+    case MacroWalking::Expansion:
+      return std::make_pair(false, true);
+
+    case MacroWalking::Arguments:
+      return std::make_pair(true, false);
+
+    case MacroWalking::ArgumentsAndExpansion:
+      return std::make_pair(true, true);
+
+    case MacroWalking::None:
+      return std::make_pair(false, false);
+    }
   }
 
   /// This method configures whether the walker should visit the body of a

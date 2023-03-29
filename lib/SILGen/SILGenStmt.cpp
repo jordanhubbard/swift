@@ -24,6 +24,7 @@
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/Basic/ProfileCounter.h"
 #include "swift/SIL/BasicBlockUtils.h"
+#include "swift/SIL/AbstractionPatternGenerators.h"
 #include "swift/SIL/SILArgument.h"
 #include "llvm/Support/SaveAndRestore.h"
 
@@ -120,7 +121,7 @@ void SILGenFunction::eraseBasicBlock(SILBasicBlock *block) {
 // merged block will be visited again to determine if it can be merged with it's
 // successor, and so on, so no edges are skipped.
 //
-// In rare cases, the predessor is merged with its earlier successor, which has
+// In rare cases, the predecessor is merged with its earlier successor, which has
 // already been visited. If the successor can also be merged, then it has
 // already happened, and there is no need to revisit the merged block.
 void SILGenFunction::mergeCleanupBlocks() {
@@ -150,7 +151,7 @@ void SILGenFunction::mergeCleanupBlocks() {
     auto beforeSucc = std::next(SILFunction::reverse_iterator(succBB));
 
     // Remember the position before the current predecessor to avoid skipping
-    // blocks or revisiting blocks unnecessarilly.
+    // blocks or revisiting blocks unnecessarily.
     auto beforePred = std::next(SILFunction::reverse_iterator(predBB));
     // Since succBB will be erased, move before it.
     if (beforePred == SILFunction::reverse_iterator(succBB))
@@ -415,7 +416,16 @@ void StmtEmitter::visitBraceStmt(BraceStmt *S) {
       if (isa<ThrowStmt>(S))
         StmtType = ThrowStmtType;
     } else if (auto *E = ESD.dyn_cast<Expr*>()) {
-      SGF.emitIgnoredExpr(E);
+      // Check to see if we have an initialization for a SingleValueStmtExpr
+      // active, and if so, use it for this expression branch. If the expression
+      // is uninhabited, we can skip this, and let unreachability checking
+      // handle it.
+      auto *init = SGF.getSingleValueStmtInit(E);
+      if (init && !E->getType()->isStructurallyUninhabited()) {
+        SGF.emitExprInto(E, init);
+      } else {
+        SGF.emitIgnoredExpr(E);
+      }
     } else {
       auto *D = ESD.get<Decl*>();
 
@@ -446,8 +456,118 @@ namespace {
   };
 } // end anonymous namespace
 
+static void wrapInSubstToOrigInitialization(SILGenFunction &SGF,
+                                    InitializationPtr &init,
+                                    AbstractionPattern origType,
+                                    CanType substType,
+                                    SILType expectedTy) {
+  if (expectedTy.getASTType() != SGF.getLoweredRValueType(substType)) {
+    auto conversion =
+      Conversion::getSubstToOrig(origType, substType, expectedTy);
+    auto convertingInit = new ConvertingInitialization(conversion,
+                                                       std::move(init));
+    init.reset(convertingInit);
+  }
+}
+
 static InitializationPtr
-prepareIndirectResultInit(SILGenFunction &SGF,
+createIndirectResultInit(SILGenFunction &SGF, SILValue addr,
+                         SmallVectorImpl<CleanupHandle> &cleanups) {
+  // Create an initialization which will initialize it.
+  auto &resultTL = SGF.getTypeLowering(addr->getType());
+  auto temporary = SGF.useBufferAsTemporary(addr, resultTL);
+
+  // Remember the cleanup that will be activated.
+  auto cleanup = temporary->getInitializedCleanup();
+  if (cleanup.isValid())
+    cleanups.push_back(cleanup);
+
+  return InitializationPtr(temporary.release());
+}
+
+static InitializationPtr
+createIndirectResultInit(SILGenFunction &SGF, SILValue addr,
+                         AbstractionPattern origType,
+                         CanType substType,
+                         SmallVectorImpl<CleanupHandle> &cleanups) {
+  auto init = createIndirectResultInit(SGF, addr, cleanups);
+  wrapInSubstToOrigInitialization(SGF, init, origType, substType,
+                                  addr->getType());
+  return init;
+}
+
+static void
+preparePackResultInit(SILGenFunction &SGF, SILLocation loc,
+                      AbstractionPattern origExpansionType,
+                      CanTupleEltTypeArrayRef resultEltTypes,
+                      SILArgument *packAddr,
+                      SmallVectorImpl<CleanupHandle> &cleanups,
+                      SmallVectorImpl<InitializationPtr> &inits) {
+  auto loweredPackType = packAddr->getType().castTo<SILPackType>();
+  assert(loweredPackType->getNumElements() == resultEltTypes.size() &&
+         "mismatched pack components; possible missing substitutions on orig type?");
+
+  // If the pack expanded to nothing, there shouldn't be any initializers
+  // for it in our context.
+  if (resultEltTypes.empty()) {
+    return;
+  }
+
+  auto origPatternType = origExpansionType.getPackExpansionPatternType();
+
+  // Induce a formal pack type from the slice of the tuple elements.
+  CanPackType formalPackType =
+    CanPackType::get(SGF.getASTContext(), resultEltTypes);
+
+  for (auto componentIndex : indices(resultEltTypes)) {
+    auto resultComponentType = formalPackType.getElementType(componentIndex);
+    auto loweredComponentType = loweredPackType->getElementType(componentIndex);
+    assert(isa<PackExpansionType>(loweredComponentType)
+             == isa<PackExpansionType>(resultComponentType) &&
+           "need expansions in similar places");
+
+    // If we have a pack expansion, the initializer had better be a
+    // pack expansion expression, and we'll generate a loop for it.
+    // Preserve enough information to do this properly.
+    if (isa<PackExpansionType>(resultComponentType)) {
+      auto resultPatternType =
+        cast<PackExpansionType>(resultComponentType).getPatternType();
+      auto expectedPatternTy = SILType::getPrimitiveAddressType(
+        cast<PackExpansionType>(loweredComponentType).getPatternType());
+
+      auto init = PackExpansionInitialization::create(SGF, packAddr,
+                                                      formalPackType,
+                                                      componentIndex);
+
+      // Remember the cleanup for destroying all of the expansion elements.
+      auto expansionCleanup = init->getExpansionCleanup();
+      if (expansionCleanup.isValid())
+        cleanups.push_back(expansionCleanup);
+
+      inits.emplace_back(init.release());
+      wrapInSubstToOrigInitialization(SGF, inits.back(), origPatternType,
+                                      resultPatternType,
+                                      expectedPatternTy);
+
+    // Otherwise, we should be able to just project out the pack
+    // address and set up a nomal indirect result into it.
+    } else {
+      auto packIndex =
+        SGF.B.createScalarPackIndex(loc, componentIndex, formalPackType);
+      auto eltAddr =
+        SGF.B.createPackElementGet(loc, packIndex, packAddr,
+                SILType::getPrimitiveAddressType(loweredComponentType));
+
+      inits.push_back(createIndirectResultInit(SGF, eltAddr,
+                                               origPatternType,
+                                               resultComponentType,
+                                               cleanups));
+    }
+  }
+}
+
+static InitializationPtr
+prepareIndirectResultInit(SILGenFunction &SGF, SILLocation loc,
                           CanSILFunctionType fnTypeForResults,
                           AbstractionPattern origResultType,
                           CanType resultType,
@@ -458,18 +578,33 @@ prepareIndirectResultInit(SILGenFunction &SGF,
   // Recursively decompose tuple abstraction patterns.
   if (origResultType.isTuple()) {
     auto resultTupleType = cast<TupleType>(resultType);
-    auto tupleInit = new TupleInitialization();
+    auto tupleInit = new TupleInitialization(resultTupleType);
     tupleInit->SubInitializations.reserve(resultTupleType->getNumElements());
 
-    for (unsigned i = 0, e = origResultType.getNumTupleElements(); i < e; ++i) {
-      auto eltInit = prepareIndirectResultInit(SGF, fnTypeForResults,
-                                         origResultType.getTupleElementType(i),
-                                         resultTupleType.getElementType(i),
-                                         allResults,
-                                         directResults,
-                                         indirectResultAddrs, cleanups);
-      tupleInit->SubInitializations.push_back(std::move(eltInit));
-    }
+    origResultType.forEachTupleElement(resultTupleType,
+                                       [&](TupleElementGenerator &elt) {
+      if (!elt.isOrigPackExpansion()) {
+        auto eltInit = prepareIndirectResultInit(SGF, loc, fnTypeForResults,
+                                                 elt.getOrigType(),
+                                                 elt.getSubstTypes()[0],
+                                                 allResults,
+                                                 directResults,
+                                                 indirectResultAddrs,
+                                                 cleanups);
+        tupleInit->SubInitializations.push_back(std::move(eltInit));
+      } else {
+        assert(allResults[0].isPack());
+        assert(SGF.silConv.isSILIndirect(allResults[0]));
+        allResults = allResults.slice(1);
+
+        auto packAddr = indirectResultAddrs[0];
+        indirectResultAddrs = indirectResultAddrs.slice(1);
+
+        preparePackResultInit(SGF, loc, elt.getOrigType(), elt.getSubstTypes(),
+                              packAddr,
+                              cleanups, tupleInit->SubInitializations);
+      }
+    });
 
     return InitializationPtr(tupleInit);
   }
@@ -485,34 +620,21 @@ prepareIndirectResultInit(SILGenFunction &SGF,
     SILValue addr = indirectResultAddrs.front();
     indirectResultAddrs = indirectResultAddrs.slice(1);
 
-    // Create an initialization which will initialize it.
-    auto &resultTL = SGF.getTypeLowering(addr->getType());
-    auto temporary = SGF.useBufferAsTemporary(addr, resultTL);
-
-    // Remember the cleanup that will be activated.
-    auto cleanup = temporary->getInitializedCleanup();
-    if (cleanup.isValid())
-      cleanups.push_back(cleanup);
-    
-    init = InitializationPtr(temporary.release());
+    init = createIndirectResultInit(SGF, addr, origResultType, resultType,
+                                    cleanups);
   } else {
     // Otherwise, make an Initialization that stores the value in the
     // next element of the directResults array.
     auto storeInit = new StoreResultInitialization(directResults[0], cleanups);
     directResults = directResults.slice(1);
     init = InitializationPtr(storeInit);
+
+    SILType expectedResultTy =
+      SGF.getSILTypeInContext(result, fnTypeForResults);
+    wrapInSubstToOrigInitialization(SGF, init, origResultType, resultType,
+                                    expectedResultTy);
   }
-  
-  // Put a conversion in front of the initialization if necessary.
-  auto loweredResultTy = SGF.getLoweredType(origResultType, resultType);
-  if (loweredResultTy != SGF.getLoweredType(resultType)) {
-    auto conversion = Conversion::getSubstToOrig(origResultType,
-                                                 resultType,
-                                                 loweredResultTy);
-    auto convertingInit = new ConvertingInitialization(conversion,
-                                                       std::move(init));
-    init.reset(convertingInit);
-  }
+
   return init;
 }
 
@@ -524,7 +646,9 @@ prepareIndirectResultInit(SILGenFunction &SGF,
 /// \param cleanups - will be filled (after initialization completes)
 ///   with all the active cleanups managing the result values
 std::unique_ptr<Initialization>
-SILGenFunction::prepareIndirectResultInit(AbstractionPattern origResultType,
+SILGenFunction::prepareIndirectResultInit(
+                                 SILLocation loc,
+                                 AbstractionPattern origResultType,
                                  CanType formalResultType,
                                  SmallVectorImpl<SILValue> &directResultsBuffer,
                                  SmallVectorImpl<CleanupHandle> &cleanups) {
@@ -537,7 +661,7 @@ SILGenFunction::prepareIndirectResultInit(AbstractionPattern origResultType,
   MutableArrayRef<SILValue> directResults = directResultsBuffer;
   ArrayRef<SILArgument*> indirectResultAddrs = F.getIndirectResults();
 
-  auto init = ::prepareIndirectResultInit(*this,
+  auto init = ::prepareIndirectResultInit(*this, loc,
                                           fnConv.funcTy,
                                           origResultType,
                                           formalResultType, allResults,
@@ -568,7 +692,7 @@ void SILGenFunction::emitReturnExpr(SILLocation branchLoc,
     // Build an initialization which recursively destructures the tuple.
     SmallVector<CleanupHandle, 4> resultCleanups;
     InitializationPtr resultInit =
-      prepareIndirectResultInit(origRetTy,
+      prepareIndirectResultInit(ret, origRetTy,
                                 ret->getType()->getCanonicalType(),
                                 directResults, resultCleanups);
 
@@ -623,6 +747,24 @@ void StmtEmitter::visitReturnStmt(ReturnStmt *S) {
 void StmtEmitter::visitThrowStmt(ThrowStmt *S) {
   ManagedValue exn = SGF.emitRValueAsSingleValue(S->getSubExpr());
   SGF.emitThrow(S, exn, /* emit a call to willThrow */ true);
+}
+
+void StmtEmitter::visitForgetStmt(ForgetStmt *S) {
+  // A 'forget' simply triggers the memberwise, consuming destruction of 'self'.
+  ManagedValue selfValue = SGF.emitRValueAsSingleValue(S->getSubExpr());
+  CleanupLocation loc(S);
+
+  // \c fn could only be null if the type checker failed to call its 'set', or
+  // we somehow got to SILGen when errors were emitted!
+  auto *fn = S->getInnermostMethodContext();
+  if (!fn)
+    llvm_unreachable("internal compiler error with forget statement");
+
+  auto *nominal = fn->getDeclContext()->getSelfNominalTypeDecl();
+  assert(nominal);
+
+  SGF.emitMoveOnlyMemberDestruction(selfValue.forward(SGF), nominal, loc,
+                                    nullptr);
 }
 
 void StmtEmitter::visitYieldStmt(YieldStmt *S) {
@@ -752,7 +894,9 @@ void StmtEmitter::visitIfStmt(IfStmt *S) {
     LexicalScope trueScope(SGF, S);
 
     auto NumTrueTaken = SGF.loadProfilerCount(S->getThenStmt());
-    auto NumFalseTaken = SGF.loadProfilerCount(S->getElseStmt());
+    auto NumFalseTaken = ProfileCounter();
+    if (auto *Else = S->getElseStmt())
+      NumFalseTaken = SGF.loadProfilerCount(Else);
 
     SGF.emitStmtCondition(S->getCond(), falseDest, S, NumTrueTaken,
                           NumFalseTaken);

@@ -167,6 +167,25 @@ def verify_incremental_dependencies :
   Flag<["-"], "verify-incremental-dependencies">,
   Flags<[FrontendOption, HelpHidden]>,
   HelpText<"Enable the dependency verifier for each frontend job">;
+  
+def strict_implicit_module_context :
+  Flag<["-"], "strict-implicit-module-context">,
+  Flags<[FrontendOption, HelpHidden]>,
+  HelpText<"Enable the strict forwarding of compilation context to downstream implicit module dependencies">;
+  
+def no_strict_implicit_module_context :
+  Flag<["-"], "no-strict-implicit-module-context">,
+  Flags<[FrontendOption, HelpHidden]>,
+  HelpText<"Disable the strict forwarding of compilation context to downstream implicit module dependencies">;
+
+def validate_clang_modules_once :
+  Flag<["-"], "validate-clang-modules-once">,
+  Flags<[FrontendOption]>,
+  HelpText<"Don't verify input files for Clang modules if the module has been successfully validated or loaded during this build session">;
+
+def clang_build_session_file : Separate<["-"], "clang-build-session-file">,
+  Flags<[FrontendOption, ArgumentIsPath]>,
+  HelpText<"Use the last modification time of <file> as the underlying Clang build session timestamp">;
 
 def disallow_forwarding_driver :
   Flag<["-"], "disallow-use-new-driver">, Flags<[]>,
@@ -205,6 +224,25 @@ def parseable_output : Flag<["-"], "parseable-output">,
   Flags<[NoInteractiveOption, DoesNotAffectIncrementalBuild]>,
   HelpText<"Emit textual output in a parseable format">;
 
+// Windows Options
+
+def windows_sdk_root : Separate<["-"], "windows-sdk-root">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Windows SDK Root">, MetaVarName<"<root>">;
+def windows_sdk_version : Separate<["-"], "windows-sdk-version">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Windows SDK Version">, MetaVarName<"<version>">;
+def visualc_tools_root : Separate<["-"], "visualc-tools-root">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"VisualC++ Tools Root">, MetaVarName<"<root>">;
+def visualc_tools_version : Separate<["-"], "visualc-tools-version">,
+  Flags<[ArgumentIsPath, FrontendOption, SwiftAPIExtractOption,
+         SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"VisualC++ ToolSet Version">, MetaVarName<"<version>">;
+
 // Standard Options
 def _DASH_DASH : Option<["--"], "", KIND_REMAINING_ARGS>,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>;
@@ -242,7 +280,7 @@ def tools_directory : Separate<["-"], "tools-directory">,
 def D : JoinedOrSeparate<["-"], "D">, Flags<[FrontendOption]>,
   HelpText<"Marks a conditional compilation flag as true">;
   
-def e : JoinedOrSeparate<["-"], "e">, Flags<[NewDriverOnlyOption]>,
+def e : Separate<["-"], "e">, Flags<[NewDriverOnlyOption]>,
   HelpText<"Executes a line of code provided on the command line">;
 
 def F : JoinedOrSeparate<["-"], "F">,
@@ -260,6 +298,15 @@ def I : JoinedOrSeparate<["-"], "I">,
   HelpText<"Add directory to the import search path">;
 def I_EQ : Joined<["-"], "I=">, Flags<[FrontendOption, ArgumentIsPath]>,
   Alias<I>;
+
+def plugin_path : Separate<["-"], "plugin-path">,
+  Flags<[FrontendOption, ArgumentIsPath, SwiftAPIExtractOption, SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Add directory to the plugin search path">;
+
+def external_plugin_path : Separate<["-"], "external-plugin-path">,
+  Flags<[FrontendOption, ArgumentIsPath, SwiftAPIExtractOption, SwiftSymbolGraphExtractOption, SwiftAPIDigesterOption]>,
+  HelpText<"Add directory to the plugin search path with a plugin server executable">,
+  MetaVarName<"<path>#<plugin-server-path>">;
 
 def import_underlying_module : Flag<["-"], "import-underlying-module">,
   Flags<[FrontendOption, NoInteractiveOption]>,
@@ -342,6 +389,10 @@ def emit_cross_import_remarks : Flag<["-"], "Rcross-import">,
 def remark_loading_module : Flag<["-"], "Rmodule-loading">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
   HelpText<"Emit a remark and file path of each loaded module">;
+
+def remark_indexing_system_module : Flag<["-"], "Rindexing-system-module">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
+  HelpText<"Emit a remark when indexing a system module">;
 
 def remark_skip_explicit_interface_build : Flag<["-"], "Rskip-explicit-interface-build">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
@@ -437,7 +488,14 @@ def define_availability : Separate<["-"], "define-availability">,
 
 def check_api_availability_only : Flag<["-"], "check-api-availability-only">,
   Flags<[HelpHidden, FrontendOption, NoInteractiveOption]>,
-  HelpText<"Only check the availability of the APIs, ignore function bodies">;
+  HelpText<"Deprecated, has no effect">;
+
+def unavailable_decl_optimization_EQ : Joined<["-"], "unavailable-decl-optimization=">,
+  MetaVarName<"<complete,none>">,
+  Flags<[FrontendOption, NoInteractiveOption]>,
+  HelpText<"Specify the optimization mode for unavailable declarations. The "
+           "value may be 'none' (no optimization) or 'complete' (code is not "
+           "generated at all unavailable declarations)">;
 
 def library_level : Separate<["-"], "library-level">,
   MetaVarName<"<level>">,
@@ -467,6 +525,12 @@ def autolink_force_load : Flag<["-"], "autolink-force-load">,
 def module_abi_name : Separate<["-"], "module-abi-name">,
   Flags<[FrontendOption, ModuleInterfaceOption]>,
   HelpText<"ABI name to use for the contents of this module">;
+def package_name : Separate<["-"], "package-name">,
+  Flags<[FrontendOption, ModuleInterfaceOptionIgnorable]>,
+  HelpText<"Name of the package the module belongs to">;
+def export_as : Separate<["-"], "export-as">,
+  Flags<[FrontendOption, ModuleInterfaceOptionIgnorable]>,
+  HelpText<"Module name to use when referenced in clients module interfaces">;
 
 def emit_module : Flag<["-"], "emit-module">,
   Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput]>,
@@ -552,6 +616,9 @@ def emit_objc_header_path : Separate<["-"], "emit-objc-header-path">,
   Flags<[FrontendOption, NoInteractiveOption, ArgumentIsPath,
          SupplementaryOutput]>,
   MetaVarName<"<path>">, HelpText<"Emit an Objective-C header file to <path>">;
+def emit_clang_header_nonmodular_includes : Flag<["-"], "emit-clang-header-nonmodular-includes">,
+  Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput]>,
+  HelpText<"Augment emitted Objective-C header with textual imports for every included modular import">;
 
 def emit_clang_header_path : Separate<["-"], "emit-clang-header-path">,
   Flags<[FrontendOption, NoDriverOption, NoInteractiveOption, ArgumentIsPath,
@@ -627,8 +694,19 @@ def enable_experimental_concise_pound_file : Flag<["-"],
 
 def enable_experimental_cxx_interop :
   Flag<["-"], "enable-experimental-cxx-interop">,
-  Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
+  Flags<[NoDriverOption, FrontendOption, HelpHidden, ModuleInterfaceOption]>,
   HelpText<"Enable experimental C++ interop code generation and config directives">;
+
+def cxx_interoperability_mode :
+  Joined<["-"], "cxx-interoperability-mode=">,
+  Flags<[FrontendOption, ModuleInterfaceOption]>,
+  HelpText<"Enables C++ interoperability; requires compatbility version to be "
+  "specified.">;
+
+def experimental_c_foreign_reference_types :
+  Flag<["-"], "experimental-c-foreign-reference-types">,
+  Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
+  HelpText<"Enable experimental C foreign references types (with reference coutning).">;
 
 def experimental_cxx_stdlib :
   Separate<["-"], "experimental-cxx-stdlib">,
@@ -652,6 +730,10 @@ def warnings_as_errors : Flag<["-"], "warnings-as-errors">,
 def no_warnings_as_errors : Flag<["-"], "no-warnings-as-errors">,
   Flags<[FrontendOption]>,
   HelpText<"Don't treat warnings as errors">;
+  
+def suppress_remarks : Flag<["-"], "suppress-remarks">,
+  Flags<[FrontendOption]>,
+  HelpText<"Suppress all remarks">;
 
 def continue_building_after_errors : Flag<["-"], "continue-building-after-errors">,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild]>,
@@ -710,11 +792,11 @@ def strict_concurrency : Joined<["-"], "strict-concurrency=">,
 
 def enable_experimental_feature :
   Separate<["-"], "enable-experimental-feature">,
-  Flags<[FrontendOption]>,
+  Flags<[FrontendOption, ModuleInterfaceOptionIgnorable]>,
   HelpText<"Enable an experimental feature">;
 
 def enable_upcoming_feature : Separate<["-"], "enable-upcoming-feature">,
-  Flags<[FrontendOption]>,
+  Flags<[FrontendOption, ModuleInterfaceOptionIgnorable]>,
   HelpText<"Enable a feature that will be introduced in an upcoming language "
            "version">;
 
@@ -771,11 +853,14 @@ def L_EQ : Joined<["-"], "L=">, Group<linker_option_Group>,
   Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ArgumentIsPath]>,
   Alias<L>;
 
+// Accept but ignore these flags.  They were once used to control
+// linking of arclite, which is no longer used on Darwin.
 def link_objc_runtime : Flag<["-"], "link-objc-runtime">,
-  Flags<[DoesNotAffectIncrementalBuild]>;
+  Flags<[DoesNotAffectIncrementalBuild]>,
+  HelpText<"Deprecated">;
 def no_link_objc_runtime : Flag<["-"], "no-link-objc-runtime">,
   Flags<[HelpHidden, DoesNotAffectIncrementalBuild]>,
-  HelpText<"Don't link in additions to the Objective-C runtime">;
+  HelpText<"Deprecated">;
 
 def static_stdlib: Flag<["-"], "static-stdlib">,
   Flags<[DoesNotAffectIncrementalBuild]>,
@@ -1002,6 +1087,10 @@ def parse_sil : Flag<["-"], "parse-sil">,
 def parse_stdlib : Flag<["-"], "parse-stdlib">,
   Flags<[FrontendOption, HelpHidden, ModuleInterfaceOption]>,
   HelpText<"Parse the input file(s) as the Swift standard library">;
+
+def enable_builtin_module : Flag<["-"], "enable-builtin-module">,
+  Flags<[FrontendOption, ModuleInterfaceOption]>,
+  HelpText<"Enables the explicit import of the Builtin module">;
 
 def modes_Group : OptionGroup<"<mode options>">, HelpText<"MODES">;
 
@@ -1312,6 +1401,10 @@ def user_module_version : Separate<["-"], "user-module-version">,
   HelpText<"Module version specified from Swift module authors">,
   MetaVarName<"<vers>">;
 
+def allowable_client : Separate<["-"], "allowable-client">,
+  Flags<[FrontendOption, ModuleInterfaceOptionIgnorable, NewDriverOnlyOption]>,
+  HelpText<"Module names that are allowed to import this module">,
+  MetaVarName<"<vers>">;
 // VFS
 
 def vfsoverlay : JoinedOrSeparate<["-"], "vfsoverlay">,
@@ -1341,6 +1434,12 @@ def disable_autolinking_runtime_compatibility_concurrency
       HelpText<"Do not use autolinking for the concurrency runtime "
                "compatibility library">;
 
+def enable_autolinking_runtime_compatibility_bytecode_layouts
+    : Flag<[ "-" ], "enable-autolinking-runtime-compatibility-bytecode-layouts">,
+      Flags<[ FrontendOption ]>,
+      HelpText<"Enable autolinking for the bytecode layouts runtime "
+               "compatibility library">;
+
 def emit_symbol_graph: Flag<["-"], "emit-symbol-graph">,
   Flags<[FrontendOption, NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
   HelpText<"Emit a symbol graph">;
@@ -1364,6 +1463,11 @@ def emit_extension_block_symbols: Flag<["-"], "emit-extension-block-symbols">,
   Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
         NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
   HelpText<"Emit 'swift.extension' symbols for extensions to external types instead of directly associating members and conformances with the extended nominal when generating symbol graphs">;
+
+def omit_extension_block_symbols: Flag<["-"], "omit-extension-block-symbols">,
+  Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
+        NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
+  HelpText<"Directly associate members and conformances with the extended nominal when generating symbol graphs instead of emitting 'swift.extension' symbols for extensions to external types">;
 
 // swift-symbolgraph-extract-only options
 def output_dir : Separate<["-"], "output-dir">,
@@ -1391,6 +1495,11 @@ def include_spi_symbols : Flag<["-"], "include-spi-symbols">,
   Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
          NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
   HelpText<"Add symbols with SPI information to the symbol graph">;
+
+def skip_protocol_implementations : Flag<["-"], "skip-protocol-implementations">,
+  Flags<[SwiftSymbolGraphExtractOption, FrontendOption,
+         NoInteractiveOption, SupplementaryOutput, HelpHidden]>,
+  HelpText<"Skip emitting symbols that are implementations of protocol requirements or inherited from protocl extensions">;
 
 // swift-api-digester-only options
 def dump_sdk: Flag<["-", "--"], "dump-sdk">,
@@ -1484,6 +1593,10 @@ def disable_os_checks: Flag<["-", "--"], "disable-os-checks">,
 def disable_remove_deprecated_check: Flag<["-", "--"], "disable-remove-deprecated-check">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
   HelpText<"Skip diagnosing removal of deprecated symbols">;
+
+def enable_remove_deprecated_check: Flag<["-", "--"], "enable-remove-deprecated-check">,
+  Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
+  HelpText<"Diagnosing removal of deprecated symbols">;
 
 def print_module: Flag<["-", "--"], "print-module">,
   Flags<[NoDriverOption, SwiftAPIDigesterOption]>,
@@ -1689,5 +1802,19 @@ def nostartfiles:
   HelpText<"Do not link in the Swift language startup routines">;
 
 // END ONLY SUPPORTED IN NEW DRIVER
+
+def load_plugin_library:
+  Separate<["-"], "load-plugin-library">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ArgumentIsPath]>,
+  HelpText<"Path to a dynamic library containing compiler plugins such as "
+           "macros">,
+  MetaVarName<"<path>">;
+
+def load_plugin_executable:
+  Separate<["-"], "load-plugin-executable">,
+  Flags<[FrontendOption, DoesNotAffectIncrementalBuild, ArgumentIsPath]>,
+  HelpText<"Path to an executable compiler plugins and providing module names "
+           "such as macros">,
+  MetaVarName<"<path>#<module-names>">;
 
 include "FrontendOptions.td"

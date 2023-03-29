@@ -308,6 +308,8 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   ABSTRACT_SINGLE_VALUE_INST(AllocationInst, SingleValueInstruction)
     SINGLE_VALUE_INST(AllocStackInst, alloc_stack,
                               AllocationInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(AllocPackInst, alloc_pack,
+                              AllocationInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(AllocRefInst, alloc_ref,
                               AllocationInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(AllocRefDynamicInst, alloc_ref_dynamic,
@@ -347,7 +349,9 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                       LiteralInst, None, DoesNotRelease)
     SINGLE_VALUE_INST(StringLiteralInst, string_literal,
                       LiteralInst, None, DoesNotRelease)
-    SINGLE_VALUE_INST_RANGE(LiteralInst, FunctionRefInst, StringLiteralInst)
+    SINGLE_VALUE_INST(HasSymbolInst, has_symbol,
+                      LiteralInst, MayRead, DoesNotRelease)
+    SINGLE_VALUE_INST_RANGE(LiteralInst, FunctionRefInst, HasSymbolInst)
 
   // Dynamic Dispatch
   ABSTRACT_SINGLE_VALUE_INST(MethodInst, SingleValueInstruction)
@@ -463,6 +467,12 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
   // running the relevant diagnostic.
   SINGLE_VALUE_INST(MarkMustCheckInst, mark_must_check,
                     SingleValueInstruction, None, DoesNotRelease)
+  // A canary value inserted by a SIL generating frontend to signal to the
+  // reference binding transform to check/transform a specific value.  Valid
+  // only in Raw SIL. The relevant checkers should remove the instruction after
+  // successfully running the relevant diagnostic.
+  SINGLE_VALUE_INST(MarkUnresolvedReferenceBindingInst, mark_unresolved_reference_binding,
+                    SingleValueInstruction, None, DoesNotRelease)
   // Convert a $T to $@moveOnly T. This is the method that one uses to convert a
   // trivial value to a non-trivial move only value. Ownership is fixed at construction by
   // frontend to express specific semantics: guaranteed for guaranteed function arguments
@@ -546,6 +556,10 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                     SingleValueInstruction, None, DoesNotRelease)
   SINGLE_VALUE_INST(TupleElementAddrInst, tuple_element_addr,
                     SingleValueInstruction, None, DoesNotRelease)
+  SINGLE_VALUE_INST(TuplePackElementAddrInst, tuple_pack_element_addr,
+                    SingleValueInstruction, None, DoesNotRelease)
+  SINGLE_VALUE_INST(PackElementGetInst, pack_element_get,
+                    SingleValueInstruction, None, DoesNotRelease)
   SINGLE_VALUE_INST(StructInst, struct,
                     SingleValueInstruction, None, DoesNotRelease)
   SINGLE_VALUE_INST(StructExtractInst, struct_extract,
@@ -594,6 +608,22 @@ ABSTRACT_VALUE_AND_INST(SingleValueInstruction, ValueBase, SILInstruction)
                             SingleValueInstruction, MayRead, DoesNotRelease)
   SINGLE_VALUE_INST(OpenExistentialBoxValueInst, open_existential_box_value,
                             SingleValueInstruction, MayRead, DoesNotRelease)
+
+  // Variadic generics
+  SINGLE_VALUE_INST(OpenPackElementInst, open_pack_element,
+                    SingleValueInstruction, None, DoesNotRelease)
+  SINGLE_VALUE_INST(PackLengthInst, pack_length,
+                    SingleValueInstruction, None, DoesNotRelease)
+
+  // Variadic pack indexing
+  ABSTRACT_SINGLE_VALUE_INST(AnyPackIndexInst, SingleValueInstruction)
+    SINGLE_VALUE_INST(DynamicPackIndexInst, dynamic_pack_index,
+                      AnyPackIndexInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(PackPackIndexInst, pack_pack_index,
+                      AnyPackIndexInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST(ScalarPackIndexInst, scalar_pack_index,
+                      AnyPackIndexInst, None, DoesNotRelease)
+    SINGLE_VALUE_INST_RANGE(AnyPackIndexInst, DynamicPackIndexInst, ScalarPackIndexInst)
 
   // Blocks
   SINGLE_VALUE_INST(ProjectBlockStorageInst, project_block_storage,
@@ -686,6 +716,8 @@ ABSTRACT_INST(TermInst, SILInstruction)
 ABSTRACT_INST(DeallocationInst, SILInstruction)
   NON_VALUE_INST(DeallocStackInst, dealloc_stack,
                  DeallocationInst, MayHaveSideEffects, DoesNotRelease)
+  NON_VALUE_INST(DeallocPackInst, dealloc_pack,
+                 DeallocationInst, MayHaveSideEffects, DoesNotRelease)
   NON_VALUE_INST(DeallocStackRefInst, dealloc_stack_ref,
                  DeallocationInst, MayHaveSideEffects, DoesNotRelease)
   NON_VALUE_INST(DeallocRefInst, dealloc_ref,
@@ -765,6 +797,10 @@ NON_VALUE_INST(MarkFunctionEscapeInst, mark_function_escape,
                SILInstruction, None, DoesNotRelease)
 NON_VALUE_INST(DebugValueInst, debug_value,
                SILInstruction, None, DoesNotRelease)
+NON_VALUE_INST(DebugStepInst, debug_step,
+               SILInstruction, MayHaveSideEffects, DoesNotRelease)
+NON_VALUE_INST(TestSpecificationInst, test_specification,
+               SILInstruction, None, DoesNotRelease)
 #define NEVER_OR_SOMETIMES_LOADABLE_CHECKED_REF_STORAGE(Name, name, ...) \
   NON_VALUE_INST(Store##Name##Inst, store_##name, \
                  SILInstruction, MayWrite, DoesNotRelease)
@@ -794,6 +830,8 @@ NON_VALUE_INST(EndApplyInst, end_apply,
                SILInstruction, MayHaveSideEffects, MayRelease)
 NON_VALUE_INST(AbortApplyInst, abort_apply,
                SILInstruction, MayHaveSideEffects, MayRelease)
+NON_VALUE_INST(PackElementSetInst, pack_element_set,
+               SILInstruction, MayHaveSideEffects, DoesNotRelease)
 
 // Runtime failure
 // FIXME: Special MemBehavior for runtime failure?

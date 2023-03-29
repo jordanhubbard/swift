@@ -441,13 +441,13 @@ protected:
     else {
       // Create a new function with this mangled name with an empty
       // body. There won't be any IR generated for it (hence the linkage),
-      // but the symbol will be refered to by the debug info metadata.
+      // but the symbol will be referred to by the debug info metadata.
       ParentFunction = FuncBuilder.getOrCreateFunction(
           ParentFunction->getLocation(), MangledName, SILLinkage::Shared,
           ParentFunction->getLoweredFunctionType(), ParentFunction->isBare(),
           ParentFunction->isTransparent(), ParentFunction->isSerialized(),
-          IsNotDynamic, IsNotDistributed, 0, ParentFunction->isThunk(),
-          ParentFunction->getClassSubclassScope());
+          IsNotDynamic, IsNotDistributed, IsNotRuntimeAccessible, 0,
+          ParentFunction->isThunk(), ParentFunction->getClassSubclassScope());
       // Increment the ref count for the inlined function, so it doesn't
       // get deleted before we can emit abstract debug info for it.
       if (!ParentFunction->isZombie()) {

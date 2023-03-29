@@ -1,8 +1,4 @@
-// RUN: %target-run-stdlib-swift(-Xllvm -sil-disable-pass=DestroyHoisting -Xfrontend -enable-experimental-move-only)
-//
-// NOTE ON ABOVE: I am disabling destroy hoisting on this test since we are
-// going to move it out of the mandatory pipeline eventually and it causes the
-// test to fail only when optimizations are enabled.
+// RUN: %target-run-stdlib-swift(-O -enable-experimental-feature MoveOnly)
 
 // REQUIRES: executable_test
 
@@ -53,7 +49,7 @@ extension Class {
         do {
             x = self.k2
         }
-        switch (_move x)[userHandle] {
+        switch (consume x)[userHandle] {
         case .foo:
             expectTrue(_isUnique(&self.k2))
         }
@@ -76,7 +72,7 @@ extension Class {
         do {
             x = self.array
         }
-        switch (_move x)[userHandle] {
+        switch (consume x)[userHandle] {
         case .foo:
             expectTrue(self.array._buffer.isUniquelyReferenced())
         }
@@ -96,7 +92,7 @@ tests.test("simpleArrayVarTest") {
 
     var y = x
     expectFalse(x._buffer.isUniquelyReferenced())
-    let _ = _move y
+    let _ = consume y
     expectTrue(x._buffer.isUniquelyReferenced())
     y = []
     expectTrue(x._buffer.isUniquelyReferenced())
@@ -106,7 +102,7 @@ tests.test("simpleArrayInoutVarTest") {
     func inOutTest(_ x: inout [Enum]) {
         var y = x
         expectFalse(x._buffer.isUniquelyReferenced())
-        let _ = _move y
+        let _ = consume y
         expectTrue(x._buffer.isUniquelyReferenced())
         y = []
         expectTrue(x._buffer.isUniquelyReferenced())

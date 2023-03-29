@@ -16,7 +16,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/USRGeneration.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
@@ -25,7 +25,8 @@ using namespace swift;
 using namespace ide;
 
 namespace {
-class ConformingMethodListCallbacks : public CodeCompletionCallbacks {
+class ConformingMethodListCallbacks : public CodeCompletionCallbacks,
+                                      public DoneParsingCallback {
   ArrayRef<const char *> ExpectedTypeNames;
   ConformingMethodListConsumer &Consumer;
   SourceLoc Loc;
@@ -40,8 +41,8 @@ public:
   ConformingMethodListCallbacks(Parser &P,
                                 ArrayRef<const char *> ExpectedTypeNames,
                                 ConformingMethodListConsumer &Consumer)
-      : CodeCompletionCallbacks(P), ExpectedTypeNames(ExpectedTypeNames),
-        Consumer(Consumer) {}
+      : CodeCompletionCallbacks(P), DoneParsingCallback(),
+        ExpectedTypeNames(ExpectedTypeNames), Consumer(Consumer) {}
 
   // Only handle callbacks for suffix completions.
   // {
@@ -49,7 +50,7 @@ public:
   void completePostfixExpr(Expr *E, bool hasSpace) override;
   // }
 
-  void doneParsing() override;
+  void doneParsing(SourceFile *SrcFile) override;
 };
 
 void ConformingMethodListCallbacks::completeDotExpr(CodeCompletionExpr *E,
@@ -64,7 +65,7 @@ void ConformingMethodListCallbacks::completePostfixExpr(Expr *E,
   ParsedExpr = E;
 }
 
-void ConformingMethodListCallbacks::doneParsing() {
+void ConformingMethodListCallbacks::doneParsing(SourceFile *SrcFile) {
   if (!ParsedExpr)
     return;
 
@@ -173,14 +174,14 @@ void ConformingMethodListCallbacks::getMatchingMethods(
 
 } // anonymous namespace.
 
-CodeCompletionCallbacksFactory *
+IDEInspectionCallbacksFactory *
 swift::ide::makeConformingMethodListCallbacksFactory(
     ArrayRef<const char *> expectedTypeNames,
     ConformingMethodListConsumer &Consumer) {
 
   // CC callback factory which produces 'ContextInfoCallbacks'.
   class ConformingMethodListCallbacksFactoryImpl
-      : public CodeCompletionCallbacksFactory {
+      : public IDEInspectionCallbacksFactory {
     ArrayRef<const char *> ExpectedTypeNames;
     ConformingMethodListConsumer &Consumer;
 
@@ -190,8 +191,10 @@ swift::ide::makeConformingMethodListCallbacksFactory(
         ConformingMethodListConsumer &Consumer)
         : ExpectedTypeNames(ExpectedTypeNames), Consumer(Consumer) {}
 
-    CodeCompletionCallbacks *createCodeCompletionCallbacks(Parser &P) override {
-      return new ConformingMethodListCallbacks(P, ExpectedTypeNames, Consumer);
+    Callbacks createCallbacks(Parser &P) override {
+      auto Callback = std::make_shared<ConformingMethodListCallbacks>(
+          P, ExpectedTypeNames, Consumer);
+      return {Callback, Callback};
     }
   };
 

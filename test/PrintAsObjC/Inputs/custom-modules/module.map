@@ -52,3 +52,14 @@ module MiserablePileOfSecrets {
   header "MiserablePileOfSecrets.h"
   export *
 }
+
+module EmitClangHeaderNonmodularIncludesStressTest {
+  header "header_subdirectory/header-regular.h"
+  header "header_subdirectory/header-symlink.h"
+  export *
+}
+
+module objc_implementation {
+  header "objc_implementation/objc_implementation.h"
+  export *
+}

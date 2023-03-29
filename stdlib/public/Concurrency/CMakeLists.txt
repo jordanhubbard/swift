@@ -44,7 +44,8 @@ if("${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}" STREQUAL "dispatch")
       dispatch)
   endif()
 elseif("${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}" STREQUAL "singlethreaded" OR
-       "${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}" STREQUAL "hooked")
+       "${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}" STREQUAL "hooked" OR
+       "${SWIFT_CONCURRENCY_GLOBAL_EXECUTOR}" STREQUAL "none")
   list(APPEND SWIFT_RUNTIME_CONCURRENCY_C_FLAGS
     "-DSWIFT_CONCURRENCY_ENABLE_DISPATCH=0")
 else()
@@ -86,6 +87,7 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
   Errors.swift
   Error.cpp
   Executor.swift
+  ExecutorAssertions.swift
   AsyncCompactMapSequence.swift
   AsyncDropFirstSequence.swift
   AsyncDropWhileSequence.swift
@@ -113,6 +115,7 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
   TaskStatus.cpp
   TaskGroup.cpp
   TaskGroup.swift
+  DiscardingTaskGroup.swift
   TaskLocal.cpp
   TaskLocal.swift
   TaskSleep.swift
@@ -146,7 +149,10 @@ add_swift_target_library(swift_Concurrency ${SWIFT_STDLIB_LIBRARY_BUILD_TYPES} I
     ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
     -parse-stdlib
     -Xfrontend -enable-experimental-concurrency
+    -enable-experimental-feature MoveOnly
+    -diagnostic-style swift
     ${SWIFT_RUNTIME_CONCURRENCY_SWIFT_FLAGS}
   ${swift_concurrency_options}
   INSTALL_IN_COMPONENT ${swift_concurrency_install_component}
+  MACCATALYST_BUILD_FLAVOR zippered
 )

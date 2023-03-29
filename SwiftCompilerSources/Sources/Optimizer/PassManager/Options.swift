@@ -10,12 +10,21 @@
 //
 //===----------------------------------------------------------------------===//
 
+import SIL
 import OptimizerBridging
 
 struct Options {
   let _bridged: BridgedPassContext
 
   var enableStackProtection: Bool {
-    SILOptions_enableStackProtection(_bridged) != 0
+    _bridged.enableStackProtection()
+  }
+
+  var enableMoveInoutStackProtection: Bool {
+    _bridged.enableMoveInoutStackProtection()
+  }
+
+  func enableSimplification(for inst: Instruction) -> Bool {
+    _bridged.enableSimplificationFor(inst.bridged)
   }
 }

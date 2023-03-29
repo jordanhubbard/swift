@@ -288,6 +288,7 @@ enum class ImplicitlyFinalReason : unsigned {
 }
 
 static bool inferFinalAndDiagnoseIfNeeded(ValueDecl *D, ClassDecl *cls,
+                                          FinalAttr *explicitFinalAttr,
                                           StaticSpellingKind staticSpelling) {
   // Are there any reasons to infer 'final'? Prefer 'static' over the class
   // being final for the purposes of diagnostics.
@@ -295,8 +296,8 @@ static bool inferFinalAndDiagnoseIfNeeded(ValueDecl *D, ClassDecl *cls,
   if (staticSpelling == StaticSpellingKind::KeywordStatic) {
     reason = ImplicitlyFinalReason::Static;
 
-    if (auto finalAttr = D->getAttrs().getAttribute<FinalAttr>()) {
-      auto finalRange = finalAttr->getRange();
+    if (explicitFinalAttr) {
+      auto finalRange = explicitFinalAttr->getRange();
       if (finalRange.isValid()) {
         auto &context = D->getASTContext();
         context.Diags.diagnose(finalRange.Start, diag::static_decl_already_final)
@@ -316,7 +317,7 @@ static bool inferFinalAndDiagnoseIfNeeded(ValueDecl *D, ClassDecl *cls,
     if (!context.isSwiftVersionAtLeast(5))
       diagID = diag::implicitly_final_cannot_be_open_swift4;
     auto inFlightDiag = context.Diags.diagnose(D, diagID,
-                                    static_cast<unsigned>(reason.getValue()));
+                                    static_cast<unsigned>(reason.value()));
     fixItAccess(inFlightDiag, D, AccessLevel::Public);
   }
 
@@ -447,7 +448,7 @@ InitKindRequest::evaluate(Evaluator &evaluator, ConstructorDecl *decl) const {
       // (or the same file) to add vtable entries, we can re-evaluate this
       // restriction.
       if (!decl->isSynthesized() &&
-          isa<ExtensionDecl>(decl->getDeclContext()) &&
+          isa<ExtensionDecl>(decl->getDeclContext()->getImplementedObjCContext()) &&
           !(decl->getAttrs().hasAttribute<DynamicReplacementAttr>())) {
 
         if (classDcl->getForeignClassKind() == ClassDecl::ForeignKind::CFType) {
@@ -497,6 +498,10 @@ BodyInitKindRequest::evaluate(Evaluator &evaluator,
     FindReferenceToInitializer(const ConstructorDecl *decl,
                                ASTContext &ctx)
         : Decl(decl), ctx(ctx) { }
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
 
     PreWalkAction walkToDeclPre(class Decl *D) override {
       // Don't walk into further nominal decls.
@@ -802,8 +807,9 @@ PrimaryAssociatedTypesRequest::evaluate(Evaluator &evaluator,
 
 bool
 IsFinalRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
+  auto explicitFinalAttr = decl->getAttrs().getAttribute<FinalAttr>();
   if (isa<ClassDecl>(decl))
-    return decl->getAttrs().hasAttribute<FinalAttr>();
+    return explicitFinalAttr;
 
   auto cls = decl->getDeclContext()->getSelfClassDecl();
   if (!cls)
@@ -831,10 +837,17 @@ IsFinalRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
         // If this variable is a class member, mark it final if the
         // class is final, or if it was declared with 'let'.
         auto *PBD = VD->getParentPatternBinding();
-        if (PBD && inferFinalAndDiagnoseIfNeeded(decl, cls, PBD->getStaticSpelling()))
+        if (PBD && inferFinalAndDiagnoseIfNeeded(decl, cls, explicitFinalAttr,
+                                                 PBD->getStaticSpelling()))
           return true;
 
         if (VD->isLet()) {
+          // If this `let` is in an `@_objcImplementation extension`, don't
+          // infer `final` unless it is written explicitly.
+          auto ed = dyn_cast<ExtensionDecl>(VD->getDeclContext());
+          if (!explicitFinalAttr && ed && ed->isObjCImplementation())
+            return false;
+
           if (VD->getFormalAccess() == AccessLevel::Open) {
             auto &context = decl->getASTContext();
             auto diagID = diag::implicitly_final_cannot_be_open;
@@ -856,7 +869,8 @@ IsFinalRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     case DeclKind::Func: {
       // Methods declared 'static' are final.
       auto staticSpelling = cast<FuncDecl>(decl)->getStaticSpelling();
-      if (inferFinalAndDiagnoseIfNeeded(decl, cls, staticSpelling))
+      if (inferFinalAndDiagnoseIfNeeded(decl, cls, explicitFinalAttr,
+                                        staticSpelling))
         return true;
       break;
     }
@@ -889,7 +903,8 @@ IsFinalRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     case DeclKind::Subscript: {
       // Member subscripts.
       auto staticSpelling = cast<SubscriptDecl>(decl)->getStaticSpelling();
-      if (inferFinalAndDiagnoseIfNeeded(decl, cls, staticSpelling))
+      if (inferFinalAndDiagnoseIfNeeded(decl, cls, explicitFinalAttr,
+                                        staticSpelling))
         return true;
       break;
     }
@@ -898,16 +913,19 @@ IsFinalRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
       break;
   }
 
-  if (decl->getAttrs().hasAttribute<FinalAttr>())
-    return true;
-
-  return false;
+  return explicitFinalAttr;
 }
 
 bool IsMoveOnlyRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   // For now only do this for nominal type decls.
-  if (isa<NominalTypeDecl>(decl))
-    return decl->getAttrs().hasAttribute<MoveOnlyAttr>();
+  if (isa<NominalTypeDecl>(decl)) {
+      if (decl->getAttrs().hasAttribute<MoveOnlyAttr>()) {
+        if (!decl->getASTContext().supportsMoveOnlyTypes())
+            decl->diagnose(diag::moveOnly_requires_lexical_lifetimes);
+
+        return true;
+      }
+  }
   return false;
 }
 
@@ -955,6 +973,11 @@ IsDynamicRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   if (decl->getAttrs().hasAttribute<DynamicAttr>()) {
     return true;
   }
+
+  // @_objcImplementation extension member implementations are implicitly
+  // dynamic.
+  if (decl->isObjCMemberImplementation())
+    return true;
 
   if (auto accessor = dyn_cast<AccessorDecl>(decl)) {
     // Runtime-replaceable accessors are dynamic when their storage declaration
@@ -1018,7 +1041,8 @@ DefaultDefinitionTypeRequest::evaluate(Evaluator &evaluator,
                                         // Diagnose unbound generics and
                                         // placeholders.
                                         /*unboundTyOpener*/ nullptr,
-                                        /*placeholderHandler*/ nullptr)
+                                        /*placeholderHandler*/ nullptr,
+                                        /*packElementOpener*/ nullptr)
         .resolveType(defaultDefinition);
   }
 
@@ -1029,6 +1053,9 @@ bool
 NeedsNewVTableEntryRequest::evaluate(Evaluator &evaluator,
                                      AbstractFunctionDecl *decl) const {
   auto *dc = decl->getDeclContext();
+
+  // FIXME: This is mysterious and seems wrong. However, changing it to return
+  // false (as it seems like it should) breaks a couple Serialization tests.
   if (!isa<ClassDecl>(dc))
     return true;
 
@@ -1130,7 +1157,9 @@ static LiteralExpr *getAutomaticRawValueExpr(AutomaticEnumValueKind valueKind,
     }
 
     if (auto intLit = dyn_cast<IntegerLiteralExpr>(prevValue)) {
-      APInt nextVal = intLit->getRawValue().sextOrSelf(128) + 1;
+      APInt raw = intLit->getRawValue();
+      APInt sext = (raw.getBitWidth() < 128 ? raw.sext(128) : raw);
+      APInt nextVal = sext + 1;
       bool negative = nextVal.slt(0);
       if (negative)
         nextVal = -nextVal;
@@ -1583,6 +1612,28 @@ TypeChecker::lookupPrecedenceGroup(DeclContext *dc, Identifier name,
   return PrecedenceGroupLookupResult(dc, name, std::move(groups));
 }
 
+SmallVector<MacroDecl *, 1>
+TypeChecker::lookupMacros(DeclContext *dc, DeclNameRef macroName,
+                          SourceLoc loc, MacroRoles roles) {
+  SmallVector<MacroDecl *, 1> choices;
+  auto moduleScopeDC = dc->getModuleScopeContext();
+  ASTContext &ctx = moduleScopeDC->getASTContext();
+  UnqualifiedLookupDescriptor descriptor(macroName, moduleScopeDC);
+  auto lookup = evaluateOrDefault(
+      ctx.evaluator, UnqualifiedLookupRequest{descriptor}, {});
+  for (const auto &found : lookup.allResults()) {
+    if (auto macro = dyn_cast<MacroDecl>(found.getValueDecl())) {
+      auto candidateRoles = macro->getMacroRoles();
+      if ((candidateRoles && roles.contains(candidateRoles)) ||
+          // FIXME: `externalMacro` should have all roles.
+          macro->getBaseIdentifier().str() == "externalMacro") {
+        choices.push_back(macro);
+      }
+    }
+  }
+  return choices;
+}
+
 /// Validate the given operator declaration.
 ///
 /// This establishes key invariants, such as an InfixOperatorDecl's
@@ -1630,8 +1681,12 @@ SelfAccessKindRequest::evaluate(Evaluator &evaluator, FuncDecl *FD) const {
     return SelfAccessKind::Mutating;
   } else if (FD->getAttrs().hasAttribute<NonMutatingAttr>()) {
     return SelfAccessKind::NonMutating;
+  } else if (FD->getAttrs().hasAttribute<LegacyConsumingAttr>()) {
+    return SelfAccessKind::LegacyConsuming;
   } else if (FD->getAttrs().hasAttribute<ConsumingAttr>()) {
     return SelfAccessKind::Consuming;
+  } else if (FD->getAttrs().hasAttribute<BorrowingAttr>()) {
+    return SelfAccessKind::Borrowing;
   }
 
   if (auto *AD = dyn_cast<AccessorDecl>(FD)) {
@@ -1693,6 +1748,20 @@ bool TypeChecker::isAvailabilitySafeForConformance(
 
   AvailabilityContext infoForConformingDecl =
       overApproximateAvailabilityAtLocation(dc->getAsDecl()->getLoc(), dc);
+
+  // Relax the requirements for @_spi witnesses by treating the requirement as
+  // if it were introduced at the deployment target. This is not strictly sound
+  // since clients of SPI do not necessarily have the same deployment target as
+  // the module declaring the requirement. However, now that the public
+  // declarations in API libraries are checked according to the minimum possible
+  // deployment target of their clients this relaxation is needed for source
+  // compatibility with some existing code and is reasonably safe for the
+  // majority of cases.
+  if (witness->isSPI()) {
+    AvailabilityContext deploymentTarget =
+        AvailabilityContext::forDeploymentTarget(Context);
+    requirementInfo.constrainWith(deploymentTarget);
+  }
 
   // Constrain over-approximates intersection of version ranges.
   witnessInfo.constrainWith(infoForConformingDecl);
@@ -1841,7 +1910,8 @@ UnderlyingTypeRequest::evaluate(Evaluator &evaluator,
   const auto result =
       TypeResolution::forInterface(typeAlias, options,
                                    /*unboundTyOpener*/ nullptr,
-                                   /*placeholderHandler*/ nullptr)
+                                   /*placeholderHandler*/ nullptr,
+                                   /*packElementOpener*/ nullptr)
           .resolveType(underlyingRepr);
 
   if (result->hasError()) {
@@ -2071,8 +2141,10 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   TypeRepr *resultTyRepr = nullptr;
   if (const auto *const funcDecl = dyn_cast<FuncDecl>(decl)) {
     resultTyRepr = funcDecl->getResultTypeRepr();
+  } else if (auto subscriptDecl = dyn_cast<SubscriptDecl>(decl)) {
+    resultTyRepr = subscriptDecl->getElementTypeRepr();
   } else {
-    resultTyRepr = cast<SubscriptDecl>(decl)->getElementTypeRepr();
+    resultTyRepr = cast<MacroDecl>(decl)->resultType.getTypeRepr();
   }
 
   if (!resultTyRepr && decl->getClangDecl() &&
@@ -2087,11 +2159,8 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
     return TupleType::getEmpty(ctx);
 
   // Handle opaque types.
-  if (decl->getOpaqueResultTypeRepr()) {
-    auto *opaqueDecl = decl->getOpaqueResultTypeDecl();
-    return (opaqueDecl
-            ? opaqueDecl->getDeclaredInterfaceType()
-            : ErrorType::get(ctx));
+  if (auto *opaqueDecl = decl->getOpaqueResultTypeDecl()) {
+      return opaqueDecl->getDeclaredInterfaceType();
   }
 
   auto options =
@@ -2102,7 +2171,8 @@ ResultTypeRequest::evaluate(Evaluator &evaluator, ValueDecl *decl) const {
   auto *const dc = decl->getInnermostDeclContext();
   return TypeResolution::forInterface(dc, options,
                                       /*unboundTyOpener*/ nullptr,
-                                      PlaceholderType::get)
+                                      PlaceholderType::get,
+                                      /*packElementOpener*/ nullptr)
       .resolveType(resultTyRepr);
 }
 
@@ -2112,12 +2182,29 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
   auto *dc = param->getDeclContext();
 
   if (param->isSelfParameter()) {
-    auto selfParam = computeSelfParam(cast<AbstractFunctionDecl>(dc),
+    auto afd = cast<AbstractFunctionDecl>(dc);
+    auto selfParam = computeSelfParam(afd,
                                       /*isInitializingCtor*/true,
                                       /*wantDynamicSelf*/false);
-    return (selfParam.getParameterFlags().isInOut()
-            ? ParamSpecifier::InOut
-            : ParamSpecifier::Default);
+    if (auto fd = dyn_cast<FuncDecl>(afd)) {
+      switch (fd->getSelfAccessKind()) {
+      case SelfAccessKind::LegacyConsuming:
+        return ParamSpecifier::LegacyOwned;
+      case SelfAccessKind::Consuming:
+        return ParamSpecifier::Consuming;
+      case SelfAccessKind::Borrowing:
+        return ParamSpecifier::Borrowing;
+      case SelfAccessKind::Mutating:
+        return ParamSpecifier::InOut;
+      case SelfAccessKind::NonMutating:
+        return ParamSpecifier::Default;
+      }
+      llvm_unreachable("nonexhaustive switch");
+    } else {
+      return (selfParam.getParameterFlags().isInOut()
+              ? ParamSpecifier::InOut
+              : ParamSpecifier::Default);
+    }
   }
 
   if (auto *accessor = dyn_cast<AccessorDecl>(dc)) {
@@ -2147,6 +2234,11 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
   assert(typeRepr != nullptr && "Should call setSpecifier() on "
          "synthesized parameter declarations");
 
+  // Look through top-level pack expansions.  These specifiers are
+  // part of what's repeated.
+  if (auto expansion = dyn_cast<PackExpansionTypeRepr>(typeRepr))
+    typeRepr = expansion->getPatternType();
+
   // Look through parens here; other than parens, specifiers
   // must appear at the top level of a parameter type.
   auto *nestedRepr = typeRepr->getWithoutParens();
@@ -2154,23 +2246,18 @@ ParamSpecifierRequest::evaluate(Evaluator &evaluator,
   if (auto isolated = dyn_cast<IsolatedTypeRepr>(nestedRepr))
     nestedRepr = isolated->getBase();
   
-  if (isa<InOutTypeRepr>(nestedRepr) &&
-      param->isDefaultArgument()) {
-    auto &ctx = param->getASTContext();
-    ctx.Diags.diagnose(param->getStructuralDefaultExpr()->getLoc(),
-                       swift::diag::cannot_provide_default_value_inout,
-                       param->getName());
-    return ParamSpecifier::Default;
+  if (auto ownershipRepr = dyn_cast<OwnershipTypeRepr>(nestedRepr)) {
+    if (ownershipRepr->getSpecifier() == ParamSpecifier::InOut
+        && param->isDefaultArgument()) {
+      auto &ctx = param->getASTContext();
+      ctx.Diags.diagnose(param->getStructuralDefaultExpr()->getLoc(),
+                         swift::diag::cannot_provide_default_value_inout,
+                         param->getName());
+      return ParamSpecifier::Default;
+    }
+    return ownershipRepr->getSpecifier();
   }
-
-  if (isa<InOutTypeRepr>(nestedRepr)) {
-    return ParamSpecifier::InOut;
-  } else if (isa<SharedTypeRepr>(nestedRepr)) {
-    return ParamSpecifier::Shared;
-  } else if (isa<OwnedTypeRepr>(nestedRepr)) {
-    return ParamSpecifier::Owned;
-  }
-
+  
   return ParamSpecifier::Default;
 }
 
@@ -2194,9 +2281,11 @@ static Type validateParameterType(ParamDecl *decl) {
     options = TypeResolutionOptions(TypeResolverContext::AbstractFunctionDecl);
   } else if (isa<SubscriptDecl>(dc)) {
     options = TypeResolutionOptions(TypeResolverContext::SubscriptDecl);
-  } else {
-    assert(isa<EnumElementDecl>(dc));
+  } else if (isa<EnumElementDecl>(dc)) {
     options = TypeResolutionOptions(TypeResolverContext::EnumElementDecl);
+  } else {
+    assert(isa<MacroDecl>(dc));
+    options = TypeResolutionOptions(TypeResolverContext::MacroDecl);
   }
 
   // Set the "preconcurrency" flag if this is a parameter of a preconcurrency
@@ -2224,40 +2313,28 @@ static Type validateParameterType(ParamDecl *decl) {
     break;
   }
 
-  if (auto *packExpansionRepr = dyn_cast<PackExpansionTypeRepr>(nestedRepr)) {
+  if (auto *varargTypeRepr = dyn_cast<VarargTypeRepr>(nestedRepr)) {
     // If the element is a variadic parameter, resolve the parameter type as if
     // it were in non-parameter position, since we want functions to be
     // @escaping in this case.
     options.setContext(TypeResolverContext::VariadicFunctionInput);
     options |= TypeResolutionFlags::Direct;
 
-    // FIXME: This duplicates code found elsewhere
-    auto *patternRepr = packExpansionRepr->getPatternType();
-
     const auto resolution =
         TypeResolution::forInterface(dc, options, unboundTyOpener,
-                                     PlaceholderType::get);
-    Ty = resolution.resolveType(patternRepr);
+                                     PlaceholderType::get,
+                                     /*packElementOpener*/ nullptr);
+    Ty = resolution.resolveType(nestedRepr);
 
-    // Find the first type sequence parameter and use that as the count type.
-    SmallVector<Type, 2> rootTypeSequenceParams;
-    Ty->getTypeSequenceParameters(rootTypeSequenceParams);
+    // Monovariadic types (T...) for <T> resolve to [T].
+    Ty = VariadicSequenceType::get(Ty);
 
-    // Handle the monovariadic/polyvariadic interface type split.
-    if (!rootTypeSequenceParams.empty()) {
-      // Polyvariadic types (T...) for <T...> resolve to pack expansions.
-      Ty = PackExpansionType::get(Ty, rootTypeSequenceParams[0]);
-    } else {
-      // Monovariadic types (T...) for <T> resolve to [T].
-      Ty = VariadicSequenceType::get(Ty);
-
-      // Set the old-style variadic bit.
-      decl->setVariadic();
-      if (!ctx.getArrayDecl()) {
-        ctx.Diags.diagnose(decl->getTypeRepr()->getLoc(),
-                           diag::sugar_type_not_found, 0);
-        return ErrorType::get(ctx);
-      }
+    // Set the old-style variadic bit.
+    decl->setVariadic();
+    if (!ctx.getArrayDecl()) {
+      ctx.Diags.diagnose(decl->getTypeRepr()->getLoc(),
+                         diag::sugar_type_not_found, 0);
+      return ErrorType::get(ctx);
     }
   } else {
     options.setContext(TypeResolverContext::FunctionInput);
@@ -2265,7 +2342,8 @@ static Type validateParameterType(ParamDecl *decl) {
 
     const auto resolution =
         TypeResolution::forInterface(dc, options, unboundTyOpener,
-                                     PlaceholderType::get);
+                                     PlaceholderType::get,
+                                     /*packElementOpener*/ nullptr);
     Ty = resolution.resolveType(decl->getTypeRepr());
   }
 
@@ -2295,11 +2373,13 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
   case DeclKind::PrecedenceGroup:
   case DeclKind::IfConfig:
   case DeclKind::PoundDiagnostic:
+  case DeclKind::Missing:
   case DeclKind::MissingMember:
   case DeclKind::Module:
   case DeclKind::OpaqueType:
   case DeclKind::GenericTypeParam:
   case DeclKind::BuiltinTuple:
+  case DeclKind::MacroExpansion:
     llvm_unreachable("should not get here");
     return Type();
 
@@ -2515,6 +2595,25 @@ InterfaceTypeRequest::evaluate(Evaluator &eval, ValueDecl *D) const {
 
     return resultTy;
   }
+
+  case DeclKind::Macro: {
+    auto macro = cast<MacroDecl>(D);
+    Type resultType = macro->getResultInterfaceType();
+    if (!macro->parameterList)
+      return resultType;
+
+    SmallVector<AnyFunctionType::Param, 4> paramTypes;
+    macro->parameterList->getParams(paramTypes);
+
+    if (auto genericSig = macro->getGenericSignature()) {
+      GenericFunctionType::ExtInfo info;
+      return GenericFunctionType::get(
+          genericSig, paramTypes, resultType, info);
+    } else {
+      FunctionType::ExtInfo info;
+      return FunctionType::get(paramTypes, resultType, info);
+    }
+  }
   }
   llvm_unreachable("invalid decl kind");
 }
@@ -2681,7 +2780,7 @@ static ArrayRef<Decl *> evaluateMembersRequest(
     return ctx.AllocateCopy(result);
   }
 
-  auto nominal = dyn_cast<NominalTypeDecl>(idc);
+  auto nominal = dyn_cast<NominalTypeDecl>(dc->getImplementedObjCContext());
 
   if (nominal) {
     // We need to add implicit initializers because they
@@ -2720,16 +2819,23 @@ static ArrayRef<Decl *> evaluateMembersRequest(
     TypeChecker::checkConformance(conformance->getRootNormalConformance());
   }
 
-  // If the type conforms to Encodable or Decodable, even via an extension,
-  // the CodingKeys enum is synthesized as a member of the type itself.
-  // Force it into existence.
   if (nominal) {
+    // If the type conforms to Encodable or Decodable, even via an extension,
+    // the CodingKeys enum is synthesized as a member of the type itself.
+    // Force it into existence.
     (void) evaluateOrDefault(
       ctx.evaluator,
       ResolveImplicitMemberRequest{nominal,
                  ImplicitMemberAction::ResolveCodingKeys},
       {});
   }
+
+  // Expand synthesized member macros.
+  auto *mutableDecl = const_cast<Decl *>(idc->getDecl());
+  (void)evaluateOrDefault(
+      ctx.evaluator,
+      ExpandSynthesizedMemberMacroRequest{mutableDecl},
+      false);
 
   // If the decl has a @main attribute, we need to force synthesis of the
   // $main function.
@@ -2751,17 +2857,22 @@ static ArrayRef<Decl *> evaluateMembersRequest(
 
   SortedDeclList synthesizedMembers;
 
-  for (auto *member : idc->getMembers()) {
+  std::function<void(Decl *)> addResult;
+  addResult = [&](Decl *member) {
+    member->visitAuxiliaryDecls(addResult);
     if (auto *vd = dyn_cast<ValueDecl>(member)) {
       // Add synthesized members to a side table and sort them by their mangled
       // name, since they could have been added to the class in any order.
       if (vd->isSynthesized()) {
         synthesizedMembers.add(vd);
-        continue;
+        return;
       }
     }
-
     result.push_back(member);
+  };
+
+  for (auto *member : idc->getMembers()) {
+    addResult(member);
   }
 
   if (!synthesizedMembers.empty()) {
@@ -2786,7 +2897,6 @@ AllMembersRequest::evaluate(
 }
 
 bool TypeChecker::isPassThroughTypealias(TypeAliasDecl *typealias,
-                                         Type underlyingType,
                                          NominalTypeDecl *nominal) {
   // Pass-through only makes sense when the typealias refers to a nominal
   // type.
@@ -2821,7 +2931,8 @@ bool TypeChecker::isPassThroughTypealias(TypeAliasDecl *typealias,
   // If neither is generic at this level, we have a pass-through typealias.
   if (!typealias->isGeneric()) return true;
 
-  auto boundGenericType = underlyingType->getAs<BoundGenericType>();
+  auto boundGenericType = typealias->getUnderlyingType()
+      ->getAs<BoundGenericType>();
   if (!boundGenericType) return false;
 
   // If our arguments line up with our innermost generic parameters, it's
@@ -2855,15 +2966,11 @@ ExtendedTypeRequest::evaluate(Evaluator &eval, ExtensionDecl *ext) const {
   if (ext->isInSpecializeExtensionContext())
     options |= TypeResolutionFlags::AllowUsableFromInline;
   const auto resolution = TypeResolution::forStructural(
-      ext->getDeclContext(), options,
-      [](auto unboundTy) {
-        // FIXME: Don't let unbound generic types escape type resolution.
-        // For now, just return the unbound generic type.
-        return unboundTy;
-      },
+      ext->getDeclContext(), options, nullptr,
       // FIXME: Don't let placeholder types escape type resolution.
       // For now, just return the placeholder type.
-      PlaceholderType::get);
+      PlaceholderType::get,
+      /*packElementOpener*/ nullptr);
 
   const auto extendedType = resolution.resolveType(extendedRepr);
 
@@ -2873,24 +2980,13 @@ ExtendedTypeRequest::evaluate(Evaluator &eval, ExtensionDecl *ext) const {
   // Hack to allow extending a generic typealias.
   if (auto *unboundGeneric = extendedType->getAs<UnboundGenericType>()) {
     if (auto *aliasDecl = dyn_cast<TypeAliasDecl>(unboundGeneric->getDecl())) {
-      // Nested Hack to break cycles if this is called before validation has
-      // finished.
-      if (aliasDecl->hasInterfaceType()) {
-        auto extendedNominal =
-            aliasDecl->getDeclaredInterfaceType()->getAnyNominal();
-        if (extendedNominal)
-          return TypeChecker::isPassThroughTypealias(
-                     aliasDecl, aliasDecl->getUnderlyingType(), extendedNominal)
-                     ? extendedType
-                     : extendedNominal->getDeclaredType();
-      } else {
-        if (auto ty = aliasDecl->getStructuralType()
-                          ->getAs<NominalOrBoundGenericNominalType>())
-          return TypeChecker::isPassThroughTypealias(aliasDecl, ty,
-                                                     ty->getDecl())
-                     ? extendedType
-                     : ty->getDecl()->getDeclaredType();
-      }
+      auto extendedNominal =
+          aliasDecl->getUnderlyingType()->getAnyNominal();
+      if (extendedNominal)
+        return TypeChecker::isPassThroughTypealias(
+                   aliasDecl, extendedNominal)
+                   ? extendedType
+                   : extendedNominal->getDeclaredType();
     }
   }
 

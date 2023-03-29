@@ -78,6 +78,15 @@ namespace irgen {
                                 llvm::Value *storageAddress,
                                 const PointerAuthEntity &entity);
 
+    static PointerAuthInfo emit(IRGenFunction &IGF,
+                                clang::PointerAuthQualifier pointerAuthQual,
+                                llvm::Value *storageAddress);
+
+    static PointerAuthInfo emit(IRGenFunction &IGF,
+                                const PointerAuthSchema &schema,
+                                llvm::Value *storageAddress,
+                                llvm::ConstantInt *otherDiscriminator);
+
     static PointerAuthInfo forFunctionPointer(IRGenModule &IGM,
                                               CanSILFunctionType fnType);
 
@@ -175,6 +184,7 @@ namespace irgen {
       AsyncLetGetThrowing,
       AsyncLetFinish,
       TaskGroupWaitNext,
+      TaskGroupWaitAll,
       DistributedExecuteTarget,
     };
 
@@ -247,6 +257,7 @@ namespace irgen {
       case SpecialKind::AsyncLetGetThrowing:
       case SpecialKind::AsyncLetFinish:
       case SpecialKind::TaskGroupWaitNext:
+      case SpecialKind::TaskGroupWaitAll:
         return true;
       case SpecialKind::DistributedExecuteTarget:
         return false;
@@ -277,6 +288,7 @@ namespace irgen {
       case SpecialKind::AsyncLetGetThrowing:
       case SpecialKind::AsyncLetFinish:
       case SpecialKind::TaskGroupWaitNext:
+      case SpecialKind::TaskGroupWaitAll:
         return true;
       case SpecialKind::DistributedExecuteTarget:
         return false;
@@ -314,19 +326,41 @@ namespace irgen {
     PointerAuthInfo AuthInfo;
 
     Signature Sig;
+    // If this is an await function pointer contains the signature of the await
+    // call (without return values).
+    llvm::Type *awaitSignature = nullptr;
+    bool useSignature = false;
 
-  public:
+    // True when this function pointer points to a non-throwing foreign
+    // function.
+    bool isForeignNoThrow = false;
+
+    // True when this function pointer points to a foreign function that traps
+    // on exception in the always_inline thunk.
+    bool foreignCallCatchesExceptionInThunk = false;
+
+    explicit FunctionPointer(Kind kind, llvm::Value *value,
+                             const Signature &signature)
+        : FunctionPointer(kind, value, PointerAuthInfo(), signature) {}
+
+    explicit FunctionPointer(Kind kind, llvm::Value *value,
+                             PointerAuthInfo authInfo,
+                             const Signature &signature)
+        : FunctionPointer(kind, value, nullptr, authInfo, signature){};
+
     /// Construct a FunctionPointer for an arbitrary pointer value.
     /// We may add more arguments to this; try to use the other
     /// constructors/factories if possible.
     explicit FunctionPointer(Kind kind, llvm::Value *value,
                              llvm::Value *secondaryValue,
                              PointerAuthInfo authInfo,
-                             const Signature &signature)
+                             const Signature &signature,
+                             llvm::Type *awaitSignature = nullptr)
         : kind(kind), Value(value), SecondaryValue(secondaryValue),
-          AuthInfo(authInfo), Sig(signature) {
+          AuthInfo(authInfo), Sig(signature), awaitSignature(awaitSignature) {
       // The function pointer should have function type.
-      assert(value->getType()->getPointerElementType()->isFunctionTy());
+      assert(!value->getContext().supportsTypedPointers() ||
+             value->getType()->getNonOpaquePointerElementType()->isFunctionTy());
       // TODO: maybe assert similarity to signature.getType()?
       if (authInfo) {
         if (kind == Kind::Function) {
@@ -337,15 +371,43 @@ namespace irgen {
       }
     }
 
-    explicit FunctionPointer(Kind kind, llvm::Value *value,
-                             PointerAuthInfo authInfo,
-                             const Signature &signature)
-        : FunctionPointer(kind, value, nullptr, authInfo, signature){};
+  public:
+    FunctionPointer()
+        : kind(FunctionPointer::Kind::Function), Value(nullptr),
+          SecondaryValue(nullptr) {}
 
-    // Temporary only!
-    explicit FunctionPointer(Kind kind, llvm::Value *value,
-                             const Signature &signature)
-      : FunctionPointer(kind, value, PointerAuthInfo(), signature) {}
+    static FunctionPointer createForAsyncCall(llvm::Value *value,
+                                              PointerAuthInfo authInfo,
+                                              const Signature &signature,
+                                              llvm::Type *awaitCallSignature) {
+      return FunctionPointer(FunctionPointer::Kind::Function, value, nullptr,
+                             authInfo, signature, awaitCallSignature);
+    }
+
+    static FunctionPointer createSigned(Kind kind, llvm::Value *value,
+                                        PointerAuthInfo authInfo,
+                                        const Signature &signature,
+                                        bool useSignature = false) {
+      auto res = FunctionPointer(kind, value, authInfo, signature);
+      res.useSignature = useSignature;
+      return res;
+    }
+    static FunctionPointer createSignedClosure(Kind kind, llvm::Value *value,
+                                        PointerAuthInfo authInfo,
+                                        const Signature &signature) {
+      auto res = FunctionPointer(kind, value, authInfo, signature);
+      res.useSignature = true;
+      return res;
+    }
+
+
+    static FunctionPointer createUnsigned(Kind kind, llvm::Value *value,
+                                          const Signature &signature,
+                                          bool useSignature = false) {
+      auto res = FunctionPointer(kind, value, signature);
+      res.useSignature = useSignature;
+      return res;
+    }
 
     static FunctionPointer forDirect(IRGenModule &IGM, llvm::Constant *value,
                                      llvm::Constant *secondaryValue,
@@ -353,9 +415,12 @@ namespace irgen {
 
     static FunctionPointer forDirect(Kind kind, llvm::Constant *value,
                                      llvm::Constant *secondaryValue,
-                                     const Signature &signature) {
-      return FunctionPointer(kind, value, secondaryValue, PointerAuthInfo(),
+                                     const Signature &signature,
+                                     bool useSignature = false) {
+      auto res = FunctionPointer(kind, value, secondaryValue, PointerAuthInfo(),
                              signature);
+      res.useSignature = useSignature;
+      return res;
     }
 
     static FunctionPointer forExplosionValue(IRGenFunction &IGF,
@@ -394,10 +459,7 @@ namespace irgen {
       return cast<llvm::Constant>(Value);
     }
 
-    llvm::FunctionType *getFunctionType() const {
-      return cast<llvm::FunctionType>(
-                                  Value->getType()->getPointerElementType());
-    }
+    llvm::FunctionType *getFunctionType() const;
 
     const PointerAuthInfo &getAuthInfo() const {
       return AuthInfo;
@@ -436,6 +498,24 @@ namespace irgen {
     }
     bool shouldSuppressPolymorphicArguments() const {
       return kind.shouldSuppressPolymorphicArguments();
+    }
+
+    void setForeignNoThrow() { isForeignNoThrow = true; }
+
+    bool canThrowForeignException() const {
+      return getForeignInfo().canThrow && !isForeignNoThrow;
+    }
+
+    void setForeignCallCatchesExceptionInThunk() {
+      foreignCallCatchesExceptionInThunk = true;
+    }
+
+    bool doesForeignCallCatchExceptionInThunk() {
+      return foreignCallCatchesExceptionInThunk;
+    }
+
+    bool shouldUseInvoke() const {
+      return canThrowForeignException() && !foreignCallCatchesExceptionInThunk;
     }
   };
 
@@ -527,6 +607,7 @@ namespace irgen {
     /// Given that this callee is an ObjC method, return the receiver
     /// argument.  This might not be 'self' anymore.
     llvm::Value *getObjCMethodSelector() const;
+    bool isDirectObjCMethod() const;
   };
 
   FunctionPointer::Kind classifyFunctionPointerKind(SILFunction *fn);

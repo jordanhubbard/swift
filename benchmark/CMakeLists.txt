@@ -45,6 +45,7 @@ set(SWIFT_BENCH_MODULES
     single-source/Breadcrumbs
     single-source/BucketSort
     single-source/BufferFill
+    single-source/BufferFind
     single-source/ByteSwap
     single-source/COWTree
     single-source/COWArrayGuaranteedParameterOverhead
@@ -57,6 +58,7 @@ set(SWIFT_BENCH_MODULES
     single-source/CharacterLiteralsLarge
     single-source/CharacterLiteralsSmall
     single-source/CharacterProperties
+    single-source/CharacterRecognizer
     single-source/Chars
     single-source/ClassArrayGetter
     single-source/CodableTest
@@ -162,7 +164,8 @@ set(SWIFT_BENCH_MODULES
     single-source/RomanNumbers
     single-source/SIMDRandomMask
     single-source/SIMDReduceInteger
-    single-source/SimpleArraySpecialization
+    # Disabled while layout prespecializations are experimental
+    #single-source/SimpleArraySpecialization
     single-source/SequenceAlgos
     single-source/SetTests
     single-source/SevenBoom
@@ -178,11 +181,13 @@ set(SWIFT_BENCH_MODULES
     single-source/StrToInt
     single-source/StringBuilder
     single-source/StringComparison
+    single-source/StringDistance
     single-source/StringEdits
     single-source/StringEnum
     single-source/StringInterpolation
     single-source/StringMatch
     single-source/StringRemoveDupes
+    single-source/StringRepeating
     single-source/StringReplaceSubrange
     single-source/StringSplitting
     single-source/StringSwitch
@@ -194,10 +199,14 @@ set(SWIFT_BENCH_MODULES
     single-source/TwoSum
     single-source/TypeFlood
     single-source/UTF8Decode
+    single-source/UTF16Decode
     single-source/Walsh
     single-source/WordCount
     single-source/XorLoop
     cxx-source/CreateObjects
+    cxx-source/CxxSetToCollection
+    cxx-source/CxxStringConversion
+    cxx-source/CxxVectorSum
     cxx-source/ReadAccessor
 )
 
@@ -216,7 +225,8 @@ endif()
 
 set(BENCH_LIBRARY_MODULES
     utils/TestsUtils
-    utils/SimpleArray
+    # Disabled while layout prespecializations are experimental
+    #utils/SimpleArray
 )
 
 set(BENCH_DRIVER_LIBRARY_MODULES

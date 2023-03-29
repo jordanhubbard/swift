@@ -4,12 +4,15 @@ target_sources(swiftSIL PRIVATE
   DebugUtils.cpp
   Dominance.cpp
   DynamicCasts.cpp
+  FieldSensitivePrunedLiveness.cpp
   GenericSpecializationMangler.cpp
   InstructionUtils.cpp
   LoopInfo.cpp
   MemAccessUtils.cpp
   MemoryLocations.cpp
   OptimizationRemark.cpp
+  OSSALifetimeCompletion.cpp
+  OwnershipLiveness.cpp
   OwnershipUtils.cpp
   PrettyStackTrace.cpp
   Projection.cpp

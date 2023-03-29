@@ -22,7 +22,7 @@
 #include "swift/Basic/LLVM.h"
 #include "swift/ABI/MetadataValues.h"
 #include "swift/AST/LayoutConstraintKind.h"
-#include "swift/AST/RequirementBase.h"
+#include "swift/AST/RequirementKind.h"
 #include "swift/Basic/Unreachable.h"
 #include "swift/Demangling/Demangler.h"
 #include "swift/Demangling/NamespaceMacros.h"
@@ -98,6 +98,9 @@ enum class ImplParameterConvention {
   Direct_Owned,
   Direct_Unowned,
   Direct_Guaranteed,
+  Pack_Owned,
+  Pack_Guaranteed,
+  Pack_Inout,
 };
 
 enum class ImplParameterDifferentiability {
@@ -135,6 +138,12 @@ public:
       return ConventionType::Direct_Unowned;
     if (conventionString == "@guaranteed")
       return ConventionType::Direct_Guaranteed;
+    if (conventionString == "@pack_owned")
+      return ConventionType::Pack_Owned;
+    if (conventionString == "@pack_guaranteed")
+      return ConventionType::Pack_Guaranteed;
+    if (conventionString == "@pack_inout")
+      return ConventionType::Pack_Inout;
 
     return None;
   }
@@ -167,6 +176,7 @@ enum class ImplResultConvention {
   Unowned,
   UnownedInnerPointer,
   Autoreleased,
+  Pack,
 };
 
 enum class ImplResultDifferentiability {
@@ -198,6 +208,8 @@ public:
       return ConventionType::UnownedInnerPointer;
     if (conventionString == "@autoreleased")
       return ConventionType::Autoreleased;
+    if (conventionString == "@pack_out")
+      return ConventionType::Pack;
 
     return None;
   }
@@ -1059,6 +1071,46 @@ protected:
       }
       return decodeMangledType(Node->getChild(0), depth + 1,
                                /*forRequirement=*/false);
+
+    case NodeKind::Pack:
+    case NodeKind::SILPackDirect:
+    case NodeKind::SILPackIndirect: {
+      llvm::SmallVector<BuiltType, 8> elements;
+
+      for (auto &element : *Node) {
+        // Decode the element type.
+        auto elementType =
+            decodeMangledType(element, depth + 1, /*forRequirement=*/false);
+        if (elementType.isError())
+          return elementType;
+
+        elements.push_back(elementType.getType());
+      }
+
+      switch (Node->getKind()) {
+      case NodeKind::Pack:
+        return Builder.createPackType(elements);
+      case NodeKind::SILPackDirect:
+        return Builder.createSILPackType(elements, /*isElementAddress=*/false);
+      case NodeKind::SILPackIndirect:
+        return Builder.createSILPackType(elements, /*isElementAddress=*/true);
+      default:
+        llvm_unreachable("Bad kind");
+      }
+    }
+
+    case NodeKind::PackExpansion: {
+      if (Node->getNumChildren() < 2)
+        return MAKE_NODE_TYPE_ERROR(Node,
+                                    "fewer children (%zu) than required (2)",
+                                    Node->getNumChildren());
+
+      auto patternType = decodeMangledType(Node->getChild(0), depth + 1);
+      auto countType = decodeMangledType(Node->getChild(1), depth + 1);
+
+      return Builder.createPackExpansionType(patternType.getType(),
+                                             countType.getType());
+    }
 
     case NodeKind::DependentGenericType: {
       if (Node->getNumChildren() < 2)

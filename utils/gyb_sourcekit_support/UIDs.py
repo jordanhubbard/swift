@@ -49,10 +49,9 @@ UID_KEYS = [
     KEY('Offset', 'key.offset'),
     KEY('Length', 'key.length'),
     KEY('SourceFile', 'key.sourcefile'),
-    KEY('SerializedSyntaxTree', 'key.serialized_syntax_tree'),
     KEY('SourceText', 'key.sourcetext'),
+    KEY('PrimaryFile', 'key.primary_file'),
     KEY('EnableSyntaxMap', 'key.enablesyntaxmap'),
-    KEY('SyntaxTreeTransferMode', 'key.syntaxtreetransfermode'),
     KEY('EnableStructure', 'key.enablesubstructure'),
     KEY('ID', 'key.id'),
     KEY('Description', 'key.description'),
@@ -85,6 +84,7 @@ UID_KEYS = [
     KEY('BodyLength', 'key.bodylength'),
     KEY('DocOffset', 'key.docoffset'),
     KEY('DocLength', 'key.doclength'),
+    KEY('IsActive', 'key.is_active'),
     KEY('IsLocal', 'key.is_local'),
     KEY('InheritedTypes', 'key.inheritedtypes'),
     KEY('Attributes', 'key.attributes'),
@@ -182,6 +182,7 @@ UID_KEYS = [
     KEY('VariableLength', 'key.variable_length'),
     KEY('VariableType', 'key.variable_type'),
     KEY('VariableTypeExplicit', 'key.variable_type_explicit'),
+    KEY('FullyQualified', 'key.fully_qualified'),
     KEY('CanonicalizeType', 'key.canonicalize_type'),
     KEY('InternalDiagnostic', 'key.internal_diagnostic'),
     KEY('VFSName', 'key.vfs.name'),
@@ -203,6 +204,7 @@ UID_KEYS = [
     # in this time. For cancellation testing purposes.
     KEY('SimulateLongRequest', 'key.simulate_long_request'),
     KEY('IsSynthesized', 'key.is_synthesized'),
+    KEY('BufferName', 'key.buffer_name')
 ]
 
 
@@ -225,6 +227,7 @@ UID_REQUESTS = [
     REQUEST('CodeCompleteSetCustom', 'source.request.codecomplete.setcustom'),
     REQUEST('TypeContextInfo', 'source.request.typecontextinfo'),
     REQUEST('ConformingMethodList', 'source.request.conformingmethods'),
+    REQUEST('ActiveRegions', 'source.request.activeregions'),
     REQUEST('CursorInfo', 'source.request.cursorinfo'),
     REQUEST('RangeInfo', 'source.request.rangeinfo'),
     REQUEST('RelatedIdents', 'source.request.relatedidents'),
@@ -370,6 +373,8 @@ UID_KINDS = [
     KIND('RefTypeAlias', 'source.lang.swift.ref.typealias'),
     KIND('DeclGenericTypeParam', 'source.lang.swift.decl.generic_type_param'),
     KIND('RefGenericTypeParam', 'source.lang.swift.ref.generic_type_param'),
+    KIND('DeclMacro', 'source.lang.swift.decl.macro'),
+    KIND('RefMacro', 'source.lang.swift.ref.macro'),
     KIND('RefModule', 'source.lang.swift.ref.module'),
     KIND('CommentTag', 'source.lang.swift.commenttag'),
     KIND('StmtForEach', 'source.lang.swift.stmt.foreach'),
@@ -475,8 +480,6 @@ UID_KINDS = [
     KIND('StatNumRequests', 'source.statistic.num-requests'),
     KIND('StatNumSemaRequests', 'source.statistic.num-semantic-requests'),
     KIND('StatInstructionCount', 'source.statistic.instruction-count'),
-    KIND('SyntaxTreeOff', 'source.syntaxtree.transfer.off'),
-    KIND('SyntaxTreeFull', 'source.syntaxtree.transfer.full'),
     KIND('Swift', 'source.lang.swift'),
     KIND('ObjC', 'source.lang.objc'),
 ]

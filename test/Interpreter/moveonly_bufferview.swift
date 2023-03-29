@@ -1,4 +1,5 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-move-only) | %FileCheck %s
+// TODO: re-enable the simplification passes once rdar://104875010 is fixed
+// RUN: %target-run-simple-swift(-Xllvm -sil-disable-pass=simplification) | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: swift_test_mode_optimize_none
@@ -8,42 +9,59 @@
 
 @_moveOnly
 public struct BufferView<T> {
-    var ptr: UnsafeMutableBufferPointer<T>
+    var ptr: UnsafeBufferPointer<T>
+
+    var count: Int {
+        return ptr.count
+    }
+
+    subscript(_ x: Int) -> T {
+        return ptr[x]
+    }
 
     deinit {}
 }
 
-extension BufferView : Sequence {
-    public typealias Iterator = UnsafeMutableBufferPointer<T>.Iterator
-    public typealias Element = UnsafeMutableBufferPointer<T>.Element
-
-    public func makeIterator() -> Self.Iterator {
-        return ptr.makeIterator()
-    }
-}
-
 extension Array {
-    public mutating func withBufferView<U>(_ f: (BufferView<Element>) -> U) -> U {
-        return withUnsafeMutableBufferPointer {
+    public mutating func withBufferView<U>(_ f: (__shared BufferView<Element>) -> U) -> U {
+        return withUnsafeBufferPointer {
             return f(BufferView(ptr: $0))
         }
     }
 }
 
 func testBufferView(_ x: __owned [Int]) {
-    var y = _move x
+    var y = consume x
     // CHECK: 1
     // CHECK: 2
     // CHECK: 3
     y.withBufferView {
-        for x in $0 {
-            print(x)
+        for i in 0..<$0.count {
+            print($0[i])
+        }
+    }
+}
+
+@inline(never)
+func getBool() -> Bool { return true }
+
+func testConditionalBufferView(_ x: __owned [Int]) {
+    (consume x).withUnsafeBufferPointer {
+        let y = BufferView(ptr: $0)
+        // CHECK: 4
+        // CHECK: 5
+        // CHECK: 6
+        if getBool() {
+            for i in 0..<y.count {
+                print(y[i])
+            }
         }
     }
 }
 
 func main() {
     testBufferView([1,2,3])
+    testConditionalBufferView([4,5,6])
 }
 
 main()

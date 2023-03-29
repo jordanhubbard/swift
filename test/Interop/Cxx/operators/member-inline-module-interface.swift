@@ -3,6 +3,7 @@
 // CHECK: struct LoadableIntWrapper {
 // CHECK:   func successor() -> LoadableIntWrapper
 // CHECK:   static func - (lhs: inout LoadableIntWrapper, rhs: LoadableIntWrapper) -> LoadableIntWrapper
+// CHECK:   static func += (lhs: inout LoadableIntWrapper, rhs: LoadableIntWrapper)
 // CHECK:   mutating func callAsFunction() -> Int32
 // CHECK:   mutating func callAsFunction(_ x: Int32) -> Int32
 // CHECK:   mutating func callAsFunction(_ x: Int32, _ y: Int32) -> Int32
@@ -10,6 +11,7 @@
 
 // CHECK: struct LoadableBoolWrapper {
 // CHECK:   prefix static func ! (lhs: inout LoadableBoolWrapper) -> LoadableBoolWrapper
+// CHECK:   func __convertToBool() -> Bool
 // CHECK: }
 
 // CHECK: struct AddressOnlyIntWrapper {
@@ -92,7 +94,7 @@
 
 // CHECK: struct TemplatedArray<T> {
 // CHECK: }
-// CHECK: struct __CxxTemplateInst14TemplatedArrayIdE {
+// CHECK: struct TemplatedArray<Double> {
 // CHECK:   subscript(i: Int32) -> Double
 
 // CHECK:   @available(*, unavailable, message: "use subscript")
@@ -101,7 +103,7 @@
 // CHECK:   @available(*, unavailable, message: "use subscript")
 // CHECK:   func __operatorSubscriptConst(_ i: Int32) -> UnsafePointer<Double>
 // CHECK: }
-// CHECK: typealias TemplatedDoubleArray = __CxxTemplateInst14TemplatedArrayIdE
+// CHECK: typealias TemplatedDoubleArray = TemplatedArray<Double>
 
 
 // CHECK: struct TemplatedSubscriptArray {
@@ -138,12 +140,12 @@
 
 // CHECK: struct TemplatedArrayByVal<T> {
 // CHECK: }
-// CHECK: struct __CxxTemplateInst19TemplatedArrayByValIdE {
+// CHECK: struct TemplatedArrayByVal<Double> {
 // CHECK:   subscript(i: Int32) -> Double { mutating get }
 // CHECK:   @available(*, unavailable, message: "use subscript")
 // CHECK:   mutating func __operatorSubscriptConst(_ i: Int32) -> Double
 // CHECK: }
-// CHECK: typealias TemplatedDoubleArrayByVal = __CxxTemplateInst19TemplatedArrayByValIdE
+// CHECK: typealias TemplatedDoubleArrayByVal = TemplatedArrayByVal<Double>
 
 // CHECK: struct TemplatedByVal<T> {
 // CHECK-NEXT: }
@@ -220,3 +222,23 @@
 // CHECK:   @available(*, unavailable, message: "use .pointee property")
 // CHECK:   func __operatorStar() -> Int32
 // CHECK: }
+
+// CHECK: struct AmbiguousOperatorStar {
+// CHECK-NEXT:   var pointee: Int32 { get }
+// CHECK-NEXT:   init()
+// CHECK-NEXT:   @available(*, unavailable, message: "use .pointee property")
+// CHECK-NEXT:   mutating func __operatorStar() -> UnsafeMutablePointer<Int32>
+// CHECK-NEXT:   @available(*, unavailable, message: "use .pointee property")
+// CHECK-NEXT:   func __operatorStar() -> UnsafePointer<Int32>
+// CHECK-NEXT: }
+
+// CHECK: struct AmbiguousOperatorStar2 {
+// CHECK-NEXT:   var pointee: Int32 { get }
+// CHECK-NEXT:   init()
+// CHECK-NEXT:   @available(*, unavailable, message: "use .pointee property")
+// CHECK-NEXT:   mutating func __operatorStar() -> UnsafeMutablePointer<Int32>
+// CHECK-NEXT:   @available(*, unavailable, message: "use .pointee property")
+// CHECK-NEXT:   func __operatorStar() -> UnsafePointer<Int32>
+// CHECK-NEXT:   @available(*, unavailable, message: "use .pointee property")
+// CHECK-NEXT:   func __operatorStar() -> UnsafePointer<Int32>
+// CHECK-NEXT: }

@@ -76,6 +76,13 @@ SEMANTICS_ATTR(OPTIMIZE_SIL_SPECIALIZE_GENERIC_SIZE_NEVER,
 SEMANTICS_ATTR(OPTIMIZE_SIL_SPECIALIZE_OWNED2GUARANTEE_NEVER,
           "optimize.sil.specialize.owned2guarantee.never")
 
+// To be used on a nominal type declaration.
+// Assumes that a class (or class references inside a nominal type) are immortal.
+// ARC operations on such types can be eliminated.
+// If specified on a protocol declaration, all types which conform to that protocol
+// are assumed to be immortal.
+SEMANTICS_ATTR(ARC_IMMORTAL, "arc.immortal")
+
 SEMANTICS_ATTR(OSLOG_MESSAGE_TYPE, "oslog.message.type")
 SEMANTICS_ATTR(OSLOG_MESSAGE_INIT_INTERPOLATION, "oslog.message.init_interpolation")
 SEMANTICS_ATTR(OSLOG_MESSAGE_INIT_STRING_LITERAL, "oslog.message.init_stringliteral")
@@ -97,6 +104,7 @@ SEMANTICS_ATTR(PROGRAMTERMINATION_POINT, "programtermination_point")
 SEMANTICS_ATTR(CONVERT_TO_OBJECTIVE_C, "convertToObjectiveC")
 
 SEMANTICS_ATTR(KEYPATH_KVC_KEY_PATH_STRING, "keypath.kvcKeyPathString")
+SEMANTICS_ATTR(KEYPATH_MUST_BE_VALID_FOR_KVO, "keypath.mustBeValidForKVO")
 
 /// The prefix used to force opt-remarks to be emitted in a specific function.
 ///
@@ -118,6 +126,10 @@ SEMANTICS_ATTR(LIFETIMEMANAGEMENT_MOVE, "lifetimemanagement.move")
 SEMANTICS_ATTR(LIFETIMEMANAGEMENT_COPY, "lifetimemanagement.copy")
 
 SEMANTICS_ATTR(NO_PERFORMANCE_ANALYSIS, "no_performance_analysis")
+
+// A flag used to turn off moveonly diagnostics on functions that allocbox to
+// stack specialized.
+SEMANTICS_ATTR(NO_MOVEONLY_DIAGNOSTICS, "sil.optimizer.moveonly.diagnostic.ignore")
 
 #undef SEMANTICS_ATTR
 

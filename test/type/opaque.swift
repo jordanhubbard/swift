@@ -578,3 +578,15 @@ do {
     x
   }
 }
+
+// https://github.com/apple/swift/issues/62787
+func f62787() -> Optional<some Collection<Int>> {
+  return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+}
+
+func f62787_1(x: Bool) -> Optional<some Collection<Int>> {
+  if x {
+    return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+  } 
+  return nil // expected-error{{underlying type for opaque result type 'Optional<some Collection<Int>>' could not be inferred from return expression}}
+}

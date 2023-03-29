@@ -92,11 +92,6 @@ class NullEditorConsumer : public EditorConsumer {
   void recordFormattedText(StringRef Text) override {}
 
   void handleSourceText(StringRef Text) override {}
-  void handleSyntaxTree(const swift::syntax::SourceFileSyntax &SyntaxTree) override {}
-
-  SyntaxTreeTransferMode syntaxTreeTransferMode() override {
-    return SyntaxTreeTransferMode::Off;
-  }
 
 public:
   bool needsSema = false;
@@ -147,8 +142,8 @@ public:
 
   void open(const char *DocName, StringRef Text,
             Optional<ArrayRef<const char *>> CArgs = llvm::None) {
-    auto Args = CArgs.hasValue() ? makeArgs(DocName, *CArgs)
-                                 : std::vector<const char *>{};
+    auto Args = CArgs.has_value() ? makeArgs(DocName, *CArgs)
+                                  : std::vector<const char *>{};
     auto Buf = MemoryBuffer::getMemBufferCopy(Text, DocName);
     getLang().editorOpen(DocName, Buf.get(), Consumer, Args, None);
   }
@@ -168,7 +163,7 @@ public:
 
     TestCursorInfo TestInfo;
     getLang().getCursorInfo(
-        DocName, Offset, /*Length=*/0, /*Actionables=*/false,
+        DocName, DocName, Offset, /*Length=*/0, /*Actionables=*/false,
         /*SymbolGraph=*/false, CancelOnSubsequentRequest, Args,
         /*vfsOptions=*/None, CancellationToken,
         [&](const RequestResult<CursorInfoData> &Result) {
@@ -453,7 +448,7 @@ TEST_F(CursorInfoTest, CursorInfoCancelsPreviousRequest) {
   // cancelled as the next cursor info (which is faster) gets requested.
   Semaphore FirstCursorInfoSema(0);
   getLang().getCursorInfo(
-      SlowDocName, SlowOffset, /*Length=*/0, /*Actionables=*/false,
+      SlowDocName, SlowDocName, SlowOffset, /*Length=*/0, /*Actionables=*/false,
       /*SymbolGraph=*/false, /*CancelOnSubsequentRequest=*/true, ArgsForSlow,
       /*vfsOptions=*/None, /*CancellationToken=*/nullptr,
       [&](const RequestResult<CursorInfoData> &Result) {
@@ -496,7 +491,7 @@ TEST_F(CursorInfoTest, CursorInfoCancellation) {
   // cancelled as the next cursor info (which is faster) gets requested.
   Semaphore CursorInfoSema(0);
   getLang().getCursorInfo(
-      SlowDocName, SlowOffset, /*Length=*/0, /*Actionables=*/false,
+      SlowDocName, SlowDocName, SlowOffset, /*Length=*/0, /*Actionables=*/false,
       /*SymbolGraph=*/false, /*CancelOnSubsequentRequest=*/false, ArgsForSlow,
       /*vfsOptions=*/None, /*CancellationToken=*/CancellationToken,
       [&](const RequestResult<CursorInfoData> &Result) {

@@ -2,10 +2,14 @@
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
+// REQUIRES: reflection
 
 // rdar://76038845
 // REQUIRES: concurrency_runtime
 // UNSUPPORTED: back_deployment_runtime
+
+// rdar://105496007
+// UNSUPPORTED: CPU=arm64e
 
 @available(SwiftStdlib 5.1, *)
 enum TL {

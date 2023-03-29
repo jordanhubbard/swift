@@ -135,9 +135,9 @@
 //         CHECK-SAME:   i32 {{(48|32)}},
 //         CHECK-SAME:   i16 {{(7|3)}},
 //         CHECK-SAME:   i16 0,
-//   CHECK-apple-SAME:   i32 {{(168|96)}},
-// CHECK-unknown-SAME:   i32 144,
-//         CHECK-SAME:   i32 {{(16|8)}},
+//   CHECK-apple-SAME:   i32 {{(176|100)}},
+// CHECK-unknown-SAME:   i32 152,
+//         CHECK-SAME:   i32 {{(24|12)}},
 //                   :   %swift.type_descriptor* bitcast (
 //                   :     <{
 //                   :       i32,
@@ -236,7 +236,7 @@ func doit() {
 }
 doit()
 
-//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main9Ancestor2[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {
+//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main9Ancestor2[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {{(section)?.*}}{
 //      CHECK: entry:
 //      CHECK:   [[ERASED_TYPE:%[0-9]+]] = bitcast %swift.type* %1 to i8*
 //      CHECK:   {{%[0-9]+}} = call swiftcc %swift.metadata_response @__swift_instantiateCanonicalPrespecializedGenericMetadata(
@@ -253,7 +253,7 @@ doit()
 //      CHECK:   ret %swift.metadata_response {{%[0-9]+}}
 //      CHECK: }
 
-//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main9Ancestor1[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {
+//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main9Ancestor1[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {{(section)?.*}}{
 //      CHECK: entry:
 //      CHECK:   [[ERASED_TYPE:%[0-9]+]] = bitcast %swift.type* %1 to i8*
 //      CHECK:   {{%[0-9]+}} = call swiftcc %swift.metadata_response @__swift_instantiateCanonicalPrespecializedGenericMetadata(
@@ -270,7 +270,7 @@ doit()
 //      CHECK:   ret %swift.metadata_response {{%[0-9]+}}
 //      CHECK: }
 
-//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {
+//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {{(section)?.*}}{
 //      CHECK: entry:
 //      CHECK:   [[ERASED_TYPE:%[0-9]+]] = bitcast %swift.type* %1 to i8*
 //      CHECK:   {{%[0-9]+}} = call swiftcc %swift.metadata_response @__swift_instantiateCanonicalPrespecializedGenericMetadata(
@@ -288,7 +288,7 @@ doit()
 //      CHECK: }
 
 //         CHECK: ; Function Attrs: noinline nounwind readnone
-//         CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CySSGMb"([[INT]] {{%[0-9]+}}) #{{[0-9]+}} {
+//         CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CySSGMb"([[INT]] {{%[0-9]+}}) #{{[0-9]+}} {{(section)?.*}}{
 //         CHECK: entry:
 //         CHECK:   call swiftcc %swift.metadata_response @"$s4main9Ancestor1[[UNIQUE_ID_1]]CySiGMb"([[INT]] 0)
 //     CHECK-NOT:   call swiftcc %swift.metadata_response @"$s4main9Ancestor2[[UNIQUE_ID_1]]CySiGMb"([[INT]] 0)

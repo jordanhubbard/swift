@@ -43,22 +43,7 @@ using namespace swift;
 namespace {
 
 static Type getNamedSwiftType(ModuleDecl *stdlib, StringRef name) {
-  auto &ctx = stdlib->getASTContext();
-  SmallVector<ValueDecl*, 1> results;
-  stdlib->lookupValue(ctx.getIdentifier(name), NLKind::QualifiedLookup,
-                      results);
-
-  // If we have one single type decl, and that decl has been
-  // type-checked, return its declared type.
-  //
-  // ...non-type-checked types should only ever show up here because
-  // of test cases using -enable-source-import, but unfortunately
-  // that's a real thing.
-  if (results.size() == 1) {
-    if (auto typeDecl = dyn_cast<TypeDecl>(results[0]))
-      return typeDecl->getDeclaredInterfaceType();
-  }
-  return Type();
+  return stdlib->getASTContext().getNamedSwiftType(stdlib, name);
 }
 
 static clang::QualType
@@ -128,10 +113,6 @@ const clang::Type *ClangTypeConverter::getFunctionType(
     ArrayRef<AnyFunctionType::Param> params, Type resultTy,
     AnyFunctionType::Representation repr) {
 
-#if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
-  return nullptr;
-#endif
-
   auto resultClangTy = convert(resultTy);
   if (resultClangTy.isNull())
     return nullptr;
@@ -175,14 +156,10 @@ const clang::Type *ClangTypeConverter::getFunctionType(
     ArrayRef<SILParameterInfo> params, Optional<SILResultInfo> result,
     SILFunctionType::Representation repr) {
 
-#if SWIFT_BUILD_ONLY_SYNTAXPARSERLIB
-  return nullptr;
-#endif
-
   // Using the interface type is sufficient as type parameters get mapped to
   // `id`, since ObjC lightweight generics use type erasure. (See also: SE-0057)
-  auto resultClangTy = result.hasValue()
-                     ? convert(result.getValue().getInterfaceType())
+  auto resultClangTy = result.has_value()
+                     ? convert(result.value().getInterfaceType())
                      : ClangASTContext.VoidTy;
 
   if (resultClangTy.isNull())

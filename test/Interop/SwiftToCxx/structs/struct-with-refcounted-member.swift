@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Structs -clang-header-expose-public-decls -emit-clang-header-path %t/structs.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Structs -clang-header-expose-decls=all-public -emit-clang-header-path %t/structs.h
 // RUN: %FileCheck %s < %t/structs.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/structs.h -Wno-unused-function)
@@ -25,9 +25,9 @@ public func printBreak(_ x: Int) {
     print("breakpoint \(x)")
 }
 
-// CHECK:      class StructWithRefcountedMember final {
+// CHECK:      class SWIFT_SYMBOL({{.*}}) StructWithRefcountedMember final {
 // CHECK-NEXT: public:
-// CHECK-NEXT:   inline ~StructWithRefcountedMember() {
+// CHECK-NEXT:   SWIFT_INLINE_THUNK ~StructWithRefcountedMember() noexcept {
 // CHECK-NEXT:     auto metadata = _impl::$s7Structs26StructWithRefcountedMemberVMa(0);
 // CHECK-NEXT:     auto *vwTableAddr = reinterpret_cast<swift::_impl::ValueWitnessTable **>(metadata._0) - 1;
 // CHECK-NEXT: #ifdef __arm64e__
@@ -37,7 +37,7 @@ public func printBreak(_ x: Int) {
 // CHECK-NEXT: #endif
 // CHECK-NEXT:     vwTable->destroy(_getOpaquePointer(), metadata._0);
 // CHECK-NEXT:   }
-// CHECK-NEXT:   inline StructWithRefcountedMember(const StructWithRefcountedMember &other) {
+// CHECK-NEXT:   SWIFT_INLINE_THUNK StructWithRefcountedMember(const StructWithRefcountedMember &other) noexcept {
 // CHECK-NEXT:     auto metadata = _impl::$s7Structs26StructWithRefcountedMemberVMa(0);
 // CHECK-NEXT:     auto *vwTableAddr = reinterpret_cast<swift::_impl::ValueWitnessTable **>(metadata._0) - 1;
 // CHECK-NEXT: #ifdef __arm64e__
@@ -47,5 +47,5 @@ public func printBreak(_ x: Int) {
 // CHECK-NEXT: #endif
 // CHECK-NEXT:     vwTable->initializeWithCopy(_getOpaquePointer(), const_cast<char *>(other._getOpaquePointer()), metadata._0);
 // CHECK-NEXT:   }
-// CHECK-NEXT:   inline StructWithRefcountedMember(StructWithRefcountedMember &&) { abort(); }
+// CHECK-NEXT:   SWIFT_INLINE_THUNK StructWithRefcountedMember(StructWithRefcountedMember &&) noexcept { abort(); }
 // CHECK-NEXT: private:

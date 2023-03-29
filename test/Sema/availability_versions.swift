@@ -625,6 +625,12 @@ class ClassAvailableOn10_51 { // expected-note {{enclosing scope requires availa
   @available(OSX, introduced: 10.9) // expected-error {{instance method cannot be more available than enclosing scope}}
   func someMethodAvailableOn10_9() { }
 
+  @available(OSX, unavailable)
+  func someMethodUnavailable() { }
+
+  @available(*, unavailable)
+  func someMethodUniversallyUnavailable() { }
+
   @available(OSX, introduced: 10.52)
   var propWithGetter: Int { // expected-note{{enclosing scope requires availability of macOS 10.52 or newer}}
     @available(OSX, introduced: 10.51) // expected-error {{getter cannot be more available than enclosing scope}}
@@ -1420,7 +1426,7 @@ class ClassForFixit {
       let _ = 6
     }
         // expected-error@-4 {{'globalFuncAvailableOn10_51()' is only available in macOS 10.51 or newer}}
-        // expected-note@-5 {{add 'if #available' version check}} {{5-6=if #available(macOS 10.51, *) {\n        if (globalFuncAvailableOn10_51() > 1066) {\n          let _ = 5\n          let _ = 6\n        }\n    } else {\n        // Fallback on earlier versions\n    }}}
+        // expected-note@-5 {{add 'if #available' version check}} {{5-+3:6=if #available(macOS 10.51, *) {\n        if (globalFuncAvailableOn10_51() > 1066) {\n          let _ = 5\n          let _ = 6\n        }\n    } else {\n        // Fallback on earlier versions\n    }}}
   }
 }
 
@@ -1725,12 +1731,11 @@ struct HasUnavailableExtension {
 
 @available(OSX, unavailable)
 extension HasUnavailableExtension {
-    // expected-note@-1 {{enclosing scope has been explicitly marked unavailable here}}
 
   public func inheritsUnavailable() { }
       // expected-note@-1 {{'inheritsUnavailable()' has been explicitly marked unavailable here}}
 
-  @available(OSX 10.9, *) // expected-warning {{instance method cannot be more available than unavailable enclosing scope}}
+  @available(OSX 10.9, *)
   public func moreAvailableButStillUnavailable() { }
       // expected-note@-1 {{'moreAvailableButStillUnavailable()' has been explicitly marked unavailable here}}
 }

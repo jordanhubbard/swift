@@ -36,11 +36,13 @@ namespace irgen {
 
 struct LoadedRef {
   llvm::PointerIntPair<llvm::Value*, 1> ValAndNonNull;
+  ReferenceCounting style;
 public:
-  LoadedRef(llvm::Value *V, bool nonNull): ValAndNonNull(V, nonNull) {}
-
+  LoadedRef(llvm::Value *V, bool nonNull, ReferenceCounting style): ValAndNonNull(V, nonNull), style(style) {}
+  LoadedRef(const LoadedRef &ref, bool nonNull): ValAndNonNull(ref.getValue(), nonNull), style(ref.getStyle()) {}
   llvm::Value *getValue() const { return ValAndNonNull.getPointer(); }
   bool isNonNull() const { return ValAndNonNull.getInt(); }
+  ReferenceCounting getStyle() const { return style; }
 };
 
 /// LoadableTypeInfo - A refinement of FixedTypeInfo designed for use
@@ -56,22 +58,28 @@ protected:
   LoadableTypeInfo(llvm::Type *type, Size size,
                    const SpareBitVector &spareBits,
                    Alignment align,
-                   IsPOD_t pod, IsFixedSize_t alwaysFixedSize,
+                   IsTriviallyDestroyable_t pod,
+                   IsCopyable_t copy,
+                   IsFixedSize_t alwaysFixedSize,
                    SpecialTypeInfoKind stik = SpecialTypeInfoKind::Loadable)
       : FixedTypeInfo(type, size, spareBits, align, pod,
                       // All currently implemented loadable types are bitwise-takable.
-                      IsBitwiseTakable, alwaysFixedSize, stik) {
+                      IsBitwiseTakable,
+                      copy, alwaysFixedSize, stik) {
     assert(isLoadable());
   }
 
   LoadableTypeInfo(llvm::Type *type, Size size,
                    SpareBitVector &&spareBits,
                    Alignment align,
-                   IsPOD_t pod, IsFixedSize_t alwaysFixedSize,
+                   IsTriviallyDestroyable_t pod,
+                   IsCopyable_t copy,
+                   IsFixedSize_t alwaysFixedSize,
                    SpecialTypeInfoKind stik = SpecialTypeInfoKind::Loadable)
       : FixedTypeInfo(type, size, std::move(spareBits), align, pod,
                       // All currently implemented loadable types are bitwise-takable.
-                      IsBitwiseTakable, alwaysFixedSize, stik) {
+                      IsBitwiseTakable,
+                      copy, alwaysFixedSize, stik) {
     assert(isLoadable());
   }
 
@@ -95,7 +103,7 @@ public:
   /// Assign a set of exploded values into an address.  The values are
   /// consumed out of the explosion.
   virtual void assign(IRGenFunction &IGF, Explosion &explosion, Address addr,
-                      bool isOutlined) const = 0;
+                      bool isOutlined, SILType T) const = 0;
 
   /// Initialize an address by consuming values out of an explosion.
   virtual void initialize(IRGenFunction &IGF, Explosion &explosion,
@@ -119,7 +127,8 @@ public:
   
   /// Release reference counts or other resources owned by the explosion.
   virtual void consume(IRGenFunction &IGF, Explosion &explosion,
-                       Atomicity atomicity) const = 0;
+                       Atomicity atomicity,
+                       SILType T) const = 0;
 
   /// Fix the lifetime of the source explosion by creating opaque calls to
   /// swift_fixLifetime for all reference types in the explosion.

@@ -280,6 +280,9 @@ void diagnoseMissingSendableConformance(
 /// state whether it conforms to Sendable, provide a diagnostic.
 void diagnoseMissingExplicitSendable(NominalTypeDecl *nominal);
 
+/// Warn about deprecated `Executor.enqueue` implementations.
+void tryDiagnoseExecutorConformance(ASTContext &C, const NominalTypeDecl *nominal, ProtocolDecl *proto);
+
 /// How the Sendable check should be performed.
 enum class SendableCheck {
   /// Sendable conformance was explicitly stated and should be
@@ -399,6 +402,11 @@ bool diagnoseSendabilityErrorBasedOn(
     NominalTypeDecl *nominal, SendableCheckContext fromContext,
     llvm::function_ref<bool(DiagnosticBehavior)> diagnose);
 
+/// If any of the imports in this source file was @preconcurrency but
+/// there were no diagnostics downgraded or suppressed due to that
+/// @preconcurrency, suggest that the attribute be removed.
+void diagnoseUnnecessaryPreconcurrencyImports(SourceFile &sf);
+
 /// Given a set of custom attributes, pick out the global actor attributes
 /// and perform any necessary resolution and diagnostics, returning the
 /// global actor attribute and type it refers to (or \c None).
@@ -427,9 +435,17 @@ AnyFunctionType *adjustFunctionTypeForConcurrency(
     llvm::function_ref<bool(const ClosureExpr *)> isolatedByPreconcurrency,
     llvm::function_ref<Type(Type)> openType);
 
+/// Classifies known dispatch queue operations.
+enum class DispatchQueueOperation {
+  /// This is a dispatch operation we know about.
+  Normal,
+  /// The closure passed to this dispatch queue operation should be Sendable.
+  Sendable,
+};
+
 /// Determine whether the given name is that of a DispatchQueue operation that
 /// takes a closure to be executed on the queue.
-bool isDispatchQueueOperationName(StringRef name);
+Optional<DispatchQueueOperation> isDispatchQueueOperationName(StringRef name);
 
 /// Check the correctness of the given Sendable conformance.
 ///

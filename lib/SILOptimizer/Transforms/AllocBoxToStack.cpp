@@ -13,11 +13,13 @@
 #define DEBUG_TYPE "allocbox-to-stack"
 
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/AST/SemanticAttrs.h"
 #include "swift/Basic/BlotMapVector.h"
 #include "swift/Basic/GraphNodeWorklist.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/Dominance.h"
+#include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILCloner.h"
@@ -70,7 +72,8 @@ static bool useCaptured(Operand *UI) {
   // These instructions do not cause the address to escape.
   if (isa<DebugValueInst>(User)
       || isa<StrongReleaseInst>(User) || isa<StrongRetainInst>(User)
-      || isa<DestroyValueInst>(User))
+      || isa<DestroyValueInst>(User)
+      || isa<EndBorrowInst>(User))
     return false;
 
   if (auto *Store = dyn_cast<StoreInst>(User)) {
@@ -254,8 +257,9 @@ static bool partialApplyEscapes(SILValue V, bool examineApply) {
     // If we have a copy_value, the copy value does not cause an escape, but its
     // uses might do so... so add the copy_value's uses to the worklist and
     // continue.
-    if (auto CVI = dyn_cast<CopyValueInst>(User)) {
-      llvm::copy(CVI->getUses(), std::back_inserter(Worklist));
+    if (isa<CopyValueInst>(User) || isa<BeginBorrowInst>(User)) {
+      llvm::copy(cast<SingleValueInstruction>(User)->getUses(),
+                 std::back_inserter(Worklist));
       continue;
     }
 
@@ -498,23 +502,76 @@ struct AllocBoxToStackState {
 };
 } // anonymous namespace
 
-static void replaceProjectBoxUsers(SILValue HeapBox, SILValue StackBox) {
-  SmallVector<Operand *, 8> Worklist(HeapBox->use_begin(), HeapBox->use_end());
-  while (!Worklist.empty()) {
-    auto *Op = Worklist.pop_back_val();
-    if (auto *PBI = dyn_cast<ProjectBoxInst>(Op->getUser())) {
+static void replaceProjectBoxUsers(SILValue heapBox, SILValue stackBox) {
+  StackList<Operand *> worklist(heapBox->getFunction());
+  for (auto *use : heapBox->getUses())
+    worklist.push_back(use);
+  while (!worklist.empty()) {
+    auto *nextUse = worklist.pop_back_val();
+    if (auto *pbi = dyn_cast<ProjectBoxInst>(nextUse->getUser())) {
       // This may result in an alloc_stack being used by begin_access [dynamic].
-      PBI->replaceAllUsesWith(StackBox);
+      pbi->replaceAllUsesWith(stackBox);
+      pbi->eraseFromParent();
       continue;
     }
 
-    auto *User = Op->getUser();
-    if (isa<MarkUninitializedInst>(User) || isa<CopyValueInst>(User) ||
-        isa<BeginBorrowInst>(User)) {
-      llvm::copy(cast<SingleValueInstruction>(User)->getUses(),
-                 std::back_inserter(Worklist));
+    auto *user = nextUse->getUser();
+    if (isa<MarkUninitializedInst>(user) || isa<CopyValueInst>(user) ||
+        isa<BeginBorrowInst>(user)) {
+      for (auto *use : cast<SingleValueInstruction>(user)->getUses()) {
+        worklist.push_back(use);
+      }
     }
   }
+}
+
+static void hoistMarkMustCheckInsts(SILValue stackBox,
+                                    MarkMustCheckInst::CheckKind checkKind) {
+  StackList<Operand *> worklist(stackBox->getFunction());
+
+  for (auto *use : stackBox->getUses()) {
+    worklist.push_back(use);
+  }
+
+  StackList<MarkMustCheckInst *> targets(stackBox->getFunction());
+  while (!worklist.empty()) {
+    auto *nextUse = worklist.pop_back_val();
+    auto *nextUser = nextUse->getUser();
+
+    if (isa<BeginBorrowInst>(nextUser) || isa<BeginAccessInst>(nextUser) ||
+        isa<CopyValueInst>(nextUser) || isa<MarkUninitializedInst>(nextUser) ||
+        isa<MarkMustCheckInst>(nextUser)) {
+      for (auto result : nextUser->getResults()) {
+        for (auto *use : result->getUses())
+          worklist.push_back(use);
+      }
+    }
+
+    if (auto *mmci = dyn_cast<MarkMustCheckInst>(nextUser)) {
+      targets.push_back(mmci);
+    }
+  }
+
+  if (targets.empty())
+    return;
+
+  while (!targets.empty()) {
+    auto *mmci = targets.pop_back_val();
+    mmci->replaceAllUsesWith(mmci->getOperand());
+    mmci->eraseFromParent();
+  }
+
+  auto *next = stackBox->getNextInstruction();
+  auto loc = next->getLoc();
+  if (isa<TermInst>(next))
+    loc = RegularLocation::getDiagnosticsOnlyLocation(loc, next->getModule());
+  SILBuilderWithScope builder(next);
+
+  auto *undef = SILUndef::get(stackBox->getType(), *stackBox->getModule());
+
+  auto *mmci = builder.createMarkMustCheckInst(loc, undef, checkKind);
+  stackBox->replaceAllUsesWith(mmci);
+  mmci->setOperand(stackBox);
 }
 
 /// rewriteAllocBoxAsAllocStack - Replace uses of the alloc_box with a
@@ -572,15 +629,22 @@ static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI) {
                                        ABI->hasDynamicLifetime(), isLexical());
 
   // Transfer a mark_uninitialized if we have one.
-  SILValue StackBox = ASI;
+  SingleValueInstruction *StackBox = ASI;
   if (Kind) {
     StackBox =
-        Builder.createMarkUninitialized(ASI->getLoc(), ASI, Kind.getValue());
+        Builder.createMarkUninitialized(ASI->getLoc(), ASI, Kind.value());
   }
 
   // Replace all uses of the address of the box's contained value with
   // the address of the stack location.
   replaceProjectBoxUsers(HeapBox, StackBox);
+
+  // Then hoist any mark_must_check [assignable_but_not_consumable] to the
+  // alloc_stack and convert them to [consumable_but_not_assignable]. This is
+  // because we are semantically converting from escaping semantics to
+  // non-escaping semantics.
+  hoistMarkMustCheckInsts(
+      StackBox, MarkMustCheckInst::CheckKind::ConsumableAndAssignable);
 
   assert(ABI->getBoxType()->getLayout()->getFields().size() == 1
          && "promoting multi-field box not implemented");
@@ -758,10 +822,9 @@ SILFunction *PromotedParamCloner::initCloned(SILOptFunctionBuilder &FuncBuilder,
       swift::getSpecializedLinkage(Orig, Orig->getLinkage()), ClonedName,
       ClonedTy, Orig->getGenericEnvironment(), Orig->getLocation(),
       Orig->isBare(), Orig->isTransparent(), Serialized, IsNotDynamic,
-      IsNotDistributed, Orig->getEntryCount(), Orig->isThunk(),
-      Orig->getClassSubclassScope(),
-      Orig->getInlineStrategy(), Orig->getEffectsKind(), Orig,
-      Orig->getDebugScope());
+      IsNotDistributed, IsNotRuntimeAccessible, Orig->getEntryCount(),
+      Orig->isThunk(), Orig->getClassSubclassScope(), Orig->getInlineStrategy(),
+      Orig->getEffectsKind(), Orig, Orig->getDebugScope());
   for (auto &Attr : Orig->getSemanticsAttrs()) {
     Fn->addSemanticsAttr(Attr);
   }
@@ -799,10 +862,7 @@ PromotedParamCloner::populateCloned() {
                                            Cloned->getModule().Types, 0);
       auto *promotedArg =
           ClonedEntryBB->createFunctionArgument(promotedTy, (*I)->getDecl());
-      promotedArg->setNoImplicitCopy(
-          cast<SILFunctionArgument>(*I)->isNoImplicitCopy());
-      promotedArg->setLifetimeAnnotation(
-          cast<SILFunctionArgument>(*I)->getLifetimeAnnotation());
+      promotedArg->copyFlags(cast<SILFunctionArgument>(*I));
       OrigPromotedParameters.insert(*I);
 
       NewPromotedArgs[ArgNo] = promotedArg;
@@ -817,10 +877,7 @@ PromotedParamCloner::populateCloned() {
       // Create a new argument which copies the original argument.
       auto *newArg = ClonedEntryBB->createFunctionArgument((*I)->getType(),
                                                            (*I)->getDecl());
-      newArg->setNoImplicitCopy(
-          cast<SILFunctionArgument>(*I)->isNoImplicitCopy());
-      newArg->setLifetimeAnnotation(
-          cast<SILFunctionArgument>(*I)->getLifetimeAnnotation());
+      newArg->copyFlags(cast<SILFunctionArgument>(*I));
       entryArgs.push_back(newArg);
     }
     ++ArgNo;
@@ -964,6 +1021,24 @@ specializeApplySite(SILOptFunctionBuilder &FuncBuilder, ApplySite Apply,
     Cloner.populateCloned();
     ClonedFn = Cloner.getCloned();
     pass.T->addFunctionToPassManagerWorklist(ClonedFn, F);
+
+    // Set the moveonly ignore flag so we do not emit an error on the original
+    // function even though it is still around.
+    F->addSemanticsAttr(semantics::NO_MOVEONLY_DIAGNOSTICS);
+
+    // If any of our promoted callee arg indices were originally noncopyable let
+    // boxes, convert them from having escaping to having non-escaping
+    // semantics.
+    for (unsigned index : PromotedCalleeArgIndices) {
+      if (F->getArgument(index)->getType().isBoxedNonCopyableType(*F)) {
+        auto boxType = F->getArgument(index)->getType().castTo<SILBoxType>();
+        bool isMutable = boxType->getLayout()->getFields()[0].isMutable();
+        auto checkKind =
+            isMutable ? MarkMustCheckInst::CheckKind::AssignableButNotConsumable
+                      : MarkMustCheckInst::CheckKind::NoConsumeOrAssign;
+        hoistMarkMustCheckInsts(ClonedFn->getArgument(index), checkKind);
+      }
+    }
   }
 
   // Now create the new ApplySite using the cloned function.
@@ -996,21 +1071,25 @@ specializeApplySite(SILOptFunctionBuilder &FuncBuilder, ApplySite Apply,
     // the stack. The partial_apply had ownership of this box so we must now
     // release it explicitly when the partial_apply is released.
     if (Apply.getKind() == ApplySiteKind::PartialApplyInst) {
-      if (PAFrontier.empty()) {
-        auto *PAI = cast<PartialApplyInst>(Apply);
-        ValueLifetimeAnalysis VLA(PAI, PAI->getUses());
-        pass.CFGChanged |= !VLA.computeFrontier(
-            PAFrontier, ValueLifetimeAnalysis::AllowToModifyCFG);
-        assert(!PAFrontier.empty() &&
-               "partial_apply must have at least one use "
-               "to release the returned function");
-      }
+      auto *PAI = cast<PartialApplyInst>(Apply);
+      // If it's already been stack promoted, then the stack closure only
+      // borrows its captures, and we don't need to adjust capture lifetimes.
+      if (!PAI->isOnStack()) {
+        if (PAFrontier.empty()) {
+          ValueLifetimeAnalysis VLA(PAI, PAI->getUses());
+          pass.CFGChanged |= !VLA.computeFrontier(
+              PAFrontier, ValueLifetimeAnalysis::AllowToModifyCFG);
+          assert(!PAFrontier.empty() &&
+                 "partial_apply must have at least one use "
+                 "to release the returned function");
+        }
 
-      // Insert destroys of the box at each point where the partial_apply
-      // becomes dead.
-      for (SILInstruction *FrontierInst : PAFrontier) {
-        SILBuilderWithScope Builder(FrontierInst);
-        Builder.emitDestroyValueOperation(Apply.getLoc(), Box);
+        // Insert destroys of the box at each point where the partial_apply
+        // becomes dead.
+        for (SILInstruction *FrontierInst : PAFrontier) {
+          SILBuilderWithScope Builder(FrontierInst);
+          Builder.emitDestroyValueOperation(Apply.getLoc(), Box);
+        }
       }
     }
   }
@@ -1082,7 +1161,7 @@ static void rewriteApplySites(AllocBoxToStackState &pass) {
     if (!iterAndSuccess.second) {
       // Blot the previously inserted apply and insert at the end with updated
       // indices
-      auto OldIndices = iterAndSuccess.first->getValue().second;
+      auto OldIndices = iterAndSuccess.first->value().second;
       OldIndices.push_back(CalleeArgIndexNumber);
       AppliesToSpecialize.erase(iterAndSuccess.first);
       AppliesToSpecialize.insert(std::make_pair(Apply, OldIndices));
@@ -1094,11 +1173,11 @@ static void rewriteApplySites(AllocBoxToStackState &pass) {
   // ApplySite.
   SILOptFunctionBuilder FuncBuilder(*pass.T);
   for (auto &It : AppliesToSpecialize) {
-    if (!It.hasValue()) {
+    if (!It.has_value()) {
       continue;
     }
-    auto Apply = It.getValue().first;
-    auto Indices = It.getValue().second;
+    auto Apply = It.value().first;
+    auto Indices = It.value().second;
     // Sort the indices and unique them.
     sortUnique(Indices);
 

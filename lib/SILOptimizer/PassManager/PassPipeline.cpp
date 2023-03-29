@@ -115,8 +115,8 @@ static void addDefiniteInitialization(SILPassPipelinePlan &P) {
 // should be in the -Onone pass pipeline and the prepare optimizations pipeline.
 static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.startPipeline("Mandatory Diagnostic Passes + Enabling Optimization Passes");
-  P.addSILGenCleanup();
   P.addDiagnoseInvalidEscapingCaptures();
+  P.addReferenceBindingTransform();
   P.addDiagnoseStaticExclusivity();
   P.addNestedSemanticFunctionCheck();
   P.addCapturePromotion();
@@ -128,27 +128,6 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.addAllocBoxToStack();
   P.addNoReturnFolding();
   addDefiniteInitialization(P);
-
-  //===---
-  // Begin Ownership Optimizations
-  //
-
-  // Check noImplicitCopy and move only types for addresses.
-  P.addMoveOnlyAddressChecker();
-  // Check noImplicitCopy and move only types for objects
-  P.addMoveOnlyObjectChecker();
-  // Convert last destroy_value to deinits.
-  P.addMoveOnlyDeinitInsertion();
-  // Lower move only wrapped trivial types.
-  P.addTrivialMoveOnlyTypeEliminator();
-  // Check no uses after _move of a value in an address.
-  P.addMoveKillsCopyableAddressesChecker();
-  // No uses after _move of copyable value.
-  P.addMoveKillsCopyableValuesChecker();
-
-  //
-  // End Ownership Optimizations
-  //===---
 
   P.addAddressLowering();
 
@@ -167,6 +146,28 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   // there.
   const auto &Options = P.getOptions();
   P.addClosureLifetimeFixup();
+
+  //===---
+  // Begin Ownership Optimizations
+  //
+  // These happen after ClosureLifetimeFixup because they depend on the
+  // resolution of nonescaping closure lifetimes to correctly check the use
+  // of move-only values as captures in nonescaping closures as borrows.
+
+  // Check noImplicitCopy and move only types for objects and addresses.
+  P.addMoveOnlyChecker();
+  // Convert last destroy_value to deinits.
+  P.addMoveOnlyDeinitInsertion();
+  // Lower move only wrapped trivial types.
+  P.addTrivialMoveOnlyTypeEliminator();
+  // Check no uses after consume operator of a value in an address.
+  P.addConsumeOperatorCopyableAddressesChecker();
+  // No uses after consume operator of copyable value.
+  P.addConsumeOperatorCopyableValuesChecker();
+
+  //
+  // End Ownership Optimizations
+  //===---
 
 #ifndef NDEBUG
   // Add a verification pass to check our work when skipping
@@ -202,7 +203,7 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
   P.addPredictableDeadAllocationElimination();
 
   // Now that we have finished performing diagnostics that rely on lexical
-  // scopes, if lexical lifetimes are not enabled, eliminate lexical lfietimes.
+  // scopes, if lexical lifetimes are not enabled, eliminate lexical lifetimes.
   if (Options.LexicalLifetimes != LexicalLifetimesOption::On) {
     P.addLexicalLifetimeEliminator();
   }
@@ -234,12 +235,21 @@ static void addMandatoryDiagnosticOptPipeline(SILPassPipelinePlan &P) {
 }
 
 SILPassPipelinePlan
-SILPassPipelinePlan::getDiagnosticPassPipeline(const SILOptions &Options) {
+SILPassPipelinePlan::getSILGenPassPipeline(const SILOptions &Options) {
   SILPassPipelinePlan P(Options);
+  P.startPipeline("SILGen Passes");
+
+  P.addSILGenCleanup();
 
   if (SILViewSILGenCFG) {
     addCFGPrinterPipeline(P, "SIL View SILGen CFG");
   }
+  return P;
+}
+
+SILPassPipelinePlan
+SILPassPipelinePlan::getDiagnosticPassPipeline(const SILOptions &Options) {
+  SILPassPipelinePlan P(Options);
 
   // If we are asked do debug serialization, instead of running all diagnostic
   // passes, just run mandatory inlining with dead transparent function cleanup
@@ -301,7 +311,7 @@ void addSimplifyCFGSILCombinePasses(SILPassPipelinePlan &P) {
   // Jump threading can expose opportunity for silcombine (enum -> is_enum_tag->
   // cond_br).
   P.addSILCombine();
-  // Which can expose opportunity for simplifcfg.
+  // Which can expose opportunity for simplifycfg.
   P.addSimplifyCFG();
 }
 
@@ -372,7 +382,7 @@ void addFunctionPasses(SILPassPipelinePlan &P,
   P.addAllocBoxToStack();
 
   if (P.getOptions().DestroyHoisting == DestroyHoistingOption::On) {
-    P.addSSADestroyHoisting();
+    P.addDestroyAddrHoisting();
   }
 
   // Propagate copies through stack locations.  Should run after
@@ -569,7 +579,7 @@ static void addPrepareOptimizationsPipeline(SILPassPipelinePlan &P) {
 #endif
 
   P.addForEachLoopUnroll();
-  P.addOptimizedMandatoryCombine();
+  P.addSimplification();
   P.addAccessMarkerElimination();
 }
 
@@ -584,6 +594,7 @@ static void addPerfEarlyModulePassPipeline(SILPassPipelinePlan &P) {
   P.addTempRValueOpt();
   // Cleanup after SILGen: remove unneeded borrows/copies.
   if (P.getOptions().CopyPropagation == CopyPropagationOption::On) {
+    P.addComputeSideEffects();
     P.addCopyPropagation();
   }
   P.addSemanticARCOpts();
@@ -638,7 +649,8 @@ static void addHighLevelFunctionPipeline(SILPassPipelinePlan &P) {
   addHighLevelLoopOptPasses(P);
   
   P.addStringOptimization();
-  P.addComputeEffects();
+  P.addComputeEscapeEffects();
+  P.addComputeSideEffects();
 }
 
 // After "high-level" function passes have processed the entire call tree, run
@@ -653,7 +665,8 @@ static void addHighLevelModulePipeline(SILPassPipelinePlan &P) {
   // Do the first stack promotion on high-level SIL before serialization.
   //
   // FIXME: why does StackPromotion need to run in the module pipeline?
-  P.addComputeEffects();
+  P.addComputeEscapeEffects();
+  P.addComputeSideEffects();
   P.addStackPromotion();
 
   P.addGlobalOpt();
@@ -694,7 +707,8 @@ static void addClosureSpecializePassPipeline(SILPassPipelinePlan &P) {
   
   // ComputeEffects should be done at the end of a function-pipeline. The next
   // pass (GlobalOpt) is a module pass, so this is the end of a function-pipeline.
-  P.addComputeEffects();
+  P.addComputeEscapeEffects();
+  P.addComputeSideEffects();
 
   // Hoist globals out of loops.
   // Global-init functions should not be inlined GlobalOpt is done.
@@ -725,7 +739,8 @@ static void addClosureSpecializePassPipeline(SILPassPipelinePlan &P) {
   // passes can expose more inlining opportunities.
   addSimplifyCFGSILCombinePasses(P);
 
-  P.addComputeEffects();
+  P.addComputeEscapeEffects();
+  P.addComputeSideEffects();
 
   // We do this late since it is a pass like the inline caches that we only want
   // to run once very late. Make sure to run at least one round of the ARC
@@ -746,7 +761,8 @@ static void addLowLevelPassPipeline(SILPassPipelinePlan &P) {
 
   // We've done a lot of optimizations on this function, attempt to FSO.
   P.addFunctionSignatureOpts();
-  P.addComputeEffects();
+  P.addComputeEscapeEffects();
+  P.addComputeSideEffects();
 }
 
 static void addLateLoopOptPassPipeline(SILPassPipelinePlan &P) {
@@ -775,7 +791,8 @@ static void addLateLoopOptPassPipeline(SILPassPipelinePlan &P) {
 
   // Sometimes stack promotion can catch cases only at this late stage of the
   // pipeline, after FunctionSignatureOpts.
-  P.addComputeEffects();
+  P.addComputeEscapeEffects();
+  P.addComputeSideEffects();
   P.addStackPromotion();
 
   // Optimize overflow checks.
@@ -962,7 +979,7 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
   // in the editor.
   P.startPipeline("Non-Diagnostic Mandatory Optimizations");
   P.addForEachLoopUnroll();
-  P.addMandatoryCombine();
+  P.addOnoneSimplification();
 
   // TODO: MandatoryARCOpts should be subsumed by CopyPropagation. There should
   // be no need to run another analysis of copies at -Onone.
@@ -979,6 +996,10 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
 
   // Now that we have serialized, propagate debug info.
   P.addMovedAsyncVarDebugInfoPropagator();
+
+  // If we are asked to stop optimizing before lowering ownership, do so now.
+  if (P.Options.StopOptimizationBeforeLoweringOwnership)
+    return P;
 
   // Now strip any transparent functions that still have ownership.
   P.addOwnershipModelEliminator();
@@ -997,6 +1018,12 @@ SILPassPipelinePlan::getOnonePassPipeline(const SILOptions &Options) {
 
   // In Onone builds, do a function-local analysis in a function pass.
   P.addFunctionStackProtection();
+
+  // This is mainly there to optimize `Builtin.isConcrete`, which must not be
+  // constant folded before any generic specialization.
+  P.addLateOnoneSimplification();
+
+  P.addCleanupDebugSteps();
 
   // Has only an effect if the -sil-based-debuginfo option is specified.
   P.addSILDebugInfoGenerator();

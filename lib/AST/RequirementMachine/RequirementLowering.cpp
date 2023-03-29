@@ -194,6 +194,15 @@ static void desugarSameTypeRequirement(Type lhs, Type rhs, SourceLoc loc,
 
     bool mismatch(TypeBase *firstType, TypeBase *secondType,
                   Type sugaredFirstType) {
+      // If one side is a parameter pack, this is a same-element requirement, which
+      // is not yet supported.
+      if (firstType->isParameterPack() != secondType->isParameterPack()) {
+        errors.push_back(RequirementError::forSameElement(
+            {RequirementKind::SameType, sugaredFirstType, secondType}, loc));
+        recordedErrors = true;
+        return true;
+      }
+
       if (firstType->isTypeParameter() && secondType->isTypeParameter()) {
         result.emplace_back(RequirementKind::SameType,
                             sugaredFirstType, secondType);
@@ -350,6 +359,23 @@ static void desugarConformanceRequirement(Type subjectType, Type constraintType,
   }
 }
 
+/// Desugar same-shape requirements by equating the shapes of the
+/// root pack types, and diagnose shape requirements on non-pack
+/// types.
+static void desugarSameShapeRequirement(Type lhs, Type rhs, SourceLoc loc,
+                                        SmallVectorImpl<Requirement> &result,
+                                        SmallVectorImpl<RequirementError> &errors) {
+  // For now, only allow shape requirements directly between pack types.
+  if (!lhs->isParameterPack() || !rhs->isParameterPack()) {
+    errors.push_back(RequirementError::forInvalidShapeRequirement(
+        {RequirementKind::SameShape, lhs, rhs}, loc));
+  }
+
+  result.emplace_back(RequirementKind::SameShape,
+                      lhs->getRootGenericParam(),
+                      rhs->getRootGenericParam());
+}
+
 /// Convert a requirement where the subject type might not be a type parameter,
 /// or the constraint type in the conformance requirement might be a protocol
 /// composition, into zero or more "proper" requirements which can then be
@@ -361,8 +387,10 @@ swift::rewriting::desugarRequirement(Requirement req, SourceLoc loc,
   auto firstType = req.getFirstType();
 
   switch (req.getKind()) {
-  case RequirementKind::SameCount:
-    llvm_unreachable("Same-count requirement not supported here");
+  case RequirementKind::SameShape:
+    desugarSameShapeRequirement(firstType, req.getSecondType(),
+                                loc, result, errors);
+    break;
 
   case RequirementKind::Conformance:
     desugarConformanceRequirement(firstType, req.getSecondType(),
@@ -448,10 +476,12 @@ namespace {
 /// AST walker that infers requirements from type representations.
 struct InferRequirementsWalker : public TypeWalker {
   ModuleDecl *module;
+  DeclContext *dc;
   SmallVector<Requirement, 2> reqs;
   SmallVector<RequirementError, 2> errors;
 
-  explicit InferRequirementsWalker(ModuleDecl *module) : module(module) {}
+  explicit InferRequirementsWalker(ModuleDecl *module, DeclContext *dc)
+      : module(module), dc(dc) {}
 
   Action walkToTypePre(Type ty) override {
     // Unbound generic types are the result of recovered-but-invalid code, and
@@ -463,15 +493,50 @@ struct InferRequirementsWalker : public TypeWalker {
   }
 
   Action walkToTypePost(Type ty) override {
+    // Skip `Sendable` conformance requirements that are inferred from
+    // `@preconcurrency` declarations.
+    auto skipRequirement = [&](Requirement req, Decl *fromDecl) {
+      if (!fromDecl->preconcurrency())
+        return false;
+
+      // If this decl is `@preconcurrency`, include concurrency
+      // requirements. The explicit annotation directly on the decl
+      // will still exclude `Sendable` requirements from ABI.
+      auto *decl = dc->getAsDecl();
+      if (!decl || decl->preconcurrency())
+        return false;
+
+      return (req.getKind() == RequirementKind::Conformance &&
+          req.getSecondType()->castTo<ProtocolType>()->getDecl()
+            ->isSpecificProtocol(KnownProtocolKind::Sendable));
+    };
+
     // Infer from generic typealiases.
     if (auto typeAlias = dyn_cast<TypeAliasType>(ty.getPointer())) {
       auto decl = typeAlias->getDecl();
       auto subMap = typeAlias->getSubstitutionMap();
       for (const auto &rawReq : decl->getGenericSignature().getRequirements()) {
+        if (skipRequirement(rawReq, decl))
+          continue;
+
         desugarRequirement(rawReq.subst(subMap), SourceLoc(), reqs, errors);
       }
 
       return Action::Continue;
+    }
+
+    // Infer same-length requirements between pack references that
+    // are expanded in parallel.
+    if (auto packExpansion = ty->getAs<PackExpansionType>()) {
+      // Get all pack parameters referenced from the pattern.
+      SmallVector<Type, 2> packReferences;
+      packExpansion->getPatternType()->getTypeParameterPacks(packReferences);
+
+      auto countType = packExpansion->getCountType();
+      for (auto pack : packReferences) {
+        Requirement req(RequirementKind::SameShape, countType, pack);
+        desugarRequirement(req, SourceLoc(), reqs, errors);
+      }
     }
 
     // Infer requirements from `@differentiable` function types.
@@ -534,6 +599,9 @@ struct InferRequirementsWalker : public TypeWalker {
     // Handle the requirements.
     // FIXME: Inaccurate TypeReprs.
     for (const auto &rawReq : genericSig.getRequirements()) {
+      if (skipRequirement(rawReq, decl))
+        continue;
+
       auto req = rawReq.subst(subMap);
       desugarRequirement(req, SourceLoc(), reqs, errors);
     }
@@ -552,12 +620,13 @@ struct InferRequirementsWalker : public TypeWalker {
 /// We automatically infer 'T : Hashable' from the fact that 'struct Set'
 /// declares a Hashable requirement on its generic parameter.
 void swift::rewriting::inferRequirements(
-    Type type, SourceLoc loc, ModuleDecl *module,
+    Type type, SourceLoc loc,
+    ModuleDecl *module, DeclContext *dc,
     SmallVectorImpl<StructuralRequirement> &result) {
   if (!type)
     return;
 
-  InferRequirementsWalker walker(module);
+  InferRequirementsWalker walker(module, dc);
   type.walk(walker);
 
   for (const auto &req : walker.reqs)
@@ -577,8 +646,8 @@ void swift::rewriting::realizeRequirement(
   auto *moduleForInference = dc->getParentModule();
 
   switch (req.getKind()) {
-  case RequirementKind::SameCount:
-    llvm_unreachable("Same-count requirement not supported here");
+  case RequirementKind::SameShape:
+    llvm_unreachable("Same-shape requirement not supported here");
 
   case RequirementKind::Superclass:
   case RequirementKind::Conformance: {
@@ -586,11 +655,11 @@ void swift::rewriting::realizeRequirement(
     if (shouldInferRequirements) {
       auto firstLoc = (reqRepr ? reqRepr->getSubjectRepr()->getStartLoc()
                                : SourceLoc());
-      inferRequirements(firstType, firstLoc, moduleForInference, result);
+      inferRequirements(firstType, firstLoc, moduleForInference, dc, result);
 
       auto secondLoc = (reqRepr ? reqRepr->getConstraintRepr()->getStartLoc()
                                 : SourceLoc());
-      inferRequirements(secondType, secondLoc, moduleForInference, result);
+      inferRequirements(secondType, secondLoc, moduleForInference, dc, result);
     }
 
     realizeTypeRequirement(dc, firstType, secondType, loc, result, errors);
@@ -601,7 +670,7 @@ void swift::rewriting::realizeRequirement(
     if (shouldInferRequirements) {
       auto firstLoc = (reqRepr ? reqRepr->getSubjectRepr()->getStartLoc()
                                : SourceLoc());
-      inferRequirements(firstType, firstLoc, moduleForInference, result);
+      inferRequirements(firstType, firstLoc, moduleForInference, dc, result);
     }
 
     SmallVector<Requirement, 2> reqs;
@@ -619,11 +688,11 @@ void swift::rewriting::realizeRequirement(
     if (shouldInferRequirements) {
       auto firstLoc = (reqRepr ? reqRepr->getFirstTypeRepr()->getStartLoc()
                                : SourceLoc());
-      inferRequirements(firstType, firstLoc, moduleForInference, result);
+      inferRequirements(firstType, firstLoc, moduleForInference, dc, result);
 
       auto secondLoc = (reqRepr ? reqRepr->getSecondTypeRepr()->getStartLoc()
                                 : SourceLoc());
-      inferRequirements(secondType, secondLoc, moduleForInference, result);
+      inferRequirements(secondType, secondLoc, moduleForInference, dc, result);
     }
 
     SmallVector<Requirement, 2> reqs;
@@ -667,7 +736,8 @@ void swift::rewriting::realizeInheritedRequirements(
     auto *typeRepr = inheritedTypes[index].getTypeRepr();
     SourceLoc loc = (typeRepr ? typeRepr->getStartLoc() : SourceLoc());
     if (shouldInferRequirements) {
-      inferRequirements(inheritedType, loc, moduleForInference, result);
+      inferRequirements(inheritedType, loc, moduleForInference,
+                        decl->getInnermostDeclContext(), result);
     }
 
     realizeTypeRequirement(dc, type, inheritedType, loc, result, errors);
@@ -691,9 +761,27 @@ StructuralRequirementsRequest::evaluate(Evaluator &evaluator,
 
   auto selfTy = proto->getSelfInterfaceType();
 
+  unsigned errorCount = errors.size();
   realizeInheritedRequirements(proto, selfTy,
                                /*inferRequirements=*/false,
                                result, errors);
+
+  if (errors.size() > errorCount) {
+    // Add requirements from inherited protocols, which are obtained via
+    // getDirectlyInheritedNominalTypeDecls(). Normally this duplicates
+    // the information found in the resolved types from the inheritance
+    // clause, except when type resolution fails and returns an ErrorType.
+    //
+    // For example, in 'protocol P: Q & Blah', where 'Blah' does not exist,
+    // the type 'Q & Blah' resolves to an ErrorType, while the simpler
+    // mechanism in getDirectlyInheritedNominalTypeDecls() still finds 'Q'.
+    for (auto *inheritedProto : proto->getInheritedProtocols()) {
+      result.push_back({
+          Requirement(RequirementKind::Conformance,
+                      selfTy, inheritedProto->getDeclaredInterfaceType()),
+          SourceLoc(), /*wasInferred=*/false});
+    }
+  }
 
   // Add requirements from the protocol's own 'where' clause.
   WhereClauseOwner(proto).visitRequirements(TypeResolutionStage::Structural,
@@ -780,7 +868,7 @@ StructuralRequirementsRequest::evaluate(Evaluator &evaluator,
 }
 
 /// This request primarily emits diagnostics about typealiases and associated
-/// type declarations that override another associate type, and can better be
+/// type declarations that override another associated type, and can better be
 /// expressed as requirements in the 'where' clause.
 ///
 /// It also implements a compatibility behavior where sometimes typealiases in

@@ -186,6 +186,48 @@ extension Task: Equatable {
   }
 }
 
+#if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+@available(SwiftStdlib 5.9, *)
+extension Task where Failure == Error {
+    @_spi(MainActorUtilities)
+    @MainActor
+    @available(SwiftStdlib 5.9, *)
+    public static func startOnMainActor(
+        priority: TaskPriority? = nil,
+        @_inheritActorContext @_implicitSelfCapture _ work: __owned @Sendable @escaping @MainActor() async throws -> Success
+    ) -> Task<Success, Error> {
+        let flags = taskCreateFlags(priority: priority, isChildTask: false,
+                                    copyTaskLocals: true, inheritContext: true,
+                                    enqueueJob: false,
+                                    addPendingGroupTaskUnconditionally: false)
+        let (task, _) = Builtin.createAsyncTask(flags, work)
+        _startTaskOnMainActor(task)
+        return Task<Success, Error>(task)
+    }
+}
+#endif
+
+#if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
+@available(SwiftStdlib 5.9, *)
+extension Task where Failure == Never {
+    @_spi(MainActorUtilities)
+    @MainActor
+    @available(SwiftStdlib 5.9, *)
+    public static func startOnMainActor(
+        priority: TaskPriority? = nil,
+        @_inheritActorContext @_implicitSelfCapture _ work: __owned @Sendable @escaping @MainActor() async -> Success
+    ) -> Task<Success, Never> {
+        let flags = taskCreateFlags(priority: priority, isChildTask: false,
+                                    copyTaskLocals: true, inheritContext: true,
+                                    enqueueJob: false,
+                                    addPendingGroupTaskUnconditionally: false)
+        let (task, _) = Builtin.createAsyncTask(flags, work)
+        _startTaskOnMainActor(task)
+        return Task(task)
+    }
+}
+#endif
+
 // ==== Task Priority ----------------------------------------------------------
 
 /// The priority of a task.
@@ -273,6 +315,26 @@ extension TaskPriority: Comparable {
   }
 }
 
+
+@available(SwiftStdlib 5.9, *)
+extension TaskPriority: CustomStringConvertible {
+  @available(SwiftStdlib 5.9, *)
+  public var description: String {
+    switch self.rawValue {
+    case Self.low.rawValue:
+      return "\(Self.self).low"
+    case Self.medium.rawValue:
+      return "\(Self.self).medium"
+    case Self.high.rawValue:
+      return "\(Self.self).high"
+    case Self.background.rawValue:
+      return "\(Self.self).background"
+    default:
+      return "\(Self.self)(rawValue: \(self.rawValue))"
+    }
+  }
+}
+
 @available(SwiftStdlib 5.1, *)
 extension TaskPriority: Codable { }
 
@@ -287,10 +349,10 @@ extension Task where Success == Never, Failure == Never {
   /// If the system can't provide a priority,
   /// this property's value is `Priority.default`.
   public static var currentPriority: TaskPriority {
-    withUnsafeCurrentTask { task in
+    withUnsafeCurrentTask { unsafeTask in
       // If we are running on behalf of a task, use that task's priority.
-      if let unsafeTask = task {
-         return TaskPriority(rawValue: _taskCurrentPriority(unsafeTask._task))
+      if let unsafeTask {
+         return unsafeTask.priority
       }
 
       // Otherwise, query the system.
@@ -311,6 +373,7 @@ extension Task where Success == Never, Failure == Never {
       return nil
     }
   }
+
 }
 
 @available(SwiftStdlib 5.1, *)
@@ -820,6 +883,15 @@ public struct UnsafeCurrentTask {
     TaskPriority(rawValue: _taskCurrentPriority(_task))
   }
 
+  /// The current task's base priority.
+  ///
+  /// - SeeAlso: `TaskPriority`
+  /// - SeeAlso: `Task.basePriority`
+  @available(SwiftStdlib 5.9, *)
+  public var basePriority: TaskPriority {
+    TaskPriority(rawValue: _taskBasePriority(_task))
+  }
+
   /// Cancel the current task.
   public func cancel() {
     _taskCancel(_task)
@@ -849,6 +921,9 @@ extension UnsafeCurrentTask: Equatable {
 @available(SwiftStdlib 5.1, *)
 @_silgen_name("swift_task_getCurrent")
 func _getCurrentAsyncTask() -> Builtin.NativeObject?
+
+@_silgen_name("swift_task_startOnMainActor")
+fileprivate func _startTaskOnMainActor(_ task: Builtin.NativeObject) -> Builtin.NativeObject?
 
 @available(SwiftStdlib 5.1, *)
 @_silgen_name("swift_task_getJobFlags")
@@ -1008,8 +1083,8 @@ extension Task where Failure == Error {
   public static func runInline(_ body: () async throws -> Success) rethrows -> Success {
     return try _runInlineHelper(
       body: {
-        do { 
-          let value = try await body() 
+        do {
+          let value = try await body()
           return Result.success(value)
         }
         catch let error {
@@ -1024,6 +1099,7 @@ extension Task where Failure == Error {
 
 #if _runtime(_ObjC)
 
+#if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
 /// Intrinsic used by SILGen to launch a task for bridging a Swift async method
 /// which was called through its ObjC-exported completion-handler-based API.
 @available(SwiftStdlib 5.1, *)
@@ -1039,5 +1115,6 @@ internal func _runTaskForBridgedAsyncMethod(@_inheritActorContext _ body: __owne
   }
 #endif
 }
+#endif
 
 #endif

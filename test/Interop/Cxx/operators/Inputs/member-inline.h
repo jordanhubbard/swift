@@ -22,6 +22,8 @@ struct LoadableIntWrapper {
     return value + x * y;
   }
 
+  operator int() const { return value; }
+
   LoadableIntWrapper &operator++() {
     value++;
     return *this;
@@ -48,7 +50,18 @@ struct LoadableBoolWrapper {
   LoadableBoolWrapper operator!() {
     return LoadableBoolWrapper{.value = !value};
   }
+  operator bool() const { return value; }
 };
+
+template<class T>
+struct TemplatedWithFriendOperator {
+  friend bool operator==(const TemplatedWithFriendOperator &lhs,
+                         const TemplatedWithFriendOperator &rhs) {
+    return true;
+  }
+};
+
+using TemplatedWithFriendOperatorSpec = TemplatedWithFriendOperator<int>;
 
 struct __attribute__((swift_attr("import_owned"))) AddressOnlyIntWrapper {
   int value;
@@ -157,6 +170,32 @@ public:
   int &operator[](int x) {
     return values[x];
   }
+};
+
+struct ReadOnlyRvalueParam {
+private:
+  int values[5] = {1, 2, 3, 4, 5};
+
+public:
+  const int &operator[](int &&x) const { return values[x]; }
+};
+
+struct ReadWriteRvalueParam {
+private:
+  int values[5] = {1, 2, 3, 4, 5};
+
+public:
+  const int &operator[](int &&x) const { return values[x]; }
+  int &operator[](int&& x) { return values[x]; }
+};
+
+struct ReadWriteRvalueGetterParam {
+private:
+  int values[5] = {1, 2, 3, 4, 5};
+  
+public:
+  const int &operator[](int &&x) const { return values[x]; }
+  int &operator[](int x) { return values[x]; }
 };
 
 struct DifferentTypesArray {
@@ -356,6 +395,23 @@ private:
   int value = 456;
 public:
   int operator*() const { return value; }
+};
+
+struct AmbiguousOperatorStar {
+private:
+  int value = 567;
+public:
+  int &operator*() { return value; }
+  const int &operator*() const { return value; }
+};
+
+struct AmbiguousOperatorStar2 {
+private:
+  int value = 678;
+public:
+  int &operator*() & { return value; }
+  const int &operator*() const & { return value; }
+  const int &&operator*() const && { return static_cast<const int &&>(value); }
 };
 
 #endif

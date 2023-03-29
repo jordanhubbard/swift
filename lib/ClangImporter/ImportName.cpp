@@ -645,7 +645,7 @@ findSwiftNameAttr(const clang::Decl *decl, ImportNameVersion version) {
 
     if (auto enumDecl = dyn_cast<clang::EnumDecl>(decl)) {
       // Intentionally don't get the canonical type here.
-      if (auto typedefType = dyn_cast<clang::TypedefType>(enumDecl->getIntegerType().getTypePtr())) {
+      if (auto typedefType = dyn_cast<clang::TypedefType>(getUnderlyingType(enumDecl))) {
         // If the typedef is available in Swift, the user will get ambiguity.
         // It also means they may not have intended this API to be imported like this.
         if (importer::isUnavailableInSwift(typedefType->getDecl(), nullptr, true)) {
@@ -984,8 +984,8 @@ bool NameImporter::hasNamingConflict(const clang::NamedDecl *decl,
   // in the same module as the decl
   // FIXME: This will miss macros.
   auto clangModule = getClangSubmoduleForDecl(decl);
-  if (clangModule.hasValue() && clangModule.getValue())
-    clangModule = clangModule.getValue()->getTopLevelModule();
+  if (clangModule.has_value() && clangModule.value())
+    clangModule = clangModule.value()->getTopLevelModule();
 
   auto conflicts = [&](const clang::Decl *OtherD) -> bool {
     // If these are simply redeclarations, they do not conflict.
@@ -1006,14 +1006,14 @@ bool NameImporter::hasNamingConflict(const clang::NamedDecl *decl,
     }
 
     auto declModule = getClangSubmoduleForDecl(OtherD);
-    if (!declModule.hasValue())
+    if (!declModule.has_value())
       return false;
 
     // Handle the bridging header case. This is pretty nasty since things
     // can get added to it *later*, but there's not much we can do.
-    if (!declModule.getValue())
+    if (!declModule.value())
       return *clangModule == nullptr;
-    return *clangModule == declModule.getValue()->getTopLevelModule();
+    return *clangModule == declModule.value()->getTopLevelModule();
   };
 
   // Allow this lookup to find hidden names.  We don't want the
@@ -1658,7 +1658,9 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
 
     if (!skipCustomName) {
       result.info.hasCustomName = true;
-      result.declName = parsedName.formDeclName(swiftCtx);
+      result.declName = parsedName.formDeclName(
+          swiftCtx, /*isSubscript=*/false,
+          isa<clang::ClassTemplateSpecializationDecl>(D));
 
       // Handle globals treated as members.
       if (parsedName.isMember()) {
@@ -1713,7 +1715,8 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
             // Update the name to reflect the new parameter labels.
             result.declName = formDeclName(
                 swiftCtx, parsedName.BaseName, parsedName.ArgumentLabels,
-                /*isFunction=*/true, isInitializer);
+                /*isFunction=*/true, isInitializer, /*isSubscript=*/false,
+                isa<clang::ClassTemplateSpecializationDecl>(D));
           } else if (nameAttr->isAsync) {
             // The custom name was for an async import, but we didn't in fact
             // import as async for some reason. Ignore this import.
@@ -1796,11 +1799,21 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
     // typedef (even if it's an anonymous enum).
     if (auto enumDecl = dyn_cast<clang::EnumDecl>(D)) {
       // Intentionally don't get the canonical type here.
-      if (auto typedefType = dyn_cast<clang::TypedefType>(enumDecl->getIntegerType().getTypePtr())) {
+      if (auto typedefType = dyn_cast<clang::TypedefType>(getUnderlyingType(enumDecl))) {
         // If the typedef is available in Swift, the user will get ambiguity.
         // It also means they may not have intended this API to be imported like this.
         if (importer::isUnavailableInSwift(typedefType->getDecl(), nullptr, true)) {
-          result.setDeclName(swiftCtx.getIdentifier(typedefType->getDecl()->getName()));
+          StringRef baseName = typedefType->getDecl()->getName();
+          SmallString<16> swiftPrivateScratch;
+          // If this declaration has the swift_private attribute, prepend "__"
+          if (shouldBeSwiftPrivate(*this, D, version,
+                                   result.info.hasAsyncInfo)) {
+            swiftPrivateScratch = "__";
+            swiftPrivateScratch += baseName;
+            baseName = swiftPrivateScratch;
+          }
+
+          result.setDeclName(swiftCtx.getIdentifier(baseName));
           result.setEffectiveContext(D->getDeclContext());
           return result;
         }
@@ -1835,7 +1848,20 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
     break;
   }
 
-  case clang::DeclarationName::CXXConversionFunctionName:
+  case clang::DeclarationName::CXXConversionFunctionName: {
+    auto conversionDecl = dyn_cast<clang::CXXConversionDecl>(D);
+    if (!conversionDecl)
+      return ImportedName();
+    auto toType = conversionDecl->getConversionType();
+    // Only import `operator bool()` for now.
+    if (toType->isBooleanType()) {
+      isFunction = true;
+      baseName = "__convertToBool";
+      addEmptyArgNamesForClangFunction(conversionDecl, argumentNames);
+      break;
+    }
+    return ImportedName();
+  }
   case clang::DeclarationName::CXXDestructorName:
   case clang::DeclarationName::CXXLiteralOperatorName:
   case clang::DeclarationName::CXXUsingDirective:
@@ -2163,30 +2189,92 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
 
   if (auto classTemplateSpecDecl =
           dyn_cast<clang::ClassTemplateSpecializationDecl>(D)) {
+    /// Symbolic specializations get imported as the symbolic class template
+    /// type.
+    if (importSymbolicCXXDecls)
+      return importNameImpl(classTemplateSpecDecl->getSpecializedTemplate(),
+                            version, givenName);
     if (!isa<clang::ClassTemplatePartialSpecializationDecl>(D)) {
-
-      auto &astContext = classTemplateSpecDecl->getASTContext();
-      // Itanium mangler produces valid Swift identifiers, use it to generate a name for
-      // this instantiation.
-      std::unique_ptr<clang::MangleContext> mangler{
-          clang::ItaniumMangleContext::create(astContext,
-                                              astContext.getDiagnostics())};
+      // When constructing the name of a C++ template, don't expand all the
+      // template, only expand one layer. Here we want to prioritize
+      // readability over total completeness.
       llvm::SmallString<128> storage;
       llvm::raw_svector_ostream buffer(storage);
-      mangler->mangleTypeName(astContext.getRecordType(classTemplateSpecDecl),
-                              buffer);
+      D->printName(buffer);
+      buffer << "<";
+      llvm::interleaveComma(classTemplateSpecDecl->getTemplateArgs().asArray(),
+                            buffer,
+                            [&buffer, this, version](const clang::TemplateArgument& arg) {
+        // Use import name here so builtin types such as "int" map to their
+        // Swift equivalent ("Int32").
+        if (arg.getKind() == clang::TemplateArgument::Type) {
+          auto ty = arg.getAsType().getTypePtr();
+          if (auto builtin = dyn_cast<clang::BuiltinType>(ty)) {
+            auto &ctx = swiftCtx;
+            Type swiftType = nullptr;
+            switch (builtin->getKind()) {
+            case clang::BuiltinType::Void:
+              swiftType = ctx.getNamedSwiftType(ctx.getStdlibModule(), "Void");
+              break;
+      #define MAP_BUILTIN_TYPE(CLANG_BUILTIN_KIND, SWIFT_TYPE_NAME)            \
+            case clang::BuiltinType::CLANG_BUILTIN_KIND:                       \
+              swiftType = ctx.getNamedSwiftType(ctx.getStdlibModule(),         \
+                                                #SWIFT_TYPE_NAME);             \
+              break;
+      #define MAP_BUILTIN_CCHAR_TYPE(CLANG_BUILTIN_KIND, SWIFT_TYPE_NAME)      \
+            case clang::BuiltinType::CLANG_BUILTIN_KIND:                       \
+              swiftType = ctx.getNamedSwiftType(ctx.getStdlibModule(),         \
+                                                #SWIFT_TYPE_NAME);             \
+              break;
+      #include "swift/ClangImporter/BuiltinMappedTypes.def"
+              default:
+                break;
+            }
+            
+            if (swiftType) {
+              if (auto nominal = dyn_cast<NominalType>(swiftType->getCanonicalType())) {
+                buffer << nominal->getDecl()->getNameStr();
+                return;
+              }
+            }
+          } else if (auto namedArg = dyn_cast_or_null<clang::NamedDecl>(ty->getAsTagDecl())) {
+            importNameImpl(namedArg, version, clang::DeclarationName()).getDeclName().print(buffer);
+            return;
+          }
+        }
+        buffer << "_";
+      });
+      buffer << ">";
 
-      // The Itanium mangler does not provide a way to get the mangled
-      // representation of a type. Instead, we call mangleTypeName() that
-      // returns the name of the RTTI typeinfo symbol, and remove the _ZTS
-      // prefix. Then we prepend __CxxTemplateInst to reduce chances of conflict
-      // with regular C and C++ structs.
-      llvm::SmallString<128> mangledNameStorage;
-      llvm::raw_svector_ostream mangledName(mangledNameStorage);
-      assert(buffer.str().take_front(4) == "_ZTS");
-      mangledName << CXX_TEMPLATE_INST_PREFIX << buffer.str().drop_front(4);
+      baseName = swiftCtx.getIdentifier(buffer.str()).get();
+    }
+  }
 
-      baseName = swiftCtx.getIdentifier(mangledName.str()).get();
+  SmallString<16> newName;
+  // Check if we need to rename the C++ method to disambiguate it.
+  if (auto method = dyn_cast<clang::CXXMethodDecl>(D)) {
+    if (!method->isConst() && !method->isOverloadedOperator()) {
+      // See if any other methods within the same struct have the same name, but
+      // differ in constness.
+      auto otherDecls = dc->lookup(method->getDeclName());
+      bool shouldRename = false;
+      for (auto otherDecl : otherDecls) {
+        if (otherDecl == D)
+          continue;
+        if (auto otherMethod = dyn_cast<clang::CXXMethodDecl>(otherDecl)) {
+          // TODO: what if the other method is also non-const?
+          if (otherMethod->isConst()) {
+            shouldRename = true;
+            break;
+          }
+        }
+      }
+
+      if (shouldRename) {
+        newName = baseName;
+        newName += "Mutating";
+        baseName = newName;
+      }
     }
   }
 
@@ -2233,11 +2321,11 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
               ? Optional<unsigned>(result.getErrorInfo()->ErrorParameterIndex)
               : None,
           method->hasRelatedResultType(), method->isInstanceMethod(),
-          result.getAsyncInfo().map(
+          result.getAsyncInfo().transform(
             [](const ForeignAsyncConvention::Info &info) {
               return info.completionHandlerParamIndex();
             }),
-          result.getAsyncInfo().map(
+          result.getAsyncInfo().transform(
             [&](const ForeignAsyncConvention::Info &info) {
               return method->getDeclName().getObjCSelector().getNameForSlot(
                                             info.completionHandlerParamIndex());
@@ -2284,7 +2372,8 @@ ImportedName NameImporter::importNameImpl(const clang::NamedDecl *D,
   baseName = renameUnsafeMethod(swiftCtx, D, baseName);
 
   result.declName = formDeclName(swiftCtx, baseName, argumentNames, isFunction,
-                                 isInitializer);
+                                 isInitializer, /*isSubscript=*/false,
+                                 isa<clang::ClassTemplateSpecializationDecl>(D));
   return result;
 }
 
@@ -2373,7 +2462,7 @@ bool NameImporter::forEachDistinctImportName(
     return true;
 
   ImportNameKey key(newName.getDeclName(), newName.getEffectiveContext(),
-                    newName.getAsyncInfo().hasValue());
+                    newName.getAsyncInfo().has_value());
   if (action(newName, activeVersion))
     seenNames.push_back(key);
 
@@ -2384,7 +2473,7 @@ bool NameImporter::forEachDistinctImportName(
         if (!newName)
           return;
         ImportNameKey key(newName.getDeclName(), newName.getEffectiveContext(),
-                          newName.getAsyncInfo().hasValue());
+                          newName.getAsyncInfo().has_value());
 
         bool seen = llvm::any_of(
             seenNames, [&key](const ImportNameKey &existing) -> bool {

@@ -15,7 +15,9 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/USRGeneration.h"
-#include "swift/Parse/CodeCompletionCallbacks.h"
+#include "swift/IDE/TypeCheckCompletionCallback.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
+#include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "clang/AST/Attr.h"
 #include "clang/AST/Decl.h"
@@ -24,7 +26,8 @@
 using namespace swift;
 using namespace ide;
 
-class ContextInfoCallbacks : public CodeCompletionCallbacks {
+class ContextInfoCallbacks : public CodeCompletionCallbacks,
+                             public DoneParsingCallback {
   TypeContextInfoConsumer &Consumer;
   SourceLoc Loc;
   Expr *ParsedExpr = nullptr;
@@ -34,7 +37,7 @@ class ContextInfoCallbacks : public CodeCompletionCallbacks {
 
 public:
   ContextInfoCallbacks(Parser &P, TypeContextInfoConsumer &Consumer)
-      : CodeCompletionCallbacks(P), Consumer(Consumer) {}
+      : CodeCompletionCallbacks(P), DoneParsingCallback(), Consumer(Consumer) {}
 
   void completePostfixExprBeginning(CodeCompletionExpr *E) override;
   void completeForEachSequenceBeginning(CodeCompletionExpr *E) override;
@@ -48,7 +51,7 @@ public:
   void completeUnresolvedMember(CodeCompletionExpr *E,
                                 SourceLoc DotLoc) override;
 
-  void doneParsing() override;
+  void doneParsing(SourceFile *SrcFile) override;
 };
 
 void ContextInfoCallbacks::completePostfixExprBeginning(CodeCompletionExpr *E) {
@@ -85,19 +88,42 @@ void ContextInfoCallbacks::completeCaseStmtBeginning(CodeCompletionExpr *E) {
   // TODO: Implement?
 }
 
-void ContextInfoCallbacks::doneParsing() {
+class TypeContextInfoCallback : public TypeCheckCompletionCallback {
+  Expr *ParsedExpr;
+  SmallVector<Type, 2> Types;
+
+  void sawSolutionImpl(const constraints::Solution &S) override {
+    if (!S.hasType(ParsedExpr)) {
+      return;
+    }
+    if (Type T = getTypeForCompletion(S, ParsedExpr)) {
+      Types.push_back(T);
+    }
+  }
+
+public:
+  TypeContextInfoCallback(Expr *ParsedExpr) : ParsedExpr(ParsedExpr) {}
+
+  ArrayRef<Type> getTypes() const { return Types; }
+};
+
+void ContextInfoCallbacks::doneParsing(SourceFile *SrcFile) {
   if (!ParsedExpr)
     return;
 
-  typeCheckContextAt(TypeCheckASTNodeAtLocContext::declContext(CurDeclContext),
-                     ParsedExpr->getLoc());
-
-  ExprContextInfo Info(CurDeclContext, ParsedExpr);
+  TypeContextInfoCallback TypeCheckCallback(ParsedExpr);
+  {
+    llvm::SaveAndRestore<TypeCheckCompletionCallback *> CompletionCollector(
+        Context.CompletionCallback, &TypeCheckCallback);
+    typeCheckContextAt(
+        TypeCheckASTNodeAtLocContext::declContext(CurDeclContext),
+        ParsedExpr->getLoc());
+  }
 
   llvm::SmallSet<CanType, 2> seenTypes;
   SmallVector<TypeContextInfoItem, 2> results;
 
-  for (auto T : Info.getPossibleTypes()) {
+  for (auto T : TypeCheckCallback.getTypes()) {
     if (T->is<ErrorType>() || T->is<UnresolvedType>())
       continue;
 
@@ -174,20 +200,21 @@ void ContextInfoCallbacks::getImplicitMembers(
                            /*includeProtocolExtensionMembers*/true);
 }
 
-CodeCompletionCallbacksFactory *swift::ide::makeTypeContextInfoCallbacksFactory(
+IDEInspectionCallbacksFactory *swift::ide::makeTypeContextInfoCallbacksFactory(
     TypeContextInfoConsumer &Consumer) {
 
   // CC callback factory which produces 'ContextInfoCallbacks'.
   class ContextInfoCallbacksFactoryImpl
-      : public CodeCompletionCallbacksFactory {
+      : public IDEInspectionCallbacksFactory {
     TypeContextInfoConsumer &Consumer;
 
   public:
     ContextInfoCallbacksFactoryImpl(TypeContextInfoConsumer &Consumer)
         : Consumer(Consumer) {}
 
-    CodeCompletionCallbacks *createCodeCompletionCallbacks(Parser &P) override {
-      return new ContextInfoCallbacks(P, Consumer);
+    Callbacks createCallbacks(Parser &P) override {
+      auto Callbacks = std::make_shared<ContextInfoCallbacks>(P, Consumer);
+      return {Callbacks, Callbacks};
     }
   };
 

@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2017 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2022 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -629,6 +629,10 @@ BUILTIN_MISC_OPERATION(DeallocRaw, "deallocRaw", "", Special)
 /// is not known at compile time, MaximumAlignment is assumed.
 BUILTIN_MISC_OPERATION(StackAlloc, "stackAlloc", "", Special)
 
+/// Like `stackAlloc`, but doesn't set the `[stack_protection]` flag on its
+/// containing function.
+BUILTIN_MISC_OPERATION(UnprotectedStackAlloc, "unprotectedStackAlloc", "", Special)
+
 /// StackDealloc has type (Builtin.RawPointer) -> ()
 ///
 /// Parameters: address.
@@ -701,6 +705,18 @@ BUILTIN_MISC_OPERATION(UToUCheckedTrunc, "u_to_u_checked_trunc", "n", Special)
 /// IntToFPWithOverflow has type (Integer) -> Float
 BUILTIN_MISC_OPERATION(IntToFPWithOverflow, "itofp_with_overflow", "n", Special)
 
+/// Builtin.bitWidth_IntLiteral has type
+/// (_ value: Builtin.IntLiteral) -> Builtin.Word
+BUILTIN_MISC_OPERATION(BitWidth, "bitWidth", "n", Special)
+
+/// Builtin.isNegative_IntLiteral has type
+/// (_ value: Builtin.IntLiteral) -> Builtin.Int1
+BUILTIN_MISC_OPERATION(IsNegative, "isNegative", "n", Special)
+
+/// Builtin.wordAtIndex_IntLiteral has type
+/// (_ value: Builtin.IntLiteral, _ index: Builtin.Word) -> Builtin.Word
+BUILTIN_MISC_OPERATION(WordAtIndex, "wordAtIndex", "n", Special)
+
 /// zeroInitializer has type <T> () -> T
 BUILTIN_MISC_OPERATION(ZeroInitializer, "zeroInitializer", "n", Special)
 
@@ -758,7 +774,11 @@ BUILTIN_MISC_OPERATION(InitializeDefaultActor, "initializeDefaultActor", "", Spe
 /// Destroy the default-actor instance in a default actor object.
 BUILTIN_MISC_OPERATION(DestroyDefaultActor, "destroyDefaultActor", "", Special)
 
-/// Allocate a "proxy" for a distributed remote actor.  TODO(distributed) change the name of this to create throughout.
+/// Initialize the extra storage state of a non-default distributed actor object.
+BUILTIN_MISC_OPERATION(InitializeNonDefaultDistributedActor,
+                       "initializeNonDefaultDistributedActor", "", Special)
+
+/// Allocate a "proxy" for a distributed remote actor.
 BUILTIN_MISC_OPERATION(InitializeDistributedRemoteActor,
                        "initializeDistributedRemoteActor", "", Special)
 
@@ -780,6 +800,10 @@ BUILTIN_MISC_OPERATION(ResumeThrowingContinuationThrowing,
 /// Create a task group.
 BUILTIN_MISC_OPERATION(CreateTaskGroup,
                        "createTaskGroup", "", Special)
+
+/// Create a task group, with options.
+BUILTIN_MISC_OPERATION(CreateTaskGroupWithFlags,
+                       "createTaskGroupWithFlags", "", Special)
 
 /// Destroy a task group.
 BUILTIN_MISC_OPERATION(DestroyTaskGroup,
@@ -915,6 +939,24 @@ BUILTIN_MISC_OPERATION_WITH_SILGEN(EndAsyncLet, "endAsyncLet", "", Special)
 /// until the endAsyncLet.
 BUILTIN_MISC_OPERATION(EndAsyncLetLifetime, "endAsyncLetLifetime", "", Special)
 
+/// addressOfBorrowOpaque (__shared T) -> Builtin.RawPointer
+/// Returns a RawPointer pointing to a borrowed rvalue.  The returned pointer is
+/// only valid within the scope of the borrow.  
+///
+/// Differs from addressOfBorrow only in that it is not lowered until
+/// AddressLowering.
+BUILTIN_MISC_OPERATION(AddressOfBorrowOpaque, "addressOfBorrowOpaque", "", Special)
+
+/// unprotectedAddressOfBorrowOpaque (__shared T) -> Builtin.RawPointer
+/// Returns a RawPointer pointing to a borrowed rvalue. The returned pointer is only
+/// valid within the scope of the borrow.
+/// In contrast to `addressOfBorrowOpaque`, this builtin doesn't trigger an
+/// insertion of stack protectors.
+///
+/// Differs from unprotectedAddressOfBorrow only in that it is not lowered until
+/// AddressLowering.
+BUILTIN_MISC_OPERATION(UnprotectedAddressOfBorrowOpaque, "unprotectedAddressOfBorrowOpaque", "", Special)
+
 /// createAsyncTask(): (
 ///     Int,                            // task-creation flags
 ///     @escaping () async throws -> T  // function
@@ -956,6 +998,11 @@ BUILTIN_MISC_OPERATION_WITH_SILGEN(AutoDiffAllocateSubcontext, "autoDiffAllocate
 /// reference.
 BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildOrdinarySerialExecutorRef,
                                    "buildOrdinarySerialExecutorRef", "n", Special)
+
+/// Build a Builtin.Executor value from an "complex equality" serial executor
+/// reference.
+BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildComplexEqualitySerialExecutorRef,
+                                   "buildComplexEqualitySerialExecutorRef", "n", Special)
 
 /// Build a Builtin.Executor value from a default actor reference.
 BUILTIN_MISC_OPERATION_WITH_SILGEN(BuildDefaultActorExecutorRef,

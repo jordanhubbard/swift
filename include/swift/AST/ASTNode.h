@@ -72,7 +72,13 @@ namespace swift {
     FUNC(Decl)
     FUNC(Pattern)
 #undef FUNC
-    
+
+    static inline ASTNode getFromOpaqueValue(void *ptr) {
+      ASTNode result;
+      result.Val = decltype(result.Val)::getFromOpaqueValue(ptr);
+      return result;
+    }
+
     SWIFT_DEBUG_DUMP;
     void dump(llvm::raw_ostream &OS, unsigned Indent = 0) const;
 
@@ -100,6 +106,19 @@ namespace llvm {
     static bool isEqual(const ASTNode LHS, const ASTNode RHS) {
       return LHS.getOpaqueValue() == RHS.getOpaqueValue();
     }
+  };
+
+  // A ASTNode is "pointer like".
+  template <>
+  struct PointerLikeTypeTraits<ASTNode> {
+  public:
+    static inline void *getAsVoidPointer(ASTNode N) {
+      return (void *)N.getOpaqueValue();
+    }
+    static inline ASTNode getFromVoidPointer(void *P) {
+      return ASTNode::getFromOpaqueValue(P);
+    }
+    enum { NumLowBitsAvailable = swift::TypeAlignInBits };
   };
 }
 

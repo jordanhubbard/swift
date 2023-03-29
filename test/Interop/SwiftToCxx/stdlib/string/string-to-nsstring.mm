@@ -1,8 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: split-file %s %t
 
-// RUN: %target-swift-frontend -parse-as-library %platform-module-dir/Swift.swiftmodule/%module-target-triple.swiftinterface -enable-library-evolution -disable-objc-attr-requires-foundation-module -typecheck -module-name Swift -parse-stdlib -enable-experimental-cxx-interop -emit-clang-header-path %t/Swift.h  -experimental-skip-all-function-bodies
-
 // RUN: %target-swift-frontend -typecheck %t/create_string.swift -typecheck -module-name StringCreator -enable-experimental-cxx-interop -emit-clang-header-path %t/StringCreator.h
 
 // RUN: %target-interop-build-clangxx -std=gnu++20 -fobjc-arc -c %t/string-to-nsstring.mm -I %t -o %t/swift-stdlib-execution.o
@@ -26,29 +24,28 @@ public func createString(_ ptr: UnsafePointer<CChar>) -> String {
 
 //--- string-to-nsstring-one-arc-op.mm
 
-#include "Swift.h"
+#include "StringCreator.h"
 
 int main() {
-  using namespace Swift;
+  using namespace swift;
   auto emptyString = String::init();
   NSString *nsStr = emptyString;
 }
 
-// CHECKARC: %[[VAL:.*]] = call swiftcc i8* @"$sSS23_bridgeToObjectiveCImplyXlyF"
-// CHECKARC: call i8* @llvm.objc.autorelease(i8* %[[VAL]])
+// CHECKARC: %[[VAL:.*]] = {{(tail )?}}call swiftcc ptr @"$sSS10FoundationE19_bridgeToObjectiveCSo8NSStringCyF"
+// CHECKARC: call ptr @llvm.objc.autorelease(ptr %[[VAL]])
 // CHECKARC: @llvm.objc.
-// CHECKARC-SAME: autorelease(i8*)
+// CHECKARC-SAME: autorelease(ptr)
 // CHECKARC-NOT: @llvm.objc.
 
 //--- string-to-nsstring.mm
 
 #include <cassert>
 #include <string>
-#include "Swift.h"
 #include "StringCreator.h"
 
 int main() {
-  using namespace Swift;
+  using namespace swift;
 
   auto emptyString = String::init();
 
@@ -63,6 +60,14 @@ int main() {
     NSString *nsStr = aStr;
     assert(std::string(nsStr.UTF8String) == "hello");
     assert([nsStr isEqualToString:@"hello"]);
+  }
+
+  {
+    NSString *nsStr = @"nsstr";
+    auto str = String::init(nsStr);
+    NSString *nsStr2 = str;
+    assert(std::string(nsStr.UTF8String) == "nsstr");
+    assert([nsStr2 isEqualToString:nsStr]);
   }
   return 0;
 }

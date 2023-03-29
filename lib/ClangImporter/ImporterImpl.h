@@ -452,6 +452,7 @@ public:
   const bool BridgingHeaderExplicitlyRequested;
   const bool DisableOverlayModules;
   const bool EnableClangSPI;
+  bool importSymbolicCXXDecls;
 
   bool IsReadingBridgingPCH;
   llvm::SmallVector<clang::serialization::SubmoduleID, 2> PCHImportedSubmodules;
@@ -613,14 +614,6 @@ public:
   /// `.second` corresponds to a setter
   llvm::MapVector<std::pair<NominalTypeDecl *, Type>,
                   std::pair<FuncDecl *, FuncDecl *>> cxxSubscripts;
-
-  /// Keep track of cxx function names, params etc in order to
-  /// allow for de-duping functions that differ strictly on "constness".
-  llvm::DenseMap<const clang::DeclContext *, llvm::DenseMap<llvm::StringRef,
-                 std::pair<
-                     llvm::DenseSet<clang::FunctionDecl *>,
-                     llvm::DenseSet<clang::FunctionDecl *>>>>
-      cxxMethods;
 
   // Keep track of the decls that were already cloned for this specific class.
   llvm::DenseMap<std::pair<ValueDecl *, DeclContext *>, ValueDecl *>
@@ -924,10 +917,10 @@ public:
   /// interface. Use this to diagnose issues with declarations that are not
   /// imported or that are not reflected in a generated interface.
   template<typename ...Args>
-  void diagnose(HeaderLoc loc, Args &&...args) {
+  InFlightDiagnostic diagnose(HeaderLoc loc, Args &&...args) {
     // If we're in the middle of pretty-printing, suppress diagnostics.
     if (SwiftContext.Diags.isPrettyPrintingDecl()) {
-      return;
+      return InFlightDiagnostic();
     }
 
     auto swiftLoc = loc.fallbackLoc;
@@ -939,7 +932,7 @@ public:
                                                       loc.clangLoc);
     }
 
-    SwiftContext.Diags.diagnose(swiftLoc, std::forward<Args>(args)...);
+    return SwiftContext.Diags.diagnose(swiftLoc, std::forward<Args>(args)...);
   }
 
   void addImportDiagnostic(
@@ -1652,6 +1645,9 @@ public:
   /// about the directly-parsed headers.
   SwiftLookupTable *findLookupTable(const clang::Module *clangModule);
 
+  /// Find the lookup table that should contain the given Clang declaration.
+  SwiftLookupTable *findLookupTable(const clang::Decl *decl);
+
   /// Visit each of the lookup tables in some deterministic order.
   ///
   /// \param fn Invoke the given visitor for each table. If the
@@ -1748,8 +1744,8 @@ public:
   void dumpSwiftLookupTables();
 
   void setSinglePCHImport(Optional<std::string> PCHFilename) {
-    if (PCHFilename.hasValue()) {
-      assert(llvm::sys::path::extension(PCHFilename.getValue())
+    if (PCHFilename.has_value()) {
+      assert(llvm::sys::path::extension(PCHFilename.value())
                  .endswith(file_types::getExtension(file_types::TY_PCH)) &&
              "Single PCH imported filename doesn't have .pch extension!");
     }
@@ -1760,7 +1756,7 @@ public:
   /// files, we can provide the PCH filename for declaration caching,
   /// especially in code completion.
   StringRef getSinglePCHImport() const {
-    if (SinglePCHImport.hasValue())
+    if (SinglePCHImport.has_value())
       return *SinglePCHImport;
     return StringRef();
   }
@@ -1908,23 +1904,36 @@ inline Optional<const clang::EnumDecl *> findAnonymousEnumForTypedef(
   if (found != foundDecls.end())
     return cast<clang::EnumDecl>(found->get<clang::NamedDecl *>());
 
+  // If a swift_private attribute has been attached to the enum, its name will
+  // be prefixed with two underscores
+  llvm::SmallString<32> swiftPrivateName;
+  swiftPrivateName += "__";
+  swiftPrivateName += typedefDecl->getName();
+  foundDecls = lookupTable->lookup(
+      SerializedSwiftName(ctx.getIdentifier(swiftPrivateName)),
+      EffectiveClangContext());
+
+  auto swiftPrivateFound =
+      llvm::find_if(foundDecls, [](SwiftLookupTable::SingleEntry decl) {
+        return decl.is<clang::NamedDecl *>() &&
+               isa<clang::EnumDecl>(decl.get<clang::NamedDecl *>()) &&
+               decl.get<clang::NamedDecl *>()
+                   ->hasAttr<clang::SwiftPrivateAttr>();
+      });
+
+  if (swiftPrivateFound != foundDecls.end())
+    return cast<clang::EnumDecl>(swiftPrivateFound->get<clang::NamedDecl *>());
+
   return None;
 }
 
-inline bool requiresCPlusPlus(const clang::Module *module) {
-  // The libc++ modulemap doesn't currently declare the requirement.
-  if (module->getTopLevelModuleName() == "std")
-    return true;
-
-  // Modulemaps often declare the requirement for the top-level module only.
-  if (auto parent = module->Parent) {
-    if (requiresCPlusPlus(parent))
-      return true;
-  }
-
-  return llvm::any_of(module->Requirements, [](clang::Module::Requirement req) {
-    return req.first == "cplusplus";
-  });
+inline std::string getPrivateOperatorName(const std::string &OperatorToken) {
+#define OVERLOADED_OPERATOR(Name, Spelling, Token, Unary, Binary, MemberOnly)  \
+  if (OperatorToken == Spelling) {                                             \
+    return "__operator" #Name;                                                 \
+  };
+#include "clang/Basic/OperatorKinds.def"
+  return "None";
 }
 
 }

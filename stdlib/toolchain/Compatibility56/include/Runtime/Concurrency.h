@@ -51,30 +51,22 @@ struct AsyncTaskAndContext {
   AsyncContext *InitialContext;
 };
 
-/// This should have the same representation as an enum like this:
-///    enum NearestTaskDeadline {
-///      case none
-///      case alreadyCancelled
-///      case active(TaskDeadline)
-///    }
-/// TODO: decide what this interface should really be.
-struct NearestTaskDeadline {
-  enum Kind : uint8_t {
-    None,
-    AlreadyCancelled,
-    Active
-  };
-
-  TaskDeadline Value;
-  Kind ValueKind;
-};
-
 
 /// Caution: not all future-initializing functions actually throw, so
 /// this signature may be incorrect.
 using FutureAsyncSignature =
   AsyncSignature<void(void*), /*throws*/ true>;
 
+/// Escalate the priority of a task and all of its child tasks.
+///
+/// This can be called from any thread.
+///
+/// This has no effect if the task already has at least the given priority.
+/// Returns the priority of the task.
+SWIFT_CC(swift)
+__attribute__((visibility("hidden")))
+JobPriority swift_task_escalateBackdeploy56(AsyncTask *task,
+                                            JobPriority newPriority);
 } // namespace swift
 
 #pragma clang diagnostic pop

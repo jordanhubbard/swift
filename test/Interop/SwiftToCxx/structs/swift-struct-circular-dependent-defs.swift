@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Structs -clang-header-expose-public-decls -emit-clang-header-path %t/structs.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Structs -clang-header-expose-decls=all-public -emit-clang-header-path %t/structs.h
 // RUN: %FileCheck %s < %t/structs.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/structs.h)
@@ -24,15 +24,15 @@ public struct B {
     let v: Large = Large()
 }
 
-// CHECK: class B;
-// CHECK: class A;
+// CHECK: class SWIFT_SYMBOL({{.*}}) B;
+// CHECK: class SWIFT_SYMBOL({{.*}}) A;
 // CHECK: namespace _impl {
 // CHECK-EMPTY:
 // CHECK-NEXT: class _impl_A;
 
-// CHECK: class A final {
+// CHECK: class SWIFT_SYMBOL({{.*}}) A final {
 
-// CHECK: B returnsB() const;
+// CHECK: B returnsB() const SWIFT_SYMBOL({{.*}});
 
 // CHECK: namespace _impl {
 // CHECK-EMPTY:
@@ -42,7 +42,7 @@ public struct B {
 // CHECK-EMPTY:
 // CHECK-NEXT: class _impl_B;
 
-// CHECK: class B final {
+// CHECK: class SWIFT_SYMBOL({{.*}}) B final {
 
-// CHECK: inline B A::returnsB() const {
-// CHECK: inline A B::returnsA() const {
+// CHECK: SWIFT_INLINE_THUNK B A::returnsB() const {
+// CHECK: SWIFT_INLINE_THUNK A B::returnsA() const {

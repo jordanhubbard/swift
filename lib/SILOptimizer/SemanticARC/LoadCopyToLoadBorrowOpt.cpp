@@ -88,7 +88,7 @@ public:
     SmallVector<Operand *, 8> endScopeUses;
     transform(access->getEndAccesses(), std::back_inserter(endScopeUses),
               [](EndAccessInst *eai) { return &eai->getAllOperands()[0]; });
-    LinearLifetimeChecker checker(ctx.getDeadEndBlocks());
+    LinearLifetimeChecker checker(&ctx.getDeadEndBlocks());
     if (!checker.validateLifetime(access, endScopeUses,
                                   liveRange.getAllConsumingUses())) {
       // If we fail the linear lifetime check, then just recur:
@@ -103,11 +103,11 @@ public:
     // If we have a modify, check if our value is /ever/ written to. If it is
     // never actually written to, then we convert to a load_borrow.
     auto result = ctx.addressToExhaustiveWriteListCache.get(access);
-    if (!result.hasValue()) {
+    if (!result.has_value()) {
       return answer(true);
     }
 
-    if (result.getValue().empty()) {
+    if (result.value().empty()) {
       return answer(false);
     }
 
@@ -126,7 +126,7 @@ public:
     if (!arg->isIndirectResult() &&
         arg->getKnownParameterInfo().isIndirectMutating()) {
       auto wellBehavedWrites = ctx.addressToExhaustiveWriteListCache.get(arg);
-      if (!wellBehavedWrites.hasValue()) {
+      if (!wellBehavedWrites.has_value()) {
         return answer(true);
       }
 
@@ -138,7 +138,7 @@ public:
       // Ok, we have some writes. See if any of them are within our live
       // range. If any are, we definitely can not promote to load_borrow.
       SmallVector<BeginAccessInst *, 16> foundBeginAccess;
-      LinearLifetimeChecker checker(ctx.getDeadEndBlocks());
+      LinearLifetimeChecker checker(&ctx.getDeadEndBlocks());
       SILValue introducerValue = liveRange.getIntroducer().value;
       if (!checker.usesNotContainedWithinLifetime(introducerValue,
                                                   liveRange.getDestroyingUses(),
@@ -244,7 +244,7 @@ public:
     value.visitLocalScopeEndingUses(
       [&](Operand *use) { endScopeInsts.push_back(use); return true; });
 
-    LinearLifetimeChecker checker(ctx.getDeadEndBlocks());
+    LinearLifetimeChecker checker(&ctx.getDeadEndBlocks());
 
     // Returns true on success. So we invert.
     bool foundError = !checker.validateLifetime(
@@ -291,7 +291,7 @@ public:
 
     // Then make sure that all of our load [copy] uses are within the
     // destroy_addr.
-    LinearLifetimeChecker checker(ctx.getDeadEndBlocks());
+    LinearLifetimeChecker checker(&ctx.getDeadEndBlocks());
     // Returns true on success. So we invert.
     bool foundError = !checker.validateLifetime(
         stack, addrDestroyingOperands /*consuming users*/,

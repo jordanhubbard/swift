@@ -119,9 +119,6 @@ def verify_generic_signatures : Separate<["-"], "verify-generic-signatures">,
   MetaVarName<"<module-name>">,
   HelpText<"Verify the generic signatures in the given module">;
 
-def verify_syntax_tree : Flag<["-"], "verify-syntax-tree">,
-  HelpText<"Verify that no unknown nodes exist in the libSyntax tree">;
-
 def show_diagnostics_after_fatal : Flag<["-"], "show-diagnostics-after-fatal">,
   HelpText<"Keep emitting subsequent diagnostics after a fatal error">;
   
@@ -187,6 +184,10 @@ def disable_typo_correction : Flag<["-"], "disable-typo-correction">,
 
 def disable_implicit_swift_modules: Flag<["-"], "disable-implicit-swift-modules">,
   HelpText<"Disable building Swift modules implicitly by the compiler">;
+
+def swift_module_file: Joined<["-"], "swift-module-file=">,
+  MetaVarName<"<name>=<path>">,
+  HelpText<"Specify Swift module input explicitly built from textual interface">;
 
 def explicit_swift_module_map
   : Separate<["-"], "explicit-swift-module-map-file">, MetaVarName<"<path>">,
@@ -307,6 +308,10 @@ def enable_experimental_eager_clang_module_diagnostics :
   Flag<["-"], "enable-experimental-eager-clang-module-diagnostics">,
   HelpText<"Enable experimental eager diagnostics reporting on the importability of all referenced C, C++, and Objective-C libraries">;
 
+def enable_import_objc_forward_declarations :
+  Flag<["-"], "enable-import-objc-forward-declarations">,
+  HelpText<"Attempt to import Objective-C forward declarations">;
+
 def enable_experimental_pairwise_build_block :
   Flag<["-"], "enable-experimental-pairwise-build-block">,
   HelpText<"Enable experimental pairwise 'buildBlock' for result builders">;
@@ -317,10 +322,6 @@ def enable_resilience : Flag<["-"], "enable-resilience">,
 def enable_experimental_async_top_level :
   Flag<["-"], "enable-experimental-async-top-level">,
   HelpText<"Enable experimental concurrency in top-level code">;
-
-def enable_experimental_layout_prespecialization :
-  Flag<["-"], "enable-experimental-layout-prespecialization">,
-  HelpText<"Enable experimental support for layout based pre-specializations">;
 }
 
 // HIDDEN FLAGS
@@ -346,6 +347,11 @@ def dump_requirement_machine : Flag<["-"], "dump-requirement-machine">,
 
 def debug_requirement_machine : Joined<["-"], "debug-requirement-machine=">,
   HelpText<"Fine-grained debug output from the generics implementation">;
+
+def dump_macro_expansions : Flag<["-"], "dump-macro-expansions">,
+  HelpText<"Dumps the results of each macro expansion">;
+def emit_macro_expansion_files : Separate<["-"], "emit-macro-expansion-files">,
+  HelpText<"Specify when to emit macro expansion file: 'none', 'debug', or 'diagnostics'">;
 
 def analyze_requirement_machine : Flag<["-"], "analyze-requirement-machine">,
   Flags<[FrontendOption, HelpHidden, DoesNotAffectIncrementalBuild]>,
@@ -438,6 +444,14 @@ def disable_implicit_concurrency_module_import : Flag<["-"],
 def disable_implicit_string_processing_module_import : Flag<["-"],
   "disable-implicit-string-processing-module-import">,
   HelpText<"Disable the implicit import of the _StringProcessing module.">;
+
+def enable_implicit_backtracing_module_import : Flag<["-"],
+  "enable-implicit-backtracing-module-import">,
+  HelpText<"Enable the implicit import of the _Backtracing module.">;
+
+def disable_implicit_backtracing_module_import : Flag<["-"],
+  "disable-implicit-backtracing-module-import">,
+  HelpText<"Disable the implicit import of the _Backtracing module.">;
 
 def disable_arc_opts : Flag<["-"], "disable-arc-opts">,
   HelpText<"Don't run SIL ARC optimization passes.">;
@@ -568,6 +582,13 @@ def disable_deserialization_recovery :
   Flag<["-"], "disable-deserialization-recovery">,
   HelpText<"Don't attempt to recover from missing xrefs (etc) in swiftmodules">;
 
+def enable_deserialization_safety :
+  Flag<["-"], "enable-deserialization-safety">,
+  HelpText<"Avoid reading potentially unsafe decls in swiftmodules">;
+def disable_deserialization_safety :
+  Flag<["-"], "disable-deserialization-safety">,
+  HelpText<"Don't avoid reading potentially unsafe decls in swiftmodules">;
+
 def enable_experimental_string_processing :
   Flag<["-"], "enable-experimental-string-processing">,
   HelpText<"Enable experimental string processing">;
@@ -575,17 +596,9 @@ def disable_experimental_string_processing :
   Flag<["-"], "disable-experimental-string-processing">,
   HelpText<"Disable experimental string processing">;
 
-def enable_experimental_variadic_generics :
-  Flag<["-"], "enable-experimental-variadic-generics">,
-  HelpText<"Enable experimental support for variadic generic types">;
-
 def enable_experimental_associated_type_inference :
   Flag<["-"], "enable-experimental-associated-type-inference">,
   HelpText<"Enable experimental associated type inference via type witness systems">;
-
-def enable_experimental_implicit_some :
-  Flag<["-"], "enable-experimental-implicit-some">,
-  HelpText<"Enable experimental implicit some">;
 
 def disable_availability_checking : Flag<["-"],
   "disable-availability-checking">,
@@ -844,9 +857,6 @@ def emit_sorted_sil : Flag<["-"], "emit-sorted-sil">,
   HelpText<"When printing SIL, print out all sil entities sorted by name to "
            "ease diffing">;
 
-def emit_syntax : Flag<["-"], "emit-syntax">,
-  HelpText<"Parse input file(s) and emit the Syntax tree(s) as JSON">, ModeOpt;
-
 def cxx_interop_getters_setters_as_properties :
   Flag<["-"], "cxx-interop-getters-setters-as-properties">,
   HelpText<"Import getters and setters as computed properties in Swift">,
@@ -889,6 +899,10 @@ def explicit_interface_module_build :
   Flag<["-"], "explicit-interface-module-build">,
   HelpText<"Use the specified command-line to build the module from interface, instead of flags specified in the interface">;
 
+def direct_clang_cc1_module_build :
+  Flag<["-"], "direct-clang-cc1-module-build">,
+  HelpText<"Use the specified -Xcc options to build a PCM by using Clang frontend directly, bypassing the Clang driver">;
+
 def build_module_from_parseable_interface :
   Flag<["-"], "build-module-from-parseable-interface">,
   Alias<compile_module_from_interface>,
@@ -903,6 +917,15 @@ def module_interface_preserve_types_as_written :
   Flag<["-"], "module-interface-preserve-types-as-written">,
   HelpText<"When emitting a module interface, preserve types as they were "
            "written in the source">;
+
+def alias_module_names_in_module_interface :
+  Flag<["-"], "alias-module-names-in-module-interface">,
+  HelpText<"When emitting a module interface, disambiguate modules using "
+           "distinct alias names">;
+def disable_alias_module_names_in_module_interface :
+  Flag<["-"], "disable-alias-module-names-in-module-interface">,
+  HelpText<"When emitting a module interface, disable disambiguating modules "
+           "using distinct alias names">;
 
 def experimental_spi_imports :
   Flag<["-"], "experimental-spi-imports">,
@@ -1077,11 +1100,18 @@ def skip_import_in_public_interface:
   HelpText<"Skip the import statement corresponding to a module name "
            "when printing the public interface.">;
 
-def clang_header_expose_public_decls:
-  Flag<["-"], "clang-header-expose-public-decls">,
-  HelpText<"Expose all public declarations in the generated clang header">,
-  Flags<[FrontendOption, HelpHidden]>;
-  
+def clang_header_expose_decls:
+  Joined<["-"], "clang-header-expose-decls=">,
+  HelpText<"Which declarations should be exposed in the generated clang header.">,
+  Flags<[FrontendOption, HelpHidden]>,
+  MetaVarName<"all-public|has-expose-attr">;
+
+def clang_header_expose_module:
+  Separate<["-"], "clang-header-expose-module">,
+  HelpText<"Allow the compiler to assume that APIs from the specified module are exposed to C/C++/Objective-C in another generated header, so that APIs in the current module that depend on declarations from the specified module can be exposed in the generated header.">,
+  Flags<[FrontendOption, HelpHidden]>,
+  MetaVarName<"<imported-module-name>=<generated-header-name>">;
+
 def weak_link_at_target :
   Flag<["-"], "weak-link-at-target">,
   HelpText<"Weakly link symbols for declarations that were introduced at the "
@@ -1102,6 +1132,37 @@ def enable_stack_protector :
 def disable_stack_protector :
   Flag<["-"], "disable-stack-protector">,
   HelpText<"Disable the stack-protector">;
+def enable_move_inout_stack_protector :
+  Flag<["-"], "enable-move-inout-stack-protector">,
+  HelpText<"Enable the stack protector by moving values to temporaries">;
+
+def enable_import_ptrauth_field_function_pointers :
+  Flag<["-"], "enable-import-ptrauth-field-function-pointers">,
+  HelpText<"Enable import of custom ptrauth qualified field function pointers">;
+def disable_import_ptrauth_field_function_pointers :
+  Flag<["-"], "disable-import-ptrauth-field-function-pointers">,
+  HelpText<"Disable import of custom ptrauth qualified field function pointers">;
+
+def enable_collocate_metadata_functions :
+  Flag<["-"], "enable-collocate-metadata-functions">,
+  HelpText<"Enable collocate metadata functions">;
+def disable_collocate_metadata_functions :
+  Flag<["-"], "disable-collocate-metadata-functions">,
+  HelpText<"Disable collocate metadata functions">;
+
+def enable_colocate_type_descriptors :
+  Flag<["-"], "enable-colocate-type-descriptors">,
+  HelpText<"Enable colocate type descriptors">;
+def disable_colocate_type_descriptors :
+  Flag<["-"], "disable-colocate-type-descriptors">,
+  HelpText<"Disable colocate type descriptors">;
+
+def enable_relative_protocol_witness_tables :
+  Flag<["-"], "enable-relative-protocol-witness-tables">,
+  HelpText<"Enable relative protocol witness tables">;
+def disable_relative_protocol_witness_tables :
+  Flag<["-"], "disable-relative-protocol-witness-tables">,
+  HelpText<"Disable relative protocol witness tables">;
 
 def enable_new_llvm_pass_manager :
   Flag<["-"], "enable-new-llvm-pass-manager">,
@@ -1122,4 +1183,8 @@ def enable_emit_generic_class_ro_t_list :
 def experimental_spi_only_imports :
   Flag<["-"], "experimental-spi-only-imports">,
   HelpText<"Enable use of @_spiOnly imports">;
+
+def enable_ossa_complete_lifetimes :
+  Flag<["-"], "enable-ossa-complete-lifetimes">,
+  HelpText<"Require linear OSSA lifetimes after SILGen">;
 } // end let Flags = [FrontendOption, NoDriverOption, HelpHidden]

@@ -41,16 +41,18 @@ namespace swift {
   class Decl;
   class DeclAttribute;
   class DiagnosticEngine;
+  class GeneratedSourceInfo;
   class SourceManager;
   class ValueDecl;
   class SourceFile;
 
-  enum class PatternKind : uint8_t;
+  enum class DescriptivePatternKind : uint8_t;
   enum class SelfAccessKind : uint8_t;
   enum class ReferenceOwnership : uint8_t;
   enum class StaticSpellingKind : uint8_t;
   enum class DescriptiveDeclKind : uint8_t;
   enum DeclAttrKind : unsigned;
+  enum class StmtKind;
 
   /// Enumeration describing all of possible diagnostics.
   ///
@@ -111,11 +113,12 @@ namespace swift {
     Type,
     TypeRepr,
     FullyQualifiedType,
-    PatternKind,
+    DescriptivePatternKind,
     SelfAccessKind,
     ReferenceOwnership,
     StaticSpellingKind,
     DescriptiveDeclKind,
+    DescriptiveStmtKind,
     DeclAttribute,
     VersionTuple,
     LayoutConstraint,
@@ -144,11 +147,12 @@ namespace swift {
       Type TypeVal;
       TypeRepr *TyR;
       FullyQualified<Type> FullyQualifiedTypeVal;
-      PatternKind PatternKindVal;
+      DescriptivePatternKind DescriptivePatternKindVal;
       SelfAccessKind SelfAccessKindVal;
       ReferenceOwnership ReferenceOwnershipVal;
       StaticSpellingKind StaticSpellingKindVal;
       DescriptiveDeclKind DescriptiveDeclKindVal;
+      StmtKind DescriptiveStmtKindVal;
       const DeclAttribute *DeclAttributeVal;
       llvm::VersionTuple VersionVal;
       LayoutConstraint LayoutConstraintVal;
@@ -216,8 +220,9 @@ namespace swift {
       }
     }
 
-    DiagnosticArgument(PatternKind K)
-        : Kind(DiagnosticArgumentKind::PatternKind), PatternKindVal(K) {}
+    DiagnosticArgument(DescriptivePatternKind DPK)
+        : Kind(DiagnosticArgumentKind::DescriptivePatternKind),
+          DescriptivePatternKindVal(DPK) {}
 
     DiagnosticArgument(ReferenceOwnership RO)
         : Kind(DiagnosticArgumentKind::ReferenceOwnership),
@@ -234,6 +239,10 @@ namespace swift {
     DiagnosticArgument(DescriptiveDeclKind DDK)
         : Kind(DiagnosticArgumentKind::DescriptiveDeclKind),
           DescriptiveDeclKindVal(DDK) {}
+
+    DiagnosticArgument(StmtKind SK)
+        : Kind(DiagnosticArgumentKind::DescriptiveStmtKind),
+          DescriptiveStmtKindVal(SK) {}
 
     DiagnosticArgument(const DeclAttribute *attr)
         : Kind(DiagnosticArgumentKind::DeclAttribute),
@@ -316,9 +325,9 @@ namespace swift {
       return FullyQualifiedTypeVal;
     }
 
-    PatternKind getAsPatternKind() const {
-      assert(Kind == DiagnosticArgumentKind::PatternKind);
-      return PatternKindVal;
+    DescriptivePatternKind getAsDescriptivePatternKind() const {
+      assert(Kind == DiagnosticArgumentKind::DescriptivePatternKind);
+      return DescriptivePatternKindVal;
     }
 
     ReferenceOwnership getAsReferenceOwnership() const {
@@ -339,6 +348,11 @@ namespace swift {
     DescriptiveDeclKind getAsDescriptiveDeclKind() const {
       assert(Kind == DiagnosticArgumentKind::DescriptiveDeclKind);
       return DescriptiveDeclKindVal;
+    }
+
+    StmtKind getAsDescriptiveStmtKind() const {
+      assert(Kind == DiagnosticArgumentKind::DescriptiveStmtKind);
+      return DescriptiveStmtKindVal;
     }
 
     const DeclAttribute *getAsDeclAttribute() const {
@@ -490,6 +504,7 @@ namespace swift {
     }
 
     void addChildNote(Diagnostic &&D);
+    void insertChildNote(unsigned beforeIndex, Diagnostic &&D);
   };
   
   /// Describes an in-flight diagnostic, which is currently active
@@ -707,6 +722,9 @@ namespace swift {
 
     /// Don't emit any warnings
     bool suppressWarnings = false;
+    
+    /// Don't emit any remarks
+    bool suppressRemarks = false;
 
     /// Emit all warnings as errors
     bool warningsAsErrors = false;
@@ -745,6 +763,10 @@ namespace swift {
     /// Whether to skip emitting warnings
     void setSuppressWarnings(bool val) { suppressWarnings = val; }
     bool getSuppressWarnings() const { return suppressWarnings; }
+    
+    /// Whether to skip emitting remarks
+    void setSuppressRemarks(bool val) { suppressRemarks = val; }
+    bool getSuppressRemarks() const { return suppressRemarks; }
 
     /// Whether to treat warnings as errors
     void setWarningsAsErrors(bool val) { warningsAsErrors = val; }
@@ -763,6 +785,7 @@ namespace swift {
     void swap(DiagnosticState &other) {
       std::swap(showDiagnosticsAfterFatalError, other.showDiagnosticsAfterFatalError);
       std::swap(suppressWarnings, other.suppressWarnings);
+      std::swap(suppressRemarks, other.suppressRemarks);
       std::swap(warningsAsErrors, other.warningsAsErrors);
       std::swap(fatalErrorOccurred, other.fatalErrorOccurred);
       std::swap(anyErrorOccurred, other.anyErrorOccurred);
@@ -878,6 +901,12 @@ namespace swift {
     void setSuppressWarnings(bool val) { state.setSuppressWarnings(val); }
     bool getSuppressWarnings() const {
       return state.getSuppressWarnings();
+    }
+
+    /// Whether to skip emitting remarks
+    void setSuppressRemarks(bool val) { state.setSuppressRemarks(val); }
+    bool getSuppressRemarks() const {
+      return state.getSuppressRemarks();
     }
 
     /// Whether to treat warnings as errors
@@ -1137,6 +1166,11 @@ namespace swift {
 
     /// Send \c diag to all diagnostic consumers.
     void emitDiagnostic(const Diagnostic &diag);
+
+    /// Retrieve the set of child notes that describe how the generated
+    /// source buffer was derived, e.g., a macro expansion backtrace.
+    std::vector<Diagnostic> getGeneratedSourceBufferNotes(
+        SourceLoc loc, Optional<unsigned> &lastBufferID);
 
     /// Handle a new diagnostic, which will either be emitted, or added to an
     /// active transaction.
@@ -1445,6 +1479,10 @@ namespace swift {
 /// This is correlated with diag::availability_deprecated and others.
 std::pair<unsigned, DeclName>
 getAccessorKindAndNameForDiagnostics(const ValueDecl *D);
+
+/// Retrieve the macro name for a generated source info that represents
+/// a macro expansion.
+DeclName getGeneratedSourceInfoMacroName(const GeneratedSourceInfo &info);
 
 } // end namespace swift
 

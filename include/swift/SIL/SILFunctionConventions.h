@@ -214,30 +214,38 @@ public:
 
   /// Get the number of SIL results passed as address-typed arguments.
   unsigned getNumIndirectSILResults() const {
-    return silConv.loweredAddresses ? funcTy->getNumIndirectFormalResults() : 0;
+    // TODO: Return packs directly in lowered-address mode
+    return silConv.loweredAddresses ? funcTy->getNumIndirectFormalResults()
+                                    : funcTy->getNumPackResults();
   }
 
   /// Are any SIL results passed as address-typed arguments?
   bool hasIndirectSILResults() const { return getNumIndirectSILResults() != 0; }
 
-  using IndirectSILResultIter = SILFunctionType::IndirectFormalResultIter;
-  using IndirectSILResultRange = SILFunctionType::IndirectFormalResultRange;
+  struct IndirectSILResultFilter {
+    bool loweredAddresses;
+    IndirectSILResultFilter(bool loweredAddresses)
+        : loweredAddresses(loweredAddresses) {}
+    bool operator()(SILResultInfo result) const {
+      return (loweredAddresses ? result.isFormalIndirect() : result.isPack());
+    }
+  };
+  using IndirectSILResultIter =
+      llvm::filter_iterator<const SILResultInfo *, IndirectSILResultFilter>;
+  using IndirectSILResultRange = iterator_range<IndirectSILResultIter>;
 
   /// Return a range of indirect result information for results passed as
   /// address-typed SIL arguments.
   IndirectSILResultRange getIndirectSILResults() const {
-    if (silConv.loweredAddresses)
-      return funcTy->getIndirectFormalResults();
-
     return llvm::make_filter_range(
-        llvm::make_range((const SILResultInfo *)0, (const SILResultInfo *)0),
-        SILFunctionType::IndirectFormalResultFilter());
+        funcTy->getResults(),
+        IndirectSILResultFilter(silConv.loweredAddresses));
   }
 
   struct SILResultTypeFunc;
 
   // Gratuitous template parameter is to delay instantiating `mapped_iterator`
-  // on the incomplete type SILParameterTypeFunc.
+  // on the incomplete type SILResultTypeFunc.
   template<bool _ = false>
   using IndirectSILResultTypeIter = typename delay_template_expansion<_, 
       llvm::mapped_iterator, IndirectSILResultIter, SILResultTypeFunc>::type;
@@ -253,15 +261,20 @@ public:
   /// Get the number of SIL results directly returned by SIL value.
   unsigned getNumDirectSILResults() const {
     return silConv.loweredAddresses ? funcTy->getNumDirectFormalResults()
-                                    : funcTy->getNumResults();
+                                    : funcTy->getNumResults() - funcTy->getNumPackResults();
   }
+
+  /// Like getNumDirectSILResults but @out tuples, which are not flattened in
+  /// the return type, are recursively flattened in the count.
+  template <bool _ = false>
+  unsigned getNumExpandedDirectSILResults(TypeExpansionContext context) const;
 
   struct DirectSILResultFilter {
     bool loweredAddresses;
     DirectSILResultFilter(bool loweredAddresses)
         : loweredAddresses(loweredAddresses) {}
     bool operator()(SILResultInfo result) const {
-      return !(loweredAddresses && result.isFormalIndirect());
+      return (loweredAddresses ? !result.isFormalIndirect() : !result.isPack());
     }
   };
   using DirectSILResultIter =
@@ -429,6 +442,34 @@ SILFunctionConventions::getDirectSILResultTypes(
                          SILResultTypeFunc(*this, context));
 }
 
+template <bool _>
+unsigned SILFunctionConventions::getNumExpandedDirectSILResults(
+    TypeExpansionContext context) const {
+  if (silConv.loweredAddresses)
+    return funcTy->getNumDirectFormalResults();
+  unsigned retval = 0;
+  // Worklist of elements to flatten or count.
+  SmallVector<SILType, 4> flattenedElements;
+  // Seed the worklist with the direct results.
+  for (auto result : getDirectSILResultTypes(context)) {
+    flattenedElements.push_back(result);
+  }
+  // Pop elements from the worklist and either increment the count or, if the
+  // type is a tuple, add its elements to the worklist.
+  while (!flattenedElements.empty()) {
+    auto ty = flattenedElements.pop_back_val();
+    if (auto tupleType = ty.getASTType()->getAs<TupleType>()) {
+      for (auto index :
+           llvm::reverse(indices(tupleType->getElementTypes()))) {
+        flattenedElements.push_back(ty.getTupleElementType(index));
+      }
+    } else {
+      retval += 1;
+    }
+  }
+  return retval;
+}
+
 struct SILFunctionConventions::SILParameterTypeFunc {
   SILFunctionConventions silConv;
   TypeExpansionContext context;
@@ -485,8 +526,12 @@ inline bool SILModuleConventions::isIndirectSILParam(SILParameterInfo param,
   case ParameterConvention::Direct_Owned:
     return false;
 
+  case ParameterConvention::Pack_Inout:
+  case ParameterConvention::Pack_Owned:
+  case ParameterConvention::Pack_Guaranteed:
+    return true;
+
   case ParameterConvention::Indirect_In:
-  case ParameterConvention::Indirect_In_Constant:
   case ParameterConvention::Indirect_In_Guaranteed:
     return (loweredAddresses ||
             param.getInterfaceType()->isOpenedExistentialWithError());
@@ -508,6 +553,8 @@ inline bool SILModuleConventions::isIndirectSILResult(SILResultInfo result,
   case ResultConvention::Indirect:
     return (loweredAddresses ||
             result.getInterfaceType()->isOpenedExistentialWithError());
+  case ResultConvention::Pack:
+    return true;
   case ResultConvention::Owned:
   case ResultConvention::Unowned:
   case ResultConvention::UnownedInnerPointer:

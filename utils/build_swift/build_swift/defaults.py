@@ -46,15 +46,15 @@ BUILD_VARIANT = 'Debug'
 CMAKE_GENERATOR = 'Ninja'
 
 COMPILER_VENDOR = 'none'
-SWIFT_USER_VISIBLE_VERSION = Version('5.8')
+SWIFT_USER_VISIBLE_VERSION = Version('5.9')
 CLANG_USER_VISIBLE_VERSION = Version('13.0.0')
 SWIFT_ANALYZE_CODE_COVERAGE = 'false'
 
 DARWIN_XCRUN_TOOLCHAIN = 'default'
-DARWIN_DEPLOYMENT_VERSION_OSX = '10.9'
-DARWIN_DEPLOYMENT_VERSION_IOS = '7.0'
-DARWIN_DEPLOYMENT_VERSION_TVOS = '9.0'
-DARWIN_DEPLOYMENT_VERSION_WATCHOS = '2.0'
+DARWIN_DEPLOYMENT_VERSION_OSX = '10.13'
+DARWIN_DEPLOYMENT_VERSION_IOS = '11.0'
+DARWIN_DEPLOYMENT_VERSION_TVOS = '11.0'
+DARWIN_DEPLOYMENT_VERSION_WATCHOS = '4.0'
 
 UNIX_INSTALL_PREFIX = '/usr'
 DARWIN_INSTALL_PREFIX = ('/Applications/Xcode.app/Contents/Developer/'
@@ -118,8 +118,8 @@ def llvm_install_components():
     """Convenience function for getting the default llvm install components for
     platforms.
     """
-    components = ['llvm-cov', 'llvm-profdata', 'IndexStore', 'clang',
-                  'clang-resource-headers', 'compiler-rt', 'clangd']
+    components = ['llvm-ar', 'llvm-cov', 'llvm-profdata', 'IndexStore', 'clang',
+                  'clang-resource-headers', 'compiler-rt', 'clangd', 'LTO']
     if os.sys.platform == 'darwin':
         components.extend(['dsymutil'])
     else:

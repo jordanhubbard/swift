@@ -26,11 +26,36 @@ void conformToCxxIteratorIfNeeded(ClangImporter::Implementation &impl,
                                   NominalTypeDecl *decl,
                                   const clang::CXXRecordDecl *clangDecl);
 
+/// If the decl is an instantiation of C++ `std::optional`, synthesize a
+/// conformance to CxxOptional protocol, which is defined in the Cxx module.
+void conformToCxxOptionalIfNeeded(ClangImporter::Implementation &impl,
+                                  NominalTypeDecl *decl,
+                                  const clang::CXXRecordDecl *clangDecl);
+
 /// If the decl is a C++ sequence, synthesize a conformance to the CxxSequence
 /// protocol, which is defined in the Cxx module.
 void conformToCxxSequenceIfNeeded(ClangImporter::Implementation &impl,
                                   NominalTypeDecl *decl,
                                   const clang::CXXRecordDecl *clangDecl);
+
+/// If the decl is an instantiation of C++ `std::set`, `std::unordered_set` or
+/// `std::multiset`, synthesize a conformance to CxxSet, which is defined in the
+/// Cxx module.
+void conformToCxxSetIfNeeded(ClangImporter::Implementation &impl,
+                             NominalTypeDecl *decl,
+                             const clang::CXXRecordDecl *clangDecl);
+
+/// If the decl is an instantiation of C++ `std::pair`, synthesize a conformance
+/// to CxxPair, which is defined in the Cxx module.
+void conformToCxxPairIfNeeded(ClangImporter::Implementation &impl,
+                              NominalTypeDecl *decl,
+                              const clang::CXXRecordDecl *clangDecl);
+
+/// If the decl is an instantiation of C++ `std::map` or `std::unordered_map`,
+/// synthesize a conformance to CxxDictionary, which is defined in the Cxx module.
+void conformToCxxDictionaryIfNeeded(ClangImporter::Implementation &impl,
+                                    NominalTypeDecl *decl,
+                                    const clang::CXXRecordDecl *clangDecl);
 
 } // namespace swift
 

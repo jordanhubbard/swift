@@ -19,6 +19,7 @@
 #include "swift/AST/TypeOrExtensionDecl.h"
 #include "llvm/ADT/Optional.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallSet.h"
 #include <limits.h>
 #include <vector>
 
@@ -256,6 +257,10 @@ struct PrintOptions {
   /// Protocols marked with @_show_in_interface are still printed.
   bool SkipUnderscoredStdlibProtocols = false;
 
+  /// Whether to skip unsafe C++ class methods that were renamed
+  /// (e.g. __fooUnsafe). See IsSafeUseOfCxxDecl.
+  bool SkipUnsafeCXXMethods = false;
+
   /// Whether to skip extensions that don't add protocols or no members.
   bool SkipEmptyExtensionDecls = true;
 
@@ -271,6 +276,10 @@ struct PrintOptions {
   /// Whether to skip printing 'import' declarations.
   bool SkipImports = false;
 
+  /// Whether to skip over the C++ inline namespace when printing its members or
+  /// when printing it out as a qualifier.
+  bool SkipInlineCXXNamespace = false;
+
   /// Whether to skip printing overrides and witnesses for
   /// protocol requirements.
   bool SkipOverrides = false;
@@ -283,6 +292,9 @@ struct PrintOptions {
   bool PrintLongAttrsOnSeparateLines = false;
 
   bool PrintImplicitAttrs = true;
+
+  /// Whether to print the \c each keyword for pack archetypes.
+  bool PrintExplicitEach = false;
 
   /// Whether to print the \c any keyword for existential
   /// types.
@@ -311,8 +323,14 @@ struct PrintOptions {
   /// for class layout
   bool PrintClassLayoutName = false;
 
+  /// Replace @freestanding(expression) with @expression.
+  bool SuppressingFreestandingExpression = false;
+
   /// Suppress emitting @available(*, noasync)
   bool SuppressNoAsyncAvailabilityAttr = false;
+
+  /// Whether to print the \c{/*not inherited*/} comment on factory initializers.
+  bool PrintFactoryInitializerComment = true;
 
   /// How to print opaque return types.
   enum class OpaqueReturnTypePrintingMode {
@@ -466,6 +484,18 @@ struct PrintOptions {
   /// of the alias.
   bool PrintTypeAliasUnderlyingType = false;
 
+  /// Use aliases when printing references to modules to avoid ambiguities
+  /// with types sharing a name with a module.
+  bool AliasModuleNames = false;
+
+  /// Name of the modules that have been aliased in AliasModuleNames mode.
+  /// Ideally we would use something other than a string to identify a module,
+  /// but since one alias can apply to more than one module, strings happen
+  /// to be pretty reliable. That is, unless there's an unexpected name
+  /// collision between two modules, which isn't supported by this workaround
+  /// yet.
+  llvm::SmallSet<StringRef, 4> *AliasModuleNamesTargets = nullptr;
+
   /// When printing an Optional<T>, rather than printing 'T?', print
   /// 'T!'. Used as a modifier only when we know we're printing
   /// something that was declared as an implicitly unwrapped optional
@@ -516,6 +546,16 @@ struct PrintOptions {
   /// Whether to print @_specialize attributes that have an availability
   /// parameter.
   bool PrintSpecializeAttributeWithAvailability = true;
+
+  /// Whether to always desugar array types from `[base_type]` to `Array<base_type>`
+  bool AlwaysDesugarArraySliceTypes = false;
+
+  /// Whether to always desugar dictionary types
+  /// from `[key_type:value_type]` to `Dictionary<key_type,value_type>`
+  bool AlwaysDesugarDictionaryTypes = false;
+
+  /// Whether to always desugar optional types from `base_type?` to `Optional<base_type>`
+  bool AlwaysDesugarOptionalTypes = false;
 
   /// \see ShouldQualifyNestedDeclarations
   enum class QualifyNestedDeclarations {
@@ -601,7 +641,7 @@ struct PrintOptions {
     return result;
   }
 
-  /// Retrieve the set of options suitable for interface generation.
+  /// Retrieve the set of options suitable for IDE interface generation.
   static PrintOptions printInterface(bool printFullConvention) {
     PrintOptions result =
         printForDiagnostics(AccessLevel::Public, printFullConvention);
@@ -610,8 +650,8 @@ struct PrintOptions {
     result.SkipSwiftPrivateClangDecls = true;
     result.SkipPrivateStdlibDecls = true;
     result.SkipUnderscoredStdlibProtocols = true;
+    result.SkipUnsafeCXXMethods = true;
     result.SkipDeinit = true;
-    result.ExcludeAttrList.push_back(DAK_DiscardableResult);
     result.EmptyLineBetweenMembers = true;
     result.CascadeDocComment = true;
     result.ShouldQualifyNestedDeclarations =
@@ -636,7 +676,12 @@ struct PrintOptions {
   static PrintOptions printSwiftInterfaceFile(ModuleDecl *ModuleToPrint,
                                               bool preferTypeRepr,
                                               bool printFullConvention,
-                                              bool printSPIs);
+                                              bool printSPIs,
+                                              bool useExportedModuleNames,
+                                              bool aliasModuleNames,
+                                              llvm::SmallSet<StringRef, 4>
+                                                *aliasModuleNamesTargets
+                                              );
 
   /// Retrieve the set of options suitable for "Generated Interfaces", which
   /// are a prettified representation of the public API of a module, to be
@@ -720,6 +765,7 @@ struct PrintOptions {
     PO.PrintDocumentationComments = false;
     PO.ExcludeAttrList.push_back(DAK_Available);
     PO.SkipPrivateStdlibDecls = true;
+    PO.SkipUnsafeCXXMethods = true;
     PO.ExplodeEnumCaseDecls = true;
     PO.ShouldQualifyNestedDeclarations = QualifyNestedDeclarations::TypesOnly;
     PO.PrintParameterSpecifiers = true;

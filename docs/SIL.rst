@@ -502,6 +502,36 @@ number of ways:
   - An ``@in_constant`` parameter is indirect.  The address must be of an
     initialized object; the function will treat the value held there as read-only.
 
+  - A ``@pack_owned`` parameter is indirect.  The parameter must be of
+    pack type and is always an address.  Whether the pack elements are
+    direct values or addresses of values is encoded in the pack type.
+    In either case, both the pack elements and their referenced storage
+    (if they are addresses) must be initialized prior to the call.  The
+    callee is responsible for destroying the values and is permitted to
+    modify both the pack elements and their referenced storage.  The
+    caller is not permitted to access either the pack or the referenced
+    storage during the call.
+
+  - A ``@pack_guaranteed`` parameter is indirect.  The parameter must
+    be of pack type and is always an address.  Whether the pack elements
+    are direct values or addresses of values is encoded in the pack type.
+    In either case, both the pack elements and their referenced storage
+    (if they are addresses) must be initialized prior to the call.
+    Neither the callee nor the caller is permitted to modify or destroy
+    the pack elements or their referenced storage during the call.
+
+  - A ``@pack_inout`` parameter is indirect.  The parameter must be of
+    pack type and is always an address.  The pack elements must also
+    always be addresses.  The element addresses are set in the pack
+    prior to the call, and the same addresses must be in the pack
+    following the call, but the callee is permitted to modify the pack
+    on a temporary basis if it wishes.  The referenced storage of
+    each element address must be initialized prior to the call, and it
+    must still be initialized after the call, but the callee may modify
+    the value stored there and potentially even leave it temporarily
+    uninitialized.  The caller is not permitted to access either the
+    pack elements or their referenced storage during the call.
+
   - Otherwise, the parameter is an unowned direct parameter.
 
 - A SIL function type declares the conventions for its results.
@@ -524,10 +554,20 @@ number of ways:
   instructions, the type of ``apply`` instructions, and the type of
   the normal result of ``try_apply`` instructions.
 
-  - An ``@out`` result is indirect.  The address must be of an
-    uninitialized object.  The function is required to leave an
-    initialized value there unless it terminates with a ``throw``
-    instruction or it has a non-Swift calling convention.
+  - An ``@out`` result is indirect.
+
+    If the result type is not a pack type, then the address must be
+    of an uninitialized object, and the callee is required to leave
+    an initialized value there unless it terminates with a ``throw``
+    or has a non-Swift calling convention.
+
+    If the result type is a pack type, then the pack must contain
+    addresses.  The addresses must be set in the pack prior to the
+    call, and these same addresses must be in the pack after the call,
+    but the callee may modify the pack elements on a temporary basis
+    if it wishes.  The addresses must be of uninitialized objects,
+    and the callee is require to initialize them unless it terminates
+    with a ``throw`` or has a non-Swift calling convention.
 
   - An ``@owned`` result is an owned direct result.
 
@@ -536,7 +576,11 @@ number of ways:
 
   - Otherwise, the parameter is an unowned direct result.
 
-A direct parameter or result of trivial type must always be unowned.
+A direct parameter, yield, or result of trivial type must always be
+unowned.
+
+A parameter or yield of pack type must always use one of the three
+pack conventions.  A result of pack type must always be ``@out``.
 
 An owned direct parameter or result is transferred to the recipient,
 which becomes responsible for destroying the value. This means that
@@ -750,6 +794,119 @@ A ``@yield_many`` coroutine may yield as many times as it desires.
 A ``@yield_once`` coroutine may yield exactly once before returning,
 although it may also ``throw`` before reaching that point.
 
+Variadic Generics
+`````````````````
+
+Swift's variadic generics feature introduces the concepts of pack
+parameters, pack arguments, and pack expansions.  When these features
+are used in formal types embedded in SIL, they follow the same rules
+as they do in Swift.  However, in its own type system and operations,
+SIL largely uses a different (if closely related) language model.
+
+Pack types
+""""""""""
+
+In (current) Swift, packs only exist as parameters, either type
+parameters or value parameters.  These parameters can then only
+be used in pack expansions, which can only appear in certain
+naturally-variadic positions, such as the elements list of a tuple
+type or the arguments list of a call expression.  Formally,
+substitution flattens these pack expansions into the surrounding
+structure.
+
+This language model poses similar problems for direct implementation
+at runtime as many of Swift's other generics features.  Normal
+compilation paths (without unportable assembly-level heroics) require
+functions to take a fixed list of parameters.  Calling a generic
+function with packs of different lengths cannot result in different
+parameters being mapped to different registers (or positions in the
+stack arguments area).  SIL must therefore organize pack expansions
+in function parameters and results into *concrete* variadic packs
+that can be passed with a fixed ABI.
+
+SIL must also directly model *temporary* packs, not just pack
+parameters.  After all, a pack parameter must be bound to something
+concretely provided by the caller.
+
+Packs are therefore something closer to a first-class type in the
+SIL type system.  A pack type is written with the syntax
+``Pack { ... }``.  By default, a pack type is *indirect*, meaning
+that its elements are addresses.  SIL does not currently support
+direct packs, but the description in this document tries to leave
+room for them.
+
+Pack types are always address-only and are always passed around by
+address.  Values of pack type cannot be moved or copied except by
+explicitly iterating over the pack elements.  They are allocated
+and deallocated with special instructions.
+
+Pack types are only allowed in two positions:
+- at the top level of a type, e.g. ``%0 : $Pack{Int, Float}``
+- as a parameter or result type of a function type, e.g.
+  ``%fn : $@convention(thin) (@pack_in Pack{Int, Float}) -> ()``
+Note in particular that they are not allowed in tuple types.  Pack
+expansions in tuple types are still flattened into the surrounding
+tuple structure like they are in Swift (unless the tuple is exploded,
+as tuples normally are in function parameters or results).  There
+are specific instructions for manipulating tuples with variadic
+elements.
+
+This explicit pack syntax can also be used to delimit type argument
+packs in positions that expect formal types, such as the substitution
+list of an ``apply`` instruction.  This is necessary because SIL
+functions can be parameterized over multiple packs, and unlike in
+Swift, the type arguments to such functions are explicit on calls.
+If Swift ever gains syntax to delimit packs in type argument lists,
+the SIL syntax will switch to use it.  Other features of SIL pack
+types, such as direct-ness, are not allowed in these positions;
+a formal pack type is purely a list of types and type expansions.
+
+Pack expansions
+"""""""""""""""
+
+Pack expansions (``repeat``) are allowed in a reduced set of
+situations in lowered types:
+- the elements list of a tuple type
+- the elements list of a pack type
+Note in particular that pack expansions cannot appear in the
+parameters list or results list of a lowered function type.  The
+function type must traffic in packs explicitly.
+
+If substitution into a lowered tuple type that is not a single unlabeled
+element that is not a pack expansion would produce a tuple with a single
+unlabeled element that is not a pack expansion, it actually produces that
+element type.  Certain instructions must be rewritten to accommodate this
+when cloned under substitution.
+
+Opened pack element archetypes
+""""""""""""""""""""""""""""""
+
+SIL must be able to work directly with the element types of a pack
+with statically unknown elements.  For example, it might need to move
+each element of a pack into a tuple.  To do this, it must be able to
+give a temporary name to the element type.  This type is called an
+*opened pack element archetype*.  It is spelled like this:
+
+::
+  @pack_element("<uuid>") T
+
+There must be an ``open_pack_element`` in the current SIL function with
+the given UUID.  The name ``T`` must resolve to a pack parameter within
+the generic signature of this instruction, and that pack parameter must
+have the same shape class in the signature as the opened shape class
+pack parameter.  The pack parameter is then translated to the
+corresponding element archetype.
+
+Opened pack element archetypes can appear in both formal and lowered types.
+As with opened existential archetypes, the ``open_pack_element`` which
+introduces an opened pack element archetype must dominate all uses of
+the archetype.
+
+The current SIL parser does not support references to opened element
+archetypes prior to the ``open_pack_element`` instruction.  This can
+occur when basic blocks are not in dominance order.  Fixing this will
+likely require changes to the syntax, at least for forward references.
+
 Properties of Types
 ```````````````````
 
@@ -956,7 +1113,7 @@ Functions
   decl ::= sil-function
   sil-function ::= 'sil' sil-linkage? sil-function-attribute+
                      sil-function-name ':' sil-type
-                     '{' argument-effect* sil-basic-block* '}'
+                     '{' effects* sil-basic-block* '}'
   sil-function-name ::= '@' [A-Za-z_0-9]+
 
 SIL functions are defined with the ``sil`` keyword. SIL function names
@@ -1070,14 +1227,14 @@ The minimal OS-version where the function is available.
 ::
 
   sil-function-attribute ::= '[' sil-function-inlining ']'
-  sil-function-inlining ::= 'never'
+  sil-function-inlining ::= 'noinline'
 
 The function is never inlined.
 ::
 
-  sil-function-inlining ::= 'always'
+  sil-function-inlining ::= 'always_inline'
 
-The function is always inlined, even in a ``Onone`` build.
+The function is always inlined.
 ::
 
   sil-function-attribute ::= '[' sil-function-optimization ']'
@@ -1128,20 +1285,32 @@ of runtime functions are allowed to be called from the function.
 Argument Effects
 ````````````````
 
-The effects for function arguments. For details see the documentation
-in ``SwiftCompilerSources/Sources/SIL/Effects.swift``.
+The function effects, especially for function arguments. For details see the
+documentation in ``SwiftCompilerSources/Sources/SIL/Effects.swift``.
 ::
 
-  argument-effect ::= '[' argument-name defined-effect? ':' effect (',' effect)*]'
+  effects ::= '[' argument-name ':' argument-effect (',' argument-effect)*]'
+  effects ::= '[' 'global' ':' global-effect (',' global-effect)*]'
   argument-name ::= '%' [0-9]+
-  defined-effect ::= '!'    // the effect is defined in the source code and not
-                            // derived by the optimizer
 
-  effect ::= 'noescape' projection-path?
-  effect ::= 'escape' projection-path? '=>' arg-or-return  // exclusive escape
-  effect ::= 'escape' projection-path? '->' arg-or-return  // not-exclusive escape
+  argument-effect ::= 'noescape' defined-effect? projection-path?
+  argument-effect ::= 'escape' defined-effect? projection-path? '=>' arg-or-return  // exclusive escape
+  argument-effect ::= 'escape' defined-effect? projection-path? '->' arg-or-return  // not-exclusive escape
+  argument-effect ::= side-effect
+
+  global-effect ::= 'traps'
+  global-effect ::= 'allocates'
+  global-effect ::= side-effect
+
+  side-effect ::= 'read' projection-path?
+  side-effect ::= 'write' projection-path?
+  side-effect ::= 'copy' projection-path?
+  side-effect ::= 'read' projection-path?
+
   arg-or-return ::= argument-name ('.' projection-path)?
   arg-or-return ::= '%r' ('.' projection-path)?
+  defined-effect ::= '!'    // the effect is defined in the source code and not
+                            // derived by the optimizer
 
   projection-path ::= path-component ('.' path-component)* 
   path-component ::= 's' [0-9]+        // struct field
@@ -2402,27 +2571,55 @@ Variable Lifetimes
 In order for programmer intended lifetimes to be maintained under optimization,
 the lifetimes of SIL values which correspond to named source-level values can
 only be modified in limited ways.  Generally, the behavior is that the lifetime
-of a named source-level value cannot _observably_ end before the end of the
-lexical scope in which that value is defined.  Specifically, code motion may
-not move the ends of these lifetimes across a **deinit barrier**.
+of a named source-level value is anchored to the variable's lexical scope and
+confined by **deinit barriers**.  Specifically, code motion may not move the
+ends of these lifetimes across a deinit barrier.
 
-A few sorts of SIL value have lifetimes that are constrained that way:
+Source level variables (lets, vars, ...) and function arguments will result in
+SIL-level lexical lifetimes if either of the two sets of circumstances apply:
+(1) Inferred lexicality.
+- the type is non-trivial
+- the type is not eager-move
+- the variable or argument is not annotated to be eager-move
+OR
+(2) Explicit lexicality.
+- the type, variable, or argument is annotated `@_lexical`
+
+A type is eager-move by satisfying one of two conditions:
+(1) Inferred: An aggregate is inferred to be eager-move if all of its fields are
+    eager-move.
+(2) Annotated: Any type can be eager-move if it is annotated with an attribute
+    that explicitly specifies it to be: `@_eagerMove`, `@_noImplicitCopy`.
+
+A variable or argument is eager-move by satisfying one of two conditions:
+(1) Inferred: Its type is eager-move.
+(2) Annotated: The variable or argument is annotated with an attribute that
+    specifies it to be: `@_eagerMove`, `@_noImplicitCopy`.
+
+These source-level rules result in a few sorts of SIL value whose destroys must
+not be moved across deinit barriers:
 
 1: `begin_borrow [lexical]`
 2: `move_value [lexical]`
-3: @owned function arguments
+3: function arguments
 4: `alloc_stack [lexical]`
 
-That these three have constrained lifetimes is encoded in ValueBase::isLexical,
-which should be checked before changing the lifetime of a value.
+To translate from the source-level representation of lexicality to the
+SIL-level representation, for source-level variables (vars, lets, ...) SILGen
+generates `begin_borrow [lexical]`, `move_value [lexical]`, `alloc_stack
+[lexical]` .  For function arguments, there is no work to do:
+a `SILFunctionArgument` itself can be lexical
+(`SILFunctionArgument::isLexical`).
 
-The reason that only @owned function arguments are constrained is that a
-@guaranteed function argument is guaranteed by the function's caller to live for
-the full duration of the function already.  Optimization of the function alone
-can't shorten it.  When such a function is inlined into its caller, though, a
-lexical borrow scope is added for each of its @guaranteed arguments, ensuring
-that the lifetime of the corresponding source-level value is not shortened in a
-way that doesn't respect deinit barriers.
+That the first three have constrained lifetimes is encoded in
+ValueBase::isLexical, which should be checked before changing the lifetime of a
+value.
+
+When a function is inlined into its caller, a lexical borrow scope is added for
+each of its @guaranteed arguments, and a lexical move is added for each of its
+@owned arguments, (unless the values being passed are already lexical
+themselves) ensuring that the lifetimes of the corresponding source-level
+values are not shortened in a way that doesn't respect deinit barriers.
 
 Unlike the other sorts, `alloc_stack [lexical]` isn't a SILValue.  Instead, it
 constrains the lifetime of an addressable variable.  Since the constraint is
@@ -2432,10 +2629,10 @@ required.
 Deinit Barriers
 ```````````````
 
-Deinit barriers (see swift::isDeinitBarrier) are instructions which would be
-affected by the side effects of deinitializers.  To maintain the order of
-effects that is visible to the programmer, destroys of lexical values cannot be
-reordered with respect to them.  There are three kinds:
+Deinit barriers (see Instruction.isDeinitBarrier(_:)) are instructions which
+would be affected by the side effects of deinitializers.  To maintain the order
+of effects that is visible to the programmer, destroys of lexical values cannot
+be reordered with respect to them.  There are three kinds:
 
 1. synchronization points (locks, memory barriers, syscalls, etc.)
 2. loads of weak or unowned values
@@ -2620,7 +2817,7 @@ which codegens to the following SIL::
   bb0(%0 : @noImplicitCopy $Klass):
     %1 = copyable_to_moveonlywrapper [guaranteed] %0 : $@moveOnly Klass
     %2 = copy_value %1 : $@moveOnly Klass
-    %3 = mark_must_check [no_copy] %2 : $@moveOnly Klass
+    %3 = mark_must_check [no_consume_or_assign] %2 : $@moveOnly Klass
     debug_value %3 : $@moveOnly Klass, let, name "x", argno 1
     %4 = begin_borrow %3 : $@moveOnly Klass
     %5 = function_ref @$s4test5KlassC11doSomethingyyF : $@convention(method) (@guaranteed Klass) -> ()
@@ -2690,7 +2887,7 @@ Today this codegens to the following Swift::
   bb0(%0 : @noImplicitCopy $Int):
     %1 = copyable_to_moveonlywrapper [owned] %0 : $Int
     %2 = move_value [lexical] %1 : $@moveOnly Int
-    %3 = mark_must_check [no_implicit_copy] %2 : $@moveOnly Int
+    %3 = mark_must_check [consumable_and_assignable] %2 : $@moveOnly Int
     %5 = begin_borrow %3 : $@moveOnly Int
     %6 = begin_borrow %3 : $@moveOnly Int
     %7 = function_ref @addIntegers : $@convention(method) (Int, Int Int.Type) -> Int
@@ -2749,7 +2946,7 @@ A hypothetical SILGen for this code is as follows::
     %3 = begin_borrow [lexical] %0 : $Klass
     %4 = copy_value %3 : $Klass
     %5 = copyable_to_moveonlywrapper [owned] %4 : $Klass
-    %6 = mark_must_check [no_implicit_copy] %5 : $@moveOnly Klass
+    %6 = mark_must_check [consumable_and_assignable] %5 : $@moveOnly Klass
     debug_value %6 : $@moveOnly Klass, let, name "value"
     %8 = begin_borrow %6 : $@moveOnly Klass
     %9 = copy_value %8 : $@moveOnly Klass
@@ -3415,6 +3612,126 @@ non-unique buffer is not shown)::
 Two adjacent ``begin_cow_mutation`` and ``end_cow_mutation`` instructions
 don't need to be in the same function.
 
+Stack discipline
+----------------
+
+Certain instructions in the SIL instruction set are identified as
+*stack allocation instructions* or *stack deallocation instructions*.
+These instructions jointly participate in a set of rules called the
+*stack allocation discipline*, designed to allow SIL functions to easily
+and safely dynamically allocate and deallocate memory in a scoped
+fashion on the stack.
+
+All stack deallocation instructions have an operand which identifies
+their *paired* stack allocation instruction.  This operand must always
+be exactly the result of a stack allocation instruction, with no
+intervening conversions, basic block arguments, or other abstractions.
+A single stack allocation instruction may be paired with any number of
+stack deallocation instructions.  It can even be paired with no
+instructions at all; by the rules below, this can only happen in
+non-terminating functions.
+
+- At any point in a SIL function, there is an ordered list of
+  stack allocation instructions called the *active allocations list*.
+
+- The active allocations list is defined to be empty at the initial
+  point of the entry block of the function.
+
+- The active allocations list is required to be the same at the
+  initial point of any successor block as it is at the final point
+  of any predecessor block.  Note that this also requires all
+  predecessors/successors of a given block to have the same
+  final/initial active allocations lists.
+
+  In other words, the set of active stack allocations must be the same
+  at a given place in the function no matter how it was reached.
+
+- The active allocations list for the point following a stack allocation
+  instruction is defined to be the result of adding that instruction to
+  the end of the active allocations list for the point preceding
+  the instruction.
+
+- The active allocations list for the point following a stack deallocation
+  instruction is defined to be the result of removing the instruction
+  from the end of the active allocations list for the point preceding
+  the instruction.  The active allocations list for the preceding point
+  is required to be non-empty, and the last instruction in it must be
+  paired with the deallocation instruction.
+
+  In other words, all stack allocations must be deallocated in last-in,
+  first-out order, aka stack order.
+
+- The active allocations list for the point following any other
+  instruction is defined to be the same as the active allocations list
+  for the point preceding the instruction.
+
+- The active allocations list is required to be empty prior to
+  ``return`` or ``throw`` instructions.
+
+  In other words, all stack allocations must be deallocated prior
+  to exiting the function.
+
+Note that these rules implicitly prevent an allocation instruction
+from still being active when it is reached.
+
+The control-flow rule forbids certain patterns that would theoretically
+be useful, such as conditionally performing an allocation around an
+operation.  SIL generally makes this sort of pattern somewhat difficult
+to use, however, as it is illegal to locally abstract over addresses, and
+therefore a conditional allocation cannot be used in the intermediate
+operation anyway.
+
+Structural type matching for pack indices
+-----------------------------------------
+
+In order to catch type errors in applying pack indices, SIL
+requires the projected element types of pack-indexing operations
+to be *structurally well-typed* for the given pack type and index.
+
+First, the projected element type must match the direct-ness of the
+indexed pack type: if the pack is indirect, the project element type
+must be an address type, and otherwise it must be an object type.
+
+Second, the pack index must be a *pack indexing instruction* (one
+of ``scalar_pack_index``, ``pack_pack_index``, or ``dynamic_pack_index``),
+and it must index into a pack type with the same shape as the indexed
+pack type.
+
+Third, additional restrictions must be satisifed depending on which
+pack indexing instruction the pack index is:
+
+- For ``scalar_pack_index``, the projected element type must be the
+  same type as the scalar type at the given index in the pack type.
+  (It must be a scalar type because of the shape restriction above.)
+
+- For ``pack_pack_index``, the projected element type must be structurally
+  well-typed for a slice of the pack type (as specified by the
+  instruction) at the pack sub-index operand.
+
+- For ``dynamic_pack_index``, consider each opened pack element archetype
+  in the projected element type that is opened by an ``open_pack_element``
+  instruction whose pack index operand is the same ``dynamic_pack_index``
+  instruction.  Because the pack substitutions in ``open_pack_element``
+  must have the same shape as the indexed pack type of its pack index
+  operand, by transitivity they must have the same shape as the indexed
+  pack type of the pack-indexing operation.  Then for each component of
+  this shape, the corresponding element component (or the pattern type
+  for a projection component) of the indexed pack type must equal
+  the result of applying a substitution to the projected element type
+  which replaces any opened pack element archetype with the
+  corresponding element component (pattern type for a projection component)
+  of the pack substitution for that archetype in the ``open_pack_element``
+  which introduced it.
+
+  For example, if the indexed pack type is
+  ``Pack{Optional<Int>, Optional<Float>, repeat Optional<each T>}``,
+  a projected element type is ``$*Optional<@pack_element("1234") U>`` is
+  structurally well-typed for a ``dynamic_pack_index`` pack index
+  if ``1234`` is the UUID of an ``open_pack_element`` indexed by the
+  same ``dynamic_pack_index`` instruction and the pack substitution
+  corresponding to ``U`` in that ``open_pack_element`` is
+  ``Pack{Int, Float, repeat each T}``.
+
 
 Instruction Set
 ---------------
@@ -3428,7 +3745,10 @@ alloc_stack
 ```````````
 ::
 
-  sil-instruction ::= 'alloc_stack' '[dynamic_lifetime]'? '[lexical]'? '[moved]'? sil-type (',' debug-var-attr)*
+  sil-instruction ::= 'alloc_stack' alloc-stack-option* sil-type (',' debug-var-attr)*
+  alloc-stack-option ::= '[dynamic_lifetime]'
+  alloc-stack-option ::= '[lexical]'
+  alloc-stack-option ::= '[moveable_value_debuginfo]'
 
   %1 = alloc_stack $T
   // %1 has type $*T
@@ -3439,13 +3759,9 @@ of the allocated memory.
 
 ``alloc_stack`` always allocates memory on the stack even for runtime-sized type.
 
-``alloc_stack`` marks the start of the lifetime of the value; the
-allocation must be balanced with a ``dealloc_stack`` instruction to
-mark the end of its lifetime. All ``alloc_stack`` allocations must be
-deallocated prior to returning from a function. If a block has multiple
-predecessors, the stack height and order of allocations must be consistent
-coming from all predecessor blocks. ``alloc_stack`` allocations must be
-deallocated in last-in, first-out stack order.
+``alloc_stack`` is a stack allocation instruction.  See the section above
+on stack discipline.  The corresponding stack deallocation instruction is
+``dealloc_stack``.
 
 The ``dynamic_lifetime`` attribute specifies that the initialization and
 destruction of the stored value cannot be verified at compile time.
@@ -3454,14 +3770,34 @@ This is the case, e.g. for conditionally initialized objects.
 The optional ``lexical`` attribute specifies that the storage corresponds to a
 local variable in the Swift source.
 
-The optional ``moved`` attribute specifies that at the source level, the
-variable associated with this alloc_stack was moved and furthermore that at the
-SIL level it passed move operator checking. This means that one can not assume
-that the value in the alloc_stack can be semantically valid over the entire
-function frame when emitting debug info.
+The optional ``moveable_value_debuginfo`` attribute specifies that when emitting
+debug info, the code generator can not assume that the value in the alloc_stack
+can be semantically valid over the entire function frame when emitting debug
+info. NOTE: This is implicitly set to true if the alloc_stack's type is
+noncopyable. This is just done to make SIL less verbose.
 
 The memory is not retainable. To allocate a retainable box for a value
 type, use ``alloc_box``.
+
+``T`` must not be a pack type.  To allocate a pack, use ``alloc_pack``.
+
+alloc_pack
+``````````
+
+::
+
+  sil-instruction ::= 'alloc_pack' sil-type
+
+  %1 = alloc_pack $Pack{Int, Float, repeat each T}
+  // %1 has type $*Pack{Int, Float, repeat each T}
+
+Allocates uninitialized memory on the stack for a value pack of the given
+type, which must be a pack type.  The result of the instruction is the
+address of the allocated memory.
+
+``alloc_pack`` is a stack allocation instruction.  See the section above
+on stack discipline.  The corresponding stack deallocation instruction is
+``dealloc_stack``.
 
 alloc_ref
 `````````
@@ -3532,7 +3868,8 @@ alloc_box
 `````````
 ::
 
-  sil-instruction ::= 'alloc_box' sil-type (',' debug-var-attr)*
+  sil-instruction ::= 'alloc_box' alloc-box-option* sil-type (',' debug-var-attr)*
+  alloc-box-option ::= moveable_value_debuginfo
 
   %1 = alloc_box $T
   //   %1 has type $@box T
@@ -3549,6 +3886,12 @@ count of zero destroys the contained value as if by ``destroy_addr``.
 Releasing a box is undefined behavior if the box's value is uninitialized.
 To deallocate a box whose value has not been initialized, ``dealloc_box``
 should be used.
+
+The optional ``moveable_value_debuginfo`` attribute specifies that when emitting
+debug info, the code generator can not assume that the value in the alloc_stack
+can be semantically valid over the entire function frame when emitting debug
+info. NOTE: This is implicitly set to true if the alloc_stack's type is
+noncopyable. This is just done to make SIL less verbose.
 
 alloc_global
 ````````````
@@ -3689,11 +4032,29 @@ dealloc_stack
 
 Deallocates memory previously allocated by ``alloc_stack``. The
 allocated value in memory must be uninitialized or destroyed prior to
-being deallocated. This instruction marks the end of the lifetime for
-the value created by the corresponding ``alloc_stack`` instruction. The operand
-must be the shallowest live ``alloc_stack`` allocation preceding the
-deallocation. In other words, deallocations must be in last-in, first-out
-stack order.
+being deallocated.
+
+``dealloc_stack`` is a stack deallocation instruction.  See the section
+on Stack Discipline above.  The operand must be an ``alloc_stack``
+instruction.
+
+dealloc_pack
+````````````
+
+::
+
+  sil-instruction ::= 'dealloc_pack' sil-operand
+
+  dealloc_pack %0 : $*Pack{Int, Float, repeat each T}
+  // %0 must be the result of `alloc_pack $Pack{Int, Float, repeat each T}`
+
+Deallocates memory for a pack value previously allocated by ``alloc_pack``.
+If the pack elements are direct, they must be uninitialized or destroyed
+prior to being deallocated.
+
+``dealloc_pack`` is a stack deallocation instruction.  See the section
+on Stack Discipline above.  The operand must be an ``alloc_pack``
+instruction.
 
 dealloc_box
 ```````````
@@ -3804,7 +4165,10 @@ debug_value
 
 ::
 
-  sil-instruction ::= debug_value '[poison]'? '[moved]'? '[trace]'? sil-operand (',' debug-var-attr)* advanced-debug-var-attr* (',' 'expr' debug-info-expr)?
+  sil-instruction ::= debug_value sil-debug-value-option* sil-operand (',' debug-var-attr)* advanced-debug-var-attr* (',' 'expr' debug-info-expr)?
+  sil-debug-value-option ::= [poison]
+  sil-debug-value-option ::= [moveable_value_debuginfo]
+  sil-debug-value-option ::= [trace]
 
   debug_value %1 : $Int
 
@@ -3813,10 +4177,12 @@ specified operand.  The declaration in question is identified by either the
 SILLocation attached to the debug_value instruction or the SILLocation specified
 in the advanced debug variable attributes.
 
-If the '[moved]' flag is set, then one knows that the debug_value's operand is
-moved at some point of the program, so one can not model the debug_value using
-constructs that assume that the value is live for the entire function (e.x.:
-llvm.dbg.declare).
+If the ``moveable_value_debuginfo`` flag is set, then one knows that the
+debug_value's operand is moved at some point of the program, so one can not
+model the debug_value using constructs that assume that the value is live for
+the entire function (e.x.: llvm.dbg.declare). NOTE: This is implicitly set to
+true if the alloc_stack's type is noncopyable. This is just done to make SIL
+less verbose.
 
 ::
 
@@ -3912,6 +4278,80 @@ SIL DIExpression can have elements with various types, like AST nodes or strings
 
 The ``[trace]`` flag is available for compiler unit testing. It is not produced during normal compilation. It is used combination with internal logging and optimization controls to select specific values to trace or to transform. For example, liveness analysis combines all "traced" values into a single live range with multiple definitions. This exposes corner cases that cannot be represented by passing valid SIL through the pipeline.
 
+debug_step
+``````````
+
+::
+
+  sil-instruction ::= debug_step
+
+  debug_step
+
+This instruction is inserted by Onone optimizations as a replacement for deleted instructions to
+ensure that it's possible to set a breakpoint on its location.
+
+It is code-generated to a NOP instruction.
+
+Testing
+~~~~~~~
+
+test_specification
+``````````````````
+::
+
+  sil-instruction ::= 'test_specification' string-literal
+
+  test_specification "parsing @trace[3] @function[other].block[2].instruction[1]"
+
+Exists only for writing FileCheck tests.  Specifies a list of test arguments
+which should be used in order to run a particular test "in the context" of the
+function containing the instruction.
+
+Parsing of these test arguments is done via ``parseTestArgumentsFromSpecification``.
+
+The following types of test arguments are supported:
+
+- boolean: true false
+- unsigned integer: 0...ULONG_MAX
+- string
+- function: @function <-- the current function
+            @function[uint] <-- function at index ``uint``
+            @function[name] <-- function named ``name``
+- block: @block <-- the block containing the test_specification instruction
+         @block[+uint] <-- the block ``uint`` blocks after the containing block
+         @block[-uint] <-- the block ``uint`` blocks before the containing block
+         @block[uint] <-- the block at index ``uint``
+         @{function}.{block} <-- the indicated block in the indicated function
+         Example: @function[foo].block[2]
+- trace: @trace <-- the first ``debug_value [trace]`` in the current function
+         @trace[uint] <-- the ``debug_value [trace]`` at index ``uint``
+         @{function}.{trace} <-- the indicated trace in the indicated function
+         Example: @function[bar].trace
+- argument: @argument <-_ the first argument of the current block
+            @argument[uint] <-- the argument at index ``uint`` of the current block
+            @{block}.{argument} <-- the indicated argument in the indicated block
+            @{function}.{argument} <-- the indicated argument in the entry block of the indicated function
+- instruction: @instruction <-- the instruction after* the test_specification instruction
+               @instruction[+uint] <-- the instruction ``uint`` instructions after* the test_specification instruction
+               @instruction[-uint] <-- the instruction ``uint`` instructions before* the test_specification instruction
+               @instruction[uint] <-- the instruction at index ``uint``
+               @{function}.{instruction} <-- the indicated instruction in the indicated function
+               Example: @function[baz].instruction[19]
+               @{block}.{instruction} <-- the indicated instruction in the indicated block
+               Example: @function[bam].block.instruction
+- operand: @operand <-- the first operand
+           @operand[uint] <-- the operand at index ``uint``
+           @{instruction}.{operand} <-- the indicated operand of the indicated instruction
+           Example: @block[19].instruction[2].operand[3]
+           Example: @function[2].instruction.operand
+
+* Not counting instructions that are deleted when processing functions for tests.
+  The following instructions currently are deleted:
+
+      test_specification
+      debug_value [trace]
+
+
 Profiling
 ~~~~~~~~~
 
@@ -3987,21 +4427,24 @@ store_borrow
 
   sil-instruction ::= 'store_borrow' sil-value 'to' sil-operand
 
-  store_borrow %0 to %1 : $*T
+  %2 = store_borrow %0 to %1 : $*T
   // $T must be a loadable type
   // %1 must be an alloc_stack $T
+  // %2 is the return address
 
 Stores the value ``%0`` to a stack location ``%1``, which must be an
 ``alloc_stack $T``.
 The stack location must not be modified by other instructions than
 ``store_borrow``.
-The stored value is alive until the ``dealloc_stack`` or until another
-``store_borrow`` overwrites the value. During the its lifetime, the stored
-value must not be modified or destroyed.
-The source value ``%0`` is borrowed (i.e. not copied) and it's borrow scope
+All uses of the store_borrow destination ```%1`` should be via the store_borrow
+return address ``%2`` except dealloc_stack.
+The stored value is alive until the ``end_borrow``. During its lifetime, the
+stored value must not be modified or destroyed.
+The source value ``%0`` is borrowed (i.e. not copied) and its borrow scope
 must outlive the lifetime of the stored value.
 
-Note: This is the current implementation and the design is not final.
+Notionally, the outer borrow scope ensures that there's something to be
+addressed.  The inner borrow scope provides the address to work with.
 
 begin_borrow
 ````````````
@@ -4097,7 +4540,7 @@ assign_by_wrapper
 
   sil-instruction ::= 'assign_by_wrapper' sil-operand 'to' mode? sil-operand ',' 'init' sil-operand ',' 'set' sil-operand
 
-  mode ::= '[initialization]' | '[assign]' | '[assign_wrapped_value]'
+  mode ::= '[init]' | '[assign]' | '[assign_wrapped_value]'
 
   assign_by_wrapper %0 : $S to %1 : $*T, init %2 : $F, set %3 : $G
   // $S can be a value or address type
@@ -4214,9 +4657,9 @@ copy_addr
 ::
 
   sil-instruction ::= 'copy_addr' '[take]'? sil-value
-                        'to' '[initialization]'? sil-operand
+                        'to' '[init]'? sil-operand
 
-  copy_addr [take] %0 to [initialization] %1 : $*T
+  copy_addr [take] %0 to [init] %1 : $*T
   // %0 and %1 must be of the same $*T address type
 
 Loads the value at address ``%0`` from memory and assigns a copy of it back into
@@ -4235,11 +4678,11 @@ is equivalent to::
 
 except that ``copy_addr`` may be used even if ``%0`` is of an address-only
 type. The ``copy_addr`` may be given one or both of the ``[take]`` or
-``[initialization]`` attributes:
+``[init]`` attributes:
 
 * ``[take]`` destroys the value at the source address in the course of the
   copy.
-* ``[initialization]`` indicates that the destination address is uninitialized.
+* ``[init]`` indicates that the destination address is uninitialized.
   Without the attribute, the destination address is treated as already
   initialized, and the existing value will be destroyed before the new value
   is stored.
@@ -4257,7 +4700,7 @@ operations::
     store %new to %1 : $*T
 
   // copy-initialization
-    copy_addr %0 to [initialization] %1 : $*T
+    copy_addr %0 to [init] %1 : $*T
   // is equivalent to:
     %new = load %0 : $*T
     strong_retain %new : $T
@@ -4265,7 +4708,7 @@ operations::
     store %new to %1 : $*T
 
   // take-initialization
-    copy_addr [take] %0 to [initialization] %1 : $*T
+    copy_addr [take] %0 to [init] %1 : $*T
   // is equivalent to:
     %new = load %0 : $*T
     // no retain of %new!
@@ -4283,9 +4726,9 @@ explicit_copy_addr
 ::
 
   sil-instruction ::= 'explicit_copy_addr' '[take]'? sil-value
-                        'to' '[initialization]'? sil-operand
+                        'to' '[init]'? sil-operand
 
-  explicit_copy_addr [take] %0 to [initialization] %1 : $*T
+  explicit_copy_addr [take] %0 to [init] %1 : $*T
   // %0 and %1 must be of the same $*T address type
 
 This instruction is exactly the same as `copy_addr`_ except that it has special
@@ -4447,6 +4890,7 @@ begin_access
   sil-enforcement ::= static
   sil-enforcement ::= dynamic
   sil-enforcement ::= unsafe
+  sil-enforcement ::= signed
   %1 = begin_access [read] [unknown] %0 : $*T
   // %0 must be of $*T type.
 
@@ -4488,6 +4932,9 @@ its scope (on any control flow path between it and its corresponding
 runtime for the duration of its scope. This access may still conflict with an
 outer access scope; therefore may still require dynamic enforcement at a single
 point.
+
+A ``signed`` access is for pointers that are signed in architectures that support
+pointer signing.
 
 A ``builtin`` access was emitted for a user-controlled Builtin (e.g. the
 standard library's KeyPath access). Non-builtin accesses are auto-generated by
@@ -4717,14 +5164,14 @@ store_weak
 
 ::
 
-  sil-instruction ::= 'store_weak' sil-value 'to' '[initialization]'? sil-operand
+  sil-instruction ::= 'store_weak' sil-value 'to' '[init]'? sil-operand
 
-  store_weak %0 to [initialization] %1 : $*@sil_weak Optional<T>
+  store_weak %0 to [init] %1 : $*@sil_weak Optional<T>
   // $T must be an optional wrapping a reference type
 
 Initializes or reassigns a weak reference.  The operand may be ``nil``.
 
-If ``[initialization]`` is given, the weak reference must currently either be
+If ``[init]`` is given, the weak reference must currently either be
 uninitialized or destroyed.  If it is not given, the weak reference must
 currently be initialized. After the evaluation:
 
@@ -5806,6 +6253,32 @@ tuple_element_addr
 Given the address of a tuple in memory, derives the
 address of an element within that value.
 
+tuple_pack_element_addr
+``````````````````
+::
+
+  sil-instruction ::= 'tuple_pack_element_addr' sil-value 'of' sil-operand 'as' sil-type
+
+  %addr = tuple_pack_element_addr %index of %tuple : $*(repeat each T) as $*@pack_element("01234567-89AB-CDEF-0123-000000000000") U
+  // %index must be of $Builtin.PackIndex type
+  // %tuple must be of address-of-tuple type
+  // %addr will be of the result type specified by the 'as' clause
+
+Given the address of a tuple in memory, derives the address of a
+dynamic element within that value.
+
+The *induced pack type* for the tuple operand is the indirect pack
+type corresponding to the types of the tuple elements and tuple
+element expansions, exactly as if the labels were removed and the
+parentheses were replaced with `Pack{`...`}`.  For example, for the
+tuple type `(repeat Optional<each T>, Float)`, the induced pack type
+is `Pack{repeat Optional<each T>, Float}`.
+
+The pack index operand must be a pack indexing instruction.  The result
+type (given by the `as` clause) must be structurally well-typed for the
+pack index and the induced pack type; see the structural type matching
+rules for pack indices.
+
 destructure_tuple
 `````````````````
 
@@ -5947,7 +6420,7 @@ an `inject_enum_addr`_ instruction::
   entry(%0 : $*AddressOnlyEnum, %1 : $*AddressOnlyType):
     // Store the data argument for the case.
     %2 = init_enum_data_addr %0 : $*AddressOnlyEnum, #AddressOnlyEnum.HasData!enumelt
-    copy_addr [take] %2 to [initialization] %1 : $*AddressOnlyType
+    copy_addr [take] %1 to [init] %2 : $*AddressOnlyType
     // Inject the tag.
     inject_enum_addr %0 : $*AddressOnlyEnum, #AddressOnlyEnum.HasData!enumelt
     return
@@ -6549,6 +7022,179 @@ init_block_storage_header
 
 *TODO* Fill this in. The printing of this instruction looks incomplete on trunk currently.
 
+Pack Indexing
+~~~~~~~~~~~~~
+
+These instructions are collectively called the *pack indexing instructions*.
+Each of them produces a single value of type ``Builtin.PackIndex``.
+Instructions that consume pack indices generally provide a projected
+element type which is required to be structurally well-typed for the
+given pack index and the actual pack type they index into.  This rule
+depends on the exact pack indexing instruction used and is described
+in a section above.
+
+All pack indexing instructions carry an **indexed pack type**, which
+is a formal type that must be a pack type.  Pack indexing instructions
+can be used to index into any pack with the same shape as the indexed
+pack type.  The components of the actual indexed pack do not need to be
+exactly the same as the components of the indexing instruction's
+indexed pack type as long as they contain expansions in the same
+places and those expansions expand pack parameters with the same shape.
+
+scalar_pack_index
+`````````````````
+
+::
+
+  sil-instruction ::= 'scalar_pack_index' int-literal 'of' sil-type
+
+Produce the dynamic pack index of a scalar (non-pack-expansion)
+component of a pack.  The type operand is the indexed pack type.  The
+integer operand is an index into the components of this pack type; it
+must be in range and resolve to a component that is not a pack expansion.
+
+Substitution must adjust the component index appropriately so that
+it still refers to the same component.  For example, if the pack
+type is ``Pack{repeat each T, Int}``, and substitution replaces ``T``
+with ``Pack{Float, repeat each U}``, a component index of 1 must be
+adjusted to 2 so that it still refers to the ``Int`` element.
+
+pack_pack_index
+```````````````
+
+::
+
+  sil-instruction ::= 'pack_pack_index' int-literal, sil-value 'of' sil-type
+
+Produce the dynamic pack index of an element of a slice of a pack.
+The type operand is the indexed pack type.  The integer operand is an
+index into the components of this pack type and must be in range.
+The value operand is the index in the pack slice and must be another
+pack indexing instruction.  The pack slice starts at the given index
+and extends for a number of components equal to the number of
+components in the indexed pack type of the operand.  The pack type
+induced from the indexed pack type by this slice must have the same
+shape as the indexed pack type of the operand.
+
+Substitution must adjust the component index appropriately so that
+it still refers to the same component.  For example, if the pack
+type is ``Pack{repeat each T, Int}``, and substitution replaces ``T``
+with ``Pack{Float, repeat each U}``, a component index of 1 must be
+adjusted to 2 so that the slice will continue to begin at the
+``Int`` element.
+
+Note how, in the example above, the slice does not contain any pack
+expansions.  (It is either empty or the singleton pack ``Pack{Int}``.)
+This is not typically how this instruction is used but can easily occur
+after inlining or other type substitution.
+
+dynamic_pack_index
+``````````````````
+
+::
+
+  sil-instruction ::= 'dynamic_pack_index' sil-value 'of' sil-type
+
+Produce the dynamic pack index of an unknown element of a pack.
+The type operand is the indexed pack type.  The value operand is
+a dynamic index into the dynamic elements of the pack and must have
+type ``Builtin.Word``.  The instruction has undefined behavior if the
+index is not in range for the pack.
+
+Variadic Generics
+~~~~~~~~~~~~~~~~~
+
+pack_length
+```````````
+
+::
+
+  sil-instruction ::= 'pack_length' sil-type
+
+Produce the dynamic length of the given pack, which must be a formal
+pack type.  The value of the instruction has type ``Builtin.Word``.
+
+open_pack_element
+`````````````````
+
+::
+
+  sil-instruction ::= 'open_pack_element' sil-value 'of' generic-parameter-list+ 'at' sil-apply-substitution-list ',' 'shape' sil-type ',' 'uuid' string-literal
+
+Binds one or more opened pack element archetypes in the local type
+environment.
+
+The generic signature is the *generalization signature* of the pack
+elements.  This signature need not be related in any way to the generic
+signature (if any) of the enclosing SIL function.
+
+The ``shape`` type operand is resolved in the context of the
+generalization signature.  It must name a pack parameter.  Archetypes
+will be bound for all pack parameters with the same shape as this
+parameter.
+
+The ``uuid`` operand must be an RFC 4122 UUID string, which is
+composed of 32 hex digits separated by hyphens in the pattern
+``8-4-4-4-12``.  There must not be any other ``open_pack_element``
+instruction with this UUID in the SIL function.  Opened pack element
+archetypes are identified by this UUID and are different from any
+other opened pack element archetypes in the function, even if the
+operands otherwise match exactly.
+
+The value operand is the pack index and must be the result of a
+pack indexing instruction.
+
+The substitution list matches the generalization signature and
+provides contextual bindings for all of the type information there.
+As usual, the substitutions for any pack parameters must be pack types.
+For pack parameters with the same shape as the shape operand, these
+pack substitutions must have the same shape as the indexed pack type
+of the pack index operand (and therefore the same shape as each other).
+
+The cost of this instruction is proportionate to the sum of the number
+of pack parameters in the generalization signature with the same shape
+as the shape type and the number of protocol conformance requirements
+the generalization signature imposes on those parameters and their
+associated types.  If any of this information is not required for the
+correct execution of the SIL function, simplifying the generalization
+signature used by the``open_pack_element`` can be a significant
+optimization.
+
+pack_element_get
+````````````````
+
+::
+
+  sil-instruction ::= 'pack_element_get' sil-value 'of' sil-operand 'as' sil-type
+
+Extracts the value previously stored in a pack at a particular index.
+If the pack element is uninitialized, this has undefined behavior.
+
+Ownership is unclear for direct packs.
+
+The first operand is the pack index and must be a pack indexing instruction.
+The second operand is the pack and must be the address of a pack value.
+The type operand is the projected element type of the pack element and
+must be structurally well-typed for the given index and pack type;
+see the structural type matching rules for pack indices.
+
+pack_element_set
+````````````````
+
+::
+
+  sil-instruction ::= 'pack_element_set' sil-operand 'into' sil-value 'of' sil-operand
+
+Places a value in a pack at a particular index.
+
+Ownership is unclear for direct packs.
+
+The first operand is the new element value.  The second operand is the
+pack index and must be a pack indexing instruction.  The third operand
+is the pack and must be the address of a pack value.  The type of the
+element value operand is the projected element type of the pack element
+and must be structurally well-typed for the given index and pack type;
+see the structural type matching rules for pack indices.
 
 Unchecked Conversions
 ~~~~~~~~~~~~~~~~~~~~~
@@ -7702,8 +8348,8 @@ mark_must_check
   sil-instruction ::= 'mark_must_check'
                       '[' sil-optimizer-analysis-marker ']'
 
-  sil-optimizer-analysis-marker ::= 'no_implicit_copy'
-                                ::= 'no_copy'
+  sil-optimizer-analysis-marker ::= 'consumable_and_assignable'
+                                ::= 'no_consume_or_assign'
 
 A canary value inserted by a SIL generating frontend to signal to the move
 checker to check a specific value.  Valid only in Raw SIL. The relevant checkers
@@ -7712,10 +8358,10 @@ relevant diagnostic. The idea here is that instead of needing to introduce
 multiple "flagging" instructions for the optimizer, we can just reuse this one
 instruction by varying the kind.
 
-If the sil optimizer analysis marker is ``no_implicit_copy`` then the move
+If the sil optimizer analysis marker is ``consumable_and_assignable`` then the move
 checker is told to check that the result of this instruction is consumed at most
-once. If the marker is ``no_copy``, then the move checker will validate that the
-result of this instruction is never consumed.
+once. If the marker is ``no_consume_or_assign``, then the move checker will
+validate that the result of this instruction is never consumed or assigned over.
 
 No Implicit Copy and No Escape Value Instructions
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -7810,3 +8456,16 @@ IRGen will replace the application by the constant representing Debug mode (0).
 This happens we can build the standard library .dylib. The generate sil will
 retain the function call but the generated .dylib will contain code with
 assertions enabled.
+
+Weak linking support
+~~~~~~~~~~~~~~~~~~~~~~~
+
+has_symbol
+```````````````````````````
+::
+
+  sil-instruction ::= 'has_symbol' sil-decl-ref
+
+Returns true if each of the underlying symbol addresses associated with the
+given declaration are non-null. This can be used to determine whether a
+weakly-imported declaration is available at runtime.

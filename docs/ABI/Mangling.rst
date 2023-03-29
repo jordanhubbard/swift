@@ -9,6 +9,7 @@ Mangling
 ::
 
   mangled-name ::= '$s' global  // Swift stable mangling
+  mangled-name ::= '@__swiftmacro_' global // Swift mangling for filenames
   mangled-name ::= '_T0' global // Swift 4.0
   mangled-name ::= '$S' global  // Swift 4.2
 
@@ -149,6 +150,7 @@ Globals
   #endif
   global ::= protocol-conformance 'Hc'   // protocol conformance runtime record
   global ::= global 'HF'                 // accessible function runtime record
+  global ::= global 'Ha'                 // runtime discoverable attribute record
 
   global ::= nominal-type 'Mo'           // class metadata immediate member base offset
 
@@ -157,11 +159,11 @@ Globals
   global ::= protocol-conformance 'MA'   // metadata for remote mirrors: associated type descriptor
   global ::= nominal-type 'MC'           // metadata for remote mirrors: superclass descriptor
 
-  // TODO check this::
   global ::= mangled-name 'TA'                     // partial application forwarder
   global ::= mangled-name 'Ta'                     // ObjC partial application forwarder
   global ::= mangled-name 'TQ' index               // Async await continuation partial function
   global ::= mangled-name 'TY' index               // Async suspend continuation partial function
+  global ::= mangled-name 'TwS'                    // #_hasSymbol query function
 
   global ::= type 'w' VALUE-WITNESS-KIND // value witness
 
@@ -346,6 +348,7 @@ Entities
   entity-spec ::= type 'fU' INDEX            // explicit anonymous closure expression
   entity-spec ::= type 'fu' INDEX            // implicit anonymous closure
   entity-spec ::= 'fA' INDEX                 // default argument N+1 generator
+  entity-spec ::= entity 'fa'                // runtime discoverable attribute generator
   entity-spec ::= 'fi'                       // non-local variable initializer
   entity-spec ::= 'fP'                       // property wrapper backing initializer
   entity-spec ::= 'fW'                       // property wrapper init from projected value
@@ -362,6 +365,8 @@ Entities
   entity-spec ::= decl-name label-list? type 'v' ACCESSOR                           // variable
   entity-spec ::= decl-name type 'fp'                                               // generic type parameter
   entity-spec ::= decl-name type 'fo'                                               // enum element (currently not used)
+  entity-spec ::= decl-name label-list? type generic-signature? 'fm'   // macro
+  entity-spec ::= context macro-discriminator-list  // macro expansion
   entity-spec ::= identifier 'Qa'                                                   // associated type declaration
 
   ACCESSOR ::= 'm'                           // materializeForSet
@@ -388,6 +393,14 @@ Entities
 
   RELATED-DISCRIMINATOR ::= [a-j]
   RELATED-DISCRIMINATOR ::= [A-J]
+
+  macro-discriminator-list ::= macro-discriminator-list? 'fM' macro-expansion-operator INDEX
+
+  macro-expansion-operator ::= identifier 'a' // accessor attached macro
+  macro-expansion-operator ::= identifier 'A' // member-attribute attached macro
+  macro-expansion-operator ::= identifier 'f' // freestanding macro
+  macro-expansion-operator ::= identifier 'm' // member attached macro
+  macro-expansion-operator ::= identifier 'u' // uniquely-named entity
 
   file-discriminator ::= identifier 'Ll'     // anonymous file-discriminated declaration
 
@@ -561,12 +574,16 @@ Types
     type ::= 'BD'                              // Builtin.DefaultActorStorage
     type ::= 'Be'                              // Builtin.Executor
   #endif
+  #if SWIFT_RUNTIME_VERSION >= 5.9
+    type ::= 'Bd'                              // Builtin.NonDefaultDistributedActorStorage
+  #endif
   type ::= 'Bf' NATURAL '_'                  // Builtin.Float<n>
   type ::= 'Bi' NATURAL '_'                  // Builtin.Int<n>
   type ::= 'BI'                              // Builtin.IntLiteral
   #if SWIFT_RUNTIME_VERSION >= 5.5
     type ::= 'Bj'                              // Builtin.Job
   #endif
+  type ::= 'BP'                              // Builtin.PackIndex
   type ::= 'BO'                              // Builtin.UnknownObject (no longer a distinct type, but still used for AnyObject)
   type ::= 'Bo'                              // Builtin.NativeObject
   type ::= 'Bp'                              // Builtin.RawPointer
@@ -637,7 +654,6 @@ Types
   METATYPE-REPR ::= 'T'                      // Thick metatype representation
   METATYPE-REPR ::= 'o'                      // ObjC metatype representation
 
-  type ::= archetype
   type ::= associated-type
   type ::= any-generic-type
   type ::= protocol-list 'p'                 // existential type
@@ -653,6 +669,14 @@ Types
   type ::= assoc-type-name 'Qz'                      // shortcut for 'Qyz'
   type ::= assoc-type-list 'QY' GENERIC-PARAM-INDEX  // associated type at depth
   type ::= assoc-type-list 'QZ'                      // shortcut for 'QYz'
+  type ::= opaque-type-decl-name bound-generic-args 'Qo' INDEX // opaque type
+  
+  type ::= pattern-type count-type 'Qp'      // pack expansion type
+  type ::= pack-element-list 'QP'            // pack type
+  type ::= pack-element-list 'QS' DIRECTNESS // SIL pack type
+
+  pack-element-list ::= type '_' type*
+  pack-element-list ::= empty-list
   
   #if SWIFT_RUNTIME_VERSION >= 5.2
     type ::= type assoc-type-name 'Qx' // associated type relative to base `type`
@@ -668,11 +692,8 @@ Types
 
   assoc-type-list ::= assoc-type-name '_' assoc-type-name*
 
-  archetype ::= associated-type
-
   associated-type ::= substitution
-  associated-type ::= protocol 'QP'          // self type of protocol
-  associated-type ::= archetype identifier 'Qa' // associated type
+  associated-type ::= type identifier 'Qa' // associated type
 
   assoc-type-name ::= identifier                // associated type name without protocol
   assoc-type-name ::= identifier protocol 'P'   //
@@ -734,6 +755,9 @@ mangled in to disambiguate.
   PARAM-CONVENTION ::= 'y'                   // direct unowned
   PARAM-CONVENTION ::= 'g'                   // direct guaranteed
   PARAM-CONVENTION ::= 'e'                   // direct deallocating
+  PARAM-CONVENTION ::= 'v'                   // pack owned
+  PARAM-CONVENTION ::= 'p'                   // pack guaranteed
+  PARAM-CONVENTION ::= 'm'                   // pack inout
 
   PARAM-DIFFERENTIABILITY ::= 'w'            // @noDerivative
 
@@ -742,8 +766,12 @@ mangled in to disambiguate.
   RESULT-CONVENTION ::= 'd'                  // unowned
   RESULT-CONVENTION ::= 'u'                  // unowned inner pointer
   RESULT-CONVENTION ::= 'a'                  // auto-released
+  RESULT-CONVENTION ::= 'k'                  // pack
 
   RESULT-DIFFERENTIABILITY ::= 'w'            // @noDerivative
+
+  DIRECTNESS ::= 'i'                         // indirect
+  DIRECTNESS ::= 'd'                         // direct
 
 For the most part, manglings follow the structure of formal language
 types.  However, in some cases it is more useful to encode the exact
@@ -862,8 +890,10 @@ now codified into the ABI; the index 0 is therefore reserved.
 
 ::
 
-  generic-signature ::= requirement* 'l'     // one generic parameter
-  generic-signature ::= requirement* 'r' GENERIC-PARAM-COUNT* 'l'
+  generic-signature ::= requirement* generic-param-pack-marker* 'l'     // one generic parameter
+  generic-signature ::= requirement* generic-param-pack-marker* 'r' GENERIC-PARAM-COUNT* 'l'
+
+  generic-param-pack-marker ::= 'Rv' GENERIC_PARAM-INDEX   // generic parameter pack marker
 
   GENERIC-PARAM-COUNT ::= 'z'                // zero parameters
   GENERIC-PARAM-COUNT ::= INDEX              // N+1 parameters
@@ -885,6 +915,8 @@ now codified into the ABI; the index 0 is therefore reserved.
   requirement ::= type assoc-type-list 'RM' GENERIC-PARAM-INDEX LAYOUT-CONSTRAINT    // layout requirement on associated type at depth
   requirement ::= type substitution 'RM' LAYOUT-CONSTRAINT                           // layout requirement with substitution
 
+  requirement ::= type 'Rh' GENERIC-PARAM-INDEX                     // same-shape requirement (only supported on a generic parameter)
+
   GENERIC-PARAM-INDEX ::= 'z'                // depth = 0,   idx = 0
   GENERIC-PARAM-INDEX ::= INDEX              // depth = 0,   idx = N+1
   GENERIC-PARAM-INDEX ::= 'd' INDEX INDEX    // depth = M+1, idx = N
@@ -904,9 +936,11 @@ now codified into the ABI; the index 0 is therefore reserved.
   LAYOUT-SIZE ::= INDEX // Size only
   LAYOUT-SIZE-AND-ALIGNMENT ::= INDEX INDEX // Size followed by alignment
 
-
-
 A generic signature begins with an optional list of requirements.
+
+This is followed by an optional list of generic-param-pack-markers to record
+which generic parameters are packs (variadic).
+
 The ``<GENERIC-PARAM-COUNT>`` describes the number of generic parameters at
 each depth of the signature. As a special case, no ``<GENERIC-PARAM-COUNT>``
 values indicates a single generic parameter at the outermost depth::

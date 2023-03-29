@@ -36,12 +36,36 @@ void PostfixCompletionCallback::fallbackTypeCheck(DeclContext *DC) {
     }
   }
 
-  SolutionApplicationTarget completionTarget(fallbackExpr, fallbackDC,
-                                             CTP_Unused, Type(),
-                                             /*isDiscared=*/true);
+  SyntacticElementTarget completionTarget(fallbackExpr, fallbackDC, CTP_Unused,
+                                          Type(),
+                                          /*isDiscared=*/true);
 
   typeCheckForCodeCompletion(completionTarget, /*needsPrecheck*/ true,
                              [&](const Solution &S) { sawSolution(S); });
+}
+
+static ClosureActorIsolation
+getClosureActorIsolation(const Solution &S, AbstractClosureExpr *ACE) {
+  auto getType = [&S](Expr *E) -> Type {
+    // Prefer the contextual type of the closure because it might be 'weaker'
+    // than the type determined for the closure by the constraints system. E.g.
+    // the contextual type might have a global actor attribute but because no
+    // methods from that global actor are called in the closure, the closure has
+    // a non-actor type.
+    if (auto target = S.getTargetFor(dyn_cast<ClosureExpr>(E))) {
+      if (auto Ty = target->getClosureContextualType())
+        return Ty;
+    }
+    if (!S.hasType(E)) {
+      return Type();
+    }
+    return getTypeForCompletion(S, E);
+  };
+  auto getClosureActorIsolationThunk = [&S](AbstractClosureExpr *ACE) {
+    return getClosureActorIsolation(S, ACE);
+  };
+  return determineClosureActorIsolation(ACE, getType,
+                                        getClosureActorIsolationThunk);
 }
 
 void PostfixCompletionCallback::sawSolutionImpl(
@@ -60,7 +84,7 @@ void PostfixCompletionCallback::sawSolutionImpl(
   auto *Locator = CS.getConstraintLocator(SemanticExpr);
   Type ExpectedTy = getTypeForCompletion(S, CompletionExpr);
   Expr *ParentExpr = CS.getParentExpr(CompletionExpr);
-  if (!ParentExpr)
+  if (!ParentExpr && !ExpectedTy)
     ExpectedTy = CS.getContextualType(CompletionExpr, /*forConstraint=*/false);
 
   auto *CalleeLocator = S.getCalleeLocator(Locator);
@@ -68,21 +92,37 @@ void PostfixCompletionCallback::sawSolutionImpl(
   if (auto SelectedOverload = S.getOverloadChoiceIfAvailable(CalleeLocator))
     ReferencedDecl = SelectedOverload->choice.getDeclOrNull();
 
+  llvm::DenseMap<AbstractClosureExpr *, ClosureActorIsolation>
+      ClosureActorIsolations;
   bool IsAsync = isContextAsync(S, DC);
+  for (auto SAT : S.targets) {
+    if (auto ACE = getAsExpr<AbstractClosureExpr>(SAT.second.getAsASTNode())) {
+      ClosureActorIsolations[ACE] = getClosureActorIsolation(S, ACE);
+    }
+  }
 
   auto Key = std::make_pair(BaseTy, ReferencedDecl);
   auto Ret = BaseToSolutionIdx.insert({Key, Results.size()});
   if (Ret.second) {
     bool ISDMT = S.isStaticallyDerivedMetatype(ParsedExpr);
     bool ImplicitReturn = isImplicitSingleExpressionReturn(CS, CompletionExpr);
-    bool DisallowVoid = ExpectedTy
-                            ? !ExpectedTy->isVoid()
-                            : !ParentExpr && CS.getContextualTypePurpose(
-                                                 CompletionExpr) != CTP_Unused;
+    bool DisallowVoid = false;
+    DisallowVoid |= ExpectedTy && !ExpectedTy->isVoid();
+    DisallowVoid |= !ParentExpr &&
+                    CS.getContextualTypePurpose(CompletionExpr) != CTP_Unused;
+    for (auto SAT : S.targets) {
+      if (DisallowVoid) {
+        // DisallowVoid is already set. No need to iterate further.
+        break;
+      }
+      if (SAT.second.getAsExpr() == CompletionExpr) {
+        DisallowVoid |= SAT.second.getExprContextualTypePurpose() != CTP_Unused;
+      }
+    }
 
     Results.push_back({BaseTy, ReferencedDecl,
                        /*ExpectedTypes=*/{}, DisallowVoid, ISDMT,
-                       ImplicitReturn, IsAsync});
+                       ImplicitReturn, IsAsync, ClosureActorIsolations});
     if (ExpectedTy) {
       Results.back().ExpectedTypes.push_back(ExpectedTy);
     }
@@ -122,6 +162,7 @@ void PostfixCompletionCallback::deliverResults(
   Lookup.shouldCheckForDuplicates(Results.size() > 1);
   for (auto &Result : Results) {
     Lookup.setCanCurrDeclContextHandleAsync(Result.IsInAsyncContext);
+    Lookup.setClosureActorIsolations(Result.ClosureActorIsolations);
     Lookup.setIsStaticMetatype(Result.BaseIsStaticMetaType);
     Lookup.getPostfixKeywordCompletions(Result.BaseTy, BaseExpr);
     Lookup.setExpectedTypes(Result.ExpectedTypes,

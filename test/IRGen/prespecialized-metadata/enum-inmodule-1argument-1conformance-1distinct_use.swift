@@ -5,7 +5,7 @@
 // UNSUPPORTED: CPU=armv7 && OS=ios
 // UNSUPPORTED: CPU=armv7s && OS=ios
 
-// CHECK: @"$sytN" = external{{( dllimport)?}} global %swift.full_type
+// CHECK: @"$sytN" = external{{( dllimport)?}} global %swift.full_existential_type
 
 // CHECK: @"$s4main5ValueOySiGMf" = linkonce_odr hidden constant <{
 // CHECK-SAME:    i8**,
@@ -54,7 +54,7 @@ func consume<T>(_ t: T) {
 // CHECK-SAME:         to %swift.full_type*
 // CHECK-SAME:       ), 
 // CHECK-SAME:       i32 0, 
-// CHECK-SAME:       i32 1
+// CHECK-SAME:       i32 2
 // CHECK-SAME:     )
 // CHECK-SAME:   )
 // CHECK: }
@@ -64,7 +64,7 @@ func doit() {
 doit()
 
 // CHECK: ; Function Attrs: noinline nounwind readnone
-// CHECK: define hidden swiftcc %swift.metadata_response @"$s4main5ValueOMa"([[INT]] %0, %swift.type* %1, i8** %2) #{{[0-9]+}} {
+// CHECK: define hidden swiftcc %swift.metadata_response @"$s4main5ValueOMa"([[INT]] %0, %swift.type* %1, i8** %2) #{{[0-9]+}} {{(section)?.*}}{
 // CHECK: entry:
 // CHECK:   [[ERASED_TYPE:%[0-9]+]] = bitcast %swift.type* %1 to i8*
 // CHECK:   [[ERASED_TABLE:%[0-9]+]] = bitcast i8** %2 to i8*

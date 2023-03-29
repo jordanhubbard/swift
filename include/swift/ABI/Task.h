@@ -25,6 +25,8 @@
 #include "swift/Runtime/Config.h"
 #include "swift/Runtime/VoucherShims.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Threading/ConditionVariable.h"
+#include "swift/Threading/Mutex.h"
 #include "bitset"
 #include "queue" // TODO: remove and replace with our own mpsc
 
@@ -35,8 +37,10 @@ class Job;
 struct OpaqueValue;
 struct SwiftError;
 class TaskStatusRecord;
+class TaskDependencyStatusRecord;
 class TaskOptionRecord;
 class TaskGroup;
+class ContinuationAsyncContext;
 
 extern FullMetadata<DispatchClassMetadata> jobHeapMetadata;
 
@@ -68,9 +72,12 @@ public:
   // Reserved for the use of the scheduler.
   void *SchedulerPrivate[2];
 
+  /// WARNING: DO NOT MOVE.
+  /// Schedulers may assume the memory location of the Flags in order to avoid a runtime call
+  /// to get the priority of a job.
   JobFlags Flags;
 
-  // Derived classes can use this to store a Job Id.
+  /// Derived classes can use this to store a Job Id.
   uint32_t Id = 0;
 
   /// The voucher associated with the job. Note: this is currently unused on
@@ -127,6 +134,10 @@ public:
 
   JobPriority getPriority() const {
     return Flags.getPriority();
+  }
+
+  uint32_t getJobId() const {
+    return Id;
   }
 
   /// Given that we've fully established the job context in the current
@@ -314,16 +325,25 @@ public:
   /// ActiveTask.
   void flagAsRunning();
 
-  /// Flag that this task is now suspended.
-  void flagAsSuspended();
+  /// Flag that this task is now suspended with information about what it is
+  /// waiting on.
+  void flagAsSuspendedOnTask(AsyncTask *task);
+  void flagAsSuspendedOnContinuation(ContinuationAsyncContext *context);
+  void flagAsSuspendedOnTaskGroup(TaskGroup *taskGroup);
 
+private:
+  // Helper function
+  void flagAsSuspended(TaskDependencyStatusRecord *dependencyStatusRecord);
+  void destroyTaskDependency(TaskDependencyStatusRecord *dependencyRecord);
+
+public:
   /// Flag that the task is to be enqueued on the provided executor and actually
   /// enqueue it
   void flagAsAndEnqueueOnExecutor(ExecutorRef newExecutor);
 
   /// Flag that this task is now completed. This normally does not do anything
   /// but can be used to locally insert logging.
-  void flagAsCompleted();
+  void flagAsDestroyed();
 
   /// Check whether this task has been cancelled.
   /// Checking this is, of course, inherently race-prone on its own.
@@ -710,6 +730,16 @@ public:
   /// The executor that should be resumed to.
   /// Public ABI.
   ExecutorRef ResumeToExecutor;
+
+#if defined(SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY)
+  /// In a task-to-thread model, instead of voluntarily descheduling the task
+  /// from the thread, we will block the thread (and therefore task).
+  /// This condition variable is lazily allocated on the stack only if the
+  /// continuation has not been resumed by the point of await. The mutex in the
+  /// condition variable is therefore not really protecting any state as all
+  /// coordination is done via the AwaitSynchronization atomic
+  ConditionVariable *Cond;
+#endif
 
   void setErrorResult(SwiftError *error) {
     ErrorResult = error;

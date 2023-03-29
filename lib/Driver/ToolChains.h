@@ -31,9 +31,6 @@ protected:
   void addLinkerInputArgs(InvocationInfo &II,
                           const JobContext &context) const;
 
-  void addArgsToLinkARCLite(llvm::opt::ArgStringList &Arguments,
-                            const JobContext &context) const;
-
   void addSanitizerArgs(llvm::opt::ArgStringList &Arguments,
                         const DynamicLinkJobAction &job,
                         const JobContext &context) const;
@@ -192,6 +189,16 @@ public:
   OpenBSD(const Driver &D, const llvm::Triple &Triple)
       : GenericUnix(D, Triple) {}
   ~OpenBSD() = default;
+};
+
+class LLVM_LIBRARY_VISIBILITY FreeBSD : public GenericUnix {
+protected:
+  std::string getDefaultLinker() const override;
+
+public:
+  FreeBSD(const Driver &D, const llvm::Triple &Triple)
+      : GenericUnix(D, Triple) {}
+  ~FreeBSD() = default;
 };
 
 } // end namespace toolchains

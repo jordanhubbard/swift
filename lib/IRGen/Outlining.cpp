@@ -113,23 +113,26 @@ void OutliningMetadataCollector::bindMetadataParameters(IRGenFunction &IGF,
 std::pair<CanType, CanGenericSignature>
 irgen::getTypeAndGenericSignatureForManglingOutlineFunction(SILType type) {
   auto loweredType = type.getASTType();
-  if (loweredType->hasArchetype()) {
-    GenericEnvironment *env = nullptr;
-    loweredType.findIf([&env](Type t) -> bool {
-        if (auto arch = t->getAs<ArchetypeType>()) {
-          if (!isa<PrimaryArchetypeType>(arch) &&
-              !isa<VariadicSequenceType>(arch))
-            return false;
-          env = arch->getGenericEnvironment();
-          return true;
-        }
-        return false;
-      });
-    assert(env && "has archetype but no archetype?!");
-    return {loweredType->mapTypeOutOfContext()->getCanonicalType(),
-            env->getGenericSignature().getCanonicalSignature()};
-  }
-  return {loweredType, nullptr};
+  if (!loweredType->hasArchetype()) return {loweredType, nullptr};
+
+  // Find a non-local, non-opaque archetype in the type and pull out
+  // its generic environment.
+  // TODO: we ought to be able to usefully minimize this
+
+  GenericEnvironment *env = nullptr;
+  loweredType.findIf([&env](CanType t) -> bool {
+      if (auto arch = dyn_cast<ArchetypeType>(t)) {
+        if (!isa<PrimaryArchetypeType>(arch) &&
+            !isa<PackArchetypeType>(arch))
+          return false;
+        env = arch->getGenericEnvironment();
+        return true;
+      }
+      return false;
+    });
+  assert(env && "has archetype but no archetype?!");
+  return {loweredType->mapTypeOutOfContext()->getCanonicalType(),
+          env->getGenericSignature().getCanonicalSignature()};
 }
 
 void TypeInfo::callOutlinedCopy(IRGenFunction &IGF, Address dest, Address src,
@@ -190,7 +193,8 @@ void OutliningMetadataCollector::emitCallToOutlinedCopy(
       IGF.IGM.getOrCreateOutlinedAssignWithCopyFunction(T, ti, *this);
   }
 
-  llvm::CallInst *call = IGF.Builder.CreateCall(outlinedFn, args);
+  llvm::CallInst *call = IGF.Builder.CreateCall(
+      cast<llvm::Function>(outlinedFn)->getFunctionType(), outlinedFn, args);
   call->setCallingConv(IGF.IGM.DefaultCC);
 }
 
@@ -207,6 +211,12 @@ bool isTypeMetadataForLayoutAccessible(SILModule &M, SILType type);
 
 static bool canUseValueWitnessForValueOp(IRGenModule &IGM, SILType T) {
   if (!IGM.getSILModule().isTypeMetadataForLayoutAccessible(T))
+    return false;
+
+  // It is not a good code size trade-off to instantiate a metatype for
+  // existentials, and also does not back-deploy gracefully in the case of
+  // constrained protocols.
+  if (T.getASTType()->isExistentialType())
     return false;
 
   if (needsSpecialOwnershipHandling(T))
@@ -360,7 +370,8 @@ void OutliningMetadataCollector::emitCallToOutlinedDestroy(
   auto outlinedFn =
     IGF.IGM.getOrCreateOutlinedDestroyFunction(T, ti, *this);
 
-  llvm::CallInst *call = IGF.Builder.CreateCall(outlinedFn, args);
+  llvm::CallInst *call = IGF.Builder.CreateCall(
+      cast<llvm::Function>(outlinedFn)->getFunctionType(), outlinedFn, args);
   call->setCallingConv(IGF.IGM.DefaultCC);
 }
 
@@ -409,7 +420,8 @@ llvm::Constant *IRGenModule::getOrCreateRetainFunction(const TypeInfo &ti,
       funcName, llvmType, argTys,
       [&](IRGenFunction &IGF) {
         auto it = IGF.CurFn->arg_begin();
-        Address addr(&*it++, loadableTI->getFixedAlignment());
+        Address addr(&*it++, loadableTI->getStorageType(),
+                     loadableTI->getFixedAlignment());
         Explosion loaded;
         loadableTI->loadAsTake(IGF, addr, loaded);
         Explosion out;
@@ -436,10 +448,11 @@ IRGenModule::getOrCreateReleaseFunction(const TypeInfo &ti,
       funcName, llvmType, argTys,
       [&](IRGenFunction &IGF) {
         auto it = IGF.CurFn->arg_begin();
-        Address addr(&*it++, loadableTI->getFixedAlignment());
+        Address addr(&*it++, loadableTI->getStorageType(),
+                     loadableTI->getFixedAlignment());
         Explosion loaded;
         loadableTI->loadAsTake(IGF, addr, loaded);
-        loadableTI->consume(IGF, loaded, atomicity);
+        loadableTI->consume(IGF, loaded, atomicity, t);
         IGF.Builder.CreateRet(addr.getAddress());
       },
       true /*setIsNoInline*/);

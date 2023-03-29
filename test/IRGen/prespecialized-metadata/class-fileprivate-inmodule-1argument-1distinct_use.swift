@@ -61,9 +61,9 @@
 //         CHECK-SAME:   i32 {{(24|12)}}, 
 //         CHECK-SAME:   i16 {{(7|3)}}, 
 //         CHECK-SAME:   i16 0, 
-//   CHECK-apple-SAME:   i32 {{(120|72)}}, 
-// CHECK-unknown-SAME:   i32 96,
-//         CHECK-SAME:   i32 {{(16|8)}}, 
+//   CHECK-apple-SAME:   i32 {{(128|76)}}, 
+// CHECK-unknown-SAME:   i32 104,
+//         CHECK-SAME:   i32 {{(24|12)}}, 
 //                   :   %swift.type_descriptor* bitcast (<{ i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i16, i16, i16, i16, i8, i8, i8, i8, i32, i32, %swift.method_descriptor }>* @"$s4main5Value[[UNIQUE_ID_1]]CMn" to %swift.type_descriptor*), 
 //         CHECK-SAME:   i8* null, 
 //         CHECK-SAME:   %swift.type* @"$sSiN", 
@@ -98,7 +98,7 @@ func doit() {
 }
 doit()
 
-// CHECK: define internal swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {
+// CHECK: define internal swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* %1) #{{[0-9]+}} {{(section)?.*}}{
 // CHECK: entry:
 // CHECK:   [[ERASED_TYPE:%[0-9]+]] = bitcast %swift.type* %1 to i8*
 // CHECK:   {{%[0-9]+}} = call swiftcc %swift.metadata_response @__swift_instantiateCanonicalPrespecializedGenericMetadata(
@@ -116,7 +116,7 @@ doit()
 // CHECK: }
 
 
-// CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_4]]CySiGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]}} {
+// CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_4]]CySiGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]}} {{(section)?.*}}{
 // CHECK: entry:
 // CHECK-apple:  [[INITIALIZED_CLASS:%[0-9]+]] = call %objc_class* @objc_opt_self(
 // CHECK-apple:    %objc_class* bitcast (

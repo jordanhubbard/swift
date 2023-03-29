@@ -8,7 +8,7 @@ include(SwiftCXXUtils)
 function(_swift_gyb_target_sources target scope)
   file(GLOB GYB_UNICODE_DATA ${SWIFT_SOURCE_DIR}/utils/UnicodeData/*)
   file(GLOB GYB_STDLIB_SUPPORT ${SWIFT_SOURCE_DIR}/utils/gyb_stdlib_support.py)
-  file(GLOB GYB_SYNTAX_SUPPORT ${SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE}/gyb_syntax_support/*.py)
+  file(GLOB GYB_SYNTAX_SUPPORT ${SWIFT_SOURCE_DIR}/utils/gyb_syntax_support/*.py)
   file(GLOB GYB_SOURCEKIT_SUPPORT ${SWIFT_SOURCE_DIR}/utils/gyb_sourcekit_support/*.py)
   set(GYB_SOURCES
     ${SWIFT_SOURCE_DIR}/utils/gyb
@@ -26,7 +26,7 @@ function(_swift_gyb_target_sources target scope)
 
     add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/${generated}
       COMMAND
-        ${CMAKE_COMMAND} -E env PYTHONPATH=${SWIFT_PATH_TO_SWIFT_SYNTAX_SOURCE} $<TARGET_FILE:Python3::Interpreter> ${SWIFT_SOURCE_DIR}/utils/gyb -D CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P} ${SWIFT_GYB_FLAGS} -o ${CMAKE_CURRENT_BINARY_DIR}/${generated}.tmp ${absolute}
+        ${CMAKE_COMMAND} -E env $<TARGET_FILE:Python3::Interpreter> ${SWIFT_SOURCE_DIR}/utils/gyb -D CMAKE_SIZEOF_VOID_P=${CMAKE_SIZEOF_VOID_P} ${SWIFT_GYB_FLAGS} -o ${CMAKE_CURRENT_BINARY_DIR}/${generated}.tmp ${absolute}
       COMMAND
         ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_BINARY_DIR}/${generated}.tmp ${CMAKE_CURRENT_BINARY_DIR}/${generated}
       COMMAND
@@ -48,6 +48,11 @@ set(SWIFTLIB_DIR
     "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/lib/swift")
 set(SWIFTSTATICLIB_DIR
     "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/lib/swift_static")
+
+# SWIFTLIBEXEC_DIR is the directory in the build tree where Swift auxiliary
+# executables should be placed.
+set(SWIFTLIBEXEC_DIR
+    "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/libexec/swift")
 
 function(_compute_lto_flag option out_var)
   string(TOLOWER "${option}" lowercase_option)
@@ -527,7 +532,7 @@ function(_add_swift_runtime_link_flags target relpath_to_lib_dir bootstrapping)
     set_property(TARGET ${target} APPEND_STRING PROPERTY
                  LINK_FLAGS " -lobjc ")
 
-  elseif(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD")
+  elseif(SWIFT_HOST_VARIANT_SDK MATCHES "LINUX|ANDROID|OPENBSD|FREEBSD")
     set(swiftrt "swiftImageRegistrationObject${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_OBJECT_FORMAT}-${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}-${SWIFT_HOST_VARIANT_ARCH}")
     if(${ASRLF_BOOTSTRAPPING_MODE} MATCHES "HOSTTOOLS|CROSSCOMPILE")
       # At build time and run time, link against the swift libraries in the
@@ -569,7 +574,7 @@ function(_add_swift_runtime_link_flags target relpath_to_lib_dir bootstrapping)
 
   if(SWIFT_SWIFT_PARSER)
     # Make sure we can find the early SwiftSyntax libraries.
-    target_link_directories(${target} PRIVATE "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/lib")
+    target_link_directories(${target} PRIVATE "${SWIFT_PATH_TO_EARLYSWIFTSYNTAX_BUILD_DIR}/lib/swift/host")
 
     # For the "end step" of bootstrapping configurations on Darwin, need to be
     # able to fall back to the SDK directory for libswiftCore et al.
@@ -579,7 +584,12 @@ function(_add_swift_runtime_link_flags target relpath_to_lib_dir bootstrapping)
           target_link_directories(${target} PRIVATE "${sdk_dir}")
 
           # Include the abi stable system stdlib in our rpath.
-         set(swift_runtime_rpath "/usr/lib/swift")
+          set(swift_runtime_rpath "/usr/lib/swift")
+
+          # Add in the toolchain directory so we can grab compatibility libraries
+          get_filename_component(TOOLCHAIN_BIN_DIR ${SWIFT_EXEC_FOR_SWIFT_MODULES} DIRECTORY)
+          get_filename_component(TOOLCHAIN_LIB_DIR "${TOOLCHAIN_BIN_DIR}/../lib/swift/${SWIFT_SDK_${SWIFT_HOST_VARIANT_SDK}_LIB_SUBDIR}" ABSOLUTE)
+          target_link_directories(${target} PUBLIC ${TOOLCHAIN_LIB_DIR})
         endif()
       endif()
     endif()
@@ -681,6 +691,8 @@ function(add_swift_host_library name)
   endif()
 
   add_library(${name} ${libkind} ${ASHL_SOURCES})
+
+  target_link_directories(${name} PUBLIC ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
 
   # Respect LLVM_COMMON_DEPENDS if it is set.
   #
@@ -906,6 +918,20 @@ function(add_swift_host_tool executable)
     endif()
   endif()
 
+  if(SWIFT_SWIFT_PARSER)
+    set(extra_relative_rpath "")
+    if(NOT ${ASHT_BOOTSTRAPPING} STREQUAL "")
+      if (${executable} MATCHES "-bootstrapping")
+        set(extra_relative_rpath "../")
+      endif()
+    endif()
+
+    set_property(
+      TARGET ${executable}
+      APPEND PROPERTY INSTALL_RPATH
+        "@executable_path/../${extra_relative_rpath}lib/swift/host")
+  endif()
+
   if(ASHT_THINLTO_LD64_ADD_FLTO_CODEGEN_ONLY)
     string(CONCAT lto_codegen_only_link_options
       "$<"
@@ -952,8 +978,8 @@ function(add_swift_fuzzer_host_tool executable)
 endfunction()
 
 macro(add_swift_tool_symlink name dest component)
-  add_llvm_tool_symlink(${name} ${dest} ALWAYS_GENERATE)
-  llvm_install_symlink(${name} ${dest} ALWAYS_GENERATE COMPONENT ${component})
+  llvm_add_tool_symlink(SWIFT ${name} ${dest} ALWAYS_GENERATE)
+  llvm_install_symlink(SWIFT ${name} ${dest} ALWAYS_GENERATE COMPONENT ${component})
 endmacro()
 
 # Declare that files in this library are built with LLVM's support

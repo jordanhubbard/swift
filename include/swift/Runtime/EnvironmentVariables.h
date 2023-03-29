@@ -24,6 +24,10 @@ void initialize(void *);
 
 extern swift::once_t initializeToken;
 
+// Define a typedef "string" in swift::runtime::environment to make string
+// environment variables work
+using string = const char *;
+
 // Declare backing variables.
 #define VARIABLE(name, type, defaultValue, help) extern type name ## _variable;
 #include "../../../stdlib/public/runtime/EnvironmentVariables.def"
@@ -35,6 +39,10 @@ extern swift::once_t initializeToken;
     return name##_variable;                                                    \
   }
 #include "../../../stdlib/public/runtime/EnvironmentVariables.def"
+
+// Wrapper around SWIFT_DEBUG_CONCURRENCY_ENABLE_COOPERATIVE_QUEUES that the
+// Concurrency library can call.
+SWIFT_RUNTIME_STDLIB_SPI bool concurrencyEnableCooperativeQueues();
 
 // Wrapper around SWIFT_ENABLE_ASYNC_JOB_DISPATCH_INTEGRATION that the
 // Concurrency library can call.

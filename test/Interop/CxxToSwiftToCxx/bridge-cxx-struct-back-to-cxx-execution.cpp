@@ -1,9 +1,9 @@
 // RUN: %empty-directory(%t)
 // RUN: split-file %s %t
 
-// RUN: %target-swift-frontend -parse-as-library %platform-module-dir/Swift.swiftmodule/%module-target-triple.swiftinterface -enable-library-evolution -disable-objc-attr-requires-foundation-module -typecheck -module-name Swift -parse-stdlib -enable-experimental-cxx-interop -emit-clang-header-path %t/Swift.h  -experimental-skip-all-function-bodies
+// RUN: %target-swift-frontend -parse-as-library %platform-module-dir/Swift.swiftmodule/%module-target-triple.swiftinterface -enable-library-evolution -disable-objc-attr-requires-foundation-module -typecheck -module-name Swift -parse-stdlib -enable-experimental-cxx-interop -clang-header-expose-decls=has-expose-attr -emit-clang-header-path %t/Swift.h  -experimental-skip-all-function-bodies
 
-// RUN: %target-swift-frontend -typecheck %t/use-cxx-types.swift -typecheck -module-name UseCxx -emit-clang-header-path %t/UseCxx.h -I %t -enable-experimental-cxx-interop -clang-header-expose-public-decls
+// RUN: %target-swift-frontend -typecheck %t/use-cxx-types.swift -typecheck -module-name UseCxx -emit-clang-header-path %t/UseCxx.h -I %t -enable-experimental-cxx-interop -clang-header-expose-decls=all-public
 
 // RUN: %target-interop-build-clangxx -std=c++20 -c %t/use-swift-cxx-types.cpp -I %t -o %t/swift-cxx-execution.o -g
 // RUN: %target-interop-build-swift %t/use-cxx-types.swift -o %t/swift-cxx-execution -Xlinker %t/swift-cxx-execution.o -module-name UseCxx -Xfrontend -entry-point-function-name -Xfrontend swiftMain -I %t -g
@@ -15,7 +15,7 @@
 
 //--- header.h
 
-extern "C" void puts(const char *);
+#include <stdio.h>
 
 struct Trivial {
     int x, y;
@@ -41,6 +41,8 @@ struct NonTrivialTemplate {
     }
 };
 
+using NonTrivialTemplateTrivial = NonTrivialTemplate<Trivial>;
+
 //--- module.modulemap
 module CxxTest {
     header "header.h"
@@ -50,19 +52,19 @@ module CxxTest {
 //--- use-cxx-types.swift
 import CxxTest
 
-public func retNonTrivial(y: CInt) -> NonTrivialTemplate<Trivial> {
-    return NonTrivialTemplate<Trivial>(Trivial(42, y))
+public func retNonTrivial(y: CInt) -> NonTrivialTemplateTrivial {
+    return NonTrivialTemplateTrivial(Trivial(42, y))
 }
 
-public func takeNonTrivial(_ x: NonTrivialTemplate<Trivial>) {
+public func takeNonTrivial(_ x: NonTrivialTemplateTrivial) {
     print(x)
 }
 
-public func passThroughNonTrivial(_ x: NonTrivialTemplate<Trivial>) -> NonTrivialTemplate<Trivial>{
+public func passThroughNonTrivial(_ x: NonTrivialTemplateTrivial) -> NonTrivialTemplateTrivial {
     return x
 }
 
-public func inoutNonTrivial(_ x: inout NonTrivialTemplate<Trivial>) {
+public func inoutNonTrivial(_ x: inout NonTrivialTemplateTrivial) {
     x.x.y *= 2
 }
 
@@ -90,8 +92,8 @@ public func retPassThroughGeneric<T>(_ x: T) -> T {
     return x
 }
 
-public func retArrayNonTrivial(_ x: CInt) -> [NonTrivialTemplate<Trivial>] {
-    return [NonTrivialTemplate<Trivial>(Trivial(x, -x))]
+public func retArrayNonTrivial(_ x: CInt) -> [NonTrivialTemplateTrivial] {
+    return [NonTrivialTemplateTrivial(Trivial(x, -x))]
 }
 
 //--- use-swift-cxx-types.cpp
@@ -148,18 +150,18 @@ int main() {
 // CHECK-NEXT: move NonTrivialTemplate
 // CHECK-NEXT: ~NonTrivialTemplate
 // CHECK-NEXT: copy NonTrivialTemplate
-// CHECK-NEXT: __CxxTemplateInst18NonTrivialTemplateI7TrivialE(x: __C.Trivial(x: 42, y: -942))
+// CHECK-NEXT: NonTrivialTemplate<Trivial>(x: __C.Trivial(x: 42, y: -942))
 // CHECK-NEXT: ~NonTrivialTemplate
 // CHECK-NEXT: ~NonTrivialTemplate
 // CHECK-NEXT: done non trivial
 // CHECK-NEXT: copy NonTrivialTemplate
-// CHECK-NEXT: GENERIC __CxxTemplateInst18NonTrivialTemplateI7TrivialE(x: __C.Trivial(x: 42, y: -1884))
+// CHECK-NEXT: GENERIC NonTrivialTemplate<Trivial>(x: __C.Trivial(x: 42, y: -1884))
 // CHECK-NEXT: ~NonTrivialTemplate
 // CHECK-NEXT: copy NonTrivialTemplate
 // CHECK-NEXT: move NonTrivialTemplate
 // CHECK-NEXT: ~NonTrivialTemplate
 // CHECK-NEXT: copy NonTrivialTemplate
-// CHECK-NEXT: __CxxTemplateInst18NonTrivialTemplateI7TrivialE(x: __C.Trivial(x: 42, y: -1884))
+// CHECK-NEXT: NonTrivialTemplate<Trivial>(x: __C.Trivial(x: 42, y: -1884))
 // CHECK-NEXT: ~NonTrivialTemplate
 // CHECK-NEXT: ~NonTrivialTemplate
 // CHECK-NEXT: secondon non trivial

@@ -75,13 +75,9 @@ namespace swift {
   class ValueDecl;
   class VarDecl;
   class VisibleDeclConsumer;
-  class SyntaxParsingCache;
   class ASTScope;
   class SourceLookupCache;
 
-  namespace syntax {
-  class SourceFileSyntax;
-}
 namespace ast_scope {
 class ASTSourceFileScope;
 }
@@ -106,7 +102,8 @@ enum class SourceFileKind {
   Library,  ///< A normal .swift file.
   Main,     ///< A .swift file that can have top-level code.
   SIL,      ///< Came from a .sil file.
-  Interface ///< Came from a .swiftinterface file, representing another module.
+  Interface, ///< Came from a .swiftinterface file, representing another module.
+  MacroExpansion, ///< Came from a macro expansion.
 };
 
 /// Contains information about where a particular path is used in
@@ -158,6 +155,63 @@ enum class ResilienceStrategy : unsigned {
 
 class OverlayFile;
 
+/// A mapping used to find the source file that contains a particular source
+/// location.
+class ModuleSourceFileLocationMap;
+
+/// A unit that allows grouping of modules by a package name.
+///
+/// PackageUnit is treated as an enclosing scope of ModuleDecl. Unlike other
+/// DeclContext subclasses where a parent context is set in ctor, PackageUnit
+/// (parent context) is set as a field in ModuleDecl (child context). It also has a
+/// pointer back to the ModuleDecl, so that it can be used to return the module
+/// in the existing DeclContext lookup functions, which assume ModuleDecl as
+/// the top level context. Since both PackageUnit and ModuleDecl are created
+/// in the ASTContext memory arena, i.e. they will be destroyed when the
+/// ASTContext is destroyed, both pointng to each other is not considered risky.
+///
+/// See \c ModuleDecl
+class PackageUnit: public DeclContext {
+  /// Identifies this package and used for the equality check
+  Identifier PackageName;
+  /// Non-null reference to ModuleDecl that points to this package.
+  /// Instead of having multiple ModuleDecls pointing to one PackageUnit, we
+  /// create one PackageUnit per ModuleDecl, to make it easier to look up the
+  /// module pointing to this package context, which is needed in the existing
+  /// DeclContext look up functions.
+  /// \see DeclContext::getModuleScopeContext
+  /// \see DeclContext::getParentModule
+  ModuleDecl &SourceModule;
+
+  PackageUnit(Identifier name, ModuleDecl &src)
+      : DeclContext(DeclContextKind::Package, nullptr), PackageName(name),
+        SourceModule(src) {}
+
+public:
+  static PackageUnit *create(Identifier name, ModuleDecl &src,
+                             ASTContext &ctx) {
+    return new (ctx) PackageUnit(name, src);
+  }
+
+  static bool classof(const DeclContext *DC) {
+    return DC->getContextKind() == DeclContextKind::Package;
+  }
+
+  static bool classof(const PackageUnit *PU) { return true; }
+
+  Identifier getName() const {
+    return PackageName;
+  }
+
+  ModuleDecl &getSourceModule() { return SourceModule; }
+
+  /// Equality check via package name instead of pointer comparison.
+  /// Returns false if the name is empty.
+  bool isSamePackageAs(PackageUnit *other) {
+    return !(getName().empty()) && getName() == other->getName();
+  }
+};
+
 /// The minimum unit of compilation.
 ///
 /// A module is made up of several file-units, which are all part of the same
@@ -171,6 +225,14 @@ class ModuleDecl
 
   /// The ABI name of the module, if it differs from the module name.
   mutable Identifier ModuleABIName;
+
+  /// A package this module belongs to. It's set as a property instead of a
+  /// parent decl context; otherwise it will break the existing decl context
+  /// lookup functions that assume ModuleDecl as the top level context.
+  PackageUnit *Package = nullptr;
+
+  /// Module name to use when referenced in clients module interfaces.
+  mutable Identifier ExportAsName;
 
 public:
   /// Produces the components of a given module's full name in reverse order.
@@ -229,8 +291,17 @@ private:
 
   SmallVector<FileUnit *, 2> Files;
 
+  /// Mapping used to find the source file associated with a given source
+  /// location.
+  ModuleSourceFileLocationMap *sourceFileLocationMap = nullptr;
+
+  /// The set of auxiliary source files build as part of this module.
+  SmallVector<SourceFile *, 2> AuxiliaryFiles;
+
   llvm::SmallDenseMap<Identifier, SmallVector<OverlayFile *, 1>>
     declaredCrossImports;
+
+  llvm::DenseMap<Identifier, SmallVector<Decl *, 2>> ObjCNameLookupCache;
 
   /// A description of what should be implicitly imported by each file of this
   /// module.
@@ -283,8 +354,8 @@ public:
     return new (ctx) ModuleDecl(name, ctx, importInfo);
   }
 
-  static ModuleDecl *
-  createMainModule(ASTContext &ctx, Identifier name, ImplicitImportInfo iinfo) {
+  static ModuleDecl *createMainModule(ASTContext &ctx, Identifier name,
+                                      ImplicitImportInfo iinfo) {
     auto *Mod = ModuleDecl::create(name, ctx, iinfo);
     Mod->Bits.ModuleDecl.IsMainModule = true;
     return Mod;
@@ -327,6 +398,17 @@ public:
   /// a file in the middle of e.g. semantic analysis, use a \c
   /// SynthesizedFileUnit instead.
   void addFile(FileUnit &newFile);
+
+  /// Add an auxiliary source file, introduced as part of the translation.
+  void addAuxiliaryFile(SourceFile &sourceFile);
+
+  /// Produces the source file that contains the given source location, or
+  /// \c nullptr if the source location isn't in this module.
+  SourceFile *getSourceFileContainingLocation(SourceLoc loc);
+
+  /// Whether the given location is inside a generated buffer, \c false if
+  /// the given location isn't in this module.
+  bool isInGeneratedBuffer(SourceLoc loc);
 
   /// Creates a map from \c #filePath strings to corresponding \c #fileID
   /// strings, diagnosing any conflicts.
@@ -385,6 +467,27 @@ public:
     ModuleABIName = name;
   }
 
+  /// Get the package name of this module
+  /// FIXME: remove this and bump module version rdar://104723918
+  Identifier getPackageName() const {
+    if (auto pkg = getPackage())
+      return pkg->getName();
+    return Identifier();
+  }
+
+  /// Get the package associated with this module
+  PackageUnit *getPackage() const { return Package; }
+
+  /// Set the package this module is associated with
+  /// FIXME: rename this with setPackage(name) rdar://104723918
+  void setPackageName(Identifier name);
+
+  Identifier getExportAsName() const { return ExportAsName; }
+
+  void setExportAsName(Identifier name) {
+    ExportAsName = name;
+  }
+
   /// Retrieve the actual module name of an alias used for this module (if any).
   ///
   /// For example, if '-module-alias Foo=Bar' is passed in when building the main module,
@@ -403,7 +506,19 @@ public:
     return UserModuleVersion;
   }
 
+  void addAllowableClientName(Identifier name) {
+    allowableClientNames.push_back(name);
+  }
+  ArrayRef<Identifier> getAllowableClientNames() const {
+    return allowableClientNames;
+  }
+  bool allowImportedBy(ModuleDecl *importer) const;
 private:
+
+  /// An array of module names that are allowed to import this one.
+  /// Any module can import this one if empty.
+  std::vector<Identifier> allowableClientNames;
+
   /// A cache of this module's underlying module and required bystander if it's
   /// an underscored cross-import overlay.
   Optional<std::pair<ModuleDecl *, Identifier>> declaringModuleAndBystander;
@@ -413,6 +528,9 @@ private:
   /// along with the name of the required bystander module. Used by tooling to
   /// present overlays as if they were part of their underlying module.
   std::pair<ModuleDecl *, Identifier> getDeclaringModuleAndBystander();
+
+  /// Update the source-file location map to make it current.
+  void updateSourceFileLocationMap();
 
 public:
   ///  If this is a traditional (non-cross-import) overlay, get its underlying
@@ -540,8 +658,21 @@ public:
   bool isSystemModule() const {
     return Bits.ModuleDecl.IsSystemModule;
   }
-  void setIsSystemModule(bool flag = true) {
-    Bits.ModuleDecl.IsSystemModule = flag;
+  void setIsSystemModule(bool flag = true);
+
+  /// \returns true if this module is part of the stdlib or contained within
+  /// the SDK. If no SDK was specified, falls back to whether the module was
+  /// specified as a system module (ie. it's on the system search path).
+  bool isNonUserModule() const;
+
+public:
+  /// Returns true if the module was rebuilt from a module interface instead
+  /// of being built from the full source.
+  bool isBuiltFromInterface() const {
+    return Bits.ModuleDecl.IsBuiltFromInterface;
+  }
+  void setIsBuiltFromInterface(bool flag = true) {
+    Bits.ModuleDecl.IsBuiltFromInterface = flag;
   }
 
   /// Returns true if this module is a non-Swift module that was imported into
@@ -568,6 +699,14 @@ public:
 
   void setIsConcurrencyChecked(bool value = true) {
     Bits.ModuleDecl.IsConcurrencyChecked = value;
+  }
+
+  bool isObjCNameLookupCachePopulated() const {
+    return Bits.ModuleDecl.ObjCNameLookupCachePopulated;
+  }
+
+  void setIsObjCNameLookupCachePopulated(bool value) {
+    Bits.ModuleDecl.ObjCNameLookupCachePopulated = value;
   }
 
   /// For the main module, retrieves the list of primary source files being
@@ -606,6 +745,24 @@ public:
   void lookupVisibleDecls(ImportPath::Access AccessPath,
                           VisibleDeclConsumer &Consumer,
                           NLKind LookupKind) const;
+
+private:
+  void populateObjCNameLookupCache();
+
+public:
+  /// Finds top-levels decls of this module by @objc provided name.
+  /// Decls that have no @objc attribute are not considered.
+  ///
+  /// This does a simple local lookup, not recursively looking through imports.
+  /// The order of the results is not guaranteed to be meaningful.
+  ///
+  /// \param Results Vector collecting the decls.
+  ///
+  /// \param name The @objc simple name to look for. Declarations with matching
+  /// name and "anonymous" @objc attribute, as well a matching named @objc
+  /// attribute will be added to Results.
+  void lookupTopLevelDeclsByObjCName(SmallVectorImpl<Decl *> &Results,
+                                     DeclName name);
 
   /// This is a hack for 'main' file parsing and the integrated REPL.
   ///
@@ -692,20 +849,49 @@ public:
   enum class ImportFilterKind {
     /// Include imports declared with `@_exported`.
     Exported = 1 << 0,
-    /// Include "regular" imports with no special annotation.
+    /// Include "regular" imports with an access-level of `public`.
     Default = 1 << 1,
     /// Include imports declared with `@_implementationOnly`.
     ImplementationOnly = 1 << 2,
-    /// Include imports of SPIs declared with `@_spi`.
-    SPIAccessControl = 1 << 3,
+    /// Include imports declared with `package import`.
+    PackageOnly = 1 << 3,
+    /// Include imports marked `internal` or lower. These differs form
+    /// implementation-only imports by stricter type-checking and loading
+    /// policies. At this moment, we can group them under the same category
+    /// as they have the same loading behavior.
+    InternalOrBelow = 1 << 4,
     /// Include imports declared with `@_spiOnly`.
-    SPIOnly = 1 << 4,
+    SPIOnly = 1 << 5,
     /// Include imports shadowed by a cross-import overlay. Unshadowed imports
     /// are included whether or not this flag is specified.
-    ShadowedByCrossImportOverlay = 1 << 5
+    ShadowedByCrossImportOverlay = 1 << 6
   };
   /// \sa getImportedModules
   using ImportFilter = OptionSet<ImportFilterKind>;
+
+  /// Returns an \c ImportFilter with all elements of \c ImportFilterKind.
+  constexpr static ImportFilter getImportFilterAll() {
+    return {ImportFilterKind::Exported,
+            ImportFilterKind::Default,
+            ImportFilterKind::ImplementationOnly,
+            ImportFilterKind::PackageOnly,
+            ImportFilterKind::InternalOrBelow,
+            ImportFilterKind::SPIOnly,
+            ImportFilterKind::ShadowedByCrossImportOverlay};
+  }
+
+  /// Import kinds visible to the module declaring them.
+  ///
+  /// This leaves out \c ShadowedByCrossImportOverlay as even if present in
+  /// the sources it's superseded by the cross-overlay as the local import.
+  constexpr static ImportFilter getImportFilterLocal() {
+    return {ImportFilterKind::Exported,
+            ImportFilterKind::Default,
+            ImportFilterKind::ImplementationOnly,
+            ImportFilterKind::PackageOnly,
+            ImportFilterKind::InternalOrBelow,
+            ImportFilterKind::SPIOnly};
+  }
 
   /// Looks up which modules are imported by this module.
   ///
@@ -809,6 +995,17 @@ public:
   /// string if this is not applicable.
   StringRef getModuleFilename() const;
 
+  /// Get the path to the file defining this module, what we consider the
+  /// source of truth about the module. Usually a swiftinterface file for a
+  /// resilient module, a swiftmodule for a non-resilient module, or the
+  /// modulemap for a clang module. Returns an empty string if not applicable.
+  StringRef getModuleSourceFilename() const;
+
+  /// Get the path to the file loaded by the compiler. Usually the binary
+  /// swiftmodule file or a pcm in the cache. Returns an empty string if not
+  /// applicable.
+  StringRef getModuleLoadedFilename() const;
+
   /// \returns true if this module is the "swift" standard library module.
   bool isStdlibModule() const;
 
@@ -845,6 +1042,10 @@ public:
 
   /// Returns the associated clang module if one exists.
   const clang::Module *findUnderlyingClangModule() const;
+
+  /// Does this module or the underlying clang module defines export_as with
+  /// a value corresponding to the \p other module?
+  bool isExportedAs(const ModuleDecl *other) const;
 
   /// Returns a generator with the components of this module's full,
   /// hierarchical name.
@@ -929,6 +1130,7 @@ public:
   std::string getFullName(bool useRealNameIfAliased = false) const;
 
   bool isSystemModule() const;
+  bool isNonUserModule() const;
   bool isBuiltinModule() const;
   const ModuleDecl *getAsSwiftModule() const;
   const clang::Module *getAsClangModule() const;
@@ -951,6 +1153,10 @@ inline bool DeclContext::isModuleScopeContext() const {
   if (ParentAndKind.getInt() == ASTHierarchy::FileUnit)
     return true;
   return isModuleContext();
+}
+
+inline bool DeclContext::isPackageContext() const {
+  return ParentAndKind.getInt() == ASTHierarchy::Package;
 }
 
 /// Extract the source location from the given module declaration.

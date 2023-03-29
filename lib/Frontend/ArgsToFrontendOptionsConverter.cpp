@@ -85,6 +85,9 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.FrontendParseableOutput |= Args.hasArg(OPT_frontend_parseable_output);
   Opts.ExplicitInterfaceBuild |= Args.hasArg(OPT_explicit_interface_module_build);
 
+  Opts.EmitClangHeaderWithNonModularIncludes |=
+      Args.hasArg(OPT_emit_clang_header_nonmodular_includes);
+
   // FIXME: Remove this flag
   Opts.EnableLibraryEvolution |= Args.hasArg(OPT_enable_resilience);
 
@@ -118,6 +121,10 @@ bool ArgsToFrontendOptionsConverter::convert(
       Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
                      A->getAsString(Args), A->getValue());
     }
+  }
+
+  for (auto A : Args.getAllArgValues(options::OPT_allowable_client)) {
+    Opts.AllowableClients.insert(StringRef(A).str());
   }
 
   Opts.DisableImplicitModules |= Args.hasArg(OPT_disable_implicit_swift_modules);
@@ -190,7 +197,7 @@ bool ArgsToFrontendOptionsConverter::convert(
     assert(!inputsAndOutputs->hasInputs());
   } else {
     HaveNewInputsAndOutputs = true;
-    Opts.InputsAndOutputs = std::move(inputsAndOutputs).getValue();
+    Opts.InputsAndOutputs = std::move(inputsAndOutputs).value();
     if (Opts.AllowModuleWithCompilerErrors)
       Opts.InputsAndOutputs.setShouldRecoverMissingInputs();
   }
@@ -249,11 +256,6 @@ bool ArgsToFrontendOptionsConverter::convert(
       Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_skipping_function_bodies);
       return true;
     }
-
-    if (Args.hasArg(OPT_check_api_availability_only)) {
-      Diags.diagnose(SourceLoc(), diag::cannot_emit_ir_checking_api_availability_only);
-      return true;
-    }
   }
 
   if (const Arg *A = Args.getLastArg(OPT_module_abi_name))
@@ -261,6 +263,14 @@ bool ArgsToFrontendOptionsConverter::convert(
 
   if (const Arg *A = Args.getLastArg(OPT_module_link_name))
     Opts.ModuleLinkName = A->getValue();
+
+  if (const Arg *A = Args.getLastArg(OPT_export_as)) {
+    auto exportAs = A->getValue();
+    if (!Lexer::isIdentifier(exportAs))
+      Diags.diagnose(SourceLoc(), diag::error_bad_export_as_name, exportAs);
+    else
+      Opts.ExportAsName = exportAs;
+  }
 
   // This must be called after computing module name, module abi name,
   // and module link name. If computing module aliases is unsuccessful,
@@ -284,8 +294,33 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.EnableIncrementalDependencyVerifier |= Args.hasArg(OPT_verify_incremental_dependencies);
   Opts.UseSharedResourceFolder = !Args.hasArg(OPT_use_static_resource_dir);
   Opts.DisableBuildingInterface = Args.hasArg(OPT_disable_building_interface);
-  Opts.ExposePublicDeclsInClangHeader =
-      Args.hasArg(OPT_clang_header_expose_public_decls);
+  if (const Arg *A = Args.getLastArg(options::OPT_clang_header_expose_decls)) {
+    Opts.ClangHeaderExposedDecls =
+        llvm::StringSwitch<
+            llvm::Optional<FrontendOptions::ClangHeaderExposeBehavior>>(
+            A->getValue())
+            .Case("all-public",
+                  FrontendOptions::ClangHeaderExposeBehavior::AllPublic)
+            .Case("has-expose-attr",
+                  FrontendOptions::ClangHeaderExposeBehavior::HasExposeAttr)
+            .Case("has-expose-attr-or-stdlib",
+                  FrontendOptions::ClangHeaderExposeBehavior::
+                      HasExposeAttrOrImplicitDeps)
+            .Default(llvm::None);
+  }
+  for (const auto &arg :
+       Args.getAllArgValues(options::OPT_clang_header_expose_module)) {
+    auto splitArg = StringRef(arg).split('=');
+    if (splitArg.second.empty()) {
+      continue;
+    }
+    Opts.clangHeaderExposedImports.push_back(
+        {splitArg.first.str(), splitArg.second.str()});
+  }
+
+  Opts.StrictImplicitModuleContext = Args.hasArg(OPT_strict_implicit_module_context,
+                                                 OPT_no_strict_implicit_module_context,
+                                                 false);
 
   computeImportObjCHeaderOptions();
   computeImplicitImportModuleNames(OPT_import_module, /*isTestable=*/false);
@@ -477,8 +512,6 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::DumpParse;
   if (Opt.matches(OPT_dump_ast))
     return FrontendOptions::ActionType::DumpAST;
-  if (Opt.matches(OPT_emit_syntax))
-    return FrontendOptions::ActionType::EmitSyntax;
   if (Opt.matches(OPT_merge_modules))
     return FrontendOptions::ActionType::MergeModules;
   if (Opt.matches(OPT_dump_scope_maps))
@@ -748,14 +781,11 @@ bool ModuleAliasesConverter::computeModuleAliases(std::vector<std::string> args,
       if (!allowModuleName) {
         if (value == options.ModuleName ||
             value == options.ModuleABIName ||
-            value == options.ModuleLinkName) {
+            value == options.ModuleLinkName ||
+            value == STDLIB_NAME) {
           diags.diagnose(SourceLoc(), diag::error_module_alias_forbidden_name, value);
           return false;
         }
-      }
-      if (value == STDLIB_NAME) {
-        diags.diagnose(SourceLoc(), diag::error_module_alias_forbidden_name, value);
-        return false;
       }
       if (!Lexer::isIdentifier(value)) {
         diags.diagnose(SourceLoc(), diag::error_bad_module_name, value, false);

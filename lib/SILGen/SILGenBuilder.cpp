@@ -20,6 +20,7 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/SIL/DynamicCasts.h"
+#include "swift/SIL/SILInstruction.h"
 
 using namespace swift;
 using namespace Lowering;
@@ -92,7 +93,8 @@ ManagedValue SILGenBuilder::createConvertEscapeToNoEscape(
   SILValue fnValue = fn.getValue();
   SILValue result =
       createConvertEscapeToNoEscape(loc, fnValue, resultTy, false);
-  return ManagedValue::forTrivialObjectRValue(result);
+  
+  return SGF.emitManagedRValueWithCleanup(result);
 }
 
 ManagedValue SILGenBuilder::createInitExistentialValue(
@@ -296,6 +298,18 @@ ManagedValue SILGenBuilder::createFormalAccessLoadBorrow(SILLocation loc,
                                                                   baseValue, i);
 }
 
+ManagedValue SILGenBuilder::createFormalAccessLoadTake(SILLocation loc,
+                                                       ManagedValue base) {
+  if (SGF.getTypeLowering(base.getType()).isTrivial()) {
+    auto *i = createLoad(loc, base.getValue(), LoadOwnershipQualifier::Trivial);
+    return ManagedValue::forUnmanaged(i);
+  }
+
+  SILValue baseValue = base.getValue();
+  auto i = emitLoadValueOperation(loc, baseValue, LoadOwnershipQualifier::Take);
+  return SGF.emitFormalAccessManagedRValueWithCleanup(loc, i);
+}
+
 ManagedValue
 SILGenBuilder::createFormalAccessCopyValue(SILLocation loc,
                                            ManagedValue originalValue) {
@@ -436,17 +450,22 @@ ManagedValue SILGenBuilder::createLoadCopy(SILLocation loc, ManagedValue v,
 static ManagedValue createInputFunctionArgument(
     SILGenBuilder &B, SILType type, SILLocation loc, ValueDecl *decl = nullptr,
     bool isNoImplicitCopy = false,
-    LifetimeAnnotation lifetimeAnnotation = LifetimeAnnotation::None) {
+    LifetimeAnnotation lifetimeAnnotation = LifetimeAnnotation::None,
+    bool isClosureCapture = false,
+    bool isFormalParameterPack = false) {
   auto &SGF = B.getSILGenFunction();
   SILFunction &F = B.getFunction();
-  assert((F.isBare() || decl) &&
+  assert((F.isBare() || isFormalParameterPack || decl) &&
          "Function arguments of non-bare functions must have a decl");
   auto *arg = F.begin()->createFunctionArgument(type, decl);
   arg->setNoImplicitCopy(isNoImplicitCopy);
+  arg->setClosureCapture(isClosureCapture);
   arg->setLifetimeAnnotation(lifetimeAnnotation);
+  arg->setFormalParameterPack(isFormalParameterPack);
   switch (arg->getArgumentConvention()) {
   case SILArgumentConvention::Indirect_In_Guaranteed:
   case SILArgumentConvention::Direct_Guaranteed:
+  case SILArgumentConvention::Pack_Guaranteed:
     // Guaranteed parameters are passed at +0.
     return ManagedValue::forUnmanaged(arg);
   case SILArgumentConvention::Direct_Unowned:
@@ -460,6 +479,9 @@ static ManagedValue createInputFunctionArgument(
   case SILArgumentConvention::Direct_Owned:
     return SGF.emitManagedRValueWithCleanup(arg);
 
+  case SILArgumentConvention::Pack_Owned:
+    return SGF.emitManagedPackWithCleanup(arg);
+
   case SILArgumentConvention::Indirect_In:
     if (SGF.silConv.useLoweredAddresses())
       return SGF.emitManagedBufferWithCleanup(arg);
@@ -467,11 +489,11 @@ static ManagedValue createInputFunctionArgument(
 
   case SILArgumentConvention::Indirect_Inout:
   case SILArgumentConvention::Indirect_InoutAliasable:
+  case SILArgumentConvention::Pack_Inout:
     // An inout parameter is +0 and guaranteed, but represents an lvalue.
     return ManagedValue::forLValue(arg);
-  case SILArgumentConvention::Indirect_In_Constant:
-    llvm_unreachable("Convention not produced by SILGen");
   case SILArgumentConvention::Indirect_Out:
+  case SILArgumentConvention::Pack_Out:
     llvm_unreachable("unsupported convention for API");
   }
   llvm_unreachable("bad parameter convention");
@@ -479,15 +501,18 @@ static ManagedValue createInputFunctionArgument(
 
 ManagedValue SILGenBuilder::createInputFunctionArgument(
     SILType type, ValueDecl *decl, bool isNoImplicitCopy,
-    LifetimeAnnotation lifetimeAnnotation) {
+    LifetimeAnnotation lifetimeAnnotation, bool isClosureCapture,
+    bool isFormalParameterPack) {
   return ::createInputFunctionArgument(*this, type, SILLocation(decl), decl,
-                                       isNoImplicitCopy, lifetimeAnnotation);
+                                       isNoImplicitCopy, lifetimeAnnotation,
+                                       isClosureCapture,
+                                       isFormalParameterPack);
 }
 
 ManagedValue
 SILGenBuilder::createInputFunctionArgument(SILType type,
                                            Optional<SILLocation> inputLoc) {
-  assert(inputLoc.hasValue() && "This optional is only for overload resolution "
+  assert(inputLoc.has_value() && "This optional is only for overload resolution "
                                 "purposes! Do not pass in None here!");
   return ::createInputFunctionArgument(*this, type, *inputLoc);
 }
@@ -876,6 +901,26 @@ void SILGenBuilder::emitDestructureValueOperation(
       });
 }
 
+void SILGenBuilder::emitDestructureAddressOperation(
+    SILLocation loc, ManagedValue value,
+    llvm::function_ref<void(unsigned, ManagedValue)> func) {
+  CleanupCloner cloner(*this, value);
+  // NOTE: We can not directly use SILBuilder::emitDestructureAddressOperation()
+  // here since we need to create all of our cleanups before invoking \p
+  // func. This is necessary since our func may want to emit conditional code
+  // with an early exit, emitting unused cleanups from the current scope via the
+  // function emitBranchAndCleanups(). If we have not yet created those
+  // cleanups, we will introduce a leak along that path.
+  SmallVector<ManagedValue, 8> destructuredAddresses;
+  emitDestructureAddressOperation(
+      loc, value.forward(SGF), [&](unsigned index, SILValue subValue) {
+        destructuredAddresses.push_back(cloner.clone(subValue));
+      });
+  for (auto p : llvm::enumerate(destructuredAddresses)) {
+    func(p.index(), p.value());
+  }
+}
+
 ManagedValue SILGenBuilder::createProjectBox(SILLocation loc, ManagedValue mv,
                                              unsigned index) {
   auto *pbi = createProjectBox(loc, mv.getValue(), index);
@@ -953,4 +998,20 @@ SILGenBuilder::createMarkMustCheckInst(SILLocation loc, ManagedValue value,
   auto *mdi = SILBuilder::createMarkMustCheckInst(
       loc, value.forward(getSILGenFunction()), kind);
   return cloner.clone(mdi);
+}
+
+ManagedValue SILGenBuilder::emitCopyValueOperation(SILLocation loc,
+                                                   ManagedValue value) {
+  auto cvi = SILBuilder::emitCopyValueOperation(loc, value.getValue());
+  // Trivial type.
+  if (cvi == value.getValue())
+    return value;
+  return SGF.emitManagedRValueWithCleanup(cvi);
+}
+
+void SILGenBuilder::emitCopyAddrOperation(SILLocation loc, SILValue srcAddr,
+                                          SILValue destAddr, IsTake_t isTake,
+                                          IsInitialization_t isInitialize) {
+  auto &lowering = getTypeLowering(srcAddr->getType());
+  lowering.emitCopyInto(*this, loc, srcAddr, destAddr, isTake, isInitialize);
 }

@@ -49,6 +49,10 @@ void swift::simple_display(
   simple_display(out, ext);
 }
 
+void swift::simple_display(llvm::raw_ostream &out, ASTContext *ctx) {
+  out << "(AST Context)";
+}
+
 void swift::simple_display(llvm::raw_ostream &out,
                            const TypeResolutionStage &value) {
   switch (value) {
@@ -946,8 +950,10 @@ Optional<Type> ResultTypeRequest::getCachedResult() const {
   auto *const decl = std::get<0>(getStorage());
   if (const auto *const funcDecl = dyn_cast<FuncDecl>(decl)) {
     type = funcDecl->FnRetType.getType();
+  } else if (auto subscript = dyn_cast<SubscriptDecl>(decl)) {
+    type = subscript->ElementTy.getType();
   } else {
-    type = cast<SubscriptDecl>(decl)->ElementTy.getType();
+    type = cast<MacroDecl>(decl)->resultType.getType();
   }
 
   if (type.isNull())
@@ -960,8 +966,10 @@ void ResultTypeRequest::cacheResult(Type type) const {
   auto *const decl = std::get<0>(getStorage());
   if (auto *const funcDecl = dyn_cast<FuncDecl>(decl)) {
     funcDecl->FnRetType.setType(type);
+  } else if (auto subscript = dyn_cast<SubscriptDecl>(decl)) {
+    subscript->ElementTy.setType(type);
   } else {
-    cast<SubscriptDecl>(decl)->ElementTy.setType(type);
+    cast<MacroDecl>(decl)->resultType.setType(type);
   }
 }
 
@@ -1001,6 +1009,25 @@ Optional<NamedPattern *> NamingPatternRequest::getCachedResult() const {
 void NamingPatternRequest::cacheResult(NamedPattern *value) const {
   auto *VD = std::get<0>(getStorage());
   VD->NamingPattern = value;
+}
+
+//----------------------------------------------------------------------------//
+// ExprPatternMatchRequest caching.
+//----------------------------------------------------------------------------//
+
+Optional<ExprPatternMatchResult>
+ExprPatternMatchRequest::getCachedResult() const {
+  auto *EP = std::get<0>(getStorage());
+  if (!EP->MatchVar)
+    return None;
+
+  return ExprPatternMatchResult(EP->MatchVar, EP->MatchExpr);
+}
+
+void ExprPatternMatchRequest::cacheResult(ExprPatternMatchResult result) const {
+  auto *EP = std::get<0>(getStorage());
+  EP->MatchVar = result.getMatchVar();
+  EP->MatchExpr = result.getMatchExpr();
 }
 
 //----------------------------------------------------------------------------//
@@ -1316,7 +1343,7 @@ void CheckRedeclarationRequest::writeDependencySink(
     return;
 
   if (currentDC->isTypeContext()) {
-    if (auto nominal = currentDC->getSelfNominalTypeDecl()) {
+    if (auto nominal = std::get<1>(getStorage())) {
       tracker.addUsedMember(nominal, current->getBaseName());
     }
   } else {
@@ -1531,14 +1558,15 @@ void swift::simple_display(llvm::raw_ostream &out, CustomAttrTypeKind value) {
     out << "property-wrapper";
     return;
 
-  case CustomAttrTypeKind::TypeWrapper:
-    out << "type-wrapper";
-    return;
-
   case CustomAttrTypeKind::GlobalActor:
     out << "global-actor";
     return;
+
+  case CustomAttrTypeKind::RuntimeMetadata:
+    out << "runtime-metadata";
+    return;
   }
+
   llvm_unreachable("bad kind");
 }
 
@@ -1553,6 +1581,11 @@ Optional<Type> CustomAttrTypeRequest::getCachedResult() const {
 void CustomAttrTypeRequest::cacheResult(Type value) const {
   auto *attr = std::get<0>(getStorage());
   attr->setType(value);
+}
+
+SourceLoc MacroDefinitionRequest::getNearestLoc() const {
+  auto &desc = std::get<0>(getStorage());
+  return desc->getLoc();
 }
 
 bool ActorIsolation::requiresSubstitution() const {
@@ -1638,4 +1671,124 @@ void swift::simple_display(
   simple_display(out, initKindAndExpr.initKind);
   out << " ";
   simple_display(out, initKindAndExpr.initExpr);
+}
+
+//----------------------------------------------------------------------------//
+// ResolveMacroRequest computation.
+//----------------------------------------------------------------------------//
+
+DeclNameRef UnresolvedMacroReference::getMacroName() const {
+  if (auto *med = pointer.dyn_cast<MacroExpansionDecl *>())
+    return med->getMacroName();
+  if (auto *mee = pointer.dyn_cast<MacroExpansionExpr *>())
+    return mee->getMacroName();
+  if (auto *attr = pointer.dyn_cast<CustomAttr *>()) {
+    auto *identTypeRepr = dyn_cast_or_null<IdentTypeRepr>(attr->getTypeRepr());
+    if (!identTypeRepr)
+      return DeclNameRef();
+    return identTypeRepr->getNameRef();
+  }
+  llvm_unreachable("Unhandled case");
+}
+
+SourceLoc UnresolvedMacroReference::getSigilLoc() const {
+  if (auto *med = pointer.dyn_cast<MacroExpansionDecl *>())
+    return med->getPoundLoc();
+  if (auto *mee = pointer.dyn_cast<MacroExpansionExpr *>())
+    return mee->getLoc();
+  if (auto *attr = pointer.dyn_cast<CustomAttr *>())
+    return attr->getRangeWithAt().Start;
+  llvm_unreachable("Unhandled case");
+}
+
+DeclNameLoc UnresolvedMacroReference::getMacroNameLoc() const {
+  if (auto *med = pointer.dyn_cast<MacroExpansionDecl *>())
+    return med->getMacroNameLoc();
+  if (auto *mee = pointer.dyn_cast<MacroExpansionExpr *>())
+    return mee->getMacroNameLoc();
+  if (auto *attr = pointer.dyn_cast<CustomAttr *>()) {
+    auto *identTypeRepr = dyn_cast_or_null<IdentTypeRepr>(attr->getTypeRepr());
+    if (!identTypeRepr)
+      return DeclNameLoc();
+    return identTypeRepr->getNameLoc();
+  }
+  llvm_unreachable("Unhandled case");
+}
+
+SourceRange UnresolvedMacroReference::getGenericArgsRange() const {
+  if (auto *med = pointer.dyn_cast<MacroExpansionDecl *>())
+    return med->getGenericArgsRange();
+  if (auto *mee = pointer.dyn_cast<MacroExpansionExpr *>())
+    return mee->getGenericArgsRange();
+
+  if (auto *attr = pointer.dyn_cast<CustomAttr *>()) {
+    auto *typeRepr = attr->getTypeRepr();
+    auto *genericTypeRepr = dyn_cast_or_null<GenericIdentTypeRepr>(typeRepr);
+    if (!genericTypeRepr)
+      return SourceRange();
+
+    return genericTypeRepr->getAngleBrackets();
+  }
+
+  llvm_unreachable("Unhandled case");
+}
+
+ArrayRef<TypeRepr *> UnresolvedMacroReference::getGenericArgs() const {
+  if (auto *med = pointer.dyn_cast<MacroExpansionDecl *>())
+    return med->getGenericArgs();
+  if (auto *mee = pointer.dyn_cast<MacroExpansionExpr *>())
+    return mee->getGenericArgs();
+
+  if (auto *attr = pointer.dyn_cast<CustomAttr *>()) {
+    auto *typeRepr = attr->getTypeRepr();
+    auto *genericTypeRepr = dyn_cast_or_null<GenericIdentTypeRepr>(typeRepr);
+    if (!genericTypeRepr)
+      return {};
+
+    return genericTypeRepr->getGenericArgs();
+  }
+
+  llvm_unreachable("Unhandled case");
+}
+
+ArgumentList *UnresolvedMacroReference::getArgs() const {
+  if (auto *med = pointer.dyn_cast<MacroExpansionDecl *>())
+    return med->getArgs();
+  if (auto *mee = pointer.dyn_cast<MacroExpansionExpr *>())
+    return mee->getArgs();
+  if (auto *attr = pointer.dyn_cast<CustomAttr *>())
+    return attr->getArgs();
+  llvm_unreachable("Unhandled case");
+}
+
+MacroRoles UnresolvedMacroReference::getMacroRoles() const {
+  if (pointer.is<MacroExpansionExpr *>() || pointer.is<MacroExpansionDecl *>())
+    return getFreestandingMacroRoles();
+
+  if (pointer.is<CustomAttr *>())
+    return getAttachedMacroRoles();
+
+  llvm_unreachable("Unsupported macro reference");
+}
+
+void swift::simple_display(llvm::raw_ostream &out,
+                           const UnresolvedMacroReference &ref) {
+  if (ref.getDecl())
+    out << "macro-expansion-decl";
+  else if (ref.getExpr())
+    out << "macro-expansion-expr";
+  else if (ref.getAttr())
+    out << "custom-attr";
+}
+
+void swift::simple_display(llvm::raw_ostream &out, MacroRoles roles) {
+  out << "macro-roles";
+}
+
+bool swift::operator==(MacroRoles lhs, MacroRoles rhs) {
+  return lhs.containsOnly(rhs);
+}
+
+llvm::hash_code swift::hash_value(MacroRoles roles) {
+  return roles.toRaw();
 }

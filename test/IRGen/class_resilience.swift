@@ -21,8 +21,8 @@
 // CHECK: @"$s16class_resilience27ClassWithResilientThenEmptyC9resilient0H7_struct0E3IntVvpWvd" = hidden global [[INT]] 0,
 
 // CHECK: @"$s16class_resilience26ClassWithResilientPropertyCMo" = {{(protected )?}}{{(dllexport )?}}constant [[BOUNDS]]
-// CHECK-32-SAME: { [[INT]] [[#MDSIZE32]], i32 2, i32 [[#MDWORDS + 6 + 4]] }
-// CHECK-64-SAME: { [[INT]] [[#MDSIZE64]], i32 2, i32 [[#MDWORDS + 3 + 4]] }
+// CHECK-32-SAME: { [[INT]] [[#MDSIZE32]], i32 3, i32 [[#MDWORDS + 6 + 4]] }
+// CHECK-64-SAME: { [[INT]] [[#MDSIZE64]], i32 3, i32 [[#MDWORDS + 3 + 4]] }
 
 // CHECK: @"$s16class_resilience28ClassWithMyResilientPropertyC1rAA0eF6StructVvpWvd" = hidden constant [[INT]] {{8|16}}
 // CHECK: @"$s16class_resilience28ClassWithMyResilientPropertyC5colors5Int32VvpWvd" = hidden constant [[INT]] {{12|20}}
@@ -105,20 +105,20 @@
 // CHECK-native-SAME: i32 0
 
 // CHECK: @"$s16class_resilience17MyResilientParentCMo" = {{(protected )?}}{{(dllexport )?}}constant [[BOUNDS]]
-// CHECK-32-SAME: { [[INT]] [[#MDSIZE32]], i32 2, i32 [[#MDWORDS + 6 + 2]] }
-// CHECK-64-SAME: { [[INT]] [[#MDSIZE64]], i32 2, i32 [[#MDWORDS + 3 + 2]] }
+// CHECK-32-SAME: { [[INT]] [[#MDSIZE32]], i32 3, i32 [[#MDWORDS + 6 + 2]] }
+// CHECK-64-SAME: { [[INT]] [[#MDSIZE64]], i32 3, i32 [[#MDWORDS + 3 + 2]] }
 
 // CHECK: @"$s16class_resilience16MyResilientChildCMo" = {{(protected )?}}{{(dllexport )?}}constant [[BOUNDS]]
-// CHECK-32-SAME: { [[INT]] [[#MDSIZE32 + WORDSIZE + WORDSIZE]], i32 2, i32 [[#MDWORDS + 6 + 3]] }
-// CHECK-64-SAME: { [[INT]] [[#MDSIZE64 + WORDSIZE + WORDSIZE]], i32 2, i32 [[#MDWORDS + 3 + 3]] }
+// CHECK-32-SAME: { [[INT]] [[#MDSIZE32 + WORDSIZE + WORDSIZE]], i32 3, i32 [[#MDWORDS + 6 + 3]] }
+// CHECK-64-SAME: { [[INT]] [[#MDSIZE64 + WORDSIZE + WORDSIZE]], i32 3, i32 [[#MDWORDS + 3 + 3]] }
 
 // CHECK: @"$s16class_resilience24MyResilientGenericParentCMo" = {{(protected )?}}{{(dllexport )?}}constant [[BOUNDS]]
-// CHECK-32-SAME: { [[INT]] [[#MDSIZE32]], i32 2, i32 [[#MDWORDS + 6 + 3]] }
-// CHECK-64-SAME: { [[INT]] [[#MDSIZE64]], i32 2, i32 [[#MDWORDS + 3 + 3]] }
+// CHECK-32-SAME: { [[INT]] [[#MDSIZE32]], i32 3, i32 [[#MDWORDS + 6 + 3]] }
+// CHECK-64-SAME: { [[INT]] [[#MDSIZE64]], i32 3, i32 [[#MDWORDS + 3 + 3]] }
 
 // CHECK: @"$s16class_resilience24MyResilientConcreteChildCMo" = {{(protected )?}}{{(dllexport )?}}constant [[BOUNDS]]
-// CHECK-32-SAME: { [[INT]] [[#MDSIZE32 + WORDSIZE + WORDSIZE + WORDSIZE]], i32 2, i32 [[#MDWORDS + 6 + 5]] }
-// CHECK-64-SAME: { [[INT]] [[#MDSIZE64 + WORDSIZE + WORDSIZE + WORDSIZE]], i32 2, i32 [[#MDWORDS + 3 + 5]] }
+// CHECK-32-SAME: { [[INT]] [[#MDSIZE32 + WORDSIZE + WORDSIZE + WORDSIZE]], i32 3, i32 [[#MDWORDS + 6 + 5]] }
+// CHECK-64-SAME: { [[INT]] [[#MDSIZE64 + WORDSIZE + WORDSIZE + WORDSIZE]], i32 3, i32 [[#MDWORDS + 3 + 5]] }
 
 // CHECK: @"$s16class_resilience27ClassWithEmptyThenResilientC5emptyAA0E0VvpWvd" = hidden constant [[INT]] 0,
 // CHECK: @"$s16class_resilience27ClassWithResilientThenEmptyC5emptyAA0G0VvpWvd" = hidden constant [[INT]] 0,
@@ -336,7 +336,7 @@ public class ClassWithResilientThenEmpty {
 
 // CHECK:      load %swift.type*
 
-// CHECK:      [[ADDR:%.*]] = getelementptr inbounds %T16class_resilience21ResilientGenericChildC, %T16class_resilience21ResilientGenericChildC* %0, i32 0, i32 0, i32 0
+// CHECK:      [[ADDR:%.*]] = bitcast %T16class_resilience21ResilientGenericChildC* %0 to %swift.type**
 // CHECK-NEXT: [[ISA:%.*]] = load %swift.type*, %swift.type** [[ADDR]]
 // CHECK-NEXT: [[BASE:%.*]] = load [[INT]], [[INT]]* getelementptr inbounds ([[BOUNDS]], [[BOUNDS]]* @"$s16class_resilience21ResilientGenericChildCMo", i32 0, i32 0)
 // CHECK-NEXT: [[METADATA_OFFSET:%.*]] = add [[INT]] [[BASE]], {{4|8}}
@@ -557,7 +557,7 @@ public class ClassWithResilientThenEmpty {
 // ResilientChild.field getter dispatch thunk
 
 // CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} swiftcc i32 @"$s16class_resilience14ResilientChildC5fields5Int32VvgTj"(%T16class_resilience14ResilientChildC* swiftself %0)
-// CHECK:      [[ISA_ADDR:%.*]] = getelementptr inbounds %T16class_resilience14ResilientChildC, %T16class_resilience14ResilientChildC* %0, i32 0, i32 0, i32 0
+// CHECK:      [[ISA_ADDR:%.*]] = bitcast %T16class_resilience14ResilientChildC* %0 to %swift.type**
 // CHECK-NEXT: [[ISA:%.*]] = load %swift.type*, %swift.type** [[ISA_ADDR]]
 // CHECK-NEXT: [[BASE_ADDR:%.*]] = load [[INT]], [[INT]]* getelementptr inbounds ([[BOUNDS]], [[BOUNDS]]* @"$s16class_resilience14ResilientChildCMo", i32 0, i32 0)
 // CHECK-NEXT: [[BASE:%.*]] = add [[INT]] [[BASE_ADDR]], {{4|8}}
@@ -573,7 +573,7 @@ public class ClassWithResilientThenEmpty {
 // ResilientChild.field setter dispatch thunk
 
 // CHECK-LABEL: define{{( dllexport)?}}{{( protected)?}} swiftcc void @"$s16class_resilience14ResilientChildC5fields5Int32VvsTj"(i32 %0, %T16class_resilience14ResilientChildC* swiftself %1)
-// CHECK:      [[ISA_ADDR:%.*]] = getelementptr inbounds %T16class_resilience14ResilientChildC, %T16class_resilience14ResilientChildC* %1, i32 0, i32 0, i32 0
+// CHECK:      [[ISA_ADDR:%.*]] = bitcast %T16class_resilience14ResilientChildC* %1 to %swift.type**
 // CHECK-NEXT: [[ISA:%.*]] = load %swift.type*, %swift.type** [[ISA_ADDR]]
 // CHECK-NEXT: [[BASE:%.*]] = load [[INT]], [[INT]]* getelementptr inbounds ([[BOUNDS]], [[BOUNDS]]* @"$s16class_resilience14ResilientChildCMo", i32 0, i32 0)
 // CHECK-NEXT: [[METADATA_OFFSET:%.*]] = add [[INT]] [[BASE]], {{8|16}}

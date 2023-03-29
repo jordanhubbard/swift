@@ -106,6 +106,16 @@ extension SmallProjectionWalkingPath {
   }
 }
 
+/// A walking path which matches everything.
+///
+/// Useful for walkers which don't care about the path and unconditionally walk to all defs/uses.
+struct UnusedWalkingPath : WalkingPath {
+  func merge(with: Self) -> Self { self }
+  func pop(kind: FieldKind) -> (index: Int, path: Self)? { nil }
+  func popIfMatches(_ kind: FieldKind, index: Int?) -> Self? { self }
+  func push(_ kind: FieldKind, index: Int) -> Self { self }
+}
+
 /// Caches the state of a walk.
 ///
 /// A client must provide this cache in a `walkUpCache` or `walkDownCache` property.
@@ -331,7 +341,7 @@ extension ValueDefUseWalker {
         return unmatchedPath(value: operand, path: path)
       }
     case is InitExistentialRefInst, is OpenExistentialRefInst,
-      is BeginBorrowInst, is CopyValueInst,
+      is BeginBorrowInst, is CopyValueInst, is MoveValueInst,
       is UpcastInst, is UncheckedRefCastInst, is EndCOWMutationInst,
       is RefToBridgeObjectInst, is BridgeObjectToRefInst, is MarkMustCheckInst:
       return walkDownUses(ofValue: (instruction as! SingleValueInstruction), path: path)
@@ -349,11 +359,14 @@ extension ValueDefUseWalker {
         return .continueWalk
       }
     case let cbr as CondBranchInst:
-      let val = cbr.getArgument(for: operand)
-      if let path = walkDownCache.needWalk(for: val, path: path) {
-        return walkDownUses(ofValue: val, path: path)
+      if let val = cbr.getArgument(for: operand) {
+        if let path = walkDownCache.needWalk(for: val, path: path) {
+          return walkDownUses(ofValue: val, path: path)
+        } else {
+          return .continueWalk
+        }
       } else {
-        return .continueWalk
+        return leafUse(value: operand, path: path)
       }
     case let se as SwitchEnumInst:
       if let (caseIdx, path) = path.pop(kind: .enumCase),
@@ -361,7 +374,7 @@ extension ValueDefUseWalker {
          let payload = succBlock.arguments.first {
         return walkDownUses(ofValue: payload, path: path)
       } else if path.popIfMatches(.anyValueFields, index: nil) != nil {
-        for succBlock in se.block.successors {
+        for succBlock in se.parentBlock.successors {
           if let payload = succBlock.arguments.first,
              walkDownUses(ofValue: payload, path: path) == .abortWalk {
             return .abortWalk
@@ -372,7 +385,7 @@ extension ValueDefUseWalker {
         return unmatchedPath(value: operand, path: path)
       }
     case let bcm as BeginCOWMutationInst:
-      return walkDownUses(ofValue: bcm.bufferResult, path: path)
+      return walkDownUses(ofValue: bcm.instanceResult, path: path)
     default:
       return leafUse(value: operand, path: path)
     }
@@ -556,6 +569,11 @@ extension ValueUseDefWalker {
     switch def {
     case let str as StructInst:
       if let (index, path) = path.pop(kind: .structField) {
+        if index >= str.operands.count {
+          // This can happen if there is a type mismatch, e.g. two different concrete types of an existential
+          // are visited for the same path.
+          return unmatchedPath(value: str, path: path)
+        }
         return walkUp(value: str.operands[index].value, path: path)
       } else if path.popIfMatches(.anyValueFields, index: nil) != nil {
         return walkUpAllOperands(of: str, path: path)
@@ -564,6 +582,11 @@ extension ValueUseDefWalker {
       }
     case let t as TupleInst:
       if let (index, path) = path.pop(kind: .tupleField) {
+        if index >= t.operands.count {
+          // This can happen if there is a type mismatch, e.g. two different concrete types of an existential
+          // are visited for the same path.
+          return unmatchedPath(value: t, path: path)
+        }
         return walkUp(value: t.operands[index].value, path: path)
       } else if path.popIfMatches(.anyValueFields, index: nil) != nil {
         return walkUpAllOperands(of: t, path: path)
@@ -572,30 +595,30 @@ extension ValueUseDefWalker {
       }
     case let e as EnumInst:
       if let path = path.popIfMatches(.enumCase, index: e.caseIndex),
-         let operand = e.operand {
-        return walkUp(value: operand, path: path)
+         let payload = e.payload {
+        return walkUp(value: payload, path: path)
       } else {
         return unmatchedPath(value: e, path: path)
       }
     case let se as StructExtractInst:
-      return walkUp(value: se.operand, path: path.push(.structField, index: se.fieldIndex))
+      return walkUp(value: se.struct, path: path.push(.structField, index: se.fieldIndex))
     case let te as TupleExtractInst:
-      return walkUp(value: te.operand, path: path.push(.tupleField, index: te.fieldIndex))
+      return walkUp(value: te.tuple, path: path.push(.tupleField, index: te.fieldIndex))
     case let ued as UncheckedEnumDataInst:
-      return walkUp(value: ued.operand, path: path.push(.enumCase, index: ued.caseIndex))
+      return walkUp(value: ued.enum, path: path.push(.enumCase, index: ued.caseIndex))
     case let mvr as MultipleValueInstructionResult:
-      let instruction = mvr.instruction
+      let instruction = mvr.parentInstruction
       if let ds = instruction as? DestructureStructInst {
-        return walkUp(value: ds.operand, path: path.push(.structField, index: mvr.index))
+        return walkUp(value: ds.struct, path: path.push(.structField, index: mvr.index))
       } else if let dt = instruction as? DestructureTupleInst {
-        return walkUp(value: dt.operand, path: path.push(.tupleField, index: mvr.index))
+        return walkUp(value: dt.tuple, path: path.push(.tupleField, index: mvr.index))
       } else if let bcm = instruction as? BeginCOWMutationInst {
-        return walkUp(value: bcm.operand, path: path)
+        return walkUp(value: bcm.instance, path: path)
       } else {
         return rootDef(value: mvr, path: path)
       }
     case is InitExistentialRefInst, is OpenExistentialRefInst,
-      is BeginBorrowInst, is CopyValueInst,
+      is BeginBorrowInst, is CopyValueInst, is MoveValueInst,
       is UpcastInst, is UncheckedRefCastInst, is EndCOWMutationInst,
       is RefToBridgeObjectInst, is BridgeObjectToRefInst, is MarkMustCheckInst:
       return walkUp(value: (def as! Instruction).operands[0].value, path: path)
@@ -612,7 +635,7 @@ extension ValueUseDefWalker {
         return .continueWalk
       }
       
-      let block = arg.block
+      let block = arg.parentBlock
       if let pred = block.singlePredecessor,
          let se = pred.terminator as? SwitchEnumInst,
          let caseIdx = se.getUniqueCase(forSuccessor: block) {
@@ -676,11 +699,11 @@ extension AddressUseDefWalker {
   mutating func walkUpDefault(address def: Value, path: Path) -> WalkResult {
     switch def {
     case let sea as StructElementAddrInst:
-      return walkUp(address: sea.operand, path: path.push(.structField, index: sea.fieldIndex))
+      return walkUp(address: sea.struct, path: path.push(.structField, index: sea.fieldIndex))
     case let tea as TupleElementAddrInst:
-      return walkUp(address: tea.operand, path: path.push(.tupleField, index: tea.fieldIndex))
+      return walkUp(address: tea.tuple, path: path.push(.tupleField, index: tea.fieldIndex))
     case is InitEnumDataAddrInst, is UncheckedTakeEnumDataAddrInst:
-      return walkUp(address: (def as! UnaryInstruction).operand,
+      return walkUp(address: (def as! UnaryInstruction).operand.value,
                     path: path.push(.enumCase, index: (def as! EnumInstruction).caseIndex))
     case is InitExistentialAddrInst, is OpenExistentialAddrInst, is BeginAccessInst, is IndexAddrInst,
          is MarkMustCheckInst:

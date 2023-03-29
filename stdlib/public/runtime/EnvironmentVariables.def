@@ -65,6 +65,9 @@ VARIABLE(SWIFT_DEBUG_ENABLE_SHARED_CACHE_PROTOCOL_CONFORMANCES, bool, true,
 
 #endif
 
+VARIABLE(SWIFT_DEBUG_CONCURRENCY_ENABLE_COOPERATIVE_QUEUES, bool, true,
+         "Enable dispatch cooperative queues in the global executor.")
+
 #ifndef NDEBUG
 
 VARIABLE(SWIFT_DEBUG_RUNTIME_EXCLUSIVITY_LOGGING, bool, false,
@@ -74,5 +77,18 @@ VARIABLE(SWIFT_DEBUG_RUNTIME_EXCLUSIVITY_LOGGING, bool, false,
 
 VARIABLE(SWIFT_BINARY_COMPATIBILITY_VERSION, uint32_t, 0,
         "Set the binary compatibility level of the Swift Standard Library")
+
+VARIABLE(SWIFT_DEBUG_FAILED_TYPE_LOOKUP, bool, false,
+         "Enable warnings when we fail to look up a type by name.")
+
+VARIABLE(SWIFT_ROOT, string, "",
+         "Overrides the root directory of the Swift installation. "
+         "This is used to locate auxiliary files relative to the runtime "
+         "itself.")
+
+VARIABLE(SWIFT_BACKTRACE, string, "",
+         "A comma-separated list of key=value pairs that controls the "
+         "crash catching and backtracing support in the runtime. "
+         "See docs/Backtracing.rst in the Swift repository for details.")
 
 #undef VARIABLE

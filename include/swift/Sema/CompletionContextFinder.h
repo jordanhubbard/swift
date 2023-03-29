@@ -49,6 +49,10 @@ class CompletionContextFinder : public ASTWalker {
   DeclContext *InitialDC;
 
 public:
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Arguments;
+  }
+
   /// Finder for completion contexts within the provided initial expression.
   CompletionContextFinder(ASTNode initialNode, DeclContext *DC)
       : InitialExpr(initialNode.dyn_cast<Expr *>()), InitialDC(DC) {
@@ -125,6 +129,14 @@ private:
            }) != Contexts.end();
   }
 };
+
+
+/// Returns \c true if \p range is valid and contains the IDE inspection
+/// target. This performs the underlying check based on \c CharSourceRange
+/// to make sure we correctly return \c true if the ide inspection target
+/// is inside a string literal that's the last token in \p range.
+bool containsIDEInspectionTarget(SourceRange range,
+                                 const SourceManager &SourceMgr);
 
 } // end namespace swift
 

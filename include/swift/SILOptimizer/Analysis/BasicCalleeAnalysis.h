@@ -31,6 +31,7 @@ class ClassDecl;
 class SILFunction;
 class SILModule;
 class SILWitnessTable;
+class SILPassManager;
 
 /// CalleeList is a data structure representing the list of potential
 /// callees at a particular apply site. It also has a query that
@@ -103,6 +104,22 @@ public:
     }
   }
 
+  size_t getCount() const {
+    switch (kind) {
+      case Kind::empty:           return 0;
+      case Kind::singleFunction:  return 1;
+      case Kind::multipleCallees: return ((Callees *)functionOrCallees)->size();
+    }
+  }
+
+  SILFunction *get(unsigned index) const {
+    switch (kind) {
+      case Kind::empty:           llvm_unreachable("empty callee list");
+      case Kind::singleFunction:  return (SILFunction *)functionOrCallees;
+      case Kind::multipleCallees: return ((Callees *)functionOrCallees)->operator[](index);
+    }
+  }
+
   bool isIncomplete() const { return incomplete; }
 
   /// Returns true if all callees are known and not external.
@@ -166,15 +183,21 @@ private:
 
 class BasicCalleeAnalysis : public SILAnalysis {
   SILModule &M;
+  SILPassManager *pm = nullptr;
   std::unique_ptr<CalleeCache> Cache;
 
 public:
+
   BasicCalleeAnalysis(SILModule *M)
       : SILAnalysis(SILAnalysisKind::BasicCallee), M(*M), Cache(nullptr) {}
+
+  ~BasicCalleeAnalysis();
 
   static bool classof(const SILAnalysis *S) {
     return S->getKind() == SILAnalysisKind::BasicCallee;
   }
+
+  virtual void initialize(SILPassManager *pm) override { this->pm = pm; }
 
   /// Invalidate all information in this analysis.
   virtual void invalidate() override {
@@ -228,7 +251,12 @@ public:
     updateCache();
     return Cache->getDestructors(type, isExactType);
   }
+
+  MemoryBehavior getMemoryBehavior(ApplySite as, bool observeRetains);
 };
+
+bool isDeinitBarrier(SILInstruction *const instruction,
+                     BasicCalleeAnalysis *bca);
 
 } // end namespace swift
 

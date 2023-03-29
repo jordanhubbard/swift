@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Structs -clang-header-expose-public-decls -emit-clang-header-path %t/structs.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Structs -clang-header-expose-decls=all-public -emit-clang-header-path %t/structs.h
 // RUN: %FileCheck %s < %t/structs.h
 
 // RUN: %check-interop-c-header-in-clang(%t/structs.h -Wno-unused-function)
@@ -22,16 +22,16 @@ public struct StructI8AndU32AndI16 {
 }
 
 // CHECK:      struct Structs_StructI8AndU32AndI16 {
-// CHECK_NEXT:   _Alignas(4) char _storage[10];
-// CHECK_NEXT: };
+// CHECK-NEXT:   _Alignas(4) char _storage[10];
+// CHECK-NEXT: };
 
 // CHECK:      struct Structs_StructOneI16AndOneStruct {
-// CHECK_NEXT:   _Alignas(4) char _storage[12];
-// CHECK_NEXT: };
+// CHECK-NEXT:   _Alignas(4) char _storage[12];
+// CHECK-NEXT: };
 
 // CHECK:      struct Structs_StructTwoI32 {
-// CHECK_NEXT:   _Alignas(4) char _storage[8];
-// CHECK_NEXT: };
+// CHECK-NEXT:   _Alignas(4) char _storage[8];
+// CHECK-NEXT: };
 
 public func returnNewStructTwoI32(_ x: Int32) -> StructTwoI32 { return StructTwoI32(x: x, y: x * 2) }
 
@@ -64,7 +64,7 @@ public func printStructI8AndU32AndI16(_ x: StructI8AndU32AndI16) {
 // CHECK-NEXT:  uint64_t _1;
 // CHECK-NEXT: };
 
-// CHECK:      static inline void swift_interop_returnDirect_Structs_uint64_t_0_8(char * _Nonnull result, struct swift_interop_returnStub_Structs_uint64_t_0_8 value) __attribute__((always_inline)) {
+// CHECK:      static SWIFT_C_INLINE_THUNK void swift_interop_returnDirect_Structs_uint64_t_0_8(char * _Nonnull result, struct swift_interop_returnStub_Structs_uint64_t_0_8 value) {
 // CHECK-NEXT:  memcpy(result + 0, &value._1, 8);
 // CHECK-NEXT: }
 
@@ -72,7 +72,7 @@ public func printStructI8AndU32AndI16(_ x: StructI8AndU32AndI16) {
 // CHECK-NEXT:  uint64_t _1;
 // CHECK-NEXT: };
 
-// CHECK:      static inline struct swift_interop_passStub_Structs_uint64_t_0_8 swift_interop_passDirect_Structs_uint64_t_0_8(const char * _Nonnull value) __attribute__((always_inline)) {
+// CHECK:      static SWIFT_C_INLINE_THUNK struct swift_interop_passStub_Structs_uint64_t_0_8 swift_interop_passDirect_Structs_uint64_t_0_8(const char * _Nonnull value) {
 // CHECK-NEXT:  struct swift_interop_passStub_Structs_uint64_t_0_8 result;
 // CHECK-NEXT:  memcpy(&result._1, value + 0, 8);
 // CHECK-NEXT:  return result;
@@ -85,7 +85,7 @@ public func printStructI8AndU32AndI16(_ x: StructI8AndU32AndI16) {
 // CHECK-NEXT:  uint16_t _2;
 // CHECK-NEXT: };
 
-// CHECK:      static inline struct swift_interop_passStub_Structs_uint64_t_0_8_uint16_t_8_10 swift_interop_passDirect_Structs_uint64_t_0_8_uint16_t_8_10(const char * _Nonnull value) __attribute__((always_inline)) {
+// CHECK:      static SWIFT_C_INLINE_THUNK struct swift_interop_passStub_Structs_uint64_t_0_8_uint16_t_8_10 swift_interop_passDirect_Structs_uint64_t_0_8_uint16_t_8_10(const char * _Nonnull value) {
 // CHECK-NEXT:  struct swift_interop_passStub_Structs_uint64_t_0_8_uint16_t_8_10 result;
 // CHECK-NEXT:  memcpy(&result._1, value + 0, 8);
 // CHECK-NEXT:  memcpy(&result._2, value + 8, 2);
@@ -99,7 +99,7 @@ public func printStructI8AndU32AndI16(_ x: StructI8AndU32AndI16) {
 // CHECK-NEXT:  uint32_t _2;
 // CHECK-NEXT: };
 
-// CHECK:      static inline struct swift_interop_passStub_Structs_uint64_t_0_8_uint32_t_8_12 swift_interop_passDirect_Structs_uint64_t_0_8_uint32_t_8_12(const char * _Nonnull value) __attribute__((always_inline)) {
+// CHECK:      static SWIFT_C_INLINE_THUNK struct swift_interop_passStub_Structs_uint64_t_0_8_uint32_t_8_12 swift_interop_passDirect_Structs_uint64_t_0_8_uint32_t_8_12(const char * _Nonnull value) {
 // CHECK-NEXT:  struct swift_interop_passStub_Structs_uint64_t_0_8_uint32_t_8_12 result;
 // CHECK-NEXT:  memcpy(&result._1, value + 0, 8);
 // CHECK-NEXT:  memcpy(&result._2, value + 8, 4);
@@ -115,7 +115,7 @@ public func printStructI8AndU32AndI16(_ x: StructI8AndU32AndI16) {
 // CHECK-NEXT:   uint16_t _2;
 // CHECK-NEXT: };
 // CHECK-EMPTY:
-// CHECK-NEXT: static inline void swift_interop_returnDirect_Structs_uint64_t_0_8_uint16_t_8_10(char * _Nonnull result, struct swift_interop_returnStub_Structs_uint64_t_0_8_uint16_t_8_10 value) __attribute__((always_inline)) {
+// CHECK-NEXT: static SWIFT_C_INLINE_THUNK void swift_interop_returnDirect_Structs_uint64_t_0_8_uint16_t_8_10(char * _Nonnull result, struct swift_interop_returnStub_Structs_uint64_t_0_8_uint16_t_8_10 value) {
 // CHECK-NEXT:   memcpy(result + 0, &value._1, 8);
 // CHECK-NEXT:   memcpy(result + 8, &value._2, 2);
 // CHECK-NEXT: }
@@ -127,7 +127,7 @@ public func printStructI8AndU32AndI16(_ x: StructI8AndU32AndI16) {
 // CHECK-NEXT:   uint32_t _2;
 // CHECK-NEXT: };
 
-// CHECK: static inline void swift_interop_returnDirect_Structs_uint64_t_0_8_uint32_t_8_12(char * _Nonnull result, struct swift_interop_returnStub_Structs_uint64_t_0_8_uint32_t_8_12 value) __attribute__((always_inline)) {
+// CHECK: static SWIFT_C_INLINE_THUNK void swift_interop_returnDirect_Structs_uint64_t_0_8_uint32_t_8_12(char * _Nonnull result, struct swift_interop_returnStub_Structs_uint64_t_0_8_uint32_t_8_12 value) {
 // CHECK-NEXT:   memcpy(result + 0, &value._1, 8);
 // CHECK-NEXT:   memcpy(result + 8, &value._2, 4);
 // CHECK-NEXT: }

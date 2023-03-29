@@ -20,6 +20,7 @@
 #include "swift/SIL/SILBasicBlock.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILValue.h"
+#include "swift/SIL/StackList.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -30,31 +31,68 @@ class SILInstruction;
 class SILModule;
 class SILValue;
 class DeadEndBlocks;
-class PrunedLiveness;
+class MultiDefPrunedLiveness;
 struct BorrowedValue;
 
-/// Returns true if v is an address or trivial.
-bool isValueAddressOrTrivial(SILValue v);
+//===----------------------------------------------------------------------===//
+//                            Forwarding Utilities
+//
+// TODO: encapsulate in a ForwardingInstruction abstraction
+//===----------------------------------------------------------------------===//
 
-/// Is the opcode that produces \p value capable of forwarding guaranteed
+/// Is the opcode that produces \p value capable of forwarding inner guaranteed
 /// values?
 ///
 /// This may be true even if the current instance of the instruction is not a
-/// ForwardingBorrow. If true, then the operation may be trivially rewritten
+/// GuaranteedForwarding. If true, then the operation may be trivially rewritten
 /// with Guaranteed ownership.
-bool canOpcodeForwardGuaranteedValues(SILValue value);
+bool canOpcodeForwardInnerGuaranteedValues(SILValue value);
 
-/// Is the opcode that consumes \p use capable of forwarding guaranteed values?
+/// Is the opcode that consumes \p use capable of forwarding inner guaranteed
+/// values?
 ///
-/// This may be true even if \p use is not a ForwardingBorrow. If true, then the
-/// operation may be trivially rewritten with Guaranteed ownership.
-bool canOpcodeForwardGuaranteedValues(Operand *use);
+/// This may be true even if \p use is not a GuaranteedForwarding. If true, then
+/// the operation may be trivially rewritten with Guaranteed ownership.
+bool canOpcodeForwardInnerGuaranteedValues(Operand *use);
 
 // This is the use-def equivalent of use->getOperandOwnership() ==
-// OperandOwnership::ForwardingBorrow.
-inline bool isForwardingBorrow(SILValue value) {
-  assert(value->getOwnershipKind() == OwnershipKind::Guaranteed);
-  return canOpcodeForwardGuaranteedValues(value);
+// OperandOwnership::GuaranteedForwarding.
+inline bool isGuaranteedForwarding(SILValue value) {
+  if (value->getOwnershipKind() != OwnershipKind::Guaranteed) {
+    return false;
+  }
+  // NOTE: canOpcodeForwardInnerGuaranteedValues returns true for transformation
+  // terminator results.
+  if (canOpcodeForwardInnerGuaranteedValues(value) ||
+      isa<SILFunctionArgument>(value)) {
+    return true;
+  }
+  // If not a phi, return false
+  auto *phi = dyn_cast<SILPhiArgument>(value);
+  if (!phi || !phi->isPhi()) {
+    return false;
+  }
+  // For a phi, if we find GuaranteedForwarding phi operand on any incoming
+  // path, we return true. Additional verification is added to ensure
+  // GuaranteedForwarding phi operands are found on zero or all paths in the
+  // OwnershipVerifier.
+  bool isGuaranteedForwardingPhi = false;
+  phi->visitTransitiveIncomingPhiOperands([&](auto *, auto *op) -> bool {
+    auto opValue = op->get();
+    assert(opValue->getOwnershipKind().isCompatibleWith(
+        OwnershipKind::Guaranteed));
+    if (canOpcodeForwardInnerGuaranteedValues(opValue) ||
+        isa<SILFunctionArgument>(opValue)) {
+      isGuaranteedForwardingPhi = true;
+      return false;
+    }
+    auto *phi = dyn_cast<SILPhiArgument>(opValue);
+    if (!phi || !phi->isPhi()) {
+      return false;
+    }
+    return true;
+  });
+  return isGuaranteedForwardingPhi;
 }
 
 /// Is the opcode that produces \p value capable of forwarding owned values?
@@ -78,7 +116,17 @@ inline bool isForwardingConsume(SILValue value) {
   return canOpcodeForwardOwnedValues(value);
 }
 
+//===----------------------------------------------------------------------===//
+//                        Ownership Def-Use Utilities
+//===----------------------------------------------------------------------===//
+
 bool hasPointerEscape(BorrowedValue value);
+
+/// Whether the specified OSSA-lifetime introducer has a pointer escape.
+///
+/// precondition: \p value introduces an OSSA-lifetime, either a BorrowedValue
+/// can be constructed from it or it's an owned value
+bool hasPointerEscape(SILValue value);
 
 /// Find leaf "use points" of \p guaranteedValue that determine its lifetime
 /// requirement. Return true if no PointerEscape use was found.
@@ -178,6 +226,15 @@ bool findExtendedTransitiveGuaranteedUses(
 bool findUsesOfSimpleValue(SILValue value,
                            SmallVectorImpl<Operand *> *usePoints = nullptr);
 
+/// Visit all GuaranteedForwardingPhis of \p value, not looking through
+/// reborrows.
+bool visitGuaranteedForwardingPhisForSSAValue(
+    SILValue value, function_ref<bool(Operand *)> func);
+
+//===----------------------------------------------------------------------===//
+//                                Abstractions
+//===----------------------------------------------------------------------===//
+
 /// An operand that forwards ownership to one or more results.
 class ForwardingOperand {
   Operand *use = nullptr;
@@ -224,9 +281,6 @@ public:
   SILValue getSingleForwardedValue() const;
 };
 
-/// Returns true if the instruction is a 'reborrow'.
-bool isReborrowInstruction(const SILInstruction *inst);
-
 class BorrowingOperandKind {
 public:
   enum Kind : uint8_t {
@@ -237,6 +291,8 @@ public:
     Apply,
     TryApply,
     Yield,
+    PartialApplyStack,
+    BeginAsyncLet,
   };
 
 private:
@@ -247,8 +303,8 @@ public:
 
   operator Kind() const { return value; }
 
-  static BorrowingOperandKind get(SILInstructionKind kind) {
-    switch (kind) {
+  static BorrowingOperandKind get(SILInstruction *i) {
+    switch (i->getKind()) {
     default:
       return Kind::Invalid;
     case SILInstructionKind::BeginBorrowInst:
@@ -263,6 +319,15 @@ public:
       return Kind::TryApply;
     case SILInstructionKind::YieldInst:
       return Kind::Yield;
+    case SILInstructionKind::PartialApplyInst:
+      return Kind::PartialApplyStack;
+    case SILInstructionKind::BuiltinInst: {
+      auto bi = cast<BuiltinInst>(i);
+      if (bi->getBuiltinKind() == BuiltinValueKind::StartAsyncLetWithLocalBuffer) {
+        return Kind::BeginAsyncLet;
+      }
+      return Kind::Invalid;
+    }
     }
   }
 
@@ -290,7 +355,7 @@ struct BorrowingOperand {
   BorrowingOperandKind kind;
 
   BorrowingOperand(Operand *op)
-      : op(op), kind(BorrowingOperandKind::get(op->getUser()->getKind())) {
+      : op(op), kind(BorrowingOperandKind::get(op->getUser())) {
     auto ownership = op->getOperandOwnership();
     if (ownership != OperandOwnership::Borrow
         && ownership != OperandOwnership::Reborrow) {
@@ -357,6 +422,8 @@ struct BorrowingOperand {
     case BorrowingOperandKind::Apply:
     case BorrowingOperandKind::TryApply:
     case BorrowingOperandKind::Yield:
+    case BorrowingOperandKind::PartialApplyStack:
+    case BorrowingOperandKind::BeginAsyncLet:
       return false;
     case BorrowingOperandKind::Branch:
       return true;
@@ -387,6 +454,8 @@ struct BorrowingOperand {
     case BorrowingOperandKind::Apply:
     case BorrowingOperandKind::TryApply:
     case BorrowingOperandKind::Yield:
+    case BorrowingOperandKind::PartialApplyStack:
+    case BorrowingOperandKind::BeginAsyncLet:
       return false;
     }
     llvm_unreachable("Covered switch isn't covered?!");
@@ -410,13 +479,7 @@ struct BorrowingOperand {
   /// set of its operands uses.
   ///
   /// E.x.: end_apply uses.
-  ///
-  /// \p errorFunction a callback that if non-null is passed an operand that
-  /// triggers a mal-formed SIL error. This is just needed for the ownership
-  /// verifier to emit good output.
-  void getImplicitUses(
-      SmallVectorImpl<Operand *> &foundUses,
-      std::function<void(Operand *)> *errorFunction = nullptr) const;
+  void getImplicitUses(SmallVectorImpl<Operand *> &foundUses) const;
 
   void print(llvm::raw_ostream &os) const;
   SWIFT_DEBUG_DUMP { print(llvm::dbgs()); }
@@ -463,6 +526,9 @@ public:
                        [](SILBasicBlock *block) {
                          return !isa<BranchInst>(block->getTerminator());
                        })) {
+        return Kind::Invalid;
+      }
+      if (isGuaranteedForwarding(value)) {
         return Kind::Invalid;
       }
       return Kind::Phi;
@@ -566,8 +632,10 @@ struct BorrowedValue {
 
   bool isLocalScope() const { return kind.isLocalScope(); }
 
-  /// Add this scopes live blocks into the PrunedLiveness result.
-  void computeLiveness(PrunedLiveness &liveness) const;
+  /// Add this scope's live blocks into the PrunedLiveness result. This
+  /// includes reborrow scopes that are reachable from this borrow scope but not
+  /// necessarilly dominated by the borrow scope.
+  void computeTransitiveLiveness(MultiDefPrunedLiveness &liveness) const;
 
   /// Returns true if \p uses are completely within this borrow introducer's
   /// local scope.
@@ -580,8 +648,8 @@ struct BorrowedValue {
   ///
   /// \p deadEndBlocks is optional during transition. It will be completely
   /// removed in an upcoming commit.
-  bool areUsesWithinTransitiveScope(ArrayRef<Operand *> uses,
-                                    DeadEndBlocks *deadEndBlocks) const;
+  bool areUsesWithinExtendedScope(ArrayRef<Operand *> uses,
+                                  DeadEndBlocks *deadEndBlocks) const;
 
   /// Given a local borrow scope introducer, visit all non-forwarding consuming
   /// users. This means that this looks through guaranteed block arguments. \p
@@ -1210,22 +1278,60 @@ OwnedValueIntroducer getSingleOwnedValueIntroducer(SILValue value);
 
 using BaseValueSet = SmallPtrSet<SILValue, 8>;
 
-/// Starting from \p initialScopeOperand, find all reborrows and their
-/// corresponding base values, and run the visitor function \p
-/// visitReborrowBaseValuePair on them.
-///  Note that a reborrow phi, can have different base values based on different
-/// control flow paths.
-void findTransitiveReborrowBaseValuePairs(
-    BorrowingOperand initialScopeOperand, SILValue origBaseValue,
-    function_ref<void(SILPhiArgument *, SILValue)> visitReborrowBaseValuePair);
+/// Starting from \p borrowInst, find all reborrows along with their base
+/// values, and run the visitor function \p visitReborrowPhiBaseValuePair on
+/// them.
+void visitExtendedReborrowPhiBaseValuePairs(
+    BeginBorrowInst *borrowInst, function_ref<void(SILPhiArgument *, SILValue)>
+                                     visitReborrowPhiBaseValuePair);
 
-/// Visit the phis in the same block as \p phi which are reborrows of a borrow
-/// of one of the values reaching \p phi.
+/// Starting from \p borrow, find all GuaranteedForwardingPhi uses along with
+/// their base values, and run the visitor function \p
+/// visitGuaranteedForwardingPhiBaseValuePair on them.
+void visitExtendedGuaranteedForwardingPhiBaseValuePairs(
+    BorrowedValue borrow, function_ref<void(SILPhiArgument *, SILValue)>
+                              visitGuaranteedForwardingPhiBaseValuePair);
+
+/// If \p value is a guaranteed non-phi value forwarded from it's instruction's
+/// operands, visit each forwarded operand.
+///
+/// Returns true if \p visitOperand was called (for convenience).
+///
+/// Precondition: \p value is not a phi. The client must handle phis first by
+/// checking if they are reborrows (using BorrowedValue). Reborrows have no
+/// forwarded operands. Guaranteed forwarding need to be handled by recursing
+/// through the phi operands.
+bool visitForwardedGuaranteedOperands(
+  SILValue value, function_ref<void(Operand *)> visitOperand);
+
+
+/// Return true of the lifetime of \p innerPhiVal depends on \p outerPhiVal.
+bool isInnerAdjacentPhi(SILArgument *innerPhiVal, SILArgument *outerPhiVal);
+
+/// Visit the phis in the same block as \p phi whose lifetime depends on \p phi.
 ///
 /// If the visitor returns false, stops visiting and returns false.  Otherwise,
 /// returns true.
-bool visitAdjacentReborrowsOfPhi(SILPhiArgument *phi,
-                                 function_ref<bool(SILPhiArgument *)> visitor);
+bool visitInnerAdjacentPhis(SILArgument *phi,
+                            function_ref<bool(SILArgument *)> visitor);
+
+/// Visit each definition of a scope that immediately encloses a guaranteed
+/// value. The guaranteed value effectively keeps these scopes alive.
+///
+/// This means something different depepending on whether \p value is itself a
+/// borrow introducer vs. a forwarded guaranteed value. If \p value is an
+/// introducer, then this discovers the enclosing borrow scope and visits all
+/// introducers of that scope. If \p value is a forwarded value, then this
+/// visits the introducers of the current borrow scope.
+bool visitEnclosingDefs(SILValue value, function_ref<bool(SILValue)> visitor);
+
+/// Visit the values that introduce the borrow scopes that includes \p
+/// value. If value is owned, or introduces a borrow scope, then this only
+/// visits \p value.
+///
+/// Returns false if the visitor returned false and exited early.
+bool visitBorrowIntroducers(SILValue value,
+                            function_ref<bool(SILValue)> visitor);
 
 /// Given a begin of a borrow scope, visit all end_borrow users of the borrow or
 /// its reborrows.
@@ -1240,6 +1346,21 @@ void visitTransitiveEndBorrows(
 /// - the value is a guaranteed argument to the function
 /// - the value is itself a begin_borrow [lexical]
 bool isNestedLexicalBeginBorrow(BeginBorrowInst *bbi);
+
+/// Whether specified move_value is redundant.
+///
+/// A move_value is redundant if it doesn't
+/// - alter constraints (lexicality, ownership)
+/// - enable optimizations (e.g, separate smaller scopes within which a value
+///   escapes)
+///
+/// For example, if the lifetimes that a move_value separates both have the
+/// same characteristics with respect to
+/// - ownership
+/// - lexicality
+/// - escaping
+/// then the move_value is redundant.
+bool isRedundantMoveValue(MoveValueInst *mvi);
 
 } // namespace swift
 

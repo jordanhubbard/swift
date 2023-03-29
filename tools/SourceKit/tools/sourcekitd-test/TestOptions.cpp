@@ -55,7 +55,7 @@ static const llvm::opt::OptTable::Info InfoTable[] = {
 // Create OptTable class for parsing actual command line arguments
 class TestOptTable : public llvm::opt::OptTable {
 public:
-  TestOptTable() : OptTable(InfoTable, llvm::array_lengthof(InfoTable)){}
+  TestOptTable() : OptTable(InfoTable, std::size(InfoTable)){}
 };
 
 } // end anonymous namespace
@@ -120,8 +120,8 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
         .Case("conformingmethods", SourceKitRequest::ConformingMethodList)
         .Case("cursor", SourceKitRequest::CursorInfo)
         .Case("related-idents", SourceKitRequest::RelatedIdents)
+        .Case("active-regions", SourceKitRequest::ActiveRegions)
         .Case("syntax-map", SourceKitRequest::SyntaxMap)
-        .Case("syntax-tree", SourceKitRequest::SyntaxTree)
         .Case("structure", SourceKitRequest::Structure)
         .Case("format", SourceKitRequest::Format)
         .Case("expand-placeholder", SourceKitRequest::ExpandPlaceholder)
@@ -154,7 +154,7 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
         .Case("compile", SourceKitRequest::Compile)
         .Case("compile.close", SourceKitRequest::CompileClose)
 #define SEMANTIC_REFACTORING(KIND, NAME, ID) .Case("refactoring." #ID, SourceKitRequest::KIND)
-#include "swift/IDE/RefactoringKinds.def"
+#include "swift/Refactoring/RefactoringKinds.def"
         .Default(SourceKitRequest::None);
 
       if (Request == SourceKitRequest::None) {
@@ -176,7 +176,6 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
                      << "- cursor\n"
                      << "- related-idents\n"
                      << "- syntax-map\n"
-                     << "- syntax-tree\n"
                      << "- structure\n"
                      << "- format\n"
                      << "- expand-placeholder\n"
@@ -205,7 +204,7 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
                      << "- global-config\n"
                      << "- dependency-updated\n"
 #define SEMANTIC_REFACTORING(KIND, NAME, ID) << "- refactoring." #ID "\n"
-#include "swift/IDE/RefactoringKinds.def"
+#include "swift/Refactoring/RefactoringKinds.def"
                         "\n";
         return true;
       }
@@ -216,12 +215,16 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       return true;
     }
 
-    case OPT_offset:
-      if (StringRef(InputArg->getValue()).getAsInteger(10, Offset)) {
+    case OPT_offset: {
+      unsigned offset;
+      if (StringRef(InputArg->getValue()).getAsInteger(10, offset)) {
         llvm::errs() << "error: expected integer for 'offset'\n";
         return true;
       }
+
+      Offset = offset;
       break;
+    }
 
     case OPT_length:
       if (StringRef(InputArg->getValue()).getAsInteger(10, Length)) {
@@ -336,6 +339,10 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       Inputs.push_back(InputArg->getValue());
       break;
 
+    case OPT_primary_file:
+      PrimaryFile = InputArg->getValue();
+      break;
+
     case OPT_rename_spec:
       RenameSpecPath = InputArg->getValue();
       break;
@@ -404,7 +411,7 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
       break;
 
     case OPT_vfs_files:
-      VFSName = VFSName.getValueOr("in-memory-vfs");
+      VFSName = VFSName.value_or("in-memory-vfs");
       for (const char *vfsFile : InputArg->getValues()) {
         StringRef name, target;
         std::tie(name, target) = StringRef(vfsFile).split('=');
@@ -446,6 +453,10 @@ bool TestOptions::parseArgs(llvm::ArrayRef<const char *> Args) {
 
     case OPT_disable_implicit_string_processing_module_import:
       DisableImplicitStringProcessingModuleImport = true;
+      break;
+
+    case OPT_disable_implicit_backtracing_module_import:
+      DisableImplicitBacktracingModuleImport = true;
       break;
 
     case OPT_UNKNOWN:

@@ -65,6 +65,15 @@ enum IsDistributed_t {
   IsNotDistributed,
   IsDistributed,
 };
+enum IsRuntimeAccessible_t {
+  IsNotRuntimeAccessible,
+  IsRuntimeAccessible
+};
+
+enum ForceEnableLexicalLifetimes_t {
+  DoNotForceEnableLexicalLifetimes,
+  DoForceEnableLexicalLifetimes
+};
 
 enum class PerformanceConstraints : uint8_t {
   None = 0,
@@ -167,7 +176,7 @@ class SILFunction
     public SwiftObjectHeader {
     
 private:
-  void *libswiftSpecificData[1];
+  void *libswiftSpecificData[4];
 
 public:
   using BlockListType = llvm::iplist<SILBasicBlock>;
@@ -266,7 +275,7 @@ private:
   /// A monotonically increasing ID which is incremented whenever a
   /// BasicBlockBitfield or NodeBitfield is constructed.
   /// For details see SILBitfield::bitfieldID;
-  uint64_t currentBitfieldID = 1;
+  int64_t currentBitfieldID = 1;
 
   /// Unique identifier for vector indexing and deterministic sorting.
   /// May be reused when zombie functions are recovered.
@@ -350,6 +359,9 @@ private:
   /// Check whether this is a distributed method.
   unsigned IsDistributed : 1;
 
+  /// Check whether this function could be looked up at runtime via special API.
+  unsigned IsRuntimeAccessible : 1;
+
   unsigned stackProtection : 1;
 
   /// True if this function is inlined at least once. This means that the
@@ -396,6 +408,9 @@ private:
   /// The function is in a statically linked module.
   unsigned IsStaticallyLinked : 1;
 
+  /// If true, the function has lexical lifetimes even if the module does not.
+  unsigned ForceEnableLexicalLifetimes : 1;
+
   static void
   validateSubclassScope(SubclassScope scope, IsThunk_t isThunk,
                         const GenericSpecializationInformation *genericInfo) {
@@ -432,7 +447,8 @@ private:
               const SILDebugScope *debugScope,
               IsDynamicallyReplaceable_t isDynamic,
               IsExactSelfClass_t isExactSelfClass,
-              IsDistributed_t isDistributed);
+              IsDistributed_t isDistributed,
+              IsRuntimeAccessible_t isRuntimeAccessible);
 
   static SILFunction *
   create(SILModule &M, SILLinkage linkage, StringRef name,
@@ -441,6 +457,7 @@ private:
          IsTransparent_t isTrans, IsSerialized_t isSerialized,
          ProfileCounter entryCount, IsDynamicallyReplaceable_t isDynamic,
          IsDistributed_t isDistributed,
+         IsRuntimeAccessible_t isRuntimeAccessible,
          IsExactSelfClass_t isExactSelfClass,
          IsThunk_t isThunk = IsNotThunk,
          SubclassScope classSubclassScope = SubclassScope::NotApplicable,
@@ -456,7 +473,8 @@ private:
             SubclassScope classSubclassScope, Inline_t inlineStrategy,
             EffectsKind E, const SILDebugScope *DebugScope,
             IsDynamicallyReplaceable_t isDynamic,
-            IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed);
+            IsExactSelfClass_t isExactSelfClass, IsDistributed_t isDistributed,
+            IsRuntimeAccessible_t isRuntimeAccessible);
 
   /// Set has ownership to the given value. True means that the function has
   /// ownership, false means it does not.
@@ -520,8 +538,6 @@ public:
     return ReplacedFunction;
   }
 
-  static SILFunction *getFunction(SILDeclRef ref, SILModule &M);
-
   void setDynamicallyReplacedFunction(SILFunction *f) {
     assert(ReplacedFunction == nullptr && "already set");
     assert(!hasObjCReplacement());
@@ -576,9 +592,7 @@ public:
     Profiler = InheritedProfiler;
   }
 
-  void createProfiler(ASTNode Root, SILDeclRef Ref);
-
-  void discardProfiler() { Profiler = nullptr; }
+  void createProfiler(SILDeclRef Ref);
 
   ProfileCounter getEntryCount() const { return EntryCount; }
 
@@ -664,6 +678,14 @@ public:
     IsStaticallyLinked = value;
   }
 
+  ForceEnableLexicalLifetimes_t forceEnableLexicalLifetimes() const {
+    return ForceEnableLexicalLifetimes_t(ForceEnableLexicalLifetimes);
+  }
+
+  void setForceEnableLexicalLifetimes(ForceEnableLexicalLifetimes_t value) {
+    ForceEnableLexicalLifetimes = value;
+  }
+
   /// Returns true if this is a reabstraction thunk of escaping function type
   /// whose single argument is a potentially non-escaping closure. i.e. the
   /// thunks' function argument may itself have @inout_aliasable parameters.
@@ -702,6 +724,10 @@ public:
   SILType getLoweredType(Lowering::AbstractionPattern orig, Type subst) const;
 
   SILType getLoweredType(Type t) const;
+
+  CanType getLoweredRValueType(Lowering::AbstractionPattern orig, Type subst) const;
+
+  CanType getLoweredRValueType(Type t) const;
 
   SILType getLoweredLoadableType(Type t) const;
 
@@ -845,6 +871,14 @@ public:
   void
   setIsDistributed(IsDistributed_t value = IsDistributed_t::IsDistributed) {
     IsDistributed = value;
+  }
+
+  IsRuntimeAccessible_t isRuntimeAccessible() const {
+    return IsRuntimeAccessible_t(IsRuntimeAccessible);
+  }
+  void setIsRuntimeAccessible(IsRuntimeAccessible_t value =
+                                  IsRuntimeAccessible_t::IsRuntimeAccessible) {
+    IsRuntimeAccessible = value;
   }
 
   bool needsStackProtection() const { return stackProtection; }
@@ -1044,9 +1078,12 @@ public:
     EffectsKindAttr = unsigned(E);
   }
   
-  std::pair<const char *, int>  parseEffects(StringRef attrs, bool fromSIL,
-                                             int argumentIndex, bool isDerived,
-                                             ArrayRef<StringRef> paramNames);
+  std::pair<const char *, int>  parseArgumentEffectsFromSource(StringRef effectStr,
+                                                              ArrayRef<StringRef> paramNames);
+  std::pair<const char *, int>  parseArgumentEffectsFromSIL(StringRef effectStr,
+                                                           int argumentIndex);
+  std::pair<const char *, int>  parseGlobalEffectsFromSIL(StringRef effectStr);
+  std::pair<const char *, int>  parseMultipleEffectsFromSIL(StringRef effectStr);
   void writeEffect(llvm::raw_ostream &OS, int effectIdx) const;
   void writeEffects(llvm::raw_ostream &OS) const {
     writeEffect(OS, -1);
@@ -1054,6 +1091,7 @@ public:
   void copyEffects(SILFunction *from);
   bool hasArgumentEffects() const;
   void visitArgEffects(std::function<void(int, int, bool)> c) const;
+  MemoryBehavior getMemoryBehavior(bool observeRetains);
 
   Purpose getSpecialPurpose() const { return specialPurpose; }
 
@@ -1235,6 +1273,7 @@ public:
   const SILBasicBlock *getEntryBlock() const { return &front(); }
 
   SILBasicBlock *createBasicBlock();
+  SILBasicBlock *createBasicBlock(llvm::StringRef debugName);
   SILBasicBlock *createBasicBlockAfter(SILBasicBlock *afterBB);
   SILBasicBlock *createBasicBlockBefore(SILBasicBlock *beforeBB);
 
@@ -1369,18 +1408,30 @@ public:
         decl->getLifetimeAnnotation());
   }
 
-  /// verify - Run the IR verifier to make sure that the SILFunction follows
+  /// verify - Run the SIL verifier to make sure that the SILFunction follows
   /// invariants.
-  void verify(bool SingleFunction = true) const;
+  void verify(bool SingleFunction = true,
+              bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
+
+  /// Run the SIL verifier without assuming OSSA lifetimes end at dead end
+  /// blocks.
+  void verifyIncompleteOSSA() const {
+    verify(/*SingleFunction=*/true, /*completeOSSALifetimes=*/false);
+  }
 
   /// Verifies the lifetime of memory locations in the function.
   void verifyMemoryLifetime();
 
-  /// Run the SIL ownership verifier to check for ownership invariant failures.
+  /// Run the SIL ownership verifier to check that all values with ownership
+  /// have a linear lifetime. Regular OSSA invariants are checked separately in
+  /// normal SIL verification.
   ///
-  /// NOTE: The ownership verifier is always run when performing normal IR
+  /// \p deadEndBlocks is nullptr when OSSA lifetimes are complete.
+  ///
+  /// NOTE: The ownership verifier is run when performing normal IR
   /// verification, so this verification can be viewed as a subset of
-  /// SILFunction::verify.
+  /// SILFunction::verify(checkLinearLifetimes=true).
   void verifyOwnership(DeadEndBlocks *deadEndBlocks) const;
 
   /// Verify that all non-cond-br critical edges have been split.

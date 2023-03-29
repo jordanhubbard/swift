@@ -40,24 +40,6 @@
 #include "SwiftObject.h"
 #endif
 
-#if defined(_WIN32)
-#include <stdarg.h>
-
-namespace {
-char *strndup(const char *s, size_t n) {
-  size_t length = std::min(strlen(s), n);
-
-  char *buffer = reinterpret_cast<char *>(malloc(length + 1));
-  if (buffer == nullptr)
-    return buffer;
-
-  strncpy(buffer, s, length);
-  buffer[length] = '\0';
-  return buffer;
-}
-}
-#endif
-
 using namespace swift;
 
 namespace {
@@ -261,7 +243,12 @@ struct TupleImpl : ReflectionMirrorImpl {
 
       // If we have a label, create it.
       if (labels && space && labels != space) {
-        *outName = strndup(labels, space - labels);
+        size_t labelLen = space - labels;
+        char *label = (char *)malloc(labelLen + 1);
+        memcpy(label, labels, labelLen);
+        label[labelLen] = '\0'; // 0-terminate the string
+
+        *outName = label;
         hasLabel = true;
       }
     }
@@ -392,7 +379,8 @@ getFieldAt(const Metadata *base, unsigned index) {
   auto result = swift_getTypeByMangledName(
       MetadataState::Complete, typeName, substitutions.getGenericArgs(),
       [&substitutions](unsigned depth, unsigned index) {
-        return substitutions.getMetadata(depth, index);
+        // FIXME: Variadic generics
+        return substitutions.getMetadata(depth, index).getMetadata();
       },
       [&substitutions](const Metadata *type, unsigned index) {
         return substitutions.getWitnessTable(type, index);
@@ -1127,14 +1115,19 @@ id swift_reflectionMirror_quickLookObject(OpaqueValue *value, const Metadata *T)
 }
 #endif
 
-SWIFT_CC(swift)
-SWIFT_RUNTIME_STDLIB_INTERNAL const char *swift_keyPath_dladdr(void *address) {
-  SymbolInfo info;
-  if (lookupSymbol(address, &info) == 0) {
-    return 0;
-  } else {
-    return info.symbolName.get();
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+const char *swift_keyPath_copySymbolName(void *address) {
+  if (auto info = SymbolInfo::lookup(address)) {
+    if (info->getSymbolName()) {
+      return strdup(info->getSymbolName());
+    }
   }
+  return nullptr;
+}
+
+SWIFT_CC(swift) SWIFT_RUNTIME_STDLIB_INTERNAL
+void swift_keyPath_freeSymbolName(const char *symbolName) {
+  free(const_cast<char *>(symbolName));
 }
 
 SWIFT_CC(swift)

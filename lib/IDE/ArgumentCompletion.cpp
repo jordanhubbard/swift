@@ -13,6 +13,7 @@
 #include "swift/IDE/ArgumentCompletion.h"
 #include "swift/IDE/CodeCompletion.h"
 #include "swift/IDE/CompletionLookup.h"
+#include "swift/IDE/SelectedOverloadInfo.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/IDETypeChecking.h"
 
@@ -23,7 +24,7 @@ using namespace swift::constraints;
 bool ArgumentTypeCheckCompletionCallback::addPossibleParams(
     const ArgumentTypeCheckCompletionCallback::Result &Res,
     SmallVectorImpl<PossibleParamInfo> &Params, SmallVectorImpl<Type> &Types) {
-  if (!Res.ParamIdx) {
+  if (!Res.ParamIdx || !Res.FuncTy) {
     // We don't really know much here. Suggest global results without a specific
     // expected type.
     return true;
@@ -35,8 +36,7 @@ bool ArgumentTypeCheckCompletionCallback::addPossibleParams(
     return true;
   }
 
-  ArrayRef<AnyFunctionType::Param> ParamsToPass =
-      Res.FuncTy->getAs<AnyFunctionType>()->getParams();
+  ArrayRef<AnyFunctionType::Param> ParamsToPass = Res.FuncTy->getParams();
 
   ParameterList *PL = nullptr;
   if (Res.FuncD) {
@@ -78,96 +78,41 @@ bool ArgumentTypeCheckCompletionCallback::addPossibleParams(
   return ShowGlobalCompletions;
 }
 
-/// Information that \c getSelectedOverloadInfo gathered about a
-/// \c SelectedOverload.
-struct SelectedOverloadInfo {
-  /// The function that is being called.
-  ValueDecl *FuncD = nullptr;
-  /// The type of the called function itself (not its result type)
-  Type FuncTy;
-  /// The type on which the function is being called. \c null if the function is
-  /// a free function.
-  Type CallBaseTy;
-};
-
-/// Extract additional information about the overload that is being called by
-/// \p CalleeLocator.
-SelectedOverloadInfo getSelectedOverloadInfo(const Solution &S,
-                                             ConstraintLocator *CalleeLocator) {
-  auto &CS = S.getConstraintSystem();
-
-  SelectedOverloadInfo Result;
-
-  auto SelectedOverload = S.getOverloadChoiceIfAvailable(CalleeLocator);
-  if (!SelectedOverload) {
-    return Result;
-  }
-
-  switch (SelectedOverload->choice.getKind()) {
-  case OverloadChoiceKind::KeyPathApplication:
-  case OverloadChoiceKind::Decl:
-  case OverloadChoiceKind::DeclViaDynamic:
-  case OverloadChoiceKind::DeclViaBridge:
-  case OverloadChoiceKind::DeclViaUnwrappedOptional: {
-    Result.CallBaseTy = SelectedOverload->choice.getBaseType();
-    if (Result.CallBaseTy) {
-      Result.CallBaseTy = S.simplifyType(Result.CallBaseTy)->getRValueType();
-    }
-
-    Result.FuncD = SelectedOverload->choice.getDeclOrNull();
-    Result.FuncTy =
-        S.simplifyTypeForCodeCompletion(SelectedOverload->adjustedOpenedType);
-
-    // For completion as the arg in a call to the implicit [keypath: _]
-    // subscript the solver can't know what kind of keypath is expected without
-    // an actual argument (e.g. a KeyPath vs WritableKeyPath) so it ends up as a
-    // hole. Just assume KeyPath so we show the expected keypath's root type to
-    // users rather than '_'.
-    if (SelectedOverload->choice.getKind() ==
-        OverloadChoiceKind::KeyPathApplication) {
-      auto Params = Result.FuncTy->getAs<AnyFunctionType>()->getParams();
-      if (Params.size() == 1 &&
-          Params[0].getPlainType()->is<UnresolvedType>()) {
-        auto *KPDecl = CS.getASTContext().getKeyPathDecl();
-        Type KPTy =
-            KPDecl->mapTypeIntoContext(KPDecl->getDeclaredInterfaceType());
-        Type KPValueTy = KPTy->castTo<BoundGenericType>()->getGenericArgs()[1];
-        KPTy = BoundGenericType::get(KPDecl, Type(),
-                                     {Result.CallBaseTy, KPValueTy});
-        Result.FuncTy =
-            FunctionType::get({Params[0].withType(KPTy)}, KPValueTy);
+/// Applies heuristic to determine whether the result type of \p E is
+/// unconstrained, that is if the constraint system is satisfiable for any
+/// result type of \p E.
+static bool isExpressionResultTypeUnconstrained(const Solution &S, Expr *E) {
+  ConstraintSystem &CS = S.getConstraintSystem();
+  if (auto ParentExpr = CS.getParentExpr(E)) {
+    if (auto Assign = dyn_cast<AssignExpr>(ParentExpr)) {
+      if (isa<DiscardAssignmentExpr>(Assign->getDest())) {
+        // _ = <expr> is unconstrained
+        return true;
       }
+    } else if (isa<RebindSelfInConstructorExpr>(ParentExpr)) {
+      // super.init() is unconstrained (it always produces the correct result
+      // by definition)
+      return true;
     }
-    break;
   }
-  case OverloadChoiceKind::KeyPathDynamicMemberLookup: {
-    auto *fnType = SelectedOverload->adjustedOpenedType->castTo<FunctionType>();
-    assert(fnType->getParams().size() == 1 &&
-           "subscript always has one argument");
-    // Parameter type is KeyPath<T, U> where `T` is a root type
-    // and U is a leaf type (aka member type).
-    auto keyPathTy =
-        fnType->getParams()[0].getPlainType()->castTo<BoundGenericType>();
+  auto target = S.getTargetFor(E);
+  if (!target)
+    return false;
 
-    auto *keyPathDecl = keyPathTy->getAnyNominal();
-    assert(isKnownKeyPathType(keyPathTy) &&
-           "parameter is supposed to be a keypath");
-
-    auto KeyPathDynamicLocator = CS.getConstraintLocator(
-        CalleeLocator, LocatorPathElt::KeyPathDynamicMember(keyPathDecl));
-    Result = getSelectedOverloadInfo(S, KeyPathDynamicLocator);
-    break;
+  assert(target->kind == SyntacticElementTarget::Kind::expression);
+  switch (target->getExprContextualTypePurpose()) {
+  case CTP_Unused:
+    // If we aren't using the contextual type, its unconstrained by definition.
+    return true;
+  case CTP_Initialization: {
+    // let x = <expr> is unconstrained
+    auto contextualType = target->getExprContextualType();
+    return !contextualType || contextualType->is<UnresolvedType>();
   }
-  case OverloadChoiceKind::DynamicMemberLookup:
-  case OverloadChoiceKind::TupleIndex:
-    // If it's DynamicMemberLookup, we don't know which function is being
-    // called, so we can't extract any information from it.
-    // TupleIndex isn't a function call and is not relevant for argument
-    // completion because it doesn't take arguments.
-    break;
+  default:
+    // Assume that it's constrained by default.
+    return false;
   }
-
-  return Result;
 }
 
 void ArgumentTypeCheckCompletionCallback::sawSolutionImpl(const Solution &S) {
@@ -178,6 +123,15 @@ void ArgumentTypeCheckCompletionCallback::sawSolutionImpl(const Solution &S) {
   Expr *ParentCall = CompletionExpr;
   while (ParentCall && ParentCall->getArgs() == nullptr) {
     ParentCall = CS.getParentExpr(ParentCall);
+  }
+  if (auto TV = S.getType(CompletionExpr)->getAs<TypeVariableType>()) {
+    auto Locator = TV->getImpl().getLocator();
+    if (Locator->isLastElement<LocatorPathElt::PatternMatch>()) {
+      // The code completion token is inside a pattern, which got rewritten from
+      // a call by ResolvePattern. Thus, we aren't actually inside a call.
+      // Rest 'ParentCall' to nullptr to reflect that.
+      ParentCall = nullptr;
+    }
   }
 
   if (!ParentCall || ParentCall == CompletionExpr) {
@@ -194,10 +148,25 @@ void ArgumentTypeCheckCompletionCallback::sawSolutionImpl(const Solution &S) {
   }
   auto ArgIdx = ArgInfo->completionIdx;
 
+  Type ExpectedCallType;
+  if (!isExpressionResultTypeUnconstrained(S, ParentCall)) {
+    ExpectedCallType = getTypeForCompletion(S, ParentCall);
+  }
+
   auto *CallLocator = CS.getConstraintLocator(ParentCall);
   auto *CalleeLocator = S.getCalleeLocator(CallLocator);
 
   auto Info = getSelectedOverloadInfo(S, CalleeLocator);
+  if (Info.Value && Info.Value->shouldHideFromEditor()) {
+    return;
+  }
+  // Disallow invalid initializer references
+  for (auto Fix : S.Fixes) {
+    if (Fix->getLocator() == CalleeLocator &&
+        Fix->getKind() == FixKind::AllowInvalidInitRef) {
+      return;
+    }
+  }
 
   // Find the parameter the completion was bound to (if any), as well as which
   // parameters are already bound (so we don't suggest them even when the args
@@ -246,9 +215,9 @@ void ArgumentTypeCheckCompletionCallback::sawSolutionImpl(const Solution &S) {
 
   // If this is a duplicate of any other result, ignore this solution.
   if (llvm::any_of(Results, [&](const Result &R) {
-        return R.FuncD == Info.FuncD &&
-               nullableTypesEqual(R.FuncTy, Info.FuncTy) &&
-               nullableTypesEqual(R.BaseType, Info.CallBaseTy) &&
+        return R.FuncD == Info.Value &&
+               nullableTypesEqual(R.FuncTy, Info.ValueTy) &&
+               nullableTypesEqual(R.BaseType, Info.BaseTy) &&
                R.ParamIdx == ParamIdx &&
                R.IsNoninitialVariadic == IsNoninitialVariadic;
       })) {
@@ -258,10 +227,43 @@ void ArgumentTypeCheckCompletionCallback::sawSolutionImpl(const Solution &S) {
   llvm::SmallDenseMap<const VarDecl *, Type> SolutionSpecificVarTypes;
   getSolutionSpecificVarTypes(S, SolutionSpecificVarTypes);
 
-  Results.push_back({ExpectedTy, isa<SubscriptExpr>(ParentCall), Info.FuncD,
-                     Info.FuncTy, ArgIdx, ParamIdx, std::move(ClaimedParams),
-                     IsNoninitialVariadic, Info.CallBaseTy, HasLabel, IsAsync,
-                     SolutionSpecificVarTypes});
+  AnyFunctionType *FuncTy = nullptr;
+  if (Info.ValueTy) {
+    FuncTy = Info.ValueTy->lookThroughAllOptionalTypes()->getAs<AnyFunctionType>();
+  }
+  Results.push_back({ExpectedTy, ExpectedCallType,
+                     isa<SubscriptExpr>(ParentCall), Info.Value, FuncTy, ArgIdx,
+                     ParamIdx, std::move(ClaimedParams), IsNoninitialVariadic,
+                     Info.BaseTy, HasLabel, IsAsync, SolutionSpecificVarTypes});
+}
+
+void ArgumentTypeCheckCompletionCallback::computeShadowedDecls(
+    SmallPtrSetImpl<ValueDecl *> &ShadowedDecls) {
+  for (size_t i = 0; i < Results.size(); ++i) {
+    auto &ResultA = Results[i];
+    for (size_t j = i + 1; j < Results.size(); ++j) {
+      auto &ResultB = Results[j];
+      if (!ResultA.FuncD || !ResultB.FuncD || !ResultA.FuncTy || !ResultB.FuncTy) {
+        continue;
+      }
+      if (ResultA.FuncD->getName() != ResultB.FuncD->getName()) {
+        continue;
+      }
+      if (!ResultA.FuncTy->isEqual(ResultB.FuncTy)) {
+        continue;
+      }
+      ProtocolDecl *inProtocolExtensionA =
+          ResultA.FuncD->getDeclContext()->getExtendedProtocolDecl();
+      ProtocolDecl *inProtocolExtensionB =
+          ResultB.FuncD->getDeclContext()->getExtendedProtocolDecl();
+
+      if (inProtocolExtensionA && !inProtocolExtensionB) {
+        ShadowedDecls.insert(ResultA.FuncD);
+      } else if (!inProtocolExtensionA && inProtocolExtensionB) {
+        ShadowedDecls.insert(ResultB.FuncD);
+      }
+    }
+  }
 }
 
 void ArgumentTypeCheckCompletionCallback::deliverResults(
@@ -272,12 +274,23 @@ void ArgumentTypeCheckCompletionCallback::deliverResults(
   CompletionLookup Lookup(CompletionCtx.getResultSink(), Ctx, DC,
                           &CompletionCtx);
 
+  SmallPtrSet<ValueDecl *, 4> ShadowedDecls;
+  computeShadowedDecls(ShadowedDecls);
+
   // Perform global completion as a fallback if we don't have any results.
   bool shouldPerformGlobalCompletion = Results.empty();
+  SmallVector<Type, 4> ExpectedCallTypes;
+  for (auto &Result : Results) {
+    ExpectedCallTypes.push_back(Result.ExpectedCallType);
+  }
+
   SmallVector<Type, 8> ExpectedTypes;
 
   if (IncludeSignature && !Results.empty()) {
     Lookup.setHaveLParen(true);
+    Lookup.setExpectedTypes(ExpectedCallTypes,
+                            /*isImplicitSingleExpressionReturn=*/false);
+
     for (auto &Result : Results) {
       auto SemanticContext = SemanticContextKind::None;
       NominalTypeDecl *BaseNominal = nullptr;
@@ -307,15 +320,18 @@ void ArgumentTypeCheckCompletionCallback::deliverResults(
         }
       }
       if (Result.FuncTy) {
-        if (auto FuncTy = Result.FuncTy->lookThroughAllOptionalTypes()
-                              ->getAs<AnyFunctionType>()) {
-          if (Result.IsSubscript) {
-            assert(SemanticContext != SemanticContextKind::None);
-            auto *SD = dyn_cast_or_null<SubscriptDecl>(Result.FuncD);
-            Lookup.addSubscriptCallPattern(FuncTy, SD, SemanticContext);
-          } else {
-            auto *FD = dyn_cast_or_null<AbstractFunctionDecl>(Result.FuncD);
-            Lookup.addFunctionCallPattern(FuncTy, FD, SemanticContext);
+        if (auto FuncTy = Result.FuncTy) {
+          if (ShadowedDecls.count(Result.FuncD) == 0) {
+            // Don't show call pattern completions if the function is
+            // overridden.
+            if (Result.IsSubscript) {
+              assert(SemanticContext != SemanticContextKind::None);
+              auto *SD = dyn_cast_or_null<SubscriptDecl>(Result.FuncD);
+              Lookup.addSubscriptCallPattern(FuncTy, SD, SemanticContext);
+            } else {
+              auto *FD = dyn_cast_or_null<AbstractFunctionDecl>(Result.FuncD);
+              Lookup.addFunctionCallPattern(FuncTy, FD, SemanticContext);
+            }
           }
         }
       }
@@ -334,6 +350,13 @@ void ArgumentTypeCheckCompletionCallback::deliverResults(
   }
 
   if (shouldPerformGlobalCompletion) {
+    llvm::SmallDenseMap<const VarDecl *, Type> SolutionSpecificVarTypes;
+    if (!Results.empty()) {
+      SolutionSpecificVarTypes = Results[0].SolutionSpecificVarTypes;
+    }
+
+    WithSolutionSpecificVarTypesRAII VarTypes(SolutionSpecificVarTypes);
+
     for (auto &Result : Results) {
       ExpectedTypes.push_back(Result.ExpectedType);
       Lookup.setSolutionSpecificVarTypes(Result.SolutionSpecificVarTypes);

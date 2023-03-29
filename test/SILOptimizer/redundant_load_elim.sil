@@ -1,5 +1,7 @@
 // RUN: %target-sil-opt -enforce-exclusivity=none -enable-sil-verify-all %s -redundant-load-elim | %FileCheck %s
 
+// REQUIRES: swift_in_compiler
+
 // Declare this SIL to be canonical because some tests break raw SIL
 // conventions. e.g. address-type block args. -enforce-exclusivity=none is also
 // required to allow address-type block args in canonical SIL.
@@ -894,12 +896,15 @@ bb9:                                              // Preds: bb7 bb8
 // in bb9 and bb10.
 //
 // CHECK-LABEL: reuse_silargument_multiple_bb_forwarding
-// CHECK: bb8([[ARG:%.*]] : $Int)
-// CHECK: bb9
+// CHECK: bb7:
+// CHECK:   br bb10(%3 : $Int)
+// CHECK: bb8:
+// CHECK:   cond_br undef, bb9, bb10(%3 : $Int)
 // CHECK-NOT: = load
-// CHECK: bb10
+// CHECK: bb10([[A:%[0-9]+]] : $Int):
 // CHECK-NOT: = load
-// CHECK: return
+// CHECK: return [[A]]
+// CHECK: } // end sil function 'reuse_silargument_multiple_bb_forwarding'
 sil hidden @reuse_silargument_multiple_bb_forwarding : $@convention(thin) (Bool) -> Int {
 bb0(%0 : $Bool):
   %1 = alloc_stack $TwoField, var, name "x"       // users: %7, %10, %13, %16, %21, %26, %28
@@ -1264,5 +1269,30 @@ bb1:
   dealloc_stack %stk2 : $*()
   %r = tuple ()
   return %r : $()
+}
+
+sil @call_closure : $@convention(method) (@noescape @callee_guaranteed () -> ()) -> ()
+sil @closure : $@convention(thin) (@inout_aliasable Int64) -> ()
+
+// CHECK-LABEL: sil @test_closure_capturing_address :
+// CHECK:         [[L:%[0-9]+]] = load
+// CHECK:         return [[L]]
+// CHECK-LABEL: } // end sil function 'test_closure_capturing_address'
+sil @test_closure_capturing_address : $@convention(thin) () -> Int64 {
+bb0:
+  %0 = alloc_stack $Int64
+  %1 = integer_literal $Builtin.Int64, 0
+  %2 = struct $Int64 (%1 : $Builtin.Int64)
+
+  %3 = function_ref @closure : $@convention(thin) (@inout_aliasable Int64) -> ()
+  %4 = partial_apply [callee_guaranteed] [on_stack] %3(%0) : $@convention(thin) (@inout_aliasable Int64) -> ()
+  store %2 to %0 : $*Int64
+
+  %6 = function_ref @call_closure : $@convention(method) (@noescape @callee_guaranteed () -> ()) -> ()
+  %7 = apply %6(%4) : $@convention(method) (@noescape @callee_guaranteed () -> ()) -> ()
+  dealloc_stack %4 : $@noescape @callee_guaranteed () -> ()
+  %9 = load %0 : $*Int64
+  dealloc_stack %0 : $*Int64
+  return %9 : $Int64
 }
 

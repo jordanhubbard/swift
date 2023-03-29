@@ -53,7 +53,6 @@ bool swift::hasPointerEscape(BorrowedValue value) {
     case OperandOwnership::InteriorPointer:
     case OperandOwnership::BitwiseEscape:
       break;
-
     case OperandOwnership::Reborrow: {
       SILArgument *phi = cast<BranchInst>(op->getUser())
                              ->getDestBB()
@@ -64,7 +63,8 @@ bool swift::hasPointerEscape(BorrowedValue value) {
       }
       break;
     }
-    case OperandOwnership::ForwardingBorrow: {
+    case OperandOwnership::GuaranteedForwarding: {
+      // This may follow a guaranteed phis.
       ForwardingOperand(op).visitForwardedValues([&](SILValue result) {
         // Do not include transitive uses with 'none' ownership
         if (result->getOwnershipKind() == OwnershipKind::None)
@@ -83,17 +83,50 @@ bool swift::hasPointerEscape(BorrowedValue value) {
   return false;
 }
 
-bool swift::isValueAddressOrTrivial(SILValue v) {
-  return v->getType().isAddress() ||
-         v->getOwnershipKind() == OwnershipKind::None;
+bool swift::hasPointerEscape(SILValue original) {
+  if (auto borrowedValue = BorrowedValue(original)) {
+    return hasPointerEscape(borrowedValue);
+  }
+  assert(original->getOwnershipKind() == OwnershipKind::Owned);
+
+  ValueWorklist worklist(original->getFunction());
+  worklist.push(original);
+  if (auto *phi = SILArgument::asPhi(original)) {
+    phi->visitTransitiveIncomingPhiOperands([&](auto *phi, auto *operand) {
+      worklist.pushIfNotVisited(operand->get());
+      return true;
+    });
+  }
+  while (auto value = worklist.popAndForget()) {
+    for (auto use : value->getUses()) {
+      switch (use->getOperandOwnership()) {
+      case OperandOwnership::PointerEscape:
+      case OperandOwnership::ForwardingUnowned:
+        return true;
+      case OperandOwnership::ForwardingConsume: {
+        auto *branch = dyn_cast<BranchInst>(use->getUser());
+        if (!branch) {
+          // Non-phi forwarding consumes end the lifetime of an owned value.
+          break;
+        }
+        auto *phi = branch->getDestBB()->getArgument(use->getOperandNumber());
+        worklist.pushIfNotVisited(phi);
+        break;
+      }
+      default:
+        break;
+      }
+    }
+  }
+  return false;
 }
 
-bool swift::canOpcodeForwardGuaranteedValues(SILValue value) {
+bool swift::canOpcodeForwardInnerGuaranteedValues(SILValue value) {
   // If we have an argument from a transforming terminator, we can forward
   // guaranteed.
   if (auto *arg = dyn_cast<SILArgument>(value))
     if (auto *ti = arg->getSingleTerminator())
-      if (ti->isTransformationTerminator())
+      if (ti->mayHaveTerminatorResult())
         return OwnershipForwardingMixin::get(ti)->preservesOwnership();
 
   if (auto *inst = value->getDefiningInstruction())
@@ -104,7 +137,7 @@ bool swift::canOpcodeForwardGuaranteedValues(SILValue value) {
   return false;
 }
 
-bool swift::canOpcodeForwardGuaranteedValues(Operand *use) {
+bool swift::canOpcodeForwardInnerGuaranteedValues(Operand *use) {
   if (auto *mixin = OwnershipForwardingMixin::get(use->getUser()))
     return mixin->preservesOwnership() &&
            !isa<OwnedFirstArgForwardingSingleValueInst>(use->getUser());
@@ -112,18 +145,12 @@ bool swift::canOpcodeForwardGuaranteedValues(Operand *use) {
 }
 
 bool swift::canOpcodeForwardOwnedValues(SILValue value) {
-  // If we have a SILArgument and we are the successor block of a transforming
-  // terminator, we are fine.
-  if (auto *arg = dyn_cast<SILPhiArgument>(value))
-    if (auto *predTerm = arg->getSingleTerminator())
-      if (predTerm->isTransformationTerminator())
-        return OwnershipForwardingMixin::get(predTerm)->preservesOwnership();
-
-  if (auto *inst = value->getDefiningInstruction())
-    if (auto *mixin = OwnershipForwardingMixin::get(inst))
+  if (auto *inst = value->getDefiningInstructionOrTerminator()) {
+    if (auto *mixin = OwnershipForwardingMixin::get(inst)) {
       return mixin->preservesOwnership() &&
              !isa<GuaranteedFirstArgForwardingSingleValueInst>(inst);
-
+    }
+  }
   return false;
 }
 
@@ -142,7 +169,8 @@ bool swift::canOpcodeForwardOwnedValues(Operand *use) {
 // Find all use points of \p guaranteedValue within its borrow scope. All uses
 // are naturally dominated by \p guaranteedValue. If a PointerEscape is found,
 // then no assumption can be made about \p guaranteedValue's lifetime. Therefore
-// the use points are incomplete and this returns false.
+// the use points are incomplete and this returns false. The escape point that
+// was found must still be in \p usePoints to distinguish from dead addresses.
 //
 // Accumulate results in \p usePoints, ignoring existing elements.
 //
@@ -152,6 +180,8 @@ bool swift::canOpcodeForwardOwnedValues(Operand *use) {
 //
 // FIXME: handle inner reborrows, which aren't dominated by
 // guaranteedValue. Audit all users to handle reborrows.
+//
+// TODO: Replace this with OwnershipUseVisitor.
 bool swift::findInnerTransitiveGuaranteedUses(
   SILValue guaranteedValue, SmallVectorImpl<Operand *> *usePoints) {
 
@@ -223,12 +253,19 @@ bool swift::findInnerTransitiveGuaranteedUses(
       foundPointerEscape = true;
       break;
 
-    case OperandOwnership::ForwardingBorrow: {
+    case OperandOwnership::GuaranteedForwarding: {
       bool nonLeaf = false;
       ForwardingOperand(use).visitForwardedValues([&](SILValue result) {
         // Do not include transitive uses with 'none' ownership
         if (result->getOwnershipKind() == OwnershipKind::None)
           return true;
+
+        // Bailout on guaranteed phis because the caller may assume dominance.
+        if (SILArgument::asPhi(result)) {
+          leafUse(use);
+          foundPointerEscape = true;
+          return true;
+        }
         for (auto *resultUse : result->getUses()) {
           if (resultUse->getOperandOwnership() != OperandOwnership::NonUse) {
             nonLeaf = true;
@@ -315,14 +352,12 @@ bool swift::findExtendedUsesOfSimpleBorrowedValue(
 
     case OperandOwnership::ForwardingUnowned:
     case OperandOwnership::PointerEscape:
+    case OperandOwnership::Reborrow:
       return false;
 
     case OperandOwnership::InstantaneousUse:
     case OperandOwnership::UnownedInstantaneousUse:
     case OperandOwnership::BitwiseEscape:
-    // Reborrow only happens when this is called on a value that creates a
-    // borrow scope.
-    case OperandOwnership::Reborrow:
     // EndBorrow either happens when this is called on a value that creates a
     // borrow scope, or when it is pushed as a use when processing a nested
     // borrow.
@@ -343,8 +378,12 @@ bool swift::findExtendedUsesOfSimpleBorrowedValue(
       }
       recordUse(use);
       break;
-
-    case OperandOwnership::ForwardingBorrow: {
+    case OperandOwnership::GuaranteedForwarding: {
+      // Conservatively assume that a forwarding phi is not dominated by the
+      // initial borrowed value and bailout.
+      if (PhiOperand(use)) {
+        return false;
+      }
       ForwardingOperand(use).visitForwardedValues([&](SILValue result) {
         // Do not include transitive uses with 'none' ownership
         if (result->getOwnershipKind() == OwnershipKind::None)
@@ -377,21 +416,69 @@ bool swift::findExtendedUsesOfSimpleBorrowedValue(
   return true;
 }
 
+// TODO: refactor this with SSAPrunedLiveness::computeLiveness.
 bool swift::findUsesOfSimpleValue(SILValue value,
                                   SmallVectorImpl<Operand *> *usePoints) {
   for (auto *use : value->getUses()) {
-    if (use->getOperandOwnership() == OperandOwnership::Borrow) {
+    switch (use->getOperandOwnership()) {
+    case OperandOwnership::PointerEscape:
+      return false;
+    case OperandOwnership::Borrow:
       if (!BorrowingOperand(use).visitScopeEndingUses([&](Operand *end) {
-            if (end->getOperandOwnership() == OperandOwnership::Reborrow) {
-              return false;
-            }
-            usePoints->push_back(end);
-            return true;
-          })) {
+        if (end->getOperandOwnership() == OperandOwnership::Reborrow) {
+          return false;
+        }
+        usePoints->push_back(end);
+        return true;
+      })) {
         return false;
       }
+      break;
+    default:
+      break;
     }
     usePoints->push_back(use);
+  }
+  return true;
+}
+
+bool swift::visitGuaranteedForwardingPhisForSSAValue(
+    SILValue value, function_ref<bool(Operand *)> visitor) {
+  assert(isa<BeginBorrowInst>(value) || isa<LoadBorrowInst>(value) ||
+         (isa<SILPhiArgument>(value) &&
+          value->getOwnershipKind() == OwnershipKind::Guaranteed));
+  // guaranteedForwardingOps is a collection of all transitive
+  // GuaranteedForwarding uses of \p value. It is a set, to avoid repeated
+  // processing of structs and tuples which are GuaranteedForwarding.
+  SmallSetVector<Operand *, 4> guaranteedForwardingOps;
+  // Collect first-level GuaranteedForwarding uses, and call the visitor on any
+  // GuaranteedForwardingPhi uses.
+  for (auto *use : value->getUses()) {
+    if (use->getOperandOwnership() == OperandOwnership::GuaranteedForwarding) {
+      if (PhiOperand(use)) {
+        if (!visitor(use)) {
+          return false;
+        }
+      }
+      guaranteedForwardingOps.insert(use);
+    }
+  }
+
+  // Transitively, collect GuaranteedForwarding uses.
+  for (unsigned i = 0; i < guaranteedForwardingOps.size(); i++) {
+    for (auto val : guaranteedForwardingOps[i]->getUser()->getResults()) {
+      for (auto *valUse : val->getUses()) {
+        if (valUse->getOperandOwnership() ==
+            OperandOwnership::GuaranteedForwarding) {
+          if (PhiOperand(valUse)) {
+            if (!visitor(valUse)) {
+              return false;
+            }
+          }
+          guaranteedForwardingOps.insert(valUse);
+        }
+      }
+    }
   }
   return true;
 }
@@ -488,6 +575,12 @@ void BorrowingOperandKind::print(llvm::raw_ostream &os) const {
   case Kind::Yield:
     os << "Yield";
     return;
+  case Kind::PartialApplyStack:
+    os << "PartialApply [stack]";
+    return;
+  case Kind::BeginAsyncLet:
+    os << "BeginAsyncLet";
+    return;
   }
   llvm_unreachable("Covered switch isn't covered?!");
 }
@@ -516,7 +609,9 @@ bool BorrowingOperand::hasEmptyRequiredEndingUses() const {
   case BorrowingOperandKind::Invalid:
     llvm_unreachable("Using invalid case");
   case BorrowingOperandKind::BeginBorrow:
-  case BorrowingOperandKind::BeginApply: {
+  case BorrowingOperandKind::BeginApply:
+  case BorrowingOperandKind::BeginAsyncLet:
+  case BorrowingOperandKind::PartialApplyStack: {
     return op->getUser()->hasUsesOfAnyResult();
   }
   case BorrowingOperandKind::Branch: {
@@ -562,6 +657,31 @@ bool BorrowingOperand::visitScopeEndingUses(
     }
     return !deadApply;
   }
+  case BorrowingOperandKind::PartialApplyStack: {
+    auto user = cast<PartialApplyInst>(op->getUser());
+    assert(user->isOnStack() && "escaping closures can't borrow");
+    // The closure's borrow lifetimes end when the closure itself ends its
+    // lifetime. That may happen transitively through conversions that forward
+    // ownership of the closure.
+    return user->visitOnStackLifetimeEnds(func);
+  }
+  case BorrowingOperandKind::BeginAsyncLet: {
+    auto user = cast<BuiltinInst>(op->getUser());
+    // The async let ends its borrow when the task is ended.
+    bool dead = true;
+    for (auto *use : user->getUses()) {
+      dead = false;
+      auto builtinUser = dyn_cast<BuiltinInst>(use->getUser());
+      if (!builtinUser
+          || builtinUser->getBuiltinKind() != BuiltinValueKind::EndAsyncLetLifetime)
+        continue;
+
+      if (!func(use)) {
+        return false;
+      }
+    }
+    return !dead;
+  }
   // These are instantaneous borrow scopes so there aren't any special end
   // scope instructions.
   case BorrowingOperandKind::Apply:
@@ -605,6 +725,8 @@ bool BorrowingOperand::visitBorrowIntroducingUserResults(
   case BorrowingOperandKind::TryApply:
   case BorrowingOperandKind::BeginApply:
   case BorrowingOperandKind::Yield:
+  case BorrowingOperandKind::PartialApplyStack:
+  case BorrowingOperandKind::BeginAsyncLet:
     llvm_unreachable("Never has borrow introducer results!");
   case BorrowingOperandKind::BeginBorrow: {
     auto value = BorrowedValue(cast<BeginBorrowInst>(op->getUser()));
@@ -629,6 +751,8 @@ BorrowedValue BorrowingOperand::getBorrowIntroducingUserResult() {
   case BorrowingOperandKind::TryApply:
   case BorrowingOperandKind::BeginApply:
   case BorrowingOperandKind::Yield:
+  case BorrowingOperandKind::PartialApplyStack:
+  case BorrowingOperandKind::BeginAsyncLet:
     return BorrowedValue();
 
   case BorrowingOperandKind::BeginBorrow:
@@ -643,8 +767,7 @@ BorrowedValue BorrowingOperand::getBorrowIntroducingUserResult() {
 }
 
 void BorrowingOperand::getImplicitUses(
-    SmallVectorImpl<Operand *> &foundUses,
-    std::function<void(Operand *)> *errorFunction) const {
+    SmallVectorImpl<Operand *> &foundUses) const {
   // FIXME: this visitScopeEndingUses should never return false once dead
   // borrows are disallowed.
   if (!visitScopeEndingUses([&](Operand *endOp) {
@@ -746,22 +869,23 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
 }
 
 /// Add this scopes live blocks into the PrunedLiveness result.
-void BorrowedValue::computeLiveness(PrunedLiveness &liveness) const {
-  liveness.initializeDefBlock(value->getParentBlock());
+void BorrowedValue::
+computeTransitiveLiveness(MultiDefPrunedLiveness &liveness) const {
+  liveness.initializeDef(value);
   visitTransitiveLifetimeEndingUses([&](Operand *endOp) {
     if (endOp->getOperandOwnership() == OperandOwnership::EndBorrow) {
       liveness.updateForUse(endOp->getUser(), /*lifetimeEnding*/ true);
       return true;
     }
     assert(endOp->getOperandOwnership() == OperandOwnership::Reborrow);
-    auto *succBlock = cast<BranchInst>(endOp->getUser())->getDestBB();
-    liveness.initializeDefBlock(succBlock);
+    PhiOperand phiOper(endOp);
+    liveness.initializeDef(phiOper.getValue());
     liveness.updateForUse(endOp->getUser(), /*lifetimeEnding*/ false);
     return true;
   });
 }
 
-bool BorrowedValue::areUsesWithinTransitiveScope(
+bool BorrowedValue::areUsesWithinExtendedScope(
     ArrayRef<Operand *> uses, DeadEndBlocks *deadEndBlocks) const {
   // First make sure that we actually have a local scope. If we have a non-local
   // scope, then we have something (like a SILFunctionArgument) where a larger
@@ -772,8 +896,8 @@ bool BorrowedValue::areUsesWithinTransitiveScope(
     return true;
 
   // Compute the local scope's liveness.
-  PrunedLiveness liveness;
-  computeLiveness(liveness);
+  MultiDefPrunedLiveness liveness(value->getFunction());
+  computeTransitiveLiveness(liveness);
   return liveness.areUsesWithinBoundary(uses, deadEndBlocks);
 }
 
@@ -915,6 +1039,10 @@ bool BorrowedValue::visitInteriorPointerOperandHelper(
   return true;
 }
 
+// FIXME: This does not yet assume complete lifetimes. Therefore, it currently
+// recursively looks through scoped uses, such as load_borrow. We should
+// separate the logic for lifetime completion from the logic that can assume
+// complete lifetimes.
 AddressUseKind
 swift::findTransitiveUsesForAddress(SILValue projectedAddress,
                                     SmallVectorImpl<Operand *> *foundUses,
@@ -932,6 +1060,8 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
 
   AddressUseKind result = AddressUseKind::NonEscaping;
 
+  // Record all uses that aren't transitively followed. These are either
+  // instanteneous uses of the addres, or cause a pointer escape.
   auto leafUse = [foundUses](Operand *use) {
     if (foundUses)
       foundUses->push_back(use);
@@ -961,6 +1091,7 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
     // the apply to be a use point.
     if (isa<PartialApplyInst>(user) || isa<AddressToPointerInst>(user)) {
       result = meet(result, AddressUseKind::PointerEscape);
+      leafUse(op);
       continue;
     }
     // First, eliminate "end point uses" that we just need to check liveness at
@@ -976,7 +1107,9 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
         isa<EndUnpairedAccessInst>(user) || isa<WitnessMethodInst>(user) ||
         isa<SwitchEnumAddrInst>(user) || isa<CheckedCastAddrBranchInst>(user) ||
         isa<SelectEnumAddrInst>(user) || isa<InjectEnumAddrInst>(user) ||
-        isa<IsUniqueInst>(user) || isa<ValueMetatypeInst>(user)) {
+        isa<IsUniqueInst>(user) || isa<ValueMetatypeInst>(user) ||
+        isa<DebugValueInst>(user) || isa<EndBorrowInst>(user) ||
+        isa<ExplicitCopyAddrInst>(user)) {
       leafUse(op);
       continue;
     }
@@ -984,6 +1117,7 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
     if (isa<UnconditionalCheckedCastAddrInst>(user)
         || isa<MarkFunctionEscapeInst>(user)) {
       assert(!user->hasResults());
+      leafUse(op);
       continue;
     }
 
@@ -1010,12 +1144,12 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
 
     // If we have a load_borrow, add it's end scope to the liveness requirement.
     if (auto *lbi = dyn_cast<LoadBorrowInst>(user)) {
-      if (foundUses) {
-        for (Operand *use : lbi->getUses()) {
-          if (use->endsLocalBorrowScope()) {
-            leafUse(use);
-          }
-        }
+      // FIXME: if we can assume complete lifetimes, then this should be
+      // as simple as:
+      //   for (Operand *use : lbi->getUses()) {
+      //     if (use->endsLocalBorrowScope()) {
+      if (!findInnerTransitiveGuaranteedUses(lbi, foundUses)) {
+        result = meet(result, AddressUseKind::PointerEscape);
       }
       continue;
     }
@@ -1056,7 +1190,8 @@ swift::findTransitiveUsesForAddress(SILValue projectedAddress,
     if (onError) {
       (*onError)(op);
     }
-    result = AddressUseKind::Unknown;
+    result = meet(result, AddressUseKind::Unknown);
+    leafUse(op);
   }
   return result;
 }
@@ -1073,13 +1208,21 @@ bool AddressOwnership::areUsesWithinLifetime(
   SILValue root = base.getOwnershipReferenceRoot();
   BorrowedValue borrow(root);
   if (borrow)
-    return borrow.areUsesWithinTransitiveScope(uses, &deadEndBlocks);
+    return borrow.areUsesWithinExtendedScope(uses, &deadEndBlocks);
 
-  // --- A reference no borrow scope. Currently happens for project_box.
+  // --- A reference with no borrow scope! Currently happens for project_box.
 
   // Compute the reference value's liveness.
-  PrunedLiveness liveness;
-  liveness.computeSSALiveness(root);
+  SSAPrunedLiveness liveness(root->getFunction());
+  liveness.initializeDef(root);
+  LiveRangeSummary summary = liveness.computeSimple();
+  // Conservatively ignore InnerBorrowKind::Reborrowed and
+  // AddressUseKind::PointerEscape and Reborrowed. The resulting liveness at
+  // least covers the known uses.
+  (void)summary;
+
+  // FIXME (implicit borrow): handle reborrows transitively just like above so
+  // we don't bail out if a uses is within the reborrowed scope.
   return liveness.areUsesWithinBoundary(uses, &deadEndBlocks);
 }
 
@@ -1143,11 +1286,12 @@ bool swift::getAllBorrowIntroducingValues(SILValue inputValue,
   if (inputValue->getOwnershipKind() != OwnershipKind::Guaranteed)
     return false;
 
-  SmallVector<SILValue, 32> worklist;
-  worklist.emplace_back(inputValue);
+  SmallSetVector<SILValue, 32> worklist;
+  worklist.insert(inputValue);
 
-  while (!worklist.empty()) {
-    SILValue value = worklist.pop_back_val();
+  // worklist grows in this loop.
+  for (unsigned idx = 0; idx < worklist.size(); idx++) {
+    SILValue value = worklist[idx];
 
     // First check if v is an introducer. If so, stash it and continue.
     if (auto scopeIntroducer = BorrowedValue(value)) {
@@ -1164,23 +1308,27 @@ bool swift::getAllBorrowIntroducingValues(SILValue inputValue,
 
     // Otherwise if v is an ownership forwarding value, add its defining
     // instruction
-    if (isForwardingBorrow(value)) {
+    if (isGuaranteedForwarding(value)) {
       if (auto *i = value->getDefiningInstruction()) {
-        llvm::copy(i->getNonTypeDependentOperandValues(),
-                   std::back_inserter(worklist));
+        for (SILValue opValue : i->getNonTypeDependentOperandValues()) {
+          worklist.insert(opValue);
+        }
         continue;
       }
 
       // Otherwise, we should have a block argument that is defined by a single
       // predecessor terminator.
       auto *arg = cast<SILPhiArgument>(value);
-      auto *termInst = arg->getSingleTerminator();
-      assert(termInst && termInst->isTransformationTerminator() &&
-             OwnershipForwardingMixin::get(termInst)->preservesOwnership());
-      assert(termInst->getNumOperands() == 1 &&
-             "Transforming terminators should always have a single operand");
-      worklist.push_back(termInst->getAllOperands()[0].get());
-      continue;
+      if (arg->isTerminatorResult()) {
+        if (auto *forwardedOper = arg->forwardedTerminatorResultOperand()) {
+          worklist.insert(forwardedOper->get());
+          continue;
+        }
+      }
+      arg->visitIncomingPhiOperands([&](auto *operand) {
+        worklist.insert(operand->get());
+        return true;
+      });
     }
 
     // Otherwise, this is an introducer we do not understand. Bail and return
@@ -1209,8 +1357,8 @@ BorrowedValue swift::getSingleBorrowIntroducingValue(SILValue inputValue) {
 
     // Otherwise if v is an ownership forwarding value, add its defining
     // instruction
-    if (isForwardingBorrow(currentValue)) {
-      if (auto *i = currentValue->getDefiningInstruction()) {
+    if (isGuaranteedForwarding(currentValue)) {
+      if (auto *i = currentValue->getDefiningInstructionOrTerminator()) {
         auto instOps = i->getNonTypeDependentOperandValues();
         // If we have multiple incoming values, return .None. We can't handle
         // this.
@@ -1222,17 +1370,6 @@ BorrowedValue swift::getSingleBorrowIntroducingValue(SILValue inputValue) {
         currentValue = *begin;
         continue;
       }
-
-      // Otherwise, we should have a block argument that is defined by a single
-      // predecessor terminator.
-      auto *arg = cast<SILPhiArgument>(currentValue);
-      auto *termInst = arg->getSingleTerminator();
-      assert(termInst && termInst->isTransformationTerminator() &&
-             OwnershipForwardingMixin::get(termInst)->preservesOwnership());
-      assert(termInst->getNumOperands() == 1 &&
-             "Transformation terminators should only have single operands");
-      currentValue = termInst->getAllOperands()[0].get();
-      continue;
     }
 
     // Otherwise, this is an introducer we do not understand. Bail and return
@@ -1270,22 +1407,11 @@ bool swift::getAllOwnedValueIntroducers(
     // Otherwise if v is an ownership forwarding value, add its defining
     // instruction
     if (isForwardingConsume(value)) {
-      if (auto *i = value->getDefiningInstruction()) {
+      if (auto *i = value->getDefiningInstructionOrTerminator()) {
         llvm::copy(i->getNonTypeDependentOperandValues(),
                    std::back_inserter(worklist));
         continue;
       }
-
-      // Otherwise, we should have a block argument that is defined by a single
-      // predecessor terminator.
-      auto *arg = cast<SILPhiArgument>(value);
-      auto *termInst = arg->getSingleTerminator();
-      assert(termInst && termInst->isTransformationTerminator() &&
-             OwnershipForwardingMixin::get(termInst)->preservesOwnership());
-      assert(termInst->getNumOperands() == 1 &&
-             "Transforming terminators should always have a single operand");
-      worklist.push_back(termInst->getAllOperands()[0].get());
-      continue;
     }
 
     // Otherwise, this is an introducer we do not understand. Bail and return
@@ -1311,7 +1437,7 @@ OwnedValueIntroducer swift::getSingleOwnedValueIntroducer(SILValue inputValue) {
     // Otherwise if v is an ownership forwarding value, add its defining
     // instruction
     if (isForwardingConsume(currentValue)) {
-      if (auto *i = currentValue->getDefiningInstruction()) {
+      if (auto *i = currentValue->getDefiningInstructionOrTerminator()) {
         auto instOps = i->getNonTypeDependentOperandValues();
         // If we have multiple incoming values, return .None. We can't handle
         // this.
@@ -1323,18 +1449,6 @@ OwnedValueIntroducer swift::getSingleOwnedValueIntroducer(SILValue inputValue) {
         currentValue = *begin;
         continue;
       }
-
-      // Otherwise, we should have a block argument that is defined by a single
-      // predecessor terminator and is directly forwarding.
-      auto *arg = cast<SILPhiArgument>(currentValue);
-      auto *termInst = arg->getSingleTerminator();
-      assert(termInst && termInst->isTransformationTerminator() &&
-             OwnershipForwardingMixin::get(termInst)->preservesOwnership());
-      assert(termInst->getNumOperands()
-             - termInst->getNumTypeDependentOperands() == 1 &&
-             "Transformation terminators should only have single operands");
-      currentValue = termInst->getAllOperands()[0].get();
-      continue;
     }
 
     // Otherwise, this is an introducer we do not understand. Bail and return
@@ -1353,30 +1467,16 @@ ForwardingOperand::ForwardingOperand(Operand *use) {
   if (use->isTypeDependent())
     return;
 
-  if (!OwnershipForwardingMixin::isa(use->getUser())) {
-    return;
-  }
-#ifndef NDEBUG
   switch (use->getOperandOwnership()) {
   case OperandOwnership::ForwardingUnowned:
   case OperandOwnership::ForwardingConsume:
-  case OperandOwnership::ForwardingBorrow:
+  case OperandOwnership::GuaranteedForwarding:
+    this->use = use;
     break;
-  case OperandOwnership::NonUse:
-  case OperandOwnership::TrivialUse:
-  case OperandOwnership::InstantaneousUse:
-  case OperandOwnership::UnownedInstantaneousUse:
-  case OperandOwnership::PointerEscape:
-  case OperandOwnership::BitwiseEscape:
-  case OperandOwnership::Borrow:
-  case OperandOwnership::DestroyingConsume:
-  case OperandOwnership::InteriorPointer:
-  case OperandOwnership::EndBorrow:
-  case OperandOwnership::Reborrow:
-    llvm_unreachable("this isn't the operand being forwarding!");
+  default:
+    this->use = nullptr;
+    return;
   }
-#endif
-  this->use = use;
 }
 
 ValueOwnershipKind ForwardingOperand::getForwardingOwnershipKind() const {
@@ -1582,283 +1682,654 @@ bool ForwardingOperand::visitForwardedValues(
   // "transforming terminators"... We know that this means that we should at
   // most have a single phi argument.
   auto *ti = cast<TermInst>(user);
-  return llvm::all_of(ti->getSuccessorBlocks(), [&](SILBasicBlock *succBlock) {
-    // If we do not have any arguments, then continue.
-    if (succBlock->args_empty())
-      return true;
+  if (ti->mayHaveTerminatorResult()) {
+    return llvm::all_of(
+        ti->getSuccessorBlocks(), [&](SILBasicBlock *succBlock) {
+          // If we do not have any arguments, then continue.
+          if (succBlock->args_empty())
+            return true;
 
-    auto args = succBlock->getSILPhiArguments();
-    assert(args.size() == 1 && "Transforming terminator with multiple args?!");
-    return visitor(args[0]);
-  });
+          auto args = succBlock->getSILPhiArguments();
+          assert(args.size() == 1 &&
+                 "Transforming terminator with multiple args?!");
+          return visitor(args[0]);
+        });
+  }
+
+  // If our terminator is function exiting, we do not have a value to visit, so
+  // just return.
+  if (ti->isFunctionExiting())
+    return true;
+
+  auto *succArg = PhiOperand(use).getValue();
+  return visitor(succArg);
 }
 
-void swift::findTransitiveReborrowBaseValuePairs(
-    BorrowingOperand initialScopedOperand, SILValue origBaseValue,
-    function_ref<void(SILPhiArgument *, SILValue)> visitReborrowBaseValuePair) {
-  // We need a SetVector to make sure we don't revisit the same reborrow operand
-  // again.
-  SmallSetVector<std::tuple<Operand *, SILValue>, 4> worklist;
+void swift::visitExtendedReborrowPhiBaseValuePairs(
+    BeginBorrowInst *borrowInst, function_ref<void(SILPhiArgument *, SILValue)>
+                                     visitReborrowPhiBaseValuePair) {
+  // A Reborrow can have different base values on different control flow
+  // paths.
+  // For that reason, worklist stores (reborrow, base value) pairs.
+  // We need a SetVector to make sure we don't revisit the same pair again.
+  SmallSetVector<std::tuple<PhiOperand, SILValue>, 4> worklist;
 
-  // Populate the worklist with reborrow and the base value
-  initialScopedOperand.visitScopeEndingUses([&](Operand *op) {
-    if (op->getOperandOwnership() == OperandOwnership::Reborrow) {
-      worklist.insert(std::make_tuple(op, origBaseValue));
-    }
-    return true;
-  });
-
-  // Size of worklist changes in this loop
-  for (unsigned idx = 0; idx < worklist.size(); idx++) {
-    Operand *reborrowOp;
-    SILValue baseValue;
-    std::tie(reborrowOp, baseValue) = worklist[idx];
-
-    BorrowingOperand borrowingOperand(reborrowOp);
-    assert(borrowingOperand.isReborrow());
-
-    auto *branchInst = cast<BranchInst>(reborrowOp->getUser());
-    auto *succBlock = branchInst->getDestBB();
-    auto *phiArg = cast<SILPhiArgument>(
-        succBlock->getArgument(reborrowOp->getOperandNumber()));
-
-    SILValue newBaseVal = baseValue;
-    // If the previous base value was also passed as a phi arg, that will be
-    // the new base value.
-    for (auto *arg : succBlock->getArguments()) {
-      if (arg->getIncomingPhiValue(branchInst->getParent()) == baseValue) {
-        newBaseVal = arg;
-        break;
-      }
-    }
-
-    // Call the visitor function
-    visitReborrowBaseValuePair(phiArg, newBaseVal);
-
-    BorrowedValue scopedValue(phiArg);
-    scopedValue.visitLocalScopeEndingUses([&](Operand *op) {
+  // Find all reborrows of value and insert the (reborrow, base value) pair into
+  // the worklist.
+  auto collectReborrows = [&](SILValue value, SILValue baseValue) {
+    BorrowedValue(value).visitLocalScopeEndingUses([&](Operand *op) {
       if (op->getOperandOwnership() == OperandOwnership::Reborrow) {
-        worklist.insert(std::make_tuple(op, newBaseVal));
+        worklist.insert(std::make_tuple(PhiOperand(op), baseValue));
       }
       return true;
     });
+  };
+
+  // Initialize the worklist.
+  collectReborrows(borrowInst, borrowInst->getOperand());
+
+  // For every (reborrow, base value) pair in the worklist:
+  // - Find phi value and new base value
+  // - Call the visitor on the phi value and new base value pair
+  // - Populate the worklist with pairs of reborrows of phi value and the new
+  // base.
+  for (unsigned idx = 0; idx < worklist.size(); idx++) {
+    PhiOperand phiOp;
+    SILValue currentBaseValue;
+    std::tie(phiOp, currentBaseValue) = worklist[idx];
+
+    auto *phiValue = phiOp.getValue();
+    SILValue newBaseValue = currentBaseValue;
+
+    // If the previous base value was also passed as a phi operand along with
+    // the reborrow, its phi value will be the new base value.
+    for (auto &op : phiOp.getBranch()->getAllOperands()) {
+      PhiOperand otherPhiOp(&op);
+      if (otherPhiOp.getSource() != currentBaseValue) {
+        continue;
+      }
+      newBaseValue = otherPhiOp.getValue();
+    }
+
+    // Call the visitor function
+    visitReborrowPhiBaseValuePair(phiValue, newBaseValue);
+
+    collectReborrows(phiValue, newBaseValue);
   }
 }
 
-/// Visit the phis in the same block as \p phi which are reborrows of a borrow
-/// of one of the values reaching \p phi.
+void swift::visitExtendedGuaranteedForwardingPhiBaseValuePairs(
+    BorrowedValue borrow, function_ref<void(SILPhiArgument *, SILValue)>
+                              visitGuaranteedForwardingPhiBaseValuePair) {
+  assert(borrow.kind == BorrowedValueKind::BeginBorrow ||
+         borrow.kind == BorrowedValueKind::LoadBorrow);
+  // A GuaranteedForwardingPhi can have different base values on different
+  // control flow paths.
+  // For that reason, worklist stores (GuaranteedForwardingPhi operand, base
+  // value) pairs. We need a SetVector to make sure we don't revisit the same
+  // pair again.
+  SmallSetVector<std::tuple<PhiOperand, SILValue>, 4> worklist;
+
+  auto collectGuaranteedForwardingPhis = [&](SILValue value,
+                                             SILValue baseValue) {
+    visitGuaranteedForwardingPhisForSSAValue(value, [&](Operand *op) {
+      worklist.insert(std::make_tuple(PhiOperand(op), baseValue));
+      return true;
+    });
+  };
+
+  // Collect all GuaranteedForwardingPhis
+  collectGuaranteedForwardingPhis(borrow.value, borrow.value);
+  borrow.visitTransitiveLifetimeEndingUses([&](Operand *endUse) {
+    if (endUse->getOperandOwnership() == OperandOwnership::Reborrow) {
+      auto *phiValue = PhiOperand(endUse).getValue();
+      collectGuaranteedForwardingPhis(phiValue, phiValue);
+    }
+    return true;
+  });
+  // For every (GuaranteedForwardingPhi operand, base value) pair in the
+  // worklist:
+  // - Find phi value and new base value
+  // - Call the visitor on the phi value and new base value pair
+  // - Populate the worklist with pairs of GuaranteedForwardingPhi ops of phi
+  // value and the new base.
+  for (unsigned idx = 0; idx < worklist.size(); idx++) {
+    PhiOperand phiOp;
+    SILValue currentBaseValue;
+    std::tie(phiOp, currentBaseValue) = worklist[idx];
+
+    auto *phiValue = phiOp.getValue();
+    SILValue newBaseValue = currentBaseValue;
+
+    // If an adjacent reborrow is found in the same block as the guaranteed phi,
+    // then set newBaseValue to the reborrow.
+    for (auto &op : phiOp.getBranch()->getAllOperands()) {
+      PhiOperand otherPhiOp(&op);
+      if (otherPhiOp.getSource() != currentBaseValue) {
+        continue;
+      }
+      newBaseValue = otherPhiOp.getValue();
+    }
+
+    // Call the visitor function
+    visitGuaranteedForwardingPhiBaseValuePair(phiValue, newBaseValue);
+
+    collectGuaranteedForwardingPhis(phiValue, newBaseValue);
+  }
+}
+
+/// If \p instruction forwards guaranteed values to its results, visit each
+/// forwarded operand. The visitor must check whether the forwarded value is
+/// guaranteed.
 ///
-/// If the visitor returns false, stops visiting and returns false.  Otherwise,
-/// returns true.
+/// Return true \p visitOperand was called at least once.
 ///
+/// \p visitOperand should always recheck for Guaranteed owernship if it
+/// matters, in case a cast forwards a trivial type to a nontrivial type.
 ///
-/// When an owned value is passed as a phi argument, it is consumed.  So any
-/// open scope borrowing that owned value must be ended no later than in that
-/// branch instruction.  Either such a borrow scope is ended beforehand
+/// This intentionally does not handle phis, which require recursive traversal
+/// to determine `isGuaranteedForwardingPhi`.
+bool swift::visitForwardedGuaranteedOperands(
+  SILValue value, function_ref<void(Operand *)> visitOperand) {
+
+  assert(!SILArgument::asPhi(value) && "phis are handled separately");
+
+  if (auto *termResult = SILArgument::isTerminatorResult(value)) {
+    if (auto *oper = termResult->forwardedTerminatorResultOperand()) {
+      visitOperand(oper);
+      return true;
+    }
+    return false;
+  }
+  auto *inst = value->getDefiningInstruction();
+  if (!inst)
+    return false;
+
+  // Bypass conversions that produce a guarantee value out of thin air.
+  if (inst->getNumRealOperands() == 0) {
+    return false;
+  }
+  if (isa<FirstArgOwnershipForwardingSingleValueInst>(inst)
+      || isa<OwnershipForwardingConversionInst>(inst)
+      || isa<OwnershipForwardingSelectEnumInstBase>(inst)
+      || isa<OwnershipForwardingMultipleValueInstruction>(inst)
+      || isa<MoveOnlyWrapperToCopyableValueInst>(inst)
+      || isa<CopyableToMoveOnlyWrapperValueInst>(inst)) {
+    assert(!isa<SingleValueInstruction>(inst)
+           || !BorrowedValue(cast<SingleValueInstruction>(inst))
+                  && "forwarded operand cannot begin a borrow scope");
+    visitOperand(&inst->getOperandRef(0));
+    return true;
+  }
+  if (isa<AllArgOwnershipForwardingSingleValueInst>(inst)) {
+    assert(inst->getNumOperands() > 0 && "checked above");
+    assert(inst->getNumOperands() == inst->getNumRealOperands() &&
+           "mixin expects all readl operands");
+    for (auto &operand : inst->getAllOperands()) {
+      visitOperand(&operand);
+    }
+    return true;
+  }
+  return false;
+}
+
+namespace {
+
+// Find the definitions of the scopes that enclose guaranteed values, handling
+// all combinations of aggregation, guaranteed forwarding phis, and reborrows.
+class FindEnclosingDefs {
+  // A separately allocated set-vector is used for each level of recursion
+  // across block boundaries (NodeSet cannot be used recursively).
+  using LocalValueSetVector = SmallPtrSetVector<SILValue, 8>;
+
+  SILFunction *function;
+  ValueSet visitedPhis;
+
+public:
+  FindEnclosingDefs(SILFunction *function) : function(function),
+                                             visitedPhis(function) {}
+
+  // Visit each definition of a scope that immediately encloses a guaranteed
+  // value. The guaranteed value effectively keeps these scopes alive.
+  //
+  // This means something different depending on whether \p value is itself a
+  // borrow introducer vs. a forwarded guaranteed value. If \p value is an
+  // introducer, then this disovers the enclosing borrow scope and visits all
+  // introducers of that scope. If \p value is a forwarded value, then this
+  // visits the introducers of the current borrow scope.
+  bool visitEnclosingDefs(SILValue value,
+                          function_ref<bool(SILValue)> visitor) && {
+    if (value->getOwnershipKind() != OwnershipKind::Guaranteed)
+      return true;
+
+    if (auto borrowedValue = BorrowedValue(value)) {
+      switch (borrowedValue.kind) {
+      case BorrowedValueKind::Invalid:
+        llvm_unreachable("checked above");
+
+      case BorrowedValueKind::Phi: {
+        StackList<SILValue> enclosingDefs(function);
+        recursivelyFindDefsOfReborrow(SILArgument::asPhi(value), enclosingDefs);
+        for (SILValue def : enclosingDefs) {
+          if (!visitor(def))
+            return false;
+        }
+        return true;
+      }
+      case BorrowedValueKind::BeginBorrow:
+        return std::move(*this).visitBorrowIntroducers(
+            cast<BeginBorrowInst>(value)->getOperand(), visitor);
+
+      case BorrowedValueKind::LoadBorrow:
+      case BorrowedValueKind::SILFunctionArgument:
+        // There is no enclosing def on this path.
+        return true;
+      }
+    }
+    // Handle forwarded guaranteed values.
+    return std::move(*this).visitBorrowIntroducers(value, visitor);
+  }
+
+  // Visit the values that introduce the borrow scopes that includes \p
+  // value. If value is owned, or introduces a borrow scope, then this only
+  // visits \p value.
+  bool visitBorrowIntroducers(SILValue value,
+                              function_ref<bool(SILValue)> visitor) && {
+    StackList<SILValue> introducers(function);
+    LocalValueSetVector visitedValues;
+    recursivelyFindBorrowIntroducers(value, introducers, visitedValues);
+    for (SILValue introducer : introducers) {
+      if (!visitor(introducer))
+        return false;
+    }
+    return true;
+  }
+
+protected:
+  // This is the identity function (i.e. just adds \p value to \p introducers)
+  // when:
+  // - \p value is owned
+  // - \p value introduces a borrow scope (begin_borrow, load_borrow, reborrow)
+  //
+  // Otherwise recurse up the use-def chain to find all introducers.
+  //
+  // Returns false if \p forwardingPhi was already encountered, either because
+  // of a phi cycle or because of reconvergent control flow. Similarly, return
+  // false if all incoming values were encountered.
+  bool recursivelyFindBorrowIntroducers(SILValue value,
+                                        StackList<SILValue> &introducers,
+                                        LocalValueSetVector &visitedValues) {
+    // Check if this value's introducers have already been added to
+    // 'introducers' to avoid duplicates and avoid exponential recursion on
+    // aggregates.
+    if (!visitedValues.insert(value))
+      return false;
+
+    switch (value->getOwnershipKind()) {
+    case OwnershipKind::Any:
+    case OwnershipKind::None:
+    case OwnershipKind::Unowned:
+      return false;
+
+    case OwnershipKind::Owned:
+      introducers.push_back(value);
+      return true;
+
+    case OwnershipKind::Guaranteed:
+      break;
+    }
+    // BorrowedValue handles the initial scope introducers: begin_borrow,
+    // load_borrow, & reborrow.
+    if (BorrowedValue(value)) {
+      introducers.push_back(value);
+      return true;
+    }
+    bool foundNewIntroducer = false;
+    // Handle forwarding phis.
+    if (auto *phi = SILArgument::asPhi(value)) {
+      foundNewIntroducer = recursivelyFindForwardingPhiIntroducers(
+          phi, introducers, visitedValues);
+    } else {
+      // Recurse through guaranteed forwarding instructions.
+      visitForwardedGuaranteedOperands(value, [&](Operand *operand) {
+        SILValue forwardedVal = operand->get();
+        if (forwardedVal->getOwnershipKind() == OwnershipKind::Guaranteed) {
+          foundNewIntroducer |=
+            recursivelyFindBorrowIntroducers(forwardedVal, introducers,
+                                             visitedValues);
+        }
+      });
+    }
+    return foundNewIntroducer;
+  }
+
+  // Given the enclosing definition on a predecessor path, identify the
+  // enclosing definitions on the successor block. Each enclosing predecessor
+  // def is either used by an outer-adjacent phi in the successor block, or it
+  // must dominate the successor block.
+  static SILValue findSuccessorDefFromPredDef(SILBasicBlock *predecessor,
+                                              SILValue enclosingPredDef) {
+
+    SILBasicBlock *successor = predecessor->getSingleSuccessorBlock();
+    assert(successor && "phi predecessor must have a single successor in OSSA");
+
+    for (auto *candidatePhi : successor->getArguments()) {
+      SILValue candidateValue =
+        candidatePhi->getIncomingPhiValue(predecessor);
+
+      // Find the outer adjacent phi in the successor block.
+      // the 'enclosingDef' from the 'pred' block.
+      if (candidateValue == enclosingPredDef)
+        return candidatePhi;
+    }
+    // No candidates phi are outer-adjacent phis. The incoming enclosingDef
+    // must dominate the current guaranteed phi. So it remains the enclosing
+    // scope.
+    return enclosingPredDef;
+  }
+
+  // Given the enclosing definitions on a predecessor path, identify the
+  // enclosing definitions on the successor block.
+  void findSuccessorDefsFromPredDefs(
+      SILBasicBlock *predecessor, const StackList<SILValue> &predDefs,
+      StackList<SILValue> &successorDefs,
+      LocalValueSetVector &visitedSuccessorValues) {
+
+    // Gather the new introducers for the successor block.
+    for (SILValue predDef : predDefs) {
+      SILValue succDef = findSuccessorDefFromPredDef(predecessor, predDef);
+      if (visitedSuccessorValues.insert(succDef))
+        successorDefs.push_back(succDef);
+    }
+  }
+
+  // Find the introducers of a forwarding phi's borrow scope. The introducers
+  // are either dominating values, or reborrows in the same block as the
+  // forwarding phi.
+  //
+  // Recurse along the use-def phi web until a begin_borrow is reached. At each
+  // level, find the outer-adjacent phi, if one exists, otherwise return the
+  // dominating definition.
+  //
+  // Returns false if \p forwardingPhi was already encountered, either because
+  // of a phi cycle or because of reconvergent control flow. Similarly, returns
+  // false if all incoming values were encountered.
+  //
+  //     one(%reborrow_1 : @guaranteed)
+  //         %field = struct_extract %reborrow_1
+  //         br two(%reborrow_1, %field)
+  //     two(%reborrow_2 : @guaranteed, %forward_2 : @guaranteed)
+  //         end_borrow %reborrow_2
+  //
+  // Calling recursivelyFindForwardingPhiIntroducers(%forward_2)
+  // recursively computes these introducers:
+  //
+  //    %field is the only value incoming to %forward_2.
+  //
+  //    %field is introduced by %reborrow_1 via
+  //    recursivelyFindBorrowIntroducers(%field).
+  //
+  //    %reborrow_1 is introduced by %reborrow_2 in block "two" via
+  //    findSuccessorDefsFromPredDefs(%reborrow_1)).
+  //
+  //    %reborrow_2 is returned.
+  //
+  bool
+  recursivelyFindForwardingPhiIntroducers(SILPhiArgument *forwardingPhi,
+                                          StackList<SILValue> &introducers,
+                                          LocalValueSetVector &visitedValues) {
+    // Phi cycles are skipped. They cannot contribute any new enclosing defs.
+    if (!visitedPhis.insert(forwardingPhi))
+      return false;
+
+    bool foundIntroducer = false;
+    SILBasicBlock *block = forwardingPhi->getParent();
+    for (auto *pred : block->getPredecessorBlocks()) {
+      SILValue incomingValue = forwardingPhi->getIncomingPhiValue(pred);
+
+      // Each phi operand requires a new introducer list and visited values
+      // set. These values will be remapped to successor phis before adding them
+      // to the caller's introducer list. It may be necessary to revisit a value
+      // that was already visited by the caller before remapping to phis.
+      StackList<SILValue> incomingIntroducers(function);
+      LocalValueSetVector incomingVisitedValues;
+      if (!recursivelyFindBorrowIntroducers(incomingValue, incomingIntroducers,
+                                            incomingVisitedValues))
+        continue;
+
+      foundIntroducer = true;
+      findSuccessorDefsFromPredDefs(pred, incomingIntroducers, introducers,
+                                    visitedValues);
+    }
+    return foundIntroducer;
+  }
+
+  // Given a reborrow operand's incoming value, find the enclosing definition.
+  void recursivelyFindDefsOfReborrowOperand(
+    SILValue incomingValue,
+    StackList<SILValue> &enclosingDefs) {
+
+    if (incomingValue->getOwnershipKind() == OwnershipKind::None)
+      return;
+
+    assert(incomingValue->getOwnershipKind() == OwnershipKind::Guaranteed);
+
+    // Avoid repeatedly constructing BorrowedValue during use-def
+    // traversal. That would be quadratic if it checks all uses for reborrows.
+    if (auto *predPhi = dyn_cast<SILPhiArgument>(incomingValue)) {
+      recursivelyFindDefsOfReborrow(predPhi, enclosingDefs);
+      return;
+    }
+
+    // Handle non-phi borrow introducers.
+    BorrowedValue borrowedValue(incomingValue);
+
+    switch (borrowedValue.kind) {
+    case BorrowedValueKind::Phi:
+      llvm_unreachable("phis are short-curcuited above");
+    case BorrowedValueKind::Invalid:
+      llvm_unreachable("A reborrow immediate operand must be a BorrowedValue.");
+    case BorrowedValueKind::BeginBorrow: {
+      LocalValueSetVector visitedValues;
+      recursivelyFindBorrowIntroducers(
+        cast<BeginBorrowInst>(incomingValue)->getOperand(), enclosingDefs,
+        visitedValues);
+      break;
+    }
+    case BorrowedValueKind::LoadBorrow:
+    case BorrowedValueKind::SILFunctionArgument:
+      // There is no enclosing def on this path.
+      break;
+    }
+  }
+
+  // Given a reborrow, find the definitions of the enclosing borrow scopes. Each
+  // enclosing borrow scope is represented by one of the following cases, which
+  // refer to the example below:
+  //
+  // dominating owned value -> %value encloses %reborrow_1
+  // owned outer-adjacent phi -> %phi_3 encloses %reborrow_3
+  // dominating outer borrow introducer -> %outerBorrowB encloses %reborrow
+  // outer-adjacent reborrow -> %outerReborrow encloses %reborrow
+  //
+  // Recurse along the use-def phi web until a begin_borrow is reached. Then
+  // find all introducers of the begin_borrow's operand. At each level, find
+  // the outer adjacent phi, if one exists, otherwise return the most recently
+  // found dominating definition.
+  //
+  // If \p reborrow was already encountered because of a phi cycle, then no
+  // enclosingDefs are added.
+  //
+  // Example:
+  //
+  //         %value = ...
+  //         %borrow = begin_borrow %value
+  //         br one(%borrow)
+  //     one(%reborrow_1 : @guaranteed)
+  //         br two(%value, %reborrow_1)
+  //     two(%phi_2 : @owned, %reborrow_2 : @guaranteed)
+  //         br three(%value, %reborrow_1)
+  //     three(%phi_3 : @owned, %reborrow_3 : @guaranteed)
+  //         end_borrow %reborrow_3
+  //         destroy_value %phi_3
+  //
+  // recursivelyFindDefsOfReborrow(%reborrow_3) returns %phi_3 by
+  // computing enclosing defs (inner -> outer) in this order:
+  //
+  //     %reborrow_1 -> %value
+  //     %reborrow_2 -> %phi_2
+  //     %reborrow_3 -> %phi_3
+  //
+  // Example:
+  //
+  //         %outerBorrowA = begin_borrow
+  //         %outerBorrowB = begin_borrow
+  //         %struct = struct (%outerBorrowA, outerBorrowB)
+  //         %borrow = begin_borrow %struct
+  //         br one(%outerBorrowA, %borrow)
+  //     one(%outerReborrow : @guaranteed, %reborrow : @guaranteed)
+  //
+  // recursivelyFindDefsOfReborrow(%reborrow) returns
+  // (%outerReborrow, %outerBorrowB).
+  //
+  void recursivelyFindDefsOfReborrow(SILPhiArgument *reborrow,
+                                     StackList<SILValue> &enclosingDefs) {
+    assert(enclosingDefs.empty());
+    LocalValueSetVector visitedDefs;
+
+    // phi cycles can be skipped. They cannot contribute any new enclosing defs.
+    if (!visitedPhis.insert(reborrow))
+      return;
+
+    SILBasicBlock *block = reborrow->getParent();
+    for (auto *pred : block->getPredecessorBlocks()) {
+      SILValue incomingValue = reborrow->getIncomingPhiValue(pred);
+
+      // Each phi operand requires a new enclosing def list. These values will
+      // be remapped to successor phis before adding them to the caller's
+      // enclosing def list. It may be necessary to revisit a value that was
+      // already visited by the caller before remapping to phis.
+      StackList<SILValue> enclosingPredDefs(function);
+      recursivelyFindDefsOfReborrowOperand(incomingValue, enclosingPredDefs);
+      findSuccessorDefsFromPredDefs(pred, enclosingPredDefs, enclosingDefs,
+                                    visitedDefs);
+    }
+  }
+};
+
+} // end namespace
+
+bool swift::visitEnclosingDefs(SILValue value,
+                               function_ref<bool(SILValue)> visitor) {
+  return FindEnclosingDefs(value->getFunction())
+    .visitEnclosingDefs(value, visitor);
+}
+
+bool swift::visitBorrowIntroducers(SILValue value,
+                                   function_ref<bool(SILValue)> visitor) {
+  return FindEnclosingDefs(value->getFunction())
+    .visitBorrowIntroducers(value, visitor);
+}
+
+/// Return true of the lifetime of \p innerPhiVal depends on \p outerPhiVal.
+///
+/// This handles SIL values with nested lifetimes that cross a control flow
+/// merge.
+///
+/// When an owned value is passed to a phi, it is consumed. So any
+/// "inner" scope borrowing that owned value must end no later than that
+/// branch instruction. Either such a borrow scope ends before the branch that
+/// represents the owned phi operand:
 ///     %lifetime = begin_borrow %value
 ///     ...
-///     end_borrow %lifetime <-- borrow scope ended here
-///     br block(%value)        <-- before consume
-/// or the borrow scope is ended in the same instruction as the owned value is
-/// consumed
+///     end_borrow %lifetime    <-- borrow scope ends here
+///     br block(%value)        <-- owned value consumed here
+/// or the borrow scope ends in another phi in the same block as (adjacent to)
+/// the owned phi:
 ///     %lifetime = begin_borrow %value
 ///     ...
 ///     end_borrow %lifetime
-///     br block(%value, %lifetime)         <-- borrow scope ended here
-///                                         <-- in same instruction as consume
-/// In particular, the following is invalid
+///     br block(%value, %lifetime)         <-- borrow scope ends here
+///                                         <-- adjacent to the consume
+/// A phi corresponding to a value nested within another phi's lifetime is an
+/// "inner adjacent phi".
+///
+/// A guaranteed phi that ends a borrow scope is a special kind of phi called a
+/// "reborrow". In the above example, the reborrow is an inner adjacent to the
+/// owned phi and the owned phi is outer adjacent to the reborrow.
+///
+/// Note that an inner lifetime cannot extend beyond the outer lifetime's scope,
+/// even of the outer value is forwarded. In particular, the following is
+/// invalid:
 ///         %lifetime = begin_borrow %value
 ///         ...
 ///         br block(%value)
 ///     block(%value_2 : @owned):
 ///         end_borrow %lifetime
 ///         destroy_value %value_2
-/// because %lifetime was guaranteed by %value but value is consumed at
-/// `br two`.
+/// because %lifetime depends on %value but %value is consumed at `br two`.
 ///
-/// Similarly, when a guaranteed value is passed as a phi argument, its borrow
-/// scope ends and a new borrow scope is begun.  And so any open nested borrow
-/// of the original outer borrow must be ended no later than in that branch
-/// instruction.
+/// Similarly, a reborrow ends its borrow scope and begins a new borrow
+/// scope. So any open nested borrow of the original outer borrow must end no
+/// later than in that branch instruction.
 ///
+/// This extends to guaranteed forwarding phis, whose lifetimes are nested
+/// within a borrow scope.
 ///
-/// Given an phi argument
-///     block(..., %value : @owned, ...)
-/// this function finds the adjacent reborrow phis
-///     block(..., %lifetime : @guaranteed, ..., %value : @owned, ...)
-///                ^^^^^^^^^^^^^^^^^^^^^^^
-/// one of whose reaching values is a borrow of a reaching value of %value.
+/// Currently, an owned phi's inner adjacent phi must be a reborrow. A
+/// reborrow's adjacent phi may be either a nested reborrow, or a guaranteed
+/// forwarding phi. In the future, we remove the requirement that all guaranteed
+/// values have borrow scopes; then an owned phi's inner adjacent phi may be a
+/// guaranteed forwarding phi.
 ///
-/// Finding these is more complicated than merely looking for guaranteed
-/// operands adjacent to the incoming operands to phi and which are borrows of
-/// the value consumed there.  The reason is that they might not be borrows of
-/// that incoming value _directly_ but rather reborrows of some other reborrow
-/// if the incoming value is itself a phi argument:
-///         %lifetime = begin_borrow %value
-///         br one(%value, %lifetime)
-///     one(%value_1 : @owned, %lifetime_1 : @guaranteed)
-///         br two(%value_1, %lifetime_1)
-///     two(%value_2 : @owned, %lifetime_2 : @guaranteed)
-///         end_borrow %lifetime_2
-///         destroy_value %value_2
-///
-/// When called with %value_2, \p visitor is invoked with both:
-///     two(%value_2 : @owned, %lifetime_2 : @guaranteed)
-///                            ^^^^^^^^^^^^^^^^^^^^^^^^^
-bool swift::visitAdjacentReborrowsOfPhi(
-    SILPhiArgument *phi, function_ref<bool(SILPhiArgument *)> visitor) {
-  assert(phi->isPhi());
+/// Given a phi, 'outerPhi', it can be determined to have an inner adjacent phi,
+/// 'innerPhi' if and only if: on any path, the operand of 'outerPhi' is the
+/// enclosing definition of the operand of 'innerPhi' on the same path.
+///      
+bool swift::isInnerAdjacentPhi(SILArgument *innerPhiVal,
+                               SILArgument *outerPhiVal) {
+  auto innerPhi = PhiValue(innerPhiVal);
+  auto outerPhi = PhiValue(outerPhiVal);
+  assert(innerPhi.phiBlock == outerPhi.phiBlock && "precondition");
 
-  // First, collect all the values that reach \p phi, that is:
-  // - operands to the phi
-  // - operands to phis which are operands to the phi
-  // - and so forth.
-  SmallPtrSet<SILValue, 8> reachingValues;
-  // At the same time, record all the phis in \p phi's phi web: the phis which
-  // are transitively operands to \p phi.  This is the subset of \p
-  // reachingValues that are phis.
-  SmallVector<SILPhiArgument *, 4> phis;
-  phi->visitTransitiveIncomingPhiOperands(
-      [&](auto *phi, auto *operand) -> bool {
-        phis.push_back(phi);
-        reachingValues.insert(phi);
-        reachingValues.insert(operand->get());
-        return true;
-      });
-
-  // Second, find all the guaranteed phis one of whose operands _could_ (by
-  // dint of being adjacent to a phi in the phi web with the appropriate
-  // ownership and type) be a reborrow of a reaching value of \p phi.
-  SmallVector<SILPhiArgument *, 4> candidates;
-  for (auto *phi : phis) {
-    SILBasicBlock *block = phi->getParentBlock();
-    for (auto *uncastAdjacent : block->getArguments()) {
-      auto *adjacent = cast<SILPhiArgument>(uncastAdjacent);
-      if (adjacent == phi)
-        continue;
-      if (adjacent->getType() != phi->getType())
-        continue;
-      if (adjacent->getOwnershipKind() != OwnershipKind::Guaranteed)
-        continue;
-      candidates.push_back(adjacent);
+  for (SILBasicBlock *predBlock : innerPhi.phiBlock->getPredecessorBlocks()) {
+    SILValue innerValue = innerPhi.getOperand(predBlock)->get();
+    SILValue outerValue = outerPhi.getOperand(predBlock)->get();
+    // Visitor returns false to stop visiting when a match is found.
+    if (!visitEnclosingDefs(innerValue, [&](SILValue def) {
+      // If innerValue's enclosing 'def' is 'outerValue', then we found an inner
+      // adjacent phi.
+      return def != outerValue;
+    })) {
+      // outerPhi ends the lifetime of an enclosing def for this predecessor.
+      return true;
     }
   }
+  return false;
+}
 
-  // Finally, look through \p candidates to find those one of whose incoming
-  // operands either
-  // (1) borrow one of reaching values of \p phi
-  // or (2) is itself a guaranteed phi which does so.
-  // Because we may discover a reborrow R1 of type (1) after visiting another
-  // R2 of type (2) which reborrows R1, we need to iterate to a fixed point.
-  //
-  // Record all the phis that we see which are borrows or reborrows of a
-  // reaching value \p so that we can check for case (2) above.
-  //
-  // Visit those phis which are both reborrows of a reaching value AND are in
-  // the same block as \phi.
-  //
-  // For example, given
-  //
-  //         %lifetime = begin_borrow %value
-  //         br one(%value, %lifetime)
-  //     one(%value_1 : @owned, %lifetime_1 : @guaranteed)
-  //         br two(%value_1, %lifetime_1)
-  //     two(%value_2 : @owned, %lifetime_2 : @guaranteed)
-  //         end_borrow %lifetime_2
-  //         destroy_value %value_2
-  //
-  // when visiting the reborrow phis adjacent to %value_2, The following steps
-  // would be taken:
-  //
-  // (1) Look at the first candidate:
-  //   two(%value_2 : @owned, %lifetime_2 : @guaranteed)
-  //                          ^^^^^^^^^^^^^^^^^^^^^^^^^
-  // but see that its one incoming value
-  //   br two(%value_1, %lifetime_1)
-  //                    ^^^^^^^^^^^
-  // although a phi argument itself, is not known (yet!) to be a reborrow phi.
-  // So the first candidate is NOT (yet!) added to reborrowPhis.
-  //
-  // (2) Look at the second candidate:
-  //     one(%value_1 : @owned, %lifetime_1 : @guaranteed)
-  //                            ^^^^^^^^^^^^^^^^^^^^^^^^^
-  // and see that one of its incoming values
-  //   br one(%value, %lifetime)
-  //                  ^^^^^^^^^
-  // is a borrow
-  //   %lifetime = begin_borrow %value
-  // of %value, one of the values reaching %value_2.
-  // So the second candidate IS added to reborrowPhis.
-  // AND changed is set to true, so we will repeat the outer loop.
-  // But this candidate is not adjacent to our phi %value_2, so it is not
-  // visited.
-  //
-  // (4.5) Changed is true: repeat the outer loop.  Set changed to false.
-  //
-  // (3) Look at the first candidate:
-  //   two(%value_2 : @owned, %lifetime_2 : @guaranteed)
-  //                          ^^^^^^^^^^^^^^^^^^^^^^^^^
-  // and see that one of its incoming values
-  //   br two(%value_1, %lifetime_1)
-  //                    ^^^^^^^^^^^
-  // is itself a phi
-  //   one(%value_1 : @owned, %lifetime_1 : @guaranteed)
-  //                          ^^^^^^^^^^^^^^^^^^^^^^^^^
-  // which was added to reborrowPhis in (2).
-  // So the first candidate IS added to reborrowPhis.
-  // AND changed is set to true.
-  // ALSO, see that the first candidate IS adjacent to our phi %value_2, so our
-  // visitor is invoked with the first candidate.
-  //
-  // (4) Look at the second candidate.
-  // See that it is already a member of reborrowPhis.
-  //
-  // (4.5) Changed is true: repeat the outer loop.  Set changed to false.
-  //
-  // (5) Look at the first candidate.
-  // See that it is already a member of reborrowPhis.
-  //
-  // (6) Look at the second candidate.
-  // See that it is already a member of reborrowPhis.
-  //
-  // (6.5) Changed is false: exit the outer loop.
-  bool changed = false;
-  SmallSetVector<SILPhiArgument *, 4> reborrowPhis;
-  do {
-    changed = false;
-    for (auto *candidate : candidates) {
-      if (reborrowPhis.contains(candidate))
-        continue;
-      auto success = candidate->visitIncomingPhiOperands([&](auto *operand) {
-        // If the value being reborrowed is itself a reborrow of a value
-        // reaching \p phi, then visit it.
-        SILPhiArgument *forwarded;
-        if ((forwarded = dyn_cast<SILPhiArgument>(operand->get()))) {
-          if (!reborrowPhis.contains(forwarded))
-            return true;
-          changed = true;
-          reborrowPhis.insert(candidate);
-          if (candidate->getParentBlock() == phi->getParentBlock())
-            return visitor(candidate);
-          return true;
-        }
-        BeginBorrowInst *bbi;
-        if (!(bbi = dyn_cast<BeginBorrowInst>(operand->get())))
-          return true;
-        auto borrowee = bbi->getOperand();
-        if (!reachingValues.contains(borrowee))
-          return true;
-        changed = true;
-        reborrowPhis.insert(candidate);
-        if (candidate->getParentBlock() == phi->getParentBlock())
-          return visitor(candidate);
-        return true;
-      });
-      if (!success)
+/// Visit the phis in the same block as \p phi whose lifetime depends on \p
+/// phi.
+///
+/// See isInnerAdjacentPhi() comments.
+///
+/// If the visitor returns false, stops visiting and returns false.  Otherwise,
+/// returns true.
+bool swift::visitInnerAdjacentPhis(SILArgument *phi,
+                                   function_ref<bool(SILArgument *)> visitor) {
+  SILBasicBlock *block = phi->getParentBlock();
+  if (block->pred_empty())
+    return true;
+
+  for (auto *adjacentPhi : block->getArguments()) {
+    if (adjacentPhi == phi)
+      continue;
+
+    if (isInnerAdjacentPhi(adjacentPhi, phi)) {
+      if (!visitor(adjacentPhi))
         return false;
     }
-  } while (changed);
-
+  }
   return true;
 }
 
@@ -1888,16 +2359,100 @@ void swift::visitTransitiveEndBorrows(
 ///
 /// A begin_borrow [lexical] is nested if the borrowed value's lifetime is
 /// guaranteed by another lexical scope.  That happens if:
-/// - the value is a guaranteed argument to the function
-/// - the value is itself a begin_borrow [lexical]
+/// - the non-guaranteed borrowee's value is lexical
+/// - the guaranteed borrowee's value's reference roots are lexical
+///   - for example, the borrowee is itself a begin_borrow [lexical]
 bool swift::isNestedLexicalBeginBorrow(BeginBorrowInst *bbi) {
   assert(bbi->isLexical());
   auto value = bbi->getOperand();
-  if (auto *outerBBI = dyn_cast<BeginBorrowInst>(value)) {
-    return outerBBI->isLexical();
+  if (value->getOwnershipKind() != OwnershipKind::Guaranteed) {
+    return value->isLexical();
   }
-  if (auto *arg = dyn_cast<SILFunctionArgument>(value)) {
-    return arg->getOwnershipKind() == OwnershipKind::Guaranteed;
+  SmallVector<SILValue, 8> roots;
+  findGuaranteedReferenceRoots(value, /*lookThroughNestedBorrows=*/false,
+                               roots);
+  return llvm::all_of(roots, [](auto root) {
+    if (auto *outerBBI = dyn_cast<BeginBorrowInst>(root)) {
+      return outerBBI->isLexical();
+    }
+    if (auto *arg = dyn_cast<SILFunctionArgument>(root)) {
+      return arg->getOwnershipKind() == OwnershipKind::Guaranteed;
+    }
+    return false;
+  });
+}
+
+bool swift::isRedundantMoveValue(MoveValueInst *mvi) {
+  // Given: %moved_to_value = move_value %original_value
+  //
+  // Check whether the original value's lifetime and the moved-to value's
+  // lifetime have the same (1) ownership, (2) lexicality, and (3) escaping.
+  //
+  // Along the way, also check for cases where they have different values for
+  // those characteristics but it doesn't matter because of how limited the uses
+  // of the original value are (for now, whether the move is the only consuming
+  // use).
+
+  auto original = mvi->getOperand();
+
+  // (1) Ownership matches?
+  // (The new value always has owned ownership.)
+  if (original->getOwnershipKind() != OwnershipKind::Owned) {
+    return false;
   }
-  return false;
+
+  // (2) Lexicality matches?
+  if (mvi->isLexical() != original->isLexical()) {
+    return false;
+  }
+
+  // The move doesn't alter constraints: ownership and lexicality match.
+
+  // Before checking whether escaping matches, check whether the move_value is
+  // redundant regardless on account of how its uses are limited.
+  //
+  // At this point, ownership and lexicality are known to match.  If the
+  // original value doesn't escape, then merging the two lifetimes won't make
+  // it harder to optimize the portion of the merged lifetime corresponding to
+  // the moved-to value.  If the original's only consuming use is the
+  // move_value, then the original value's lifetime couldn't be shortened
+  // anyway.
+  //
+  // Summary: !escaping(original)
+  //       && singleConsumingUser(original) == move
+  //       => redundant(mvi)
+  //
+  // Check this in two ways, one cheaper than the other.
+
+  // First, avoid calling hasPointerEscape(original).
+  //
+  // If the original value is not a phi (a phi's incoming values might have
+  // escaping uses) and its only user is the move, then it doesn't escape. Also
+  // if its only user is the move, then its only _consuming_ user is the move.
+  auto *singleUser =
+      original->getSingleUse() ? original->getSingleUse()->getUser() : nullptr;
+  if (mvi == singleUser && !SILArgument::asPhi(original)) {
+    assert(!hasPointerEscape(original));
+    assert(original->getSingleConsumingUse()->getUser() == mvi);
+    // - !escaping(original)
+    // - singleConsumingUser(original) == move
+    return true;
+  }
+
+  // Second, call hasPointerEscape(original).
+  //
+  // Explicitly check both
+  // - !escaping(original)
+  // - singleConsumingUser(original) == move
+  auto originalHasEscape = hasPointerEscape(original);
+  auto *singleConsumingUser = original->getSingleConsumingUse()
+                                  ? original->getSingleConsumingUse()->getUser()
+                                  : nullptr;
+  if (mvi == singleConsumingUser && !originalHasEscape) {
+    return true;
+  }
+
+  // (3) Escaping matches?  (Expensive check, saved for last.)
+  auto moveHasEscape = hasPointerEscape(mvi);
+  return moveHasEscape == originalHasEscape;
 }

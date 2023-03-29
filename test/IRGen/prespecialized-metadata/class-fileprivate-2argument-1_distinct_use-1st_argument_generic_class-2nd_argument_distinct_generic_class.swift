@@ -80,9 +80,9 @@
 //         CHECK-SAME:   i32 {{(32|16)}}, 
 //         CHECK-SAME:   i16 {{(7|3)}}, 
 //         CHECK-SAME:   i16 0, 
-//   CHECK-apple-SAME:   i32 {{(136|80)}}, 
-// CHECK-unknown-SAME:   i32 112,
-//         CHECK-SAME:   i32 {{(16|8)}}, 
+//   CHECK-apple-SAME:   i32 {{(144|84)}}, 
+// CHECK-unknown-SAME:   i32 120,
+//         CHECK-SAME:   i32 {{(24|12)}}, 
 //                   :   %swift.type_descriptor* bitcast (
 //                   :     <{
 //                   :       i32,
@@ -144,7 +144,7 @@
 //         CHECK-SAME:       }>* @"$s4main9Argument1[[UNIQUE_ID_1]]LLCySiGMf" to %swift.full_heapmetadata*
 //         CHECK-SAME:     ),
 //         CHECK-SAME:     i32 0,
-//         CHECK-SAME:     i32 2
+//         CHECK-SAME:     i32 3
 //         CHECK-SAME:   ),
 //         CHECK-SAME:   %swift.type* getelementptr inbounds (
 //         CHECK-SAME:     %swift.full_heapmetadata,
@@ -178,7 +178,7 @@
 //         CHECK-SAME:       }>* @"$s4main9Argument2[[UNIQUE_ID_1]]LLCySSGMf" to %swift.full_heapmetadata*
 //         CHECK-SAME:     ),
 //         CHECK-SAME:     i32 0,
-//         CHECK-SAME:     i32 2
+//         CHECK-SAME:     i32 3
 //         CHECK-SAME:   ),
 //         CHECK-SAME:   [[INT]] {{(16|8)}},
 //         CHECK-SAME:   [[INT]] {{(24|12)}},
@@ -234,7 +234,7 @@ func doit() {
 }
 doit()
 
-//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]LLCMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* [[ARGUMENT1_METADATA:%[0-9]+]], %swift.type* [[ARGUMENT2_METADATA:%[0-9]+]]) #{{[0-9]+}} {
+//      CHECK: define internal swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]LLCMa"([[INT]] [[METADATA_REQUEST:%[0-9]+]], %swift.type* [[ARGUMENT1_METADATA:%[0-9]+]], %swift.type* [[ARGUMENT2_METADATA:%[0-9]+]]) #{{[0-9]+}} {{(section)?.*}}{
 //      CHECK: entry:
 //      CHECK:   [[ERASED_ARGUMENT1:%[0-9]+]] = bitcast %swift.type* [[ARGUMENT1_METADATA]] to i8*
 //      CHECK:   [[ERASED_ARGUMENT2:%[0-9]+]] = bitcast %swift.type* [[ARGUMENT2_METADATA]] to i8*
@@ -253,7 +253,7 @@ doit()
 //      CHECK: }
 
 
-//         CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_4]]LLCyAA9Argument1ACLLCySiGAA9Argument2ACLLCySSGGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]}} {
+//         CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_4]]LLCyAA9Argument1ACLLCySiGAA9Argument2ACLLCySSGGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]}} {{(section)?.*}}{
 //         CHECK: entry:
 //         CHECK:  call swiftcc %swift.metadata_response @"$s4main9Argument1[[UNIQUE_ID_1]]LLCySiGMb"([[INT]] 0)
 //         CHECK:  call swiftcc %swift.metadata_response @"$s4main9Argument2[[UNIQUE_ID_1]]LLCySSGMb"([[INT]] 0)

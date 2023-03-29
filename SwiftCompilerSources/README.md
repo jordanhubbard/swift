@@ -24,7 +24,7 @@ The bootstrapping mode is cached in the `CMakeCache.txt` file in the Swift build
 
 ### Bootstrapping
 
-The bootstrapping process is completely implemented with CMake dependencies. The build-script is not required to build the whole bootstrapping chain. For example, a `ninja swift-frontend` invocation builds all the required bootstrapping steps required for the final `swift-frontend`.
+The bootstrapping process is completely implemented with CMake dependencies. The build-script is not required to build the whole bootstrapping chain. For example, a `ninja bin/swift-frontend` invocation builds all the required bootstrapping steps required for the final `swift-frontend`.
 
 Bootstrapping involves the following steps:
 
@@ -156,9 +156,9 @@ With instruction passes it's possible to implement small peephole optimizations 
 
 To add a new instruction pass:
 
-* add a `SWIFT_INSTRUCTION_PASS` entry in `Passes.def`
+* add a `SWIFT_SILCOMBINE_PASS` entry in `Passes.def`
 * create a new Swift file in `SwiftCompilerSources/Optimizer/InstructionPasses`
-* add an `InstructionPass` global
+* implement the `simplify` function in conformance to `SILCombineSimplifyable`
 * register the pass in `registerSwiftPasses()`
 * if this pass replaces an existing `SILCombiner` visit function, remove the old visit function
 

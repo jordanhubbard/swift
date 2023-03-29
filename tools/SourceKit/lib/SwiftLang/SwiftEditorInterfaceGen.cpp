@@ -21,7 +21,7 @@
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
 #include "swift/IDE/ModuleInterfacePrinting.h"
 #include "swift/IDE/SyntaxModel.h"
-#include "swift/IDE/Utils.h"
+#include "swift/IDETool/CompilerInvocation.h"
 #include "swift/Parse/ParseVersion.h"
 #include "swift/Strings.h"
 
@@ -252,10 +252,10 @@ static void reportSemanticAnnotations(const SourceTextInfo &IFaceInfo,
     bool IsSystem;
     if (Ref.Mod) {
       Kind = SwiftLangSupport::getUIDForModuleRef();
-      IsSystem = Ref.Mod.isSystemModule();
+      IsSystem = Ref.Mod.isNonUserModule();
     } else if (Ref.Dcl) {
       Kind = SwiftLangSupport::getUIDForDecl(Ref.Dcl, /*IsRef=*/true);
-      IsSystem = Ref.Dcl->getModuleContext()->isSystemModule();
+      IsSystem = Ref.Dcl->getModuleContext()->isNonUserModule();
     }
     if (Kind.isInvalid())
       continue;
@@ -287,21 +287,36 @@ static bool getModuleInterfaceInfo(ASTContext &Ctx,
     ErrMsg += ModuleName;
     return true;
   }
+  if (Mod->failedToLoad() && ModuleName == "CxxStdlib") {
+    // We might fail to load the underlying Clang module
+    // for a Swift overlay module like 'CxxStdlib'. Make sure an error is reported in this case, so that we can either retry to load with C++ interoperability enabled, and if that fails, we can report this to the user.
+    ErrMsg = "Could not load underlying module for: ";
+    ErrMsg += ModuleName;
+    return true;
+  }
 
   PrintOptions Options = PrintOptions::printModuleInterface(
       Ctx.TypeCheckerOpts.PrintFullConvention);
+  if (Mod->findUnderlyingClangModule()) {
+    if (Ctx.LangOpts.EnableCXXInterop) {
+      // Show unavailable C++ APIs.
+      Options.SkipUnavailable = false;
+      // Skip over inline namespaces.
+      Options.SkipInlineCXXNamespace = true;
+    }
+  }
   ModuleTraversalOptions TraversalOptions = None; // Don't print submodules.
   SmallString<128> Text;
   llvm::raw_svector_ostream OS(Text);
   AnnotatingPrinter Printer(Info, OS);
   if (!Group && InterestedUSR) {
-    Group = findGroupNameForUSR(Mod, InterestedUSR.getValue());
+    Group = findGroupNameForUSR(Mod, InterestedUSR.value());
   }
-  printModuleInterface(Mod, Group.hasValue()
-                         ? llvm::makeArrayRef(Group.getValue())
+  printModuleInterface(Mod, Group.has_value()
+                         ? llvm::makeArrayRef(Group.value())
                          : ArrayRef<StringRef>(),
                        TraversalOptions, Printer, Options,
-                       Group.hasValue() && SynthesizedExtensions);
+                       Group.has_value() && SynthesizedExtensions);
 
   Info.Text = std::string(OS.str());
   return false;
@@ -505,7 +520,7 @@ bool SwiftInterfaceGenContext::matches(StringRef ModuleName,
   if (Invok.getSDKPath() != Impl.Invocation.getSDKPath())
     return false;
 
-  if (Impl.Mod->isSystemModule())
+  if (Impl.Mod->isNonUserModule())
     return true;
 
   const SearchPathOptions &SPOpts = Invok.getSearchPathOptions();
@@ -694,8 +709,26 @@ void SwiftLangSupport::editorOpenInterface(EditorConsumer &Consumer,
                                                       SynthesizedExtensions,
                                                       InterestedUSR);
   if (!IFaceGenRef) {
-    Consumer.handleRequestError(ErrMsg.c_str());
-    return;
+      // Retry to generate a module interface with C++ interop enabled,
+      // if the first attempt failed.
+      bool retryWithCxxEnabled = true;
+      for (const auto &arg: Args) {
+          if (StringRef(arg).startswith("-cxx-interoperability-mode=") ||
+              StringRef(arg).startswith("-enable-experimental-cxx-interop")) {
+              retryWithCxxEnabled = false;
+              break;
+          }
+      }
+      if (retryWithCxxEnabled) {
+          std::vector<const char *> AdjustedArgs(Args.begin(), Args.end());
+          AdjustedArgs.push_back("-cxx-interoperability-mode=swift-5.9");
+          return editorOpenInterface(Consumer, Name, ModuleName, Group, AdjustedArgs,
+                                     SynthesizedExtensions, InterestedUSR);
+      }
+      else {
+          Consumer.handleRequestError(ErrMsg.c_str());
+          return;
+      }
   }
 
   IFaceGenRef->reportEditorInfo(Consumer);
@@ -787,9 +820,9 @@ void SwiftLangSupport::editorOpenHeaderInterface(EditorConsumer &Consumer,
   if (!swiftVersion.empty()) {
     auto swiftVer =
         VersionParser::parseVersionString(swiftVersion, SourceLoc(), nullptr);
-    if (swiftVer.hasValue())
+    if (swiftVer.has_value())
       Invocation.getLangOptions().EffectiveLanguageVersion =
-          swiftVer.getValue();
+          swiftVer.value();
   }
   auto IFaceGenRef = SwiftInterfaceGenContext::create(Name,
                                                       /*IsModule=*/false,

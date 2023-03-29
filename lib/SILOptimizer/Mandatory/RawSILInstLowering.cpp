@@ -143,12 +143,15 @@ static void getAssignByWrapperArgsRecursively(SmallVectorImpl<SILValue> &args,
       break;
     case SILArgumentConvention::Direct_Unowned:
     case SILArgumentConvention::Indirect_In:
-    case SILArgumentConvention::Indirect_In_Constant:
     case SILArgumentConvention::Direct_Owned:
       break;
     case SILArgumentConvention::Indirect_Inout:
     case SILArgumentConvention::Indirect_InoutAliasable:
     case SILArgumentConvention::Indirect_Out:
+    case SILArgumentConvention::Pack_Inout:
+    case SILArgumentConvention::Pack_Guaranteed:
+    case SILArgumentConvention::Pack_Owned:
+    case SILArgumentConvention::Pack_Out:
       llvm_unreachable("wrong convention for setter/initializer src argument");
   }
   args.push_back(src);
@@ -165,9 +168,10 @@ static void getAssignByWrapperArgs(SmallVectorImpl<SILValue> &args,
          "initializer or setter has too many arguments");
 }
 
-static void lowerAssignByWrapperInstruction(SILBuilderWithScope &b,
-                                             AssignByWrapperInst *inst,
-                                        SmallSetVector<SILValue, 8> &toDelete) {
+static void
+lowerAssignByWrapperInstruction(SILBuilderWithScope &b,
+                                AssignByWrapperInst *inst,
+                                SmallSetVector<SILValue, 8> &toDelete) {
   LLVM_DEBUG(llvm::dbgs() << "  *** Lowering " << *inst << "\n");
 
   ++numAssignRewritten;
@@ -199,8 +203,8 @@ static void lowerAssignByWrapperInstruction(SILBuilderWithScope &b,
         b.createApply(loc, initFn, SubstitutionMap(), args);
       } else {
         getAssignByWrapperArgs(args, src, convention, b, forCleanup);
-        SILValue wrappedSrc = b.createApply(loc, initFn, SubstitutionMap(),
-                                            args);
+        SILValue wrappedSrc =
+            b.createApply(loc, initFn, SubstitutionMap(), args);
         if (inst->getMode() == AssignByWrapperInst::Initialization ||
             inst->getDest()->getType().isTrivial(*inst->getFunction())) {
           b.createTrivialStoreOr(loc, wrappedSrc, dest,
@@ -209,6 +213,7 @@ static void lowerAssignByWrapperInstruction(SILBuilderWithScope &b,
           b.createStore(loc, wrappedSrc, dest, StoreOwnershipQualifier::Assign);
         }
       }
+
       // The unused partial_apply violates memory lifetime rules in case "self"
       // is an inout. Therefore we cannot keep it as a dead closure to be
       // cleaned up later. We have to delete it in this pass.

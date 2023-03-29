@@ -27,7 +27,7 @@ using TypeRelation = CodeCompletionResultTypeRelation;
 /// Returns the kind of attributes \c Ty can be used as.
 static OptionSet<CustomAttributeKind> getCustomAttributeKinds(Type Ty) {
   OptionSet<CustomAttributeKind> Result;
-  if (auto NominalTy = Ty->getAs<NominalType>()) {
+  if (auto NominalTy = Ty->getAs<NominalOrBoundGenericNominalType>()) {
     auto NominalDecl = NominalTy->getDecl();
     if (NominalDecl->getAttrs().hasAttribute<PropertyWrapperAttr>()) {
       Result |= CustomAttributeKind::PropertyWrapper;
@@ -184,7 +184,7 @@ const USRBasedType *USRBasedType::fromType(Type Ty, USRBasedTypeArena &Arena) {
   Ty = Ty->getCanonicalType();
 
   // For opaque types like 'some View', consider them equivalent to 'View'.
-  if (auto OpaqueType = Ty->getAs<OpaqueTypeArchetypeType>()) {
+  if (auto OpaqueType = Ty->getAs<ArchetypeType>()) {
     if (auto Existential = OpaqueType->getExistentialType()) {
       Ty = Existential;
     }

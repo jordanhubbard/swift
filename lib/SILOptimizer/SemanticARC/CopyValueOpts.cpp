@@ -76,7 +76,7 @@ bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
   SmallVector<BorrowedValue, 4> borrowScopeIntroducers;
 
   // Find all borrow introducers for our copy operand. If we are unable to find
-  // all of the reproducers (due to pattern matching failure), conservatively
+  // all of the introducers (due to pattern matching failure), conservatively
   // return false. We can not optimize.
   //
   // NOTE: We can get multiple introducers if our copy_value's operand
@@ -155,7 +155,7 @@ bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
   // TODO: There may be some way of sinking this into the loop below.
   //
   // FIXME: The haveAnyLocalScopes and destroy.empty() checks are relics of
-  // attempts to handle dead end blocks during areUsesWithinTransitiveScope. If
+  // attempts to handle dead end blocks during areUsesWithinExtendedScope. If
   // we don't use dead end blocks at all, they should not be relevant.
   bool haveAnyLocalScopes =
       llvm::any_of(borrowScopeIntroducers, [](BorrowedValue borrowScope) {
@@ -182,13 +182,13 @@ bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
   //    need to insert an end_borrow since all of our borrow introducers are
   //    non-local scopes.
   //
-  // The call to areUsesWithinTransitiveScope cannot consider dead-end blocks. A
+  // The call to areUsesWithinExtendedScope cannot consider dead-end blocks. A
   // local borrow scope requires all its inner uses to be inside the borrow
   // scope, regardless of whether the end of the scope is inside a dead-end
   // block.
   {
     if (llvm::any_of(borrowScopeIntroducers, [&](BorrowedValue borrowScope) {
-          return !borrowScope.areUsesWithinTransitiveScope(
+          return !borrowScope.areUsesWithinExtendedScope(
               lr.getAllConsumingUses(), nullptr);
         })) {
       return false;
@@ -216,8 +216,19 @@ bool SemanticARCOptVisitor::performGuaranteedCopyValueOptimization(
         return false;
       }
 
+      // Replacing owned phi operands with a local borrow introducer can
+      // introduce reborrows. Since lifetime adjustment is not implemented for
+      // this case, disable here.
+      // Returning false here will make sure so this isn't populated in
+      // joinedOwnedIntroducerToConsumedOperands which is used by
+      // semanticarc::tryConvertOwnedPhisToGuaranteedPhis for transforming owned
+      // phi to guaranteed.
+      if (haveAnyLocalScopes) {
+        return false;
+      }
+
       if (llvm::any_of(borrowScopeIntroducers, [&](BorrowedValue borrowScope) {
-            return !borrowScope.areUsesWithinTransitiveScope(
+            return !borrowScope.areUsesWithinExtendedScope(
                 phiArgLR.getAllConsumingUses(), nullptr);
           })) {
         return false;
@@ -765,7 +776,7 @@ bool SemanticARCOptVisitor::tryPerformOwnedCopyValueOptimization(
   // Ok, we have an owned value. If we do not have any non-destroying consuming
   // uses, see if all of our uses (ignoring destroying uses) are within our
   // parent owned value's lifetime.
-  LinearLifetimeChecker checker(ctx.getDeadEndBlocks());
+  LinearLifetimeChecker checker(&ctx.getDeadEndBlocks());
   if (!checker.validateLifetime(originalValue, parentLifetimeEndingUses,
                                 allCopyUses))
     return false;

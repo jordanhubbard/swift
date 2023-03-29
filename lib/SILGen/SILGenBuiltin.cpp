@@ -478,6 +478,17 @@ static ManagedValue emitBuiltinAddressOfBorrowBuiltins(SILGenFunction &SGF,
   // naturally emitted borrowed in memory.
   auto borrow = SGF.emitRValue(argument, SGFContext::AllowGuaranteedPlusZero)
      .getAsSingleValue(SGF, argument);
+  if (!SGF.F.getConventions().useLoweredAddresses()) {
+    auto &context = SGF.getASTContext();
+    auto identifier =
+        stackProtected
+            ? context.getIdentifier("addressOfBorrowOpaque")
+            : context.getIdentifier("unprotectedAddressOfBorrowOpaque");
+    auto builtin = SGF.B.createBuiltin(loc, identifier, rawPointerType,
+                                       substitutions, {borrow.getValue()});
+    return ManagedValue::forUnmanaged(builtin);
+  }
+
   if (!borrow.isPlusZero() || !borrow.getType().isAddress()) {
     SGF.SGM.diagnose(argument->getLoc(), diag::non_borrowed_indirect_addressof);
     return SGF.emitUndef(rawPointerType);
@@ -1152,15 +1163,15 @@ static ManagedValue emitBuiltinAutoDiffApplyDerivativeFunction(
     AutoDiffDerivativeFunctionKind kind, unsigned arity,
     bool throws, SILGenFunction &SGF, SILLocation loc,
     SubstitutionMap substitutions, ArrayRef<ManagedValue> args, SGFContext C) {
-  // FIXME(SR-11853): Support throwing functions.
+  // FIXME(https://github.com/apple/swift/issues/54259): Support throwing functions.
   assert(!throws && "Throwing functions are not yet supported");
 
-  auto origFnVal = args[0].getValue();
+  auto origFnVal = args[0];
   SmallVector<SILValue, 2> origFnArgVals;
   for (auto& arg : args.drop_front(1))
     origFnArgVals.push_back(arg.getValue());
 
-  auto origFnType = origFnVal->getType().castTo<SILFunctionType>();
+  auto origFnType = origFnVal.getType().castTo<SILFunctionType>();
   auto origFnUnsubstType = origFnType->getUnsubstitutedType(SGF.getModule());
   if (origFnType != origFnUnsubstType) {
     origFnVal = SGF.B.createConvertFunction(
@@ -1169,8 +1180,9 @@ static ManagedValue emitBuiltinAutoDiffApplyDerivativeFunction(
   }
 
   // Get the derivative function.
+  origFnVal = SGF.B.createBeginBorrow(loc, origFnVal);
   SILValue derivativeFn = SGF.B.createDifferentiableFunctionExtract(
-      loc, kind, origFnVal);
+      loc, kind, origFnVal.getValue());
   auto derivativeFnType = derivativeFn->getType().castTo<SILFunctionType>();
   assert(derivativeFnType->getNumResults() == 2);
   assert(derivativeFnType->getNumParameters() == origFnArgVals.size());
@@ -1185,9 +1197,9 @@ static ManagedValue emitBuiltinAutoDiffApplyDerivativeFunction(
   }
 
   // We don't need to destroy the original function or retain the
-  // `derivativeFn`, because they are trivial (because they are @noescape).
-  assert(origFnVal->getType().isTrivial(SGF.F));
-  assert(derivativeFn->getType().isTrivial(SGF.F));
+  // `derivativeFn`, because they are noescape.
+  assert(origFnType->isTrivialNoEscape());
+  assert(derivativeFnType->isTrivialNoEscape());
 
   // Do the apply for the indirect result case.
   if (derivativeFnType->hasIndirectFormalResults()) {
@@ -1221,7 +1233,7 @@ static ManagedValue emitBuiltinAutoDiffApplyDerivativeFunction(
 static ManagedValue emitBuiltinAutoDiffApplyTransposeFunction(
     unsigned arity, bool throws, SILGenFunction &SGF, SILLocation loc,
     SubstitutionMap substitutions, ArrayRef<ManagedValue> args, SGFContext C) {
-  // FIXME(SR-11853): Support throwing functions.
+  // FIXME(https://github.com/apple/swift/issues/54259): Support throwing functions.
   assert(!throws && "Throwing functions are not yet supported");
 
   auto origFnVal = args.front().getValue();
@@ -1519,7 +1531,7 @@ ManagedValue emitBuiltinCreateAsyncTask(SILGenFunction &SGF, SILLocation loc,
 
   // Form the metatype of the result type.
   CanType futureResultType =
-      Type(MetatypeType::get(GenericTypeParamType::get(/*type sequence*/ false,
+      Type(MetatypeType::get(GenericTypeParamType::get(/*isParameterPack*/ false,
                                                        /*depth*/ 0, /*index*/ 0,
                                                        SGF.getASTContext()),
                              MetatypeRepresentation::Thick))
@@ -1545,7 +1557,7 @@ ManagedValue emitBuiltinCreateAsyncTask(SILGenFunction &SGF, SILLocation loc,
           .build();
   auto genericSig = subs.getGenericSignature().getCanonicalSignature();
   auto genericResult =
-      GenericTypeParamType::get(/*type sequence*/ false,
+      GenericTypeParamType::get(/*isParameterPack*/ false,
                                 /*depth*/ 0, /*index*/ 0, SGF.getASTContext());
   // <T> () async throws -> T
   CanType functionTy =
@@ -1577,7 +1589,7 @@ static ManagedValue emitBuiltinCreateAsyncTaskInGroup(
 
   // Form the metatype of the result type.
   CanType futureResultType =
-      Type(MetatypeType::get(GenericTypeParamType::get(/*type sequence*/ false,
+      Type(MetatypeType::get(GenericTypeParamType::get(/*isParameterPack*/ false,
                                                        /*depth*/ 0, /*index*/ 0,
                                                        SGF.getASTContext()),
                              MetatypeRepresentation::Thick))
@@ -1757,6 +1769,12 @@ static ManagedValue emitBuiltinBuildOrdinarySerialExecutorRef(
     ArrayRef<ManagedValue> args, SGFContext C) {
   return emitBuildExecutorRef(SGF, loc, subs, args,
                             BuiltinValueKind::BuildOrdinarySerialExecutorRef);
+}
+static ManagedValue emitBuiltinBuildComplexEqualitySerialExecutorRef(
+    SILGenFunction &SGF, SILLocation loc, SubstitutionMap subs,
+    ArrayRef<ManagedValue> args, SGFContext C) {
+  return emitBuildExecutorRef(SGF, loc, subs, args,
+                            BuiltinValueKind::BuildComplexEqualitySerialExecutorRef);
 }
 static ManagedValue emitBuiltinBuildDefaultActorExecutorRef(
     SILGenFunction &SGF, SILLocation loc, SubstitutionMap subs,

@@ -10,6 +10,17 @@
 // RUN:   -target %target-cpu-apple-macosx10.10 -require-explicit-availability=warn \
 // RUN:   -require-explicit-availability-target "macOS 10.10"
 
+/// Using -library-level api defaults to enabling warnings, without fixits.
+// RUN: sed -e "s/}} {{.*/}}/" < %s > %t/NoFixits.swift
+// RUN: %target-swift-frontend -typecheck -parse-as-library -verify %t/NoFixits.swift \
+// RUN:   -target %target-cpu-apple-macosx10.10 -library-level api
+
+/// Explicitly disable the diagnostic.
+// RUN: sed -e 's/xpected-warning/not-something-expected/' < %s > %t/None.swift
+// RUN: %target-swift-frontend -typecheck -parse-as-library -verify %t/None.swift \
+// RUN:   -target %target-cpu-apple-macosx10.10 -require-explicit-availability=ignore \
+// RUN:   -require-explicit-availability-target "macOS 10.10" -library-level api
+
 /// Upgrade the diagnostic to an error.
 // RUN: sed -e "s/xpected-warning/xpected-error/" < %s > %t/Errors.swift
 // RUN: %target-swift-frontend -typecheck -parse-as-library -verify %t/Errors.swift \
@@ -33,7 +44,7 @@ public struct UnavailableStruct {
 public func foo() { bar() } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
 
 @usableFromInline
-func bar() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
+func bar() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{-1:1-1=@available(macOS 10.10, *)\n}}
 
 @available(macOS 10.1, *)
 public func ok() { }
@@ -42,10 +53,10 @@ public func ok() { }
 public func unavailableOk() { }
 
 @available(macOS, deprecated: 10.10)
-public func missingIntro() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
+public func missingIntro() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{-1:1-1=@available(macOS 10.10, *)\n}}
 
 @available(iOS 9.0, *)
-public func missingTargetPlatform() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{1-1=@available(macOS 10.10, *)\n}}
+public func missingTargetPlatform() { } // expected-warning {{public declarations should have an availability attribute with an introduction version}} {{-1:1-1=@available(macOS 10.10, *)\n}}
 
 func privateFunc() { }
 

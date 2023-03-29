@@ -12,9 +12,11 @@
 
 #include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/SourceManager.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/PrettyStackTrace.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/Signals.h"
 
 using namespace swift;
 
@@ -32,23 +34,50 @@ void SourceManager::verifyAllBuffers() const {
     arbitraryTotal += buffer->getBufferStart()[0];
     arbitraryTotal += buffer->getBufferEnd()[-1];
   }
+  (void)arbitraryTotal;
 }
 
-SourceLoc SourceManager::getCodeCompletionLoc() const {
-  if (CodeCompletionBufferID == 0U)
+SourceLoc SourceManager::getIDEInspectionTargetLoc() const {
+  if (IDEInspectionTargetBufferID == 0U)
     return SourceLoc();
 
-  return getLocForBufferStart(CodeCompletionBufferID)
-      .getAdvancedLoc(CodeCompletionOffset);
+  return getLocForBufferStart(IDEInspectionTargetBufferID)
+      .getAdvancedLoc(IDEInspectionTargetOffset);
 }
 
-StringRef SourceManager::getDisplayNameForLoc(SourceLoc Loc) const {
+bool SourceManager::containsRespectingReplacedRanges(SourceRange Range,
+                                                     SourceLoc Loc) const {
+  if (Loc.isInvalid() || Range.isInvalid()) {
+    return false;
+  }
+
+  if (Range.contains(Loc)) {
+    return true;
+  }
+  for (const auto &pair : getReplacedRanges()) {
+    auto OriginalRange = pair.first;
+    auto NewRange = pair.second;
+    if (NewRange.contains(Loc) && Range.overlaps(OriginalRange)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool SourceManager::rangeContainsRespectingReplacedRanges(
+    SourceRange Enclosing, SourceRange Inner) const {
+  return containsRespectingReplacedRanges(Enclosing, Inner.Start) &&
+         containsRespectingReplacedRanges(Enclosing, Inner.End);
+}
+
+StringRef SourceManager::getDisplayNameForLoc(SourceLoc Loc, bool ForceGeneratedSourceToDisk) const {
   // Respect #line first
   if (auto VFile = getVirtualFile(Loc))
     return VFile->Name;
 
   // Next, try the stat cache
-  auto Ident = getIdentifierForBuffer(findBufferContainingLoc(Loc));
+  auto Ident = getIdentifierForBuffer(
+      findBufferContainingLoc(Loc), ForceGeneratedSourceToDisk);
   auto found = StatusCache.find(Ident);
   if (found != StatusCache.end()) {
     return found->second.getName();
@@ -183,9 +212,94 @@ SourceManager::getIDForBufferIdentifier(StringRef BufIdentifier) const {
   return It->second;
 }
 
-StringRef SourceManager::getIdentifierForBuffer(unsigned bufferID) const {
+SourceManager::~SourceManager() {
+  for (auto &generated : GeneratedSourceInfos) {
+    free((void*)generated.second.onDiskBufferCopyFileName.data());
+  }
+}
+
+/// Dump the contents of the given memory buffer to a file, returning the
+/// name of that file (when successful) and \c None otherwise.
+static Optional<std::string>
+dumpBufferToFile(const llvm::MemoryBuffer *buffer,
+                 const SourceManager &sourceMgr,
+                 CharSourceRange originalSourceRange) {
+  // Create file in the system temporary directory.
+  SmallString<128> outputFileName;
+  llvm::sys::path::system_temp_directory(true, outputFileName);
+  llvm::sys::path::append(outputFileName, "swift-generated-sources");
+  if (llvm::sys::fs::create_directory(outputFileName))
+    return None;
+
+  // Finalize the name of the resulting file. This is unique based on name
+  // mangling.
+  llvm::sys::path::append(outputFileName, buffer->getBufferIdentifier());
+
+  std::error_code ec = atomicallyWritingToFile(outputFileName,
+     [&](llvm::raw_pwrite_stream &out) {
+       auto contents = buffer->getBuffer();
+       out << contents;
+
+        // Make sure we have a trailing newline.
+        if (contents.empty() || contents.back() != '\n')
+          out << "\n";
+
+        // If we know the source range this comes from, append it later in
+        // the file so one can trace.
+        if (originalSourceRange.isValid()) {
+          out << "\n";
+
+          auto originalFilename =
+            sourceMgr.getDisplayNameForLoc(originalSourceRange.getStart(),
+                                           true);
+          unsigned startLine, startColumn, endLine, endColumn;
+          std::tie(startLine, startColumn) =
+              sourceMgr.getPresumedLineAndColumnForLoc(
+                originalSourceRange.getStart());
+          std::tie(endLine, endColumn) =
+              sourceMgr.getPresumedLineAndColumnForLoc(
+                originalSourceRange.getEnd());
+          out << "// original-source-range: "
+              << originalFilename
+              << ":" << startLine << ":" << startColumn
+              << "-" << endLine << ":" << endColumn
+              << "\n";
+      }
+    });
+  if (ec)
+    return None;
+
+  return outputFileName.str().str();
+}
+
+StringRef SourceManager::getIdentifierForBuffer(
+    unsigned bufferID, bool ForceGeneratedSourceToDisk
+) const {
   auto *buffer = LLVMSourceMgr.getMemoryBuffer(bufferID);
   assert(buffer && "invalid buffer ID");
+
+  // If this is generated source code, and we're supposed to force it to disk
+  // so external clients can see it, do so now.
+  if (ForceGeneratedSourceToDisk) {
+    if (auto generatedInfo = getGeneratedSourceInfo(bufferID)) {
+      // We only care about macros, so skip everything else.
+      if (generatedInfo->kind == GeneratedSourceInfo::ReplacedFunctionBody ||
+          generatedInfo->kind == GeneratedSourceInfo::PrettyPrinted)
+        return buffer->getBufferIdentifier();
+
+      if (generatedInfo->onDiskBufferCopyFileName.empty()) {
+        if (auto newFileNameOpt = dumpBufferToFile(
+                buffer, *this,  generatedInfo->originalSourceRange)) {
+          generatedInfo->onDiskBufferCopyFileName =
+              strdup(newFileNameOpt->c_str());
+        }
+      }
+
+      if (!generatedInfo->onDiskBufferCopyFileName.empty())
+        return generatedInfo->onDiskBufferCopyFileName;
+    }
+  }
+
   return buffer->getBufferIdentifier();
 }
 
@@ -252,6 +366,43 @@ StringRef SourceManager::extractText(CharSourceRange Range,
                        Range.getByteLength());
 }
 
+void SourceManager::setGeneratedSourceInfo(
+    unsigned bufferID, GeneratedSourceInfo info
+) {
+  assert(GeneratedSourceInfos.count(bufferID) == 0);
+  GeneratedSourceInfos[bufferID] = info;
+
+  switch (info.kind) {
+  case GeneratedSourceInfo::ExpressionMacroExpansion:
+  case GeneratedSourceInfo::FreestandingDeclMacroExpansion:
+  case GeneratedSourceInfo::AccessorMacroExpansion:
+  case GeneratedSourceInfo::MemberAttributeMacroExpansion:
+  case GeneratedSourceInfo::MemberMacroExpansion:
+  case GeneratedSourceInfo::PeerMacroExpansion:
+  case GeneratedSourceInfo::ConformanceMacroExpansion:
+  case GeneratedSourceInfo::PrettyPrinted:
+    break;
+
+  case GeneratedSourceInfo::ReplacedFunctionBody:
+    // Keep track of the replaced range.
+    SourceRange orig(info.originalSourceRange.getStart(),
+                     info.originalSourceRange.getEnd());
+    ReplacedRanges[orig] =
+        SourceRange(info.generatedSourceRange.getStart(),
+                    info.generatedSourceRange.getEnd());
+    break;
+  }
+}
+
+Optional<GeneratedSourceInfo> SourceManager::getGeneratedSourceInfo(
+    unsigned bufferID
+) const {
+  auto known = GeneratedSourceInfos.find(bufferID);
+  if (known == GeneratedSourceInfos.end())
+    return None;
+  return known->second;
+}
+
 Optional<unsigned>
 SourceManager::findBufferContainingLocInternal(SourceLoc Loc) const {
   assert(Loc.isValid());
@@ -271,13 +422,13 @@ SourceManager::findBufferContainingLocInternal(SourceLoc Loc) const {
 
 unsigned SourceManager::findBufferContainingLoc(SourceLoc Loc) const {
   auto Id = findBufferContainingLocInternal(Loc);
-  if (Id.hasValue())
+  if (Id.has_value())
     return *Id;
   llvm_unreachable("no buffer containing location found");
 }
 
 bool SourceManager::isOwning(SourceLoc Loc) const {
-  return findBufferContainingLocInternal(Loc).hasValue();
+  return findBufferContainingLocInternal(Loc).has_value();
 }
 
 void SourceRange::widen(SourceRange Other) {
@@ -384,7 +535,7 @@ SourceManager::getLineLength(unsigned BufferId, unsigned Line) const {
   auto BegOffset = resolveFromLineCol(BufferId, Line, 0);
   auto EndOffset = resolveFromLineCol(BufferId, Line, ~0u);
   if (BegOffset && EndOffset) {
-     return EndOffset.getValue() - BegOffset.getValue();
+     return EndOffset.value() - BegOffset.value();
   }
   return None;
 }
@@ -440,7 +591,7 @@ SourceManager::getLocFromExternalSource(StringRef Path, unsigned Line,
   if (BufferId == 0u)
     return SourceLoc();
   auto Offset = resolveFromLineCol(BufferId, Line, Col);
-  if (!Offset.hasValue())
+  if (!Offset.has_value())
     return SourceLoc();
   return getLocForOffset(BufferId, *Offset);
 }

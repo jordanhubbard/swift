@@ -265,7 +265,7 @@ bool RedundantPhiEliminationPass::valuesAreEqual(SILValue val1, SILValue val2) {
     
     if (auto *inst1 = dyn_cast<SingleValueInstruction>(val1)) {
       // Bail if the instructions have any side effects.
-      if (inst1->getMemoryBehavior() != SILInstruction::MemoryBehavior::None)
+      if (inst1->getMemoryBehavior() != MemoryBehavior::None)
         return false;
 
       // Allocation instructions are defined to have no side-effects.
@@ -459,7 +459,7 @@ bool PhiExpansionPass::optimizeArg(SILPhiArgument *initialArg) {
 
       SILInstruction *branchInst = op->getUser();
       SILBuilder builder(branchInst);
-      auto *strExtract = builder.createStructExtract(loc.getValue(),
+      auto *strExtract = builder.createStructExtract(loc.value(),
                                                      op->get(), field, newType);
       op->set(strExtract);
     }

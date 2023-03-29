@@ -50,6 +50,7 @@ namespace swift {
 /// this is the task of the type visitor invoking it.
 /// \returns The found opened archetype or empty type otherwise.
 CanOpenedArchetypeType getOpenedArchetypeOf(CanType Ty);
+CanLocalArchetypeType getLocalArchetypeOf(CanType Ty);
 
 /// How an existential type container is represented.
 enum class ExistentialRepresentation {
@@ -242,16 +243,19 @@ public:
 
   /// Retrieve the ClassDecl for a type that maps to a Swift class or
   /// bound generic class type.
+  SWIFT_IMPORT_UNSAFE
   ClassDecl *getClassOrBoundGenericClass() const {
     return getASTType().getClassOrBoundGenericClass();
   }
   /// Retrieve the StructDecl for a type that maps to a Swift struct or
   /// bound generic struct type.
+  SWIFT_IMPORT_UNSAFE
   StructDecl *getStructOrBoundGenericStruct() const {
     return getASTType().getStructOrBoundGenericStruct();
   }
   /// Retrieve the EnumDecl for a type that maps to a Swift enum or
   /// bound generic enum type.
+  SWIFT_IMPORT_UNSAFE
   EnumDecl *getEnumOrBoundGenericEnum() const {
     return getASTType().getEnumOrBoundGenericEnum();
   }
@@ -265,6 +269,7 @@ public:
 
   /// Retrieve the NominalTypeDecl for a type that maps to a Swift
   /// nominal or bound generic nominal type.
+  SWIFT_IMPORT_UNSAFE
   NominalTypeDecl *getNominalOrBoundGenericNominal() const {
     return getASTType().getNominalOrBoundGenericNominal();
   }
@@ -332,6 +337,8 @@ public:
   /// even though they are technically trivial.
   bool isTrivial(const SILFunction &F) const;
 
+  bool isTrivial(const SILFunction *f) const { return isTrivial(*f); }
+
   /// True if the type is the Builtin.RawPointer or a struct/tuple/enum which
   /// contains a Builtin.RawPointer.
   /// Returns false for types for which this property is not known, e.g. generic
@@ -339,7 +346,7 @@ public:
   bool isOrContainsRawPointer(const SILFunction &F) const;
 
   /// An efficient implementation of `!isTrivial() && isOrContainsRawPointer()`.
-  bool isNonTrivialOrContainsRawPointer(const SILFunction &F) const;
+  bool isNonTrivialOrContainsRawPointer(const SILFunction *f) const;
 
   /// True if the type is an empty tuple or an empty struct or a tuple or
   /// struct containing only empty types.
@@ -349,6 +356,8 @@ public:
   /// be a scalar reference-counted type such as a class, box, or thick function
   /// type. Returns false for non-trivial aggregates.
   bool isReferenceCounted(SILModule &M) const;
+
+  bool isReferenceCounted(SILFunction *f) const;
 
   /// Returns true if the referenced type is a function type that never
   /// returns.
@@ -404,6 +413,12 @@ public:
   bool hasOpenedExistential() const {
     return getASTType()->hasOpenedExistential();
   }
+
+  /// Returns true if the referenced type is expressed in terms of one
+  /// or more local archetypes.
+  bool hasLocalArchetype() const {
+    return getASTType()->hasLocalArchetype();
+  }
   
   /// Returns the representation used by an existential type. If the concrete
   /// type is provided, this may return a specialized representation kind that
@@ -443,6 +458,13 @@ public:
     return isObject() && isClassOrClassMetatype(getASTType());
   }
 
+  bool isFunctionTypeWithContext() const {
+    if (auto *fTy = getASTType()->getAs<SILFunctionType>()) {
+      return fTy->getExtInfo().hasContext();
+    }
+    return false;
+  }
+
   /// True if the type involves any archetypes.
   bool hasArchetype() const { return getASTType()->hasArchetype(); }
 
@@ -477,12 +499,16 @@ public:
     if (auto optPayload = ty.getOptionalObjectType()) {
       ty = optPayload;
     }
-      
+
     auto fTy = ty.getAs<SILFunctionType>();
     if (!fTy)
       return false;
     return fTy->getRepresentation() == SILFunctionType::Representation::Block;
   }
+
+  bool isTuple() const { return is<TupleType>(); }
+  bool isFunction() const { return is<SILFunctionType>(); }
+  bool isMetatype() const { return is<MetatypeType>(); }
 
   /// Given that this is a nominal type, return the lowered type of
   /// the given field.  Applies substitutions as necessary.  The
@@ -493,6 +519,19 @@ public:
 
   SILType getFieldType(VarDecl *field, SILModule &M,
                        TypeExpansionContext context) const;
+
+  SILType getFieldType(VarDecl *field, SILFunction *fn) const;
+
+  SILType getFieldType(intptr_t fieldIndex, SILFunction *function) const;
+
+  SWIFT_IMPORT_UNSAFE
+  StringRef getFieldName(intptr_t fieldIndex) const;
+
+  // Returns < 0 if the field was not found.
+  intptr_t getFieldIdxOfNominalType(StringRef fieldName) const;
+
+  // Returns < 0 if the field was not found.
+  intptr_t getCaseIdxOfEnumType(StringRef caseName) const;
 
   /// Given that this is an enum type, return the lowered type of the
   /// data for the given element.  Applies substitutions as necessary.
@@ -510,15 +549,39 @@ public:
   /// NOTE: Takes the type expansion context from \p fn.
   SILType getEnumElementType(EnumElementDecl *elt, SILFunction *fn) const;
 
+  EnumElementDecl *getEnumElement(int caseIndex) const;
+
   /// Given that this is an enum type, return true if this type is effectively
   /// exhausted.
   bool isEffectivelyExhaustiveEnumType(SILFunction *f);
 
+  unsigned getNumTupleElements() const {
+    TupleType *tupleTy = castTo<TupleType>();
+    return tupleTy->getNumElements();
+  }
+
   /// Given that this is a tuple type, return the lowered type of the
   /// given tuple element.  The result will have the same value
   /// category as the base type.
-  SILType getTupleElementType(unsigned index) const {
+  SILType getTupleElementType(intptr_t index) const {
     return SILType(castTo<TupleType>().getElementType(index), getCategory());
+  }
+
+  /// Given that this is a pack type, return the lowered type of the
+  /// given pack element.  The result will have the same value
+  /// category as the base type.
+  SILType getPackElementType(unsigned index) const {
+    return SILType(castTo<SILPackType>()->getElementType(index), getCategory());
+  }
+
+  unsigned getNumNominalFields() const ;
+
+  /// Given that this is a pack expansion type, return the lowered type
+  /// of the pattern type.  The result will have the same value category
+  /// as the base type.
+  SILType getPackExpansionPatternType() const {
+    return SILType(castTo<PackExpansionType>().getPatternType(),
+                   getCategory());
   }
 
   /// Return the immediate superclass type of this type, or null if
@@ -588,6 +651,10 @@ public:
                 CanGenericSignature genericSig = CanGenericSignature(),
                 bool shouldSubstituteOpaqueArchetypes = false) const;
 
+  SILType subst(Lowering::TypeConverter &tc,
+                InFlightSubstitution &IFS,
+                CanGenericSignature genericSig) const;
+
   SILType subst(Lowering::TypeConverter &tc, SubstitutionMap subs) const;
 
   SILType subst(SILModule &M, SubstitutionMap subs) const;
@@ -622,9 +689,13 @@ public:
   /// wrapped type.
   bool isMoveOnly() const;
 
+  /// Is this a type that is a first class move only type. This returns false
+  /// for a move only wrapped type.
+  bool isPureMoveOnly() const;
+
   /// Returns true if and only if this type is a first class move only
   /// type. NOTE: Returns false if the type is a move only wrapped type.
-  bool isMoveOnlyType() const;
+  bool isMoveOnlyNominalType() const;
 
   /// Returns true if this SILType is a move only wrapper type.
   ///
@@ -688,7 +759,7 @@ public:
   ///
   /// \p field Return the type of the ith field of the box. Default set to 0
   /// since we only support one field today. This is just future proofing.
-  SILType getSILBoxFieldType(const SILFunction *f, unsigned field = 0);
+  SILType getSILBoxFieldType(const SILFunction *f, unsigned field = 0) const;
 
   /// Returns the hash code for the SILType.
   llvm::hash_code getHashCode() const {
@@ -700,6 +771,28 @@ public:
   /// type of its field, which it is guaranteed to have identical layout to.
   SILType getSingletonAggregateFieldType(SILModule &M,
                                          ResilienceExpansion expansion) const;
+
+  /// \returns true if this is a SILBoxType containing a noncopyable type.
+  bool isBoxedNonCopyableType(const SILFunction *fn) const {
+    if (!this->is<SILBoxType>())
+      return false;
+    return getSILBoxFieldType(fn).isMoveOnly();
+  }
+
+  bool isBoxedNonCopyableType(const SILFunction &fn) const {
+    return isBoxedNonCopyableType(&fn);
+  }
+
+  SILType getInstanceTypeOfMetatype(SILFunction *function) const;
+
+  bool isOrContainsObjectiveCClass() const;
+
+  bool isCalleeConsumedFunction() const {
+    auto funcTy = castTo<SILFunctionType>();
+    return funcTy->isCalleeConsumed() && !funcTy->isNoEscape();
+  }
+
+  bool isMarkedAsImmortal() const;
 
   //
   // Accessors for types used in SIL instructions:
@@ -730,6 +823,9 @@ public:
   /// Get the SIL token type.
   static SILType getSILTokenType(const ASTContext &C);
 
+  /// Get the type for pack indexes.
+  static SILType getPackIndexType(const ASTContext &C);
+
   /// Return '()'
   static SILType getEmptyTupleType(const ASTContext &C);
 
@@ -758,6 +854,8 @@ public:
   void dump() const;
   void print(raw_ostream &OS,
              const PrintOptions &PO = PrintOptions::printSIL()) const;
+
+  std::string getDebugDescription() const;
 };
 
 // Statically prevent SILTypes from being directly cast to a type
@@ -787,6 +885,13 @@ inline llvm::raw_ostream &operator<<(llvm::raw_ostream &OS, SILType T) {
 
 inline SILType SILBlockStorageType::getCaptureAddressType() const {
   return SILType::getPrimitiveAddressType(getCaptureType());
+}
+
+inline SILType SILPackType::getSILElementType(unsigned index) const {
+  return SILType::getPrimitiveType(getElementType(index),
+                                   isElementAddress()
+                                     ? SILValueCategory::Address
+                                     : SILValueCategory::Object);
 }
 
 /// The hash of a SILType is the hash of its opaque value.

@@ -337,7 +337,8 @@ public:
       return D;
     if (auto *FD = dyn_cast<FuncDecl>(D)) {
       if (BraceStmt *B = FD->getBody()) {
-        BraceStmt *NB = transformBraceStmt(B);
+        const ParameterList *PL = FD->getParameters();
+        BraceStmt *NB = transformBraceStmt(B, PL);
         // Since it would look strange going straight to the first line in a
         // function body, we throw in a before/after pointing at the function
         // decl at the start of the transformed body
@@ -366,7 +367,9 @@ public:
     return D;
   }
 
-  BraceStmt *transformBraceStmt(BraceStmt *BS, bool TopLevel = false) override {
+  BraceStmt *transformBraceStmt(BraceStmt *BS,
+                                const ParameterList *PL = nullptr,
+                                bool TopLevel = false) override {
     ArrayRef<ASTNode> OriginalElements = BS->getElements();
     SmallVector<swift::ASTNode, 3> Elements(OriginalElements.begin(),
                                             OriginalElements.end());
@@ -552,10 +555,10 @@ public:
         Context.SourceMgr.getPresumedLineAndColumnForLoc(
             Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
 
-    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first);
-    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first);
-    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second);
-    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second);
+    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first, SR.Start);
+    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first, SR.End);
+    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second, SR.Start);
+    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second, SR.End);
 
     Expr *ModuleExpr = buildIDArgumentExpr(ModuleIdentifier, SR);
     Expr *FileExpr = buildIDArgumentExpr(FileIdentifier, SR);
@@ -623,10 +626,10 @@ public:
         Context.SourceMgr.getPresumedLineAndColumnForLoc(
             Lexer::getLocForEndOfToken(Context.SourceMgr, SR.End));
 
-    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first);
-    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first);
-    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second);
-    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second);
+    Expr *StartLine = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.first, SR.Start);
+    Expr *EndLine = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.first, SR.End);
+    Expr *StartColumn = IntegerLiteralExpr::createFromUnsigned(Context, StartLC.second, SR.Start);
+    Expr *EndColumn = IntegerLiteralExpr::createFromUnsigned(Context, EndLC.second, SR.End);
 
     Expr *ModuleExpr = buildIDArgumentExpr(ModuleIdentifier, SR);
     Expr *FileExpr = buildIDArgumentExpr(FileIdentifier, SR);
@@ -674,6 +677,10 @@ void swift::performPCMacro(SourceFile &SF) {
   public:
     ExpressionFinder() = default;
 
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Expansion;
+    }
+
     PreWalkAction walkToDeclPre(Decl *D) override {
       ASTContext &ctx = D->getASTContext();
       if (auto *FD = dyn_cast<AbstractFunctionDecl>(D)) {
@@ -688,7 +695,7 @@ void swift::performPCMacro(SourceFile &SF) {
         if (!TLCD->isImplicit()) {
           if (BraceStmt *Body = TLCD->getBody()) {
             Instrumenter I(ctx, TLCD, TmpNameIndex);
-            BraceStmt *NewBody = I.transformBraceStmt(Body, true);
+            BraceStmt *NewBody = I.transformBraceStmt(Body, nullptr, true);
             if (NewBody != Body) {
               TLCD->setBody(NewBody);
               TypeChecker::checkTopLevelEffects(TLCD);

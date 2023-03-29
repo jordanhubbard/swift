@@ -24,6 +24,7 @@
 
 namespace swift {
 class ASTContext;
+class AvailableAttr;
 class Decl;
 
 /// A lattice of version ranges of the form [x.y.z, +Inf).
@@ -208,6 +209,10 @@ public:
   const VersionRange &getRequiredOSVersionRange() const {
     return RequiredDeploymentRange;
   }
+
+  /// Returns true if the required OS version range's lower endpoint is at or
+  /// below the deployment target of the given ASTContext.
+  bool requiresDeploymentTargetOrEarlier(ASTContext &Ctx) const;
 };
 
 /// Represents everything that a particular chunk of code may assume about its
@@ -219,6 +224,9 @@ public:
 /// See #unionWith, #intersectWith, and #constrainWith.
 ///
 /// [lattice]: http://mathworld.wolfram.com/Lattice.html
+///
+/// NOTE: Generally you should use the utilities on \c AvailabilityInference
+/// to create an \c AvailabilityContext, rather than creating one directly.
 class AvailabilityContext {
   VersionRange OSVersion;
   llvm::Optional<bool> SPI;
@@ -326,6 +334,10 @@ public:
 
 class AvailabilityInference {
 public:
+  /// Returns the decl that should be considered the parent decl of the given
+  /// decl when looking for inherited availability annotations.
+  static const Decl *parentDeclForInferredAvailability(const Decl *D);
+
   /// Infers the common availability required to access an array of
   /// declarations and adds attributes reflecting that availability
   /// to ToDecl.
@@ -339,6 +351,18 @@ public:
   /// Returns the context where a declaration is available
   ///  We assume a declaration without an annotation is always available.
   static AvailabilityContext availableRange(const Decl *D, ASTContext &C);
+
+  /// Returns the availability context for a declaration with the given
+  /// @available attribute.
+  ///
+  /// NOTE: The attribute must be active on the current platform.
+  static AvailabilityContext availableRange(const AvailableAttr *attr,
+                                            ASTContext &C);
+
+  /// Returns the attribute that should be used to determine the availability
+  /// range of the given declaration, or nullptr if there is none.
+  static const AvailableAttr *attrForAnnotatedAvailableRange(const Decl *D,
+                                                             ASTContext &Ctx);
 
   /// Returns the context for which the declaration
   /// is annotated as available, or None if the declaration

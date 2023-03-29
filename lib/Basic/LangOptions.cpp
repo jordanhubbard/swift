@@ -33,6 +33,7 @@ LangOptions::LangOptions() {
   // Note: Introduce default-on language options here.
 #ifndef NDEBUG
   Features.insert(Feature::ParserRoundTrip);
+  Features.insert(Feature::ParserValidation);
 #endif
 }
 
@@ -75,11 +76,17 @@ static const SupportedConditionalValue SupportedConditionalCompilationArches[] =
   "powerpc64le",
   "s390x",
   "wasm32",
+  "riscv64",
 };
 
 static const SupportedConditionalValue SupportedConditionalCompilationEndianness[] = {
   "little",
   "big"
+};
+
+static const SupportedConditionalValue SupportedConditionalCompilationPointerBitWidths[] = {
+  "_32",
+  "_64"
 };
 
 static const SupportedConditionalValue SupportedConditionalCompilationRuntimes[] = {
@@ -112,6 +119,8 @@ ArrayRef<SupportedConditionalValue> getSupportedConditionalCompilationValues(con
     return SupportedConditionalCompilationArches;
   case PlatformConditionKind::Endianness:
     return SupportedConditionalCompilationEndianness;
+  case PlatformConditionKind::PointerBitWidth:
+    return SupportedConditionalCompilationPointerBitWidths;
   case PlatformConditionKind::Runtime:
     return SupportedConditionalCompilationRuntimes;
   case PlatformConditionKind::CanImport:
@@ -179,6 +188,7 @@ checkPlatformConditionSupported(PlatformConditionKind Kind, StringRef Value,
   case PlatformConditionKind::OS:
   case PlatformConditionKind::Arch:
   case PlatformConditionKind::Endianness:
+  case PlatformConditionKind::PointerBitWidth:
   case PlatformConditionKind::Runtime:
   case PlatformConditionKind::TargetEnvironment:
   case PlatformConditionKind::PtrAuth:
@@ -270,7 +280,7 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
     llvm::VersionTuple OSVersion;
     triple.getMacOSXVersion(OSVersion);
 
-    osx << OSVersion.getMajor() << "." << OSVersion.getMinor().getValueOr(0);
+    osx << OSVersion.getMajor() << "." << OSVersion.getMinor().value_or(0);
     if (auto Subminor = OSVersion.getSubminor())
       osx << "." << *Subminor;
 
@@ -325,6 +335,12 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
   case llvm::Triple::WASI:
     addPlatformConditionValue(PlatformConditionKind::OS, "WASI");
     break;
+  case llvm::Triple::UnknownOS:
+    if (Target.getOSName() == "none") {
+      addPlatformConditionValue(PlatformConditionKind::OS, "none");
+      break;
+    }
+    LLVM_FALLTHROUGH;
   default:
     UnsupportedOS = true;
     break;
@@ -367,6 +383,9 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
   case llvm::Triple::ArchType::wasm32:
     addPlatformConditionValue(PlatformConditionKind::Arch, "wasm32");
     break;
+  case llvm::Triple::ArchType::riscv64:
+    addPlatformConditionValue(PlatformConditionKind::Arch, "riscv64");
+    break;
   default:
     UnsupportedArch = true;
   }
@@ -385,11 +404,31 @@ std::pair<bool, bool> LangOptions::setTarget(llvm::Triple triple) {
   case llvm::Triple::ArchType::wasm32:
   case llvm::Triple::ArchType::x86:
   case llvm::Triple::ArchType::x86_64:
+  case llvm::Triple::ArchType::riscv64:
     addPlatformConditionValue(PlatformConditionKind::Endianness, "little");
     break;
   case llvm::Triple::ArchType::ppc64:
   case llvm::Triple::ArchType::systemz:
     addPlatformConditionValue(PlatformConditionKind::Endianness, "big");
+    break;
+  }
+
+  // Set the "_pointerBitWidth" platform condition.
+  switch (Target.getArch()) {
+  default: llvm_unreachable("undefined architecture pointer bit width");
+  case llvm::Triple::ArchType::arm:
+  case llvm::Triple::ArchType::thumb:
+  case llvm::Triple::ArchType::aarch64_32:
+  case llvm::Triple::ArchType::x86:
+  case llvm::Triple::ArchType::wasm32:
+    addPlatformConditionValue(PlatformConditionKind::PointerBitWidth, "_32");
+    break;
+  case llvm::Triple::ArchType::aarch64:
+  case llvm::Triple::ArchType::ppc64:
+  case llvm::Triple::ArchType::ppc64le:
+  case llvm::Triple::ArchType::x86_64:
+  case llvm::Triple::ArchType::systemz:
+    addPlatformConditionValue(PlatformConditionKind::PointerBitWidth, "_64");
     break;
   }
 
@@ -442,6 +481,17 @@ bool swift::isSuppressibleFeature(Feature feature) {
   llvm_unreachable("covered switch");
 }
 
+bool swift::isFeatureAvailableInProduction(Feature feature) {
+  switch (feature) {
+#define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)  \
+  case Feature::FeatureName: return true;
+#define EXPERIMENTAL_FEATURE(FeatureName, AvailableInProd)            \
+  case Feature::FeatureName: return AvailableInProd;
+#include "swift/Basic/Features.def"
+  }
+  llvm_unreachable("covered switch");
+}
+
 llvm::Optional<Feature> swift::getUpcomingFeature(llvm::StringRef name) {
   return llvm::StringSwitch<Optional<Feature>>(name)
 #define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)
@@ -454,7 +504,7 @@ llvm::Optional<Feature> swift::getUpcomingFeature(llvm::StringRef name) {
 llvm::Optional<Feature> swift::getExperimentalFeature(llvm::StringRef name) {
   return llvm::StringSwitch<Optional<Feature>>(name)
 #define LANGUAGE_FEATURE(FeatureName, SENumber, Description, Option)
-#define EXPERIMENTAL_FEATURE(FeatureName) \
+#define EXPERIMENTAL_FEATURE(FeatureName, AvailableInProd)                  \
                    .Case(#FeatureName, Feature::FeatureName)
 #include "swift/Basic/Features.def"
                    .Default(None);

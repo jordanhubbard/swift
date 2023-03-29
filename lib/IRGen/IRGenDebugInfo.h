@@ -177,18 +177,21 @@ public:
                         const SILDebugScope *DS, bool InCoroContext = false,
                         AddrDbgInstrKind = AddrDbgInstrKind::DbgDeclare);
 
-  enum { NotHeapAllocated = false };
-  
   /// Create debug metadata for a global variable.
   void emitGlobalVariableDeclaration(llvm::GlobalVariable *Storage,
                                      StringRef Name, StringRef LinkageName,
                                      DebugTypeInfo DebugType,
-                                     bool IsLocalToUnit, bool InFixedBuffer,
+                                     bool IsLocalToUnit,
                                      Optional<SILLocation> Loc);
 
   /// Emit debug metadata for type metadata (for generic types). So meta.
   void emitTypeMetadata(IRGenFunction &IGF, llvm::Value *Metadata,
                         unsigned Depth, unsigned Index, StringRef Name);
+
+  /// Emit debug info for the IR function parameter holding the size of one or
+  /// more parameter / type packs.
+  void emitPackCountParameter(IRGenFunction &IGF, llvm::Value *Metadata,
+                              SILDebugVariable VarInfo);
 
   /// Return the DIBuilder.
   llvm::DIBuilder &getBuilder();

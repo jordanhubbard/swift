@@ -26,6 +26,12 @@
     },
     {
       "name": "emit-const-value-sidecar"
+    },
+    {
+      "name": "emit-extension-block-symbols"
+    },
+    {
+      "name": "package-name"
     }
   ]
 }

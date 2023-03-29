@@ -16,7 +16,7 @@
 #
 function(add_swift_compiler_module module)
   cmake_parse_arguments(ALSM
-                        "ADD_TO_SYNTAXPARSE"
+                        ""
                         ""
                         "DEPENDS;SOURCES"
                         ${ARGN})
@@ -35,7 +35,6 @@ function(add_swift_compiler_module module)
 
   set_property(TARGET ${target_name} PROPERTY module_name ${module})
   set_property(TARGET ${target_name} PROPERTY module_depends ${ALSM_DEPENDS})
-  set_property(TARGET ${target_name} PROPERTY add_to_syntaxparse ${ALSM_ADD_TO_SYNTAXPARSE})
 
   get_property(modules GLOBAL PROPERTY swift_compiler_modules)
   set_property(GLOBAL PROPERTY swift_compiler_modules ${modules} ${module})
@@ -76,6 +75,7 @@ function(add_swift_compiler_modules_library name)
   set(swift_compile_options
       "-Xfrontend" "-validate-tbd-against-ir=none"
       "-Xfrontend" "-enable-experimental-cxx-interop"
+      "-Xcc" "-std=c++17"
       "-Xcc" "-UIBOutlet" "-Xcc" "-UIBAction" "-Xcc" "-UIBInspectable")
   if (NOT BOOTSTRAPPING_MODE STREQUAL "HOSTTOOLS")
     list(APPEND swift_compile_options "-Xfrontend" "-disable-implicit-string-processing-module-import")
@@ -127,14 +127,13 @@ function(add_swift_compiler_modules_library name)
       ${SWIFT_HOST_VARIANT_ARCH} "${deployment_version}")
 
   # Let Swift discover SwiftShims headers which are included by some headers
-  # under `include/swift`.
+  # under `include/swift`. These are either located next to the compiler (in case of open source toolchains) or
+  # in the SDK (in case a Swift compiler from Xcode)
   get_filename_component(swift_exec_bin_dir ${ALS_SWIFT_EXEC} DIRECTORY)
-  set(sdk_option ${sdk_option} "-I" "${swift_exec_bin_dir}/../lib")
+  set(sdk_option ${sdk_option} "-I" "${swift_exec_bin_dir}/../lib" "-I" "${sdk_path}/usr/lib")
 
   set(all_obj_files)
   set(all_module_targets)
-  set(syntaxparse_obj_files)
-  set(syntaxparse_module_targets)
   get_property(modules GLOBAL PROPERTY "swift_compiler_modules")
   foreach(module ${modules})
 
@@ -142,7 +141,6 @@ function(add_swift_compiler_modules_library name)
     get_target_property(module ${module_target} "module_name")
     get_target_property(sources ${module_target} SOURCES)
     get_target_property(dependencies ${module_target} "module_depends")
-    get_target_property(add_to_syntaxparse ${module_target} "add_to_syntaxparse")
     set(deps, "")
     if (dependencies)
       foreach(dep_module ${dependencies})
@@ -162,9 +160,6 @@ function(add_swift_compiler_modules_library name)
     set_property(TARGET ${module_target} PROPERTY "module_file" "${module_file}")
 
     set(all_obj_files ${all_obj_files} ${module_obj_file})
-    if (add_to_syntaxparse)
-      set(syntaxparse_obj_files ${syntaxparse_obj_files} ${module_obj_file})
-    endif()
     set(c_include_paths
       # LLVM modules and headers.
       "${LLVM_MAIN_INCLUDE_DIR}"
@@ -182,27 +177,25 @@ function(add_swift_compiler_modules_library name)
     endforeach()
 
     # Compile the module into an object file
-    add_custom_command_target(dep_target OUTPUT ${module_obj_file}
+    add_custom_command_target(dep_target
+      COMMAND ${ALS_SWIFT_EXEC} "-c" "-o" ${module_obj_file}
+        ${sdk_option}
+        "-target" ${target}
+        "-module-name" ${module} "-emit-module"
+        "-emit-module-path" "${build_dir}/${module}.swiftmodule"
+        "-parse-as-library" ${sources}
+        "-wmo" ${swift_compile_options}
+        ${c_include_paths_args}
+        # Generated swift modules.
+        "-I" "${build_dir}"
+      OUTPUT ${module_obj_file}
       WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
       DEPENDS ${sources} ${deps} ${ALS_DEPENDS}
         importedHeaderDependencies
-      COMMAND ${ALS_SWIFT_EXEC} "-c" "-o" ${module_obj_file}
-              ${sdk_option}
-              "-target" ${target}
-              "-module-name" ${module} "-emit-module"
-              "-emit-module-path" "${build_dir}/${module}.swiftmodule"
-              "-parse-as-library" ${sources}
-              "-wmo" ${swift_compile_options}
-              ${c_include_paths_args}
-              # Generated swift modules.
-              "-I" "${build_dir}"
       COMMENT "Building swift module ${module}")
 
     set("${module}_dep_target" ${dep_target})
     set(all_module_targets ${all_module_targets} ${dep_target})
-    if (add_to_syntaxparse)
-      set(syntaxparse_module_targets ${syntaxparse_module_targets} ${dep_target})
-    endif()
   endforeach()
 
   # Create a static library containing all module object files.
@@ -216,15 +209,6 @@ function(add_swift_compiler_modules_library name)
   add_dependencies(${name} ${all_module_targets})
   set_target_properties(${name} PROPERTIES LINKER_LANGUAGE CXX)
   set_property(GLOBAL APPEND PROPERTY SWIFT_BUILDTREE_EXPORTS ${name})
-
-  if (XCODE)
-    set(syntaxparse_obj_files force_lib.c ${syntaxparse_obj_files})
-  endif()
-  add_library("${name}_SwiftSyntax" STATIC ${syntaxparse_obj_files})
-  add_dependencies("${name}_SwiftSyntax" ${syntaxparse_module_targets})
-  set_target_properties("${name}_SwiftSyntax" PROPERTIES LINKER_LANGUAGE CXX)
-  set_property(GLOBAL APPEND PROPERTY SWIFT_BUILDTREE_EXPORTS "${name}_SwiftSyntax")
-
 endfunction()
 
 
@@ -234,7 +218,6 @@ add_swift_host_library(swiftCompilerStub OBJECT stubs.cpp)
 if (NOT BOOTSTRAPPING_MODE)
 
   add_library(swiftCompilerModules ALIAS swiftCompilerStub)
-  add_library(swiftCompilerModules_SwiftSyntax ALIAS swiftCompilerStub)
 
 else()
   # Note: "Swift" is not added intentionally here, because it would break

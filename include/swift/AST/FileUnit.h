@@ -210,6 +210,14 @@ public:
   /// The order of the results is not guaranteed to be meaningful.
   virtual void getTopLevelDecls(SmallVectorImpl<Decl*> &results) const {}
 
+  /// Finds all top-level decls in this file with their auxiliary decls such as
+  /// macro expansions.
+  ///
+  /// This does a simple local lookup, not recursively looking through imports.
+  /// The order of the results is not guaranteed to be meaningful.
+  void getTopLevelDeclsWithAuxiliaryDecls(
+      SmallVectorImpl<Decl*> &results) const;
+
   virtual void
   getExportedPrespecializations(SmallVectorImpl<Decl *> &results) const {}
 
@@ -322,8 +330,11 @@ public:
   /// The 'real name' is the actual binary name of the module, which can be different from the 'name'
   /// if module aliasing was used (via -module-alias flag).
   ///
-  /// Usually this is the module real name itself, but certain Clang features allow
-  /// substituting another name instead.
+  /// This is usually the module real name which can be overriden by an
+  /// `export_as` definition of a clang module, or `-export-as` flag on an
+  /// imported Swift module. Swift modules built from source do not apply
+  /// their own `-export-as` flag, this way the swiftinterface can be
+  /// verified.
   virtual StringRef getExportedModuleName() const {
     return getParentModule()->getRealName().str();
   }
@@ -403,6 +414,19 @@ public:
   ///
   /// This is usually a filesystem path.
   virtual StringRef getFilename() const;
+
+  /// Get the path to the file loaded by the compiler. Usually the binary
+  /// swiftmodule file or a pcm in the cache. Returns an empty string if not
+  /// applicable.
+  virtual StringRef getLoadedFilename() const { return StringRef(); }
+
+  /// Returns the path of the file for the module represented by this
+  /// \c FileUnit, or an empty string if there is none. For modules either
+  /// built by or adjacent to a module interface, returns the module
+  /// interface instead.
+  virtual StringRef getSourceFilename() const {
+    return getModuleDefiningPath();
+  }
 
   virtual StringRef getFilenameForPrivateDecl(const ValueDecl *decl) const {
     return StringRef();

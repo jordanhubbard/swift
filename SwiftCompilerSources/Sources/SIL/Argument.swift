@@ -18,16 +18,15 @@ import SILBridging
 /// Maps to both, SILPhiArgument and SILFunctionArgument.
 public class Argument : Value, Hashable {
   public var definingInstruction: Instruction? { nil }
-  public var definingBlock: BasicBlock { block }
 
-  public var block: BasicBlock {
-    return SILArgument_getParent(bridged).block
+  public var parentBlock: BasicBlock {
+    return bridged.getParent().block
   }
 
   var bridged: BridgedArgument { BridgedArgument(obj: SwiftObject(self)) }
   
   public var index: Int {
-    return block.arguments.firstIndex(of: self)!
+    return parentBlock.arguments.firstIndex(of: self)!
   }
   
   public static func ==(lhs: Argument, rhs: Argument) -> Bool {
@@ -41,13 +40,13 @@ public class Argument : Value, Hashable {
 
 final public class FunctionArgument : Argument {
   public var convention: ArgumentConvention {
-    SILArgument_getConvention(bridged).convention
+    bridged.getConvention().convention
   }
 }
 
 final public class BlockArgument : Argument {
   public var isPhiArgument: Bool {
-    block.predecessors.allSatisfy {
+    parentBlock.predecessors.allSatisfy {
       let term = $0.terminator
       return term is BranchInst || term is CondBranchInst
     }
@@ -56,16 +55,16 @@ final public class BlockArgument : Argument {
   public var incomingPhiOperands: LazyMapSequence<PredecessorList, Operand> {
     assert(isPhiArgument)
     let idx = index
-    return block.predecessors.lazy.map {
+    return parentBlock.predecessors.lazy.map {
       switch $0.terminator {
         case let br as BranchInst:
           return br.operands[idx]
         case let condBr as CondBranchInst:
-          if condBr.trueBlock == self.block {
-            assert(condBr.falseBlock != self.block)
+          if condBr.trueBlock == self.parentBlock {
+            assert(condBr.falseBlock != self.parentBlock)
             return condBr.trueOperands[idx]
           } else {
-            assert(condBr.falseBlock == self.block)
+            assert(condBr.falseBlock == self.parentBlock)
             return condBr.falseOperands[idx]
           }
         default:
@@ -85,11 +84,6 @@ public enum ArgumentConvention {
   /// object.  The callee may assume that the address does not alias any valid
   /// object.
   case indirectIn
-
-  /// This argument is passed indirectly, i.e. by directly passing the address
-  /// of an object in memory.  The callee must treat the object as read-only
-  /// The callee may assume that the address does not alias any valid object.
-  case indirectInConstant
 
   /// This argument is passed indirectly, i.e. by directly passing the address
   /// of an object in memory.  The callee may not modify and does not destroy
@@ -128,10 +122,39 @@ public enum ArgumentConvention {
   /// guarantees its validity for the entirety of the call.
   case directGuaranteed
 
+  public var isIndirect: Bool {
+    switch self {
+    case .indirectIn, .indirectInGuaranteed,
+         .indirectInout, .indirectInoutAliasable, .indirectOut:
+      return true
+    case .directOwned, .directUnowned, .directGuaranteed:
+      return false
+    }
+  }
+
+  public var isIndirectIn: Bool {
+    switch self {
+    case .indirectIn, .indirectInGuaranteed:
+      return true
+    case .directOwned, .directUnowned, .directGuaranteed,
+         .indirectInout, .indirectInoutAliasable, .indirectOut:
+      return false
+    }
+  }
+
+  public var isGuaranteed: Bool {
+    switch self {
+    case .indirectInGuaranteed, .directGuaranteed:
+      return true
+    case .indirectIn, .directOwned, .directUnowned,
+         .indirectInout, .indirectInoutAliasable, .indirectOut:
+      return false
+    }
+  }
+
   public var isExclusiveIndirect: Bool {
     switch self {
     case .indirectIn,
-         .indirectInConstant,
          .indirectOut,
          .indirectInGuaranteed,
          .indirectInout:
@@ -152,7 +175,6 @@ public enum ArgumentConvention {
       return true
 
     case .indirectIn,
-         .indirectInConstant,
          .indirectOut,
          .indirectInGuaranteed,
          .directUnowned,
@@ -174,15 +196,14 @@ extension BridgedArgument {
 extension BridgedArgumentConvention {
   var convention: ArgumentConvention {
     switch self {
-      case ArgumentConvention_Indirect_In:             return .indirectIn
-      case ArgumentConvention_Indirect_In_Constant:    return .indirectInConstant
-      case ArgumentConvention_Indirect_In_Guaranteed:  return .indirectInGuaranteed
-      case ArgumentConvention_Indirect_Inout:          return .indirectInout
-      case ArgumentConvention_Indirect_InoutAliasable: return .indirectInoutAliasable
-      case ArgumentConvention_Indirect_Out:            return .indirectOut
-      case ArgumentConvention_Direct_Owned:            return .directOwned
-      case ArgumentConvention_Direct_Unowned:          return .directUnowned
-      case ArgumentConvention_Direct_Guaranteed:       return .directGuaranteed
+      case .Indirect_In:             return .indirectIn
+      case .Indirect_In_Guaranteed:  return .indirectInGuaranteed
+      case .Indirect_Inout:          return .indirectInout
+      case .Indirect_InoutAliasable: return .indirectInoutAliasable
+      case .Indirect_Out:            return .indirectOut
+      case .Direct_Owned:            return .directOwned
+      case .Direct_Unowned:          return .directUnowned
+      case .Direct_Guaranteed:       return .directGuaranteed
       default:
         fatalError("unsupported argument convention")
     }

@@ -204,6 +204,12 @@ struct PointerAuthOptions : clang::PointerAuthOptions {
 
   /// C type StoreExtraInhabitantTag function descriminator.
   PointerAuthSchema StoreExtraInhabitantTagFunction;
+
+  /// Relative protocol witness table descriminator.
+  PointerAuthSchema RelativeProtocolWitnessTable;
+
+  /// Type layout string descriminator.
+  PointerAuthSchema TypeLayoutString;
 };
 
 enum class JITDebugArtifact : unsigned {
@@ -245,9 +251,6 @@ public:
   /// Should we spend time verifying that the IR we produce is
   /// well-formed?
   unsigned Verify : 1;
-
-  /// Should we use the legacy pass manager.
-  unsigned LegacyPassManager : 1;
 
   OptimizationMode OptMode;
 
@@ -419,6 +422,15 @@ public:
 
   unsigned DisableReadonlyStaticObjects : 1;
 
+  /// Collocate metadata functions in their own section.
+  unsigned CollocatedMetadataFunctions : 1;
+
+  /// Colocate type descriptors in their own section.
+  unsigned ColocateTypeDescriptors : 1;
+
+  /// Use relative (and constant) protocol witness tables.
+  unsigned UseRelativeProtocolWitnessTables : 1;
+
   /// The number of threads for multi-threaded code generation.
   unsigned NumThreads = 0;
 
@@ -448,6 +460,7 @@ public:
   Optional<llvm::VersionTuple> AutolinkRuntimeCompatibilityDynamicReplacementLibraryVersion;
   Optional<llvm::VersionTuple>
       AutolinkRuntimeCompatibilityConcurrencyLibraryVersion;
+  bool AutolinkRuntimeCompatibilityBytecodeLayoutsLibrary;
 
   JITDebugArtifact DumpJIT = JITDebugArtifact::None;
 
@@ -458,7 +471,7 @@ public:
   IRGenOptions()
       : DWARFVersion(2),
         OutputKind(IRGenOutputKind::LLVMAssemblyAfterOptimization),
-        Verify(true), LegacyPassManager(0), OptMode(OptimizationMode::NotSet),
+        Verify(true), OptMode(OptimizationMode::NotSet),
         Sanitizers(OptionSet<SanitizerKind>()),
         SanitizersWithRecoveryInstrumentation(OptionSet<SanitizerKind>()),
         SanitizeAddressUseODRIndicator(false),
@@ -488,7 +501,10 @@ public:
         WitnessMethodElimination(false), ConditionalRuntimeRecords(false),
         InternalizeAtLink(false), InternalizeSymbols(false),
         EmitGenericRODatas(false), NoPreallocatedInstantiationCaches(false),
-        DisableReadonlyStaticObjects(false), CmdArgs(),
+        DisableReadonlyStaticObjects(false),
+        CollocatedMetadataFunctions(false),
+        ColocateTypeDescriptors(true),
+        UseRelativeProtocolWitnessTables(false), CmdArgs(),
         SanitizeCoverage(llvm::SanitizerCoverageOptions()),
         TypeInfoFilter(TypeInfoDumpFilter::All) {
 #ifndef NDEBUG
@@ -546,6 +562,12 @@ public:
   /// Return a hash code of any components from these options that should
   /// contribute to a Swift Bridging PCH hash.
   llvm::hash_code getPCHHashComponents() const {
+    return llvm::hash_value(0);
+  }
+
+  /// Return a hash code of any components from these options that should
+  /// contribute to a Swift Dependency Scanning hash.
+  llvm::hash_code getModuleScanningHashComponents() const {
     return llvm::hash_value(0);
   }
 

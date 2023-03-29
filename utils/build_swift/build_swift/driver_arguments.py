@@ -56,9 +56,20 @@ def _apply_default_arguments(args):
        args.lldb_build_with_xcode is not None:
         args.build_lldb = True
 
+    # Set the default CMake generator.
+    if args.cmake_generator is None:
+        args.cmake_generator = 'Ninja'
+    elif args.cmake_generator == 'Xcode':
+        # Building with Xcode is deprecated.
+        args.skip_build = True
+        args.build_early_swift_driver = False
+        args.build_early_swiftsyntax = False
+
     # Set the default build variant.
     if args.build_variant is None:
-        args.build_variant = 'Debug'
+        args.build_variant = (
+            'MinSizeRel' if args.cmake_generator == 'Xcode' else 'Debug'
+        )
 
     if args.llvm_build_variant is None:
         args.llvm_build_variant = args.build_variant
@@ -118,10 +129,6 @@ def _apply_default_arguments(args):
 
     if args.lldb_assertions is None:
         args.lldb_assertions = args.assertions
-
-    # Set the default CMake generator.
-    if args.cmake_generator is None:
-        args.cmake_generator = 'Ninja'
 
     # --ios-all etc are not supported by open-source Swift.
     if args.ios_all:
@@ -445,6 +452,10 @@ def create_argument_parser():
            help='enable sanitizer coverage for swift tools. Necessary for '
                 'fuzzing swiftc')
 
+    option('--swift-enable-backtracing', toggle_true,
+           default=True,
+           help='enable backtracing support')
+
     option('--compiler-vendor', store,
            choices=['none', 'apple'],
            default=defaults.COMPILER_VENDOR,
@@ -514,6 +525,9 @@ def create_argument_parser():
 
     option('--clang-profile-instr-use', store_path,
            help='profile file to use for clang PGO')
+
+    option('--swift-profile-instr-use', store_path,
+           help='profile file to use for clang PGO while building swift')
 
     option('--llvm-max-parallel-lto-link-jobs', store_int,
            default=defaults.LLVM_MAX_PARALLEL_LTO_LINK_JOBS,
@@ -646,6 +660,9 @@ def create_argument_parser():
     option(['--back-deploy-concurrency'], toggle_true('build_backdeployconcurrency'),
            help='build back-deployment support for concurrency')
 
+    option('--install-llvm', toggle_true,
+           help='install llvm')
+
     option(['--install-back-deploy-concurrency'],
            toggle_true('install_backdeployconcurrency'),
            help='install back-deployment support libraries for concurrency')
@@ -699,7 +716,12 @@ def create_argument_parser():
            toggle_true('swiftsyntax_verify_generated_files'),
            help='set to verify that the generated files in the source tree '
                 'match the ones that would be generated from current main')
+    option('--swiftsyntax-lint',
+           toggle_true('swiftsyntax_lint'),
+           help='verify that swift-syntax Source code is formatted correctly')
     option(['--install-sourcekit-lsp'], toggle_true('install_sourcekitlsp'),
+           help='install SourceKitLSP')
+    option(['--install-swiftformat'], toggle_true('install_swiftformat'),
            help='install SourceKitLSP')
     option(['--install-skstresstester'], toggle_true('install_skstresstester'),
            help='install the SourceKit stress tester')
@@ -717,6 +739,9 @@ def create_argument_parser():
            toggle_true('build_swift_inspect'),
            help='build SwiftInspect using swiftpm against the just built '
                 'toolchain')
+    option(['--build-minimal-stdlib'], toggle_true('build_minimalstdlib'),
+           help='build the \'minimal\' freestanding stdlib variant into a '
+                'separate build directory ')
 
     option('--xctest', toggle_true('build_xctest'),
            help='build xctest')
@@ -748,9 +773,6 @@ def create_argument_parser():
     option('--build-ninja', toggle_true,
            help='build the Ninja tool')
 
-    option(['--build-libparser-only'], toggle_true('build_libparser_only'),
-           help='build only libParser for SwiftSyntax')
-
     option(['--build-lld'], toggle_true('build_lld'),
            help='build lld as part of llvm')
 
@@ -758,6 +780,11 @@ def create_argument_parser():
            toggle_false('build_clang_tools_extra'),
            default=True,
            help='skip building clang-tools-extra as part of llvm')
+
+    option('--skip-build-compiler-rt',
+           toggle_false('build_compiler_rt'),
+           default=True,
+           help='skip building compiler-rt as part of llvm')
 
     # -------------------------------------------------------------------------
     in_group('Extra actions to perform before or in addition to building')
@@ -1053,6 +1080,14 @@ def create_argument_parser():
            help='Include Unicode data in the standard library.'
                 'Note: required for full String functionality')
 
+    option('--build-swift-remote-mirror', toggle_true,
+           default=True,
+           help='Build Remote Mirror')
+
+    option('--build-swift-libexec', toggle_true,
+           default=True,
+           help='build auxiliary executables')
+
     option(['-S', '--skip-build'], store_true,
            help='generate build directory only without building')
 
@@ -1107,6 +1142,9 @@ def create_argument_parser():
            help='build the private part of the Standard Library. '
                 'This can be useful to reduce build times when e.g. '
                 'tests do not need to run')
+
+    option('--build-toolchain-only', toggle_true,
+           help='only build the necessary tools to build an external toolchain')
 
     # -------------------------------------------------------------------------
     in_group('Skip testing specified targets')
@@ -1208,6 +1246,9 @@ def create_argument_parser():
     # -------------------------------------------------------------------------
     in_group('Build settings specific for LLVM')
 
+    option('--llvm-enable-modules', toggle_true('llvm_enable_modules'),
+           help='enable building llvm using modules')
+
     option('--llvm-targets-to-build', store,
            default='X86;ARM;AArch64;PowerPC;SystemZ;Mips',
            help='LLVM target generators to build')
@@ -1226,6 +1267,15 @@ def create_argument_parser():
                 'llvm-ninja-targets (or the default ones). '
                 'Can be called multiple times '
                 'to add multiple such options.')
+
+    option('--no-llvm-include-tests', toggle_false('llvm_include_tests'),
+           help='do not generate testing targets for LLVM')
+
+    option('--llvm-cmake-options', append,
+           type=argparse.ShellSplitType(),
+           help='CMake options used for llvm in the form of comma '
+                'separated options "-DCMAKE_VAR1=YES,-DCMAKE_VAR2=/tmp". Can '
+                'be called multiple times to add multiple such options.')
 
     # -------------------------------------------------------------------------
     in_group('Build settings for Android')
@@ -1272,6 +1322,10 @@ def create_argument_parser():
            default=True,
            help='Enable experimental Swift string processing.')
 
+    option('--enable-experimental-observation', toggle_true,
+           default=True,
+           help='Enable experimental Swift observation.')
+
     # -------------------------------------------------------------------------
     in_group('Unsupported options')
 
@@ -1291,6 +1345,9 @@ def create_argument_parser():
            help='skip building cmark')
     option('--skip-build-llvm', toggle_false('build_llvm'),
            help='skip building llvm')
+    option('--build-llvm', toggle_true('_build_llvm'),
+           default=True,
+           help='build llvm and clang')
     option('--skip-build-swift', toggle_false('build_swift'),
            help='skip building swift')
     option('--skip-build-libxml2', toggle_false('build_libxml2'),

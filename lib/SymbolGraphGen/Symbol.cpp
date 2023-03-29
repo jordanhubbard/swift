@@ -30,6 +30,8 @@
 #include "SymbolGraphASTWalker.h"
 #include "DeclarationFragmentPrinter.h"
 
+#include <queue>
+
 using namespace swift;
 using namespace symbolgraphgen;
 
@@ -111,6 +113,8 @@ std::pair<StringRef, StringRef> Symbol::getKind(const Decl *D) {
     return {"swift.associatedtype", "Associated Type"};
   case swift::DeclKind::Extension:
     return {"swift.extension", "Extension"};
+  case swift::DeclKind::Macro:
+    return {"swift.macro", "Macro"};
   default:
     llvm::errs() << "Unsupported kind: " << D->getKindName(D->getKind());
     llvm_unreachable("Unsupported declaration kind for symbol graph");
@@ -221,6 +225,60 @@ const ValueDecl *Symbol::getDeclInheritingDocs() const {
     // symbol.
     return DocCommentProvidingDecl;
   }
+}
+
+const ValueDecl *Symbol::getForeignProtocolRequirement() const {
+  if (const auto *VD = dyn_cast_or_null<ValueDecl>(D)) {
+    std::queue<const ValueDecl *> requirements;
+    while (true) {
+      for (auto *req : VD->getSatisfiedProtocolRequirements()) {
+        if (req->getModuleContext()->getNameStr() != Graph->M.getNameStr())
+          return req;
+        else
+          requirements.push(req);
+      }
+      if (requirements.empty())
+        return nullptr;
+      VD = requirements.front();
+      requirements.pop();
+    }
+  }
+
+  return nullptr;
+}
+
+const ValueDecl *Symbol::getProtocolRequirement() const {
+  if (const auto *VD = dyn_cast_or_null<ValueDecl>(D)) {
+    auto reqs = VD->getSatisfiedProtocolRequirements();
+
+    if (!reqs.empty())
+      return reqs.front();
+    else
+      return nullptr;
+  }
+
+  return nullptr;
+}
+
+const ValueDecl *Symbol::getInheritedDecl() const {
+  const ValueDecl *InheritingDecl = nullptr;
+  if (const auto *ID = getDeclInheritingDocs())
+    InheritingDecl = ID;
+
+  if (!InheritingDecl && getSynthesizedBaseTypeDecl())
+    InheritingDecl = getSymbolDecl();
+
+  if (!InheritingDecl) {
+    if (const auto *ID = getForeignProtocolRequirement())
+      InheritingDecl = ID;
+  }
+
+  if (!InheritingDecl) {
+    if (const auto *ID = getProtocolRequirement())
+      InheritingDecl = ID;
+  }
+
+  return InheritingDecl;
 }
 
 namespace {
@@ -784,7 +842,8 @@ bool Symbol::supportsKind(DeclKind Kind) {
   case DeclKind::Subscript: LLVM_FALLTHROUGH;
   case DeclKind::TypeAlias: LLVM_FALLTHROUGH;
   case DeclKind::AssociatedType: LLVM_FALLTHROUGH;
-  case DeclKind::Extension:
+  case DeclKind::Extension: LLVM_FALLTHROUGH;
+  case DeclKind::Macro:
     return true;
   default:
     return false;

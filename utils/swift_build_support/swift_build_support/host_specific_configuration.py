@@ -15,6 +15,7 @@ import sys
 from argparse import ArgumentError
 
 from . import compiler_stage
+from .cmake import CMakeOptions
 from .targets import StdlibDeploymentTarget
 
 
@@ -79,11 +80,12 @@ class HostSpecificConfiguration(object):
         # vs. build vs. run) and the SDKs to configure with.
         self.sdks_to_configure = set()
         self.swift_stdlib_build_targets = []
+        self.swift_libexec_build_targets = []
         self.swift_test_run_targets = []
         self.swift_benchmark_build_targets = []
         self.swift_benchmark_run_targets = []
         self.swift_flags = ''
-        self.cmake_options = ''
+        self.cmake_options = CMakeOptions()
         for deployment_target_name in stdlib_targets_to_configure:
             # Get the target object.
             deployment_target = StdlibDeploymentTarget.get_target_for_name(
@@ -113,6 +115,7 @@ class HostSpecificConfiguration(object):
             build_benchmarks = build and dt_supports_benchmark
             build_external_benchmarks = all([build, dt_supports_benchmark,
                                              args.build_external_benchmarks])
+            build_libexec = build and args.build_swift_libexec
 
             # FIXME: Note, `build-script-impl` computed a property here
             # w.r.t. testing, but it was actually unused.
@@ -146,6 +149,9 @@ class HostSpecificConfiguration(object):
                 else:
                     self.swift_stdlib_build_targets.append(
                         "swift-test-stdlib-" + name)
+            if build_libexec:
+                self.swift_libexec_build_targets.append(
+                    'swift-libexec-' + name)
             if build_benchmarks:
                 self.swift_benchmark_build_targets.append(
                     "swift-benchmark-" + name)

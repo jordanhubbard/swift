@@ -57,6 +57,7 @@ RequirementMachine::getLocalRequirements(
 
   GenericSignature::LocalRequirements result;
   result.anchor = Map.getTypeForTerm(term, genericParams);
+  result.packShape = getReducedShape(depType, genericParams);
 
   auto *props = Map.lookUpProperties(term);
   if (!props)
@@ -243,10 +244,19 @@ RequirementMachine::getLongestValidPrefix(const MutableTerm &term) const {
              "Protocol symbol can only appear at the start of a type term");
       break;
 
-    case Symbol::Kind::GenericParam:
+    case Symbol::Kind::GenericParam: {
       assert(prefix.empty() &&
              "Generic parameter symbol can only appear at the start of a type term");
+
+      if (std::find_if(Params.begin(), Params.end(),
+                       [&](Type otherParam) -> bool {
+                         return otherParam->isEqual(symbol.getGenericParam());
+                       }) == Params.end()) {
+        return prefix;
+      }
+
       break;
+    }
 
     case Symbol::Kind::AssociatedType: {
       const auto *props = Map.lookUpProperties(prefix);
@@ -267,6 +277,7 @@ RequirementMachine::getLongestValidPrefix(const MutableTerm &term) const {
     case Symbol::Kind::Superclass:
     case Symbol::Kind::ConcreteType:
     case Symbol::Kind::ConcreteConformance:
+    case Symbol::Kind::Shape:
       llvm::errs() <<"Invalid symbol in a type term: " << term << "\n";
       abort();
     }
@@ -353,6 +364,17 @@ Type RequirementMachine::getReducedType(
   return type.transformRec([&](Type t) -> Optional<Type> {
     if (!t->hasTypeParameter())
       return t;
+
+    // The reduced type of a PackExpansionType has a reduced *shape* for
+    // the count type.
+    if (auto *packExpansionType = t->getAs<PackExpansionType>()) {
+      auto reducedPattern = getReducedType(packExpansionType->getPatternType(),
+                                           genericParams);
+      auto reducedShape = packExpansionType->getCountType();
+      if (reducedShape->isParameterPack())
+        reducedShape = getReducedShape(reducedShape, genericParams);
+      return Type(PackExpansionType::get(reducedPattern, reducedShape));
+    }
 
     if (!t->isTypeParameter())
       return None;
@@ -695,6 +717,42 @@ RequirementMachine::lookupNestedType(Type depType, Identifier name) const {
   return nullptr;
 }
 
+MutableTerm
+RequirementMachine::getReducedShapeTerm(Type type) const {
+  assert(type->isParameterPack());
+
+  auto rootType = type->getRootGenericParam();
+  auto term = Context.getMutableTermForType(rootType->getCanonicalType(),
+                                            /*proto=*/nullptr);
+
+  // Append the 'shape' symbol to the term.
+  term.add(Symbol::forShape(Context));
+
+  System.simplify(term);
+  verify(term);
+
+  // Remove the 'shape' symbol from the term.
+  assert(term.back().getKind() == Symbol::Kind::Shape);
+  MutableTerm reducedTerm(term.begin(), term.end() - 1);
+
+  return reducedTerm;
+}
+
+Type RequirementMachine::getReducedShape(Type type,
+                      TypeArrayView<GenericTypeParamType> genericParams) const {
+  if (!type->isParameterPack())
+    return Type();
+
+  return Map.getTypeForTerm(getReducedShapeTerm(type), genericParams);
+}
+
+bool RequirementMachine::haveSameShape(Type type1, Type type2) const {
+  auto term1 = getReducedShapeTerm(type1);
+  auto term2 = getReducedShapeTerm(type2);
+
+  return term1 == term2;
+}
+
 void RequirementMachine::verify(const MutableTerm &term) const {
 #ifndef NDEBUG
   // If the term is in the generic parameter domain, ensure we have a valid
@@ -735,6 +793,7 @@ void RequirementMachine::verify(const MutableTerm &term) const {
       case Symbol::Kind::Superclass:
       case Symbol::Kind::ConcreteType:
       case Symbol::Kind::ConcreteConformance:
+      case Symbol::Kind::Shape:
         llvm::errs() << "Bad initial symbol in " << term << "\n";
         abort();
         break;
@@ -749,6 +808,10 @@ void RequirementMachine::verify(const MutableTerm &term) const {
 
     case Symbol::Kind::AssociatedType:
       erased.add(Symbol::forName(symbol.getName(), Context));
+      break;
+
+    case Symbol::Kind::Shape:
+      erased.add(symbol);
       break;
 
     case Symbol::Kind::Protocol:

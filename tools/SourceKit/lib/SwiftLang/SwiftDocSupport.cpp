@@ -28,7 +28,7 @@
 #include "swift/IDE/ModuleInterfacePrinting.h"
 #include "swift/IDE/SourceEntityWalker.h"
 #include "swift/IDE/SyntaxModel.h"
-#include "swift/IDE/Refactoring.h"
+#include "swift/Refactoring/Refactoring.h"
 // This is included only for createLazyResolver(). Move to different header ?
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/Config.h"
@@ -142,18 +142,18 @@ public:
   }
 
   bool shouldContinuePre(const Decl *D, Optional<BracketOptions> Bracket) {
-    assert(Bracket.hasValue());
-    if (!Bracket.getValue().shouldOpenExtension(D) &&
+    assert(Bracket.has_value());
+    if (!Bracket.value().shouldOpenExtension(D) &&
         isa<ExtensionDecl>(D))
       return false;
     return true;
   }
 
   bool shouldContinuePost(const Decl *D, Optional<BracketOptions> Bracket) {
-    assert(Bracket.hasValue());
-    if (!Bracket.getValue().shouldCloseNominal(D) && isa<NominalTypeDecl>(D))
+    assert(Bracket.has_value());
+    if (!Bracket.value().shouldCloseNominal(D) && isa<NominalTypeDecl>(D))
       return false;
-    if (!Bracket.getValue().shouldCloseExtension(D) &&
+    if (!Bracket.value().shouldCloseExtension(D) &&
         isa<ExtensionDecl>(D))
       return false;
     return true;
@@ -508,6 +508,8 @@ static bool initDocEntityInfo(const Decl *D,
     case DeclContextKind::SerializedLocal:
     case DeclContextKind::ExtensionDecl:
     case DeclContextKind::GenericTypeDecl:
+    case DeclContextKind::MacroDecl:
+    case DeclContextKind::Package:
       break;
 
     // We report sub-module information only for top-level decls.
@@ -769,6 +771,10 @@ public:
     : SM(SM), BufferID(BufferID), References(References), Consumer(Consumer) {}
 
   bool walkToNodePre(SyntaxNode Node) override {
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(Node.Range.getStart()))
+      return false;
+
     unsigned Offset = SM.getLocOffsetInBuffer(Node.Range.getStart(), BufferID);
     unsigned Length = Node.Range.getByteLength();
 
@@ -829,6 +835,11 @@ public:
       auto passAnnotation = [&](UIdent Kind, SourceLoc Loc, Identifier Name) {
         if (Loc.isInvalid())
           return;
+
+        // Ignore things that don't come from this buffer.
+        if (!SM.getRangeForBuffer(BufferID).contains(Loc))
+          return;
+
         unsigned Offset = SM.getLocOffsetInBuffer(Loc, BufferID);
         unsigned Length = Name.empty() ? 1 : Name.getLength();
         reportRefsUntil(Offset);
@@ -916,9 +927,13 @@ static void addParameters(ArrayRef<Identifier> &ArgNames,
 
     if (auto typeRepr = param->getTypeRepr()) {
       SourceRange TypeRange = typeRepr->getSourceRange();
-      if (auto InOutTyR = dyn_cast_or_null<InOutTypeRepr>(typeRepr))
-        TypeRange = InOutTyR->getBase()->getSourceRange();
+      if (auto OwnTyR = dyn_cast_or_null<OwnershipTypeRepr>(typeRepr))
+        TypeRange = OwnTyR->getBase()->getSourceRange();
       if (TypeRange.isInvalid())
+        continue;
+
+      // Ignore things that don't come from this buffer.
+      if (!SM.getRangeForBuffer(BufferID).contains(TypeRange.Start))
         continue;
 
       unsigned StartOffs = SM.getLocOffsetInBuffer(TypeRange.Start, BufferID);
@@ -968,6 +983,11 @@ public:
              llvm::MutableArrayRef<TextEntity*> FuncEnts)
     : SM(SM), BufferID(BufferID), FuncEnts(FuncEnts) {}
 
+  /// Only walk the arguments of a macro, to represent the source as written.
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   PreWalkAction walkToDeclPre(Decl *D) override {
     if (D->isImplicit())
       return Action::SkipChildren(); // Skip body.
@@ -977,6 +997,10 @@ public:
 
     if (!isa<AbstractFunctionDecl>(D) && !isa<SubscriptDecl>(D))
       return Action::Continue();
+
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(D->getLoc()))
+      return Action::SkipChildren();
 
     unsigned Offset = SM.getLocOffsetInBuffer(D->getLoc(), BufferID);
     auto Found = FuncEnts.end();
@@ -1131,6 +1155,11 @@ public:
       return true;
     if (isLocal(D))
       return true;
+
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(D->getSourceRange().Start))
+      return false;
+
     TextRange TR = getTextRange(D->getSourceRange());
     unsigned LocOffset = getOffset(Range.getStart());
     EntitiesStack.emplace_back(D, TypeOrExtensionDecl(), nullptr, TR, LocOffset,
@@ -1156,6 +1185,10 @@ public:
                           ReferenceMetaData Data) override {
     if (Data.isImplicit || !Range.isValid())
       return true;
+    // Ignore things that don't come from this buffer.
+    if (!SM.getRangeForBuffer(BufferID).contains(Range.getStart()))
+      return false;
+
     unsigned StartOffset = getOffset(Range.getStart());
     References.emplace_back(D, StartOffset, Range.getByteLength(), Ty);
     return true;
@@ -1282,8 +1315,9 @@ public:
                         R.EndColumn,
                         R.ArgIndex};
               });
-          return {Start.first, Start.second, End.first,
-                  End.second,  R.Text.str(), std::move(SubRanges)};
+          return {R.Path.str(), Start.first,         Start.second,
+                  End.first,    End.second,          R.BufferName.str(),
+                  R.Text.str(), std::move(SubRanges)};
         });
     unsigned End = AllEdits.size();
     StartEnds.emplace_back(Start, End);
@@ -1491,7 +1525,7 @@ SourceFile *SwiftLangSupport::getSyntacticSourceFile(
   unsigned BufferID = ParseCI.getInputBufferIDs().back();
   for (auto Unit : ParseCI.getMainModule()->getFiles()) {
     if (auto Current = dyn_cast<SourceFile>(Unit)) {
-      if (Current->getBufferID().getValue() == BufferID) {
+      if (Current->getBufferID().value() == BufferID) {
         SF = Current;
         break;
       }

@@ -2,16 +2,30 @@ set(library_name "swiftCompatibility56")
 
 include_directories("include/" "${SWIFT_STDLIB_SOURCE_DIR}")
 
+set(CMAKE_C_VISIBILITY_PRESET hidden)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN YES)
+
+add_compile_definitions(SWIFT_COMPATIBILITY56)
 add_swift_target_library("${library_name}" STATIC
   Overrides.cpp
   Concurrency/Task.cpp
+  Concurrency/TaskLocal.cpp
+  Concurrency/TaskStatus.cpp
   Concurrency/Error.cpp
   Concurrency/Actor.cpp
   Concurrency/AsyncLet.cpp
+  Concurrency/ThreadSanitizer.cpp
+  Concurrency/TaskAlloc.cpp
+  Concurrency/MutexPThread.cpp
+  Runtime/Exclusivity.cpp
 
   TARGET_SDKS ${SWIFT_DARWIN_PLATFORMS}
 
-  C_COMPILE_FLAGS ${CXX_COMPILE_FLAGS}
+  C_COMPILE_FLAGS
+    ${CXX_COMPILE_FLAGS}
+    "-D__STDC_WANT_LIB_EXT1__=1"
+    "-DSWIFT_THREADING_IS_COMPATIBILITY_LIBRARY"
   LINK_FLAGS ${CXX_LINK_FLAGS}
   INCORPORATE_OBJECT_LIBRARIES swiftCompatibilityThreading
   SWIFT_COMPILE_FLAGS ${SWIFT_STANDARD_LIBRARY_SWIFT_FLAGS}
@@ -19,6 +33,8 @@ add_swift_target_library("${library_name}" STATIC
   DEPLOYMENT_VERSION_IOS ${COMPATIBILITY_MINIMUM_DEPLOYMENT_VERSION_IOS}
   DEPLOYMENT_VERSION_TVOS ${COMPATIBILITY_MINIMUM_DEPLOYMENT_VERSION_TVOS}
   DEPLOYMENT_VERSION_WATCHOS ${COMPATIBILITY_MINIMUM_DEPLOYMENT_VERSION_WATCHOS}
+
+  MACCATALYST_BUILD_FLAVOR "zippered"
 
   INSTALL_IN_COMPONENT compiler
   INSTALL_WITH_SHARED)

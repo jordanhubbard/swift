@@ -91,7 +91,7 @@ void FutureFragment::destroy() {
   auto queueHead = waitQueue.load(std::memory_order_acquire);
   switch (queueHead.getStatus()) {
   case Status::Executing:
-    assert(false && "destroying a task that never completed");
+    swift_unreachable("destroying a task that never completed");
 
   case Status::Success:
     resultType->vw_destroy(getStoragePtr());
@@ -114,9 +114,9 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
   assert(isFuture());
   auto fragment = futureFragment();
 
+  // NOTE: this acquire synchronizes with `completeFuture`.
   auto queueHead = fragment->waitQueue.load(std::memory_order_acquire);
   bool contextInitialized = false;
-  auto escalatedPriority = JobPriority::Unspecified;
   while (true) {
     switch (queueHead.getStatus()) {
     case Status::Error:
@@ -146,48 +146,7 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
       context->successResultPointer = result;
       context->ResumeParent = resumeFn;
       context->Parent = callerContext;
-      waitingTask->flagAsSuspended();
-    }
-
-    // Escalate the blocking task to the priority of the waiting task.
-    // FIXME: Also record that the waiting task is now waiting on the
-    // blocking task so that escalators of the waiting task can propagate
-    // the escalation to the blocking task.
-    //
-    // Recording this dependency is tricky because we need escalators
-    // to be able to escalate without worrying about the blocking task
-    // concurrently finishing, resuming the escalated task, and being
-    // invalidated.  So we're not doing that yet.  In the meantime, we
-    // do the best-effort alternative of escalating the blocking task
-    // as a one-time deal to the current priority of the waiting task.
-    // If the waiting task is escalated after this point, the priority
-    // will not be escalated, but that's inevitable in the absence of
-    // propagation during escalation.
-    //
-    // We have to do the escalation before we successfully enqueue the
-    // waiting task on the blocking task's wait queue, because as soon as
-    // we do, this thread is no longer blocking the resumption of the
-    // waiting task, and so both the blocking task (which is retained
-    // during the wait only from the waiting task's perspective) and the
-    // waiting task (which can simply terminate) must be treat as
-    // invalidated from this thread's perspective.
-    //
-    // When we do fix this bug to record the dependency, we will have to
-    // do it before this escalation of the blocking task so that there
-    // isn't a race where an escalation of the waiting task can fail
-    // to propagate to the blocking task.  The correct priority to
-    // escalate to is the priority we observe when we successfully record
-    // the dependency; any later escalations will automatically propagate.
-    //
-    // If the blocking task finishes while we're doing this escalation,
-    // the escalation will be innocuous.  The wasted effort is acceptable;
-    // programmers should be encouraged to give tasks that will block
-    // other tasks the correct priority to begin with.
-    auto waitingStatus =
-      waitingTask->_private()._status().load(std::memory_order_relaxed);
-    if (waitingStatus.getStoredPriority() > escalatedPriority) {
-      swift_task_escalate(this, waitingStatus.getStoredPriority());
-      escalatedPriority = waitingStatus.getStoredPriority();
+      waitingTask->flagAsSuspendedOnTask(this);
     }
 
 #if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
@@ -214,6 +173,7 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
     continue;
 #else
     // Put the waiting task at the beginning of the wait queue.
+    // NOTE: this acquire-release synchronizes with `completeFuture`.
     waitingTask->getNextWaitingTask() = queueHead.getTask();
     auto newQueueHead = WaitQueueItem::get(Status::Executing, waitingTask);
     if (fragment->waitQueue.compare_exchange_weak(
@@ -231,10 +191,9 @@ FutureFragment::Status AsyncTask::waitFuture(AsyncTask *waitingTask,
 void NullaryContinuationJob::process(Job *_job) {
   auto *job = cast<NullaryContinuationJob>(_job);
 
-  auto *task = job->Task;
   auto *continuation = job->Continuation;
 
-  _swift_task_dealloc_specific(task, job);
+  delete job;
 
   auto *context =
     static_cast<ContinuationAsyncContext*>(continuation->ResumeContext);
@@ -267,8 +226,10 @@ void AsyncTask::completeFuture(AsyncContext *context) {
     hadErrorResult ? Status::Error : Status::Success,
     nullptr
   );
+
+  // NOTE: this acquire-release synchronizes with `waitFuture`.
   auto queueHead = fragment->waitQueue.exchange(
-      newQueueHead, std::memory_order_acquire);
+      newQueueHead, std::memory_order_acq_rel);
   assert(queueHead.getStatus() == Status::Executing);
 
   // If this is task group child, notify the parent group about the completion.
@@ -326,7 +287,7 @@ static void destroyJob(SWIFT_CONTEXT HeapObject *obj) {
 }
 
 AsyncTask::~AsyncTask() {
-  flagAsCompleted();
+  flagAsDestroyed();
 
   // For a future, destroy the result.
   if (isFuture()) {
@@ -368,7 +329,7 @@ static void destroyTask(SWIFT_CONTEXT HeapObject *obj) {
   // the task-local allocator.  There's actually nothing else to clean up
   // here.
 
-  SWIFT_TASK_DEBUG_LOG("destroy task %p", task);
+  SWIFT_TASK_DEBUG_LOG("Destroyed task %p", task);
   free(task);
 }
 
@@ -398,6 +359,9 @@ static const unsigned long dispatchSwiftObjectType = 1;
 FullMetadata<DispatchClassMetadata> swift::jobHeapMetadata = {
   {
     {
+      /*type layout*/ nullptr,
+    },
+    {
       &destroyJob
     },
     {
@@ -414,6 +378,9 @@ FullMetadata<DispatchClassMetadata> swift::jobHeapMetadata = {
 /// Heap metadata for an asynchronous task.
 static FullMetadata<DispatchClassMetadata> taskHeapMetadata = {
   {
+    {
+      /*type layout*/ nullptr
+    },
     {
       &destroyTask
     },
@@ -588,18 +555,20 @@ const void *AsyncTask::getResumeFunctionForLogging() {
   return __ptrauth_swift_runtime_function_entry_strip(result);
 }
 
-JobPriority swift::swift_task_currentPriority(AsyncTask *task)
-{
+JobPriority swift::swift_task_currentPriority(AsyncTask *task) {
   // This is racey but this is to be used in an API is inherently racey anyways.
   auto oldStatus = task->_private()._status().load(std::memory_order_relaxed);
   return oldStatus.getStoredPriority();
 }
 
-JobPriority swift::swift_task_basePriority(AsyncTask *task)
-{
+JobPriority swift::swift_task_basePriority(AsyncTask *task) {
   JobPriority pri = task->_private().BasePriority;
   SWIFT_TASK_DEBUG_LOG("Task %p has base priority = %zu", task, pri);
   return pri;
+}
+
+JobPriority swift::swift_concurrency_jobPriority(Job *job) {
+  return job->getPriority();
 }
 
 static inline bool isUnspecified(JobPriority priority) {
@@ -1227,10 +1196,13 @@ size_t swift::swift_task_getJobFlags(AsyncTask *task) {
   return task->Flags.getOpaqueValue();
 }
 
+// This function exists primarily for the purpose of the concurrency runtime
+// unit tests and does not serve a functional purpose.
 SWIFT_CC(swift)
 static AsyncTask *swift_task_suspendImpl() {
-  auto task = _swift_task_clearCurrent();
-  task->flagAsSuspended();
+  auto task = swift_task_getCurrent();
+  task->flagAsSuspendedOnContinuation(nullptr);
+  _swift_task_clearCurrent();
   return task;
 }
 
@@ -1311,14 +1283,17 @@ static AsyncTask *swift_continuation_initImpl(ContinuationAsyncContext *context,
                                         ? ContinuationStatus::Awaited
                                         : ContinuationStatus::Pending,
                                       std::memory_order_relaxed);
-
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  context->Cond = nullptr;
+#endif
   AsyncTask *task;
 
   // A preawait immediately suspends the task.
   if (flags.isPreawaited()) {
-    task = _swift_task_clearCurrent();
+    task = swift_task_getCurrent();
     assert(task && "initializing a continuation with no current task");
-    task->flagAsSuspended();
+    task->flagAsSuspendedOnContinuation(context);
+    _swift_task_clearCurrent();
   } else {
     task = swift_task_getCurrent();
     assert(task && "initializing a continuation with no current task");
@@ -1351,8 +1326,7 @@ static void swift_continuation_awaitImpl(ContinuationAsyncContext *context) {
          "awaiting a corrupt or already-awaited continuation");
 
   // If the status is already Resumed, we can resume immediately.
-  // Comparing against Pending may be very slightly more compact.
-  if (oldStatus != ContinuationStatus::Pending) {
+  if (oldStatus == ContinuationStatus::Resumed) {
     if (context->isExecutorSwitchForced())
       return swift_task_switch(context, context->ResumeParent,
                                context->ResumeToExecutor);
@@ -1364,19 +1338,57 @@ static void swift_continuation_awaitImpl(ContinuationAsyncContext *context) {
   auto task = swift_task_getCurrent();
 #endif
 
-  // Flag the task as suspended.
-  task->flagAsSuspended();
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  // In the task to thread model, we do not suspend the task that is waiting on
+  // the continuation resumption. Instead we simply block the thread on a
+  // condition variable keep the task alive on the thread.
+  //
+  // This condition variable can be allocated on the stack of the blocking
+  // thread - with the address of it published to the resuming thread via the
+  // context.
+  ConditionVariable Cond;
 
-  // Try to transition to Awaited.
+  context->Cond = &Cond;
+#else /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
+  // Flag the task as suspended on the continuation.
+  task->flagAsSuspendedOnContinuation(context);
+#endif /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
+
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  // If the cmpxchg is successful, the store release also publishes the write to
+  // the Cond in the ContinuationAsyncContext to any concurrent accessing
+  // thread.
+  //
+  // If it failed, then someone concurrently resumed the continuation in which
+  // case, we don't care about publishing the Cond in the
+  // ContinuationAsyncContext anyway.
+#endif
+  // Try to transition to Awaited
   bool success =
     sync.compare_exchange_strong(oldStatus, ContinuationStatus::Awaited,
                                  /*success*/ std::memory_order_release,
                                  /*failure*/ std::memory_order_acquire);
 
-  // If that succeeded, we have nothing to do.
   if (success) {
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+    // This lock really protects nothing but we need to hold it
+    // while calling the condition wait
+    Cond.lock();
+
+    // Condition variables can have spurious wakeups so we need to check this in
+    // a do-while loop.
+    do {
+      Cond.wait();
+      oldStatus = sync.load(std::memory_order_relaxed);
+    } while (oldStatus != ContinuationStatus::Resumed);
+
+    Cond.unlock();
+#else
+    // If that succeeded, we have nothing to do since we've successfully
+    // suspended the task
     _swift_task_clearCurrent();
     return;
+#endif /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
   }
 
   // If it failed, it should be because someone concurrently resumed
@@ -1384,8 +1396,14 @@ static void swift_continuation_awaitImpl(ContinuationAsyncContext *context) {
   assert(oldStatus == ContinuationStatus::Resumed &&
          "continuation was concurrently corrupted or awaited");
 
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  // Since the condition variable is stack allocated, we don't need to do
+  // anything here to clean up
+#else
   // Restore the running state of the task and resume it.
   task->flagAsRunning();
+#endif /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
+
   if (context->isExecutorSwitchForced())
     return swift_task_switch(context, context->ResumeParent,
                              context->ResumeToExecutor);
@@ -1397,6 +1415,7 @@ static void resumeTaskAfterContinuation(AsyncTask *task,
   continuationChecking::willResume(context);
 
   auto &sync = context->AwaitSynchronization;
+
   auto status = sync.load(std::memory_order_acquire);
   assert(status != ContinuationStatus::Resumed &&
          "continuation was already resumed");
@@ -1405,27 +1424,41 @@ static void resumeTaskAfterContinuation(AsyncTask *task,
   // restarting.
   _swift_tsan_release(static_cast<Job *>(task));
 
-  // The status should be either Pending or Awaited.  If it's Awaited,
-  // which is probably the most likely option, then we should immediately
-  // enqueue; we don't need to update the state because there shouldn't
-  // be a racing attempt to resume the continuation.  If it's Pending,
-  // we need to set it to Resumed; if that fails (with a strong cmpxchg),
-  // it should be because the original thread concurrently set it to
-  // Awaited, and so we need to enqueue.
+  // The status should be either Pending or Awaited.
+  //
+  // Case 1: Status is Pending
+  // No one has awaited us, we just need to set it to Resumed; if that fails
+  // (with a strong cmpxchg), it should be because the original thread
+  // concurrently set it to Awaited, in which case, we fall into Case 2.
+  //
+  // Case 2: Status is Awaited
+  // This is probably the more frequently hit case.
+  // In task-to-thread model, we update status to be Resumed and signal the
+  // waiting thread. In regular model, we immediately enqueue the task and can
+  // skip updates to the continuation state since there shouldn't be a racing
+  // attempt to resume the continuation.
   if (status == ContinuationStatus::Pending &&
       sync.compare_exchange_strong(status, ContinuationStatus::Resumed,
                                    /*success*/ std::memory_order_release,
-                                   /*failure*/ std::memory_order_relaxed)) {
+                                   /*failure*/ std::memory_order_acquire)) {
     return;
   }
   assert(status == ContinuationStatus::Awaited &&
          "detected concurrent attempt to resume continuation");
+#if SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL
+  // If we see status == ContinuationStatus::Awaited, then we should also be
+  // seeing a pointer to the cond var since we're doing a load acquire on sync
+  // which pairs with the store release in swift_continuation_awaitImpl
+  assert(context->Cond != nullptr);
 
+  sync.store(ContinuationStatus::Resumed, std::memory_order_relaxed);
+  context->Cond->signal();
+#else
   // TODO: maybe in some mode we should set the status to Resumed here
   // to make a stronger best-effort attempt to catch racing attempts to
   // resume the continuation?
-
   task->flagAsAndEnqueueOnExecutor(context->ResumeToExecutor);
+#endif /* SWIFT_CONCURRENCY_TASK_TO_THREAD_MODEL */
 }
 
 SWIFT_CC(swift)
@@ -1469,8 +1502,8 @@ swift_task_addCancellationHandlerImpl(
 
   bool fireHandlerNow = false;
 
-  addStatusRecord(record, [&](ActiveTaskStatus parentStatus) {
-    if (parentStatus.isCancelled()) {
+  addStatusRecordToSelf(record, [&](ActiveTaskStatus oldStatus, ActiveTaskStatus& newStatus) {
+    if (oldStatus.isCancelled()) {
       fireHandlerNow = true;
       // We don't fire the cancellation handler here since this function needs
       // to be idempotent
@@ -1487,7 +1520,7 @@ swift_task_addCancellationHandlerImpl(
 SWIFT_CC(swift)
 static void swift_task_removeCancellationHandlerImpl(
     CancellationNotificationStatusRecord *record) {
-  removeStatusRecord(record);
+  removeStatusRecordFromSelf(record);
   swift_task_dealloc(record);
 }
 
@@ -1496,12 +1529,8 @@ static NullaryContinuationJob*
 swift_task_createNullaryContinuationJobImpl(
     size_t priority,
     AsyncTask *continuation) {
-  void *allocation =
-      swift_task_alloc(sizeof(NullaryContinuationJob));
-  auto *job =
-      ::new (allocation) NullaryContinuationJob(
-        swift_task_getCurrent(), static_cast<JobPriority>(priority),
-        continuation);
+  auto *job = new NullaryContinuationJob(swift_task_getCurrent(),
+        static_cast<JobPriority>(priority), continuation);
 
   return job;
 }
@@ -1560,5 +1589,60 @@ static void swift_task_asyncMainDrainQueueImpl() {
 #endif
 }
 
+SWIFT_CC(swift)
+void (*swift::swift_task_asyncMainDrainQueue_hook)(
+    swift_task_asyncMainDrainQueue_original original,
+    swift_task_asyncMainDrainQueue_override compatOverride) = nullptr;
+
+SWIFT_CC(swift)
+static void swift_task_startOnMainActorImpl(AsyncTask* task) {
+  AsyncTask * originalTask = _swift_task_clearCurrent();
+  ExecutorRef mainExecutor = swift_task_getMainExecutor();
+  if (swift_task_getCurrentExecutor() != swift_task_getMainExecutor())
+    swift_Concurrency_fatalError(0, "Not on the main executor");
+  swift_retain(task);
+  swift_job_run(task, mainExecutor);
+  _swift_task_setCurrent(originalTask);
+}
+
 #define OVERRIDE_TASK COMPATIBILITY_OVERRIDE
+
+#ifdef SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT
+/// The original COMPATIBILITY_OVERRIDE defined in CompatibilityOverride.h
+/// returns the result of the impl function and override function. This results
+/// in a warning emitted for noreturn functions. Overriding the override macro
+/// to not return.
+#define HOOKED_OVERRIDE_TASK_NORETURN(name, attrs, ccAttrs, namespace,         \
+                                      typedArgs, namedArgs)                    \
+  attrs ccAttrs void namespace swift_##name COMPATIBILITY_PAREN(typedArgs) {   \
+    static Override_##name Override;                                           \
+    static swift_once_t Predicate;                                             \
+    swift_once(                                                                \
+        &Predicate, [](void *) { Override = getOverride_##name(); }, nullptr); \
+    if (swift_##name##_hook) {                                                 \
+      swift_##name##_hook(COMPATIBILITY_UNPAREN_WITH_COMMA(namedArgs)          \
+                              swift_##name##Impl,                              \
+                          Override);                                           \
+      abort();                                                                 \
+    }                                                                          \
+    if (Override != nullptr)                                                   \
+      Override(COMPATIBILITY_UNPAREN_WITH_COMMA(namedArgs)                     \
+                   swift_##name##Impl);                                        \
+    swift_##name##Impl COMPATIBILITY_PAREN(namedArgs);                         \
+  }
+
+#else // ifndef SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT
+// Call directly through to the original implementation when we don't support
+// overrides.
+#define HOOKED_OVERRIDE_TASK_NORETURN(name, attrs, ccAttrs, namespace,         \
+                                      typedArgs, namedArgs)                    \
+  attrs ccAttrs void namespace swift_##name COMPATIBILITY_PAREN(typedArgs) {   \
+    if (swift_##name##_hook) {                                                 \
+      swift_##name##_hook(swift_##name##Impl, nullptr);                        \
+      abort();                                                                 \
+    }                                                                          \
+    swift_##name##Impl COMPATIBILITY_PAREN(namedArgs);                         \
+  }
+#endif // #else SWIFT_STDLIB_SUPPORT_BACK_DEPLOYMENT
+
 #include COMPATIBILITY_OVERRIDE_INCLUDE_PATH

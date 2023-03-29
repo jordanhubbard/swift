@@ -113,8 +113,9 @@ public:
   /// statistics to make sure that we haven't hurt debuggability by making the
   /// change.
   bool hasMovedElt() const {
-    return llvm::any_of(Elts,
-                        [](AllocStackInst *asi) { return asi->getWasMoved(); });
+    return llvm::any_of(Elts, [](AllocStackInst *asi) {
+      return asi->getUsesMoveableValueDebugInfo();
+    });
   }
 };
 } // end anonymous namespace
@@ -155,10 +156,10 @@ void moveAllocStackToBeginningOfBlock(
     if (auto varInfo = AS->getVarInfo()) {
       SILBuilderWithScope Builder(AS);
       auto *DVI = Builder.createDebugValue(AS->getLoc(), AS, *varInfo);
-      DVI->markAsMoved();
+      DVI->setUsesMoveableValueDebugInfo();
       DebugValueToBreakBlocksAt.push_back(DVI);
       AS->invalidateVarInfo();
-      AS->markAsMoved();
+      AS->markUsesMoveableValueDebugInfo();
     }
   }
   AS->moveFront(BB);
@@ -197,7 +198,7 @@ void Partition::assignStackLocation(
         SILBuilderWithScope Builder(AllocStack);
         auto *DVI = Builder.createDebugValue(AllocStack->getLoc(), AssignedLoc,
                                              *VarInfo);
-        DVI->markAsMoved();
+        DVI->setUsesMoveableValueDebugInfo();
         DebugValueToBreakBlocksAt.push_back(DVI);
       }
     }
@@ -427,12 +428,15 @@ private:
 };
 } // end anonymous namespace
 
-bool indicatesDynamicAvailabilityCheckUse(SILInstruction *I) {
+bool inhibitsAllocStackHoisting(SILInstruction *I) {
   if (auto *Apply = dyn_cast<ApplyInst>(I)) {
     return Apply->hasSemantics(semantics::AVAILABILITY_OSVERSION);
   }
   if (auto *bi = dyn_cast<BuiltinInst>(I)) {
     return bi->getBuiltinInfo().ID == BuiltinValueKind::TargetOSVersionAtLeast;
+  }
+  if (isa<HasSymbolInst>(I)) {
+    return true;
   }
   return false;
 }
@@ -453,8 +457,10 @@ void HoistAllocStack::collectHoistableInstructions() {
           FunctionExits.push_back(Term);
         continue;
       }
-      // Don't perform alloc_stack hoisting in functions with availability.
-      if (indicatesDynamicAvailabilityCheckUse(&Inst)) {
+      // Don't perform alloc_stack hoisting in functions containing
+      // instructions that indicate hoisting may be unsafe (e.g. `if
+      // #available(...)` or `if #_hasSymbol(...)`.
+      if (inhibitsAllocStackHoisting(&Inst)) {
         AllocStackToHoist.clear();
         return;
       }

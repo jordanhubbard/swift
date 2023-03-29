@@ -33,6 +33,7 @@ import BitCount
 import Breadcrumbs
 import BucketSort
 import BufferFill
+import BufferFind
 import ByteSwap
 import COWTree
 import COWArrayGuaranteedParameterOverhead
@@ -45,11 +46,15 @@ import ChainedFilterMap
 import CharacterLiteralsLarge
 import CharacterLiteralsSmall
 import CharacterProperties
+import CharacterRecognizer
 import Chars
 import ClassArrayGetter
 import CodableTest
 import Combos
 import CreateObjects
+import CxxSetToCollection
+import CxxStringConversion
+import CxxVectorSum
 import DataBenchmarks
 import DeadArray
 import DevirtualizeProtocolComposition
@@ -165,7 +170,7 @@ import SequenceAlgos
 import SetTests
 import SevenBoom
 import Sim2DArray
-import SimpleArraySpecialization
+//import SimpleArraySpecialization
 import SortArrayInClass
 import SortIntPyramids
 import SortLargeExistentials
@@ -177,11 +182,13 @@ import StrComplexWalk
 import StrToInt
 import StringBuilder
 import StringComparison
+import StringDistance
 import StringEdits
 import StringEnum
 import StringInterpolation
 import StringMatch
 import StringRemoveDupes
+import StringRepeating
 import StringReplaceSubrange
 import StringSplitting
 import StringSwitch
@@ -193,6 +200,7 @@ import SuperChars
 import TwoSum
 import TypeFlood
 import UTF8Decode
+import UTF16Decode
 import Walsh
 import WordCount
 import XorLoop
@@ -216,6 +224,7 @@ register(BitCount.benchmarks)
 register(Breadcrumbs.benchmarks)
 register(BucketSort.benchmarks)
 register(BufferFill.benchmarks)
+register(BufferFind.benchmarks)
 register(ByteSwap.benchmarks)
 register(COWTree.benchmarks)
 register(COWArrayGuaranteedParameterOverhead.benchmarks)
@@ -228,11 +237,15 @@ register(ChainedFilterMap.benchmarks)
 register(CharacterLiteralsLarge.benchmarks)
 register(CharacterLiteralsSmall.benchmarks)
 register(CharacterProperties.benchmarks)
+register(CharacterRecognizer.benchmarks)
 register(Chars.benchmarks)
 register(CodableTest.benchmarks)
 register(Combos.benchmarks)
 register(ClassArrayGetter.benchmarks)
 register(CreateObjects.benchmarks)
+register(CxxSetToCollection.benchmarks)
+register(CxxStringConversion.benchmarks)
+register(CxxVectorSum.benchmarks)
 register(DataBenchmarks.benchmarks)
 register(DeadArray.benchmarks)
 register(DevirtualizeProtocolComposition.benchmarks)
@@ -349,7 +362,7 @@ register(SequenceAlgos.benchmarks)
 register(SetTests.benchmarks)
 register(SevenBoom.benchmarks)
 register(Sim2DArray.benchmarks)
-register(SimpleArraySpecialization.benchmarks)
+//register(SimpleArraySpecialization.benchmarks)
 register(SortArrayInClass.benchmarks)
 register(SortIntPyramids.benchmarks)
 register(SortLargeExistentials.benchmarks)
@@ -360,12 +373,14 @@ register(StaticArray.benchmarks)
 register(StrComplexWalk.benchmarks)
 register(StrToInt.benchmarks)
 register(StringBuilder.benchmarks)
+register(StringComparison.benchmarks)
+register(StringDistance.benchmarks)
 register(StringEdits.benchmarks)
 register(StringEnum.benchmarks)
-register(StringComparison.benchmarks)
 register(StringInterpolation.benchmarks)
 register(StringMatch.benchmarks)
 register(StringRemoveDupes.benchmarks)
+register(StringRepeating.benchmarks)
 register(StringReplaceSubrange.benchmarks)
 
 if #available(macOS 10.15, iOS 13, tvOS 13, watchOS 6, *) {
@@ -381,6 +396,7 @@ register(SuperChars.benchmarks)
 register(TwoSum.benchmarks)
 register(TypeFlood.benchmarks)
 register(UTF8Decode.benchmarks)
+register(UTF16Decode.benchmarks)
 register(Walsh.benchmarks)
 register(WordCount.benchmarks)
 register(XorLoop.benchmarks)

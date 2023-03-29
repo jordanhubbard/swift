@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/IDE/SourceEntityWalker.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/Decl.h"
@@ -20,12 +19,15 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Stmt.h"
+#include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Parse/Lexer.h"
 #include "clang/Basic/Module.h"
+#include "swift/IDE/SourceEntityWalker.h"
+#include "swift/IDE/Utils.h"
 
 using namespace swift;
 
@@ -54,6 +56,10 @@ private:
 
   bool shouldWalkSerializedTopLevelInternalDecls() override {
     return false;
+  }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return SEWalker.getMacroWalkingBehavior();
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override;
@@ -93,19 +99,6 @@ private:
   bool passCallArgNames(Expr *Fn, ArgumentList *ArgList);
 
   bool shouldIgnore(Decl *D);
-
-  ValueDecl *extractDecl(Expr *Fn) const {
-    Fn = Fn->getSemanticsProvidingExpr();
-    if (auto *DRE = dyn_cast<DeclRefExpr>(Fn))
-      return DRE->getDecl();
-    if (auto ApplyE = dyn_cast<ApplyExpr>(Fn))
-      return extractDecl(ApplyE->getFn());
-    if (auto *ACE = dyn_cast<AutoClosureExpr>(Fn)) {
-      if (auto *Unwrapped = ACE->getUnwrappedCurryThunkExpr())
-        return extractDecl(Unwrapped);
-    }
-    return nullptr;
-  }
 };
 
 } // end anonymous namespace
@@ -219,6 +212,14 @@ ASTWalker::PreWalkAction SemaAnnotator::walkToDeclPreProper(Decl *D) {
       }
       return Action::SkipChildren();
     }
+  } else if (auto *MD = dyn_cast<MacroExpansionDecl>(D)) {
+    if (auto *macro =
+            dyn_cast_or_null<MacroDecl>(MD->getMacroRef().getDecl())) {
+      auto macroRefType = macro->getDeclaredInterfaceType();
+      if (!passReference(macro, macroRefType, MD->getMacroNameLoc(),
+                         ReferenceMetaData(SemaReferenceKind::DeclRef, None)))
+        return Action::Stop();
+    }
   }
 
   CharSourceRange Range = (Loc.isValid()) ? CharSourceRange(Loc, NameLen)
@@ -297,7 +298,7 @@ SemaAnnotator::walkToArgumentListPre(ArgumentList *ArgList) {
   if (ArgList->isImplicit())
     return Action::Continue(ArgList);
 
-  // FIXME: What about SubscriptExpr and KeyPathExpr arg labels? (SR-15063)
+  // FIXME(https://github.com/apple/swift/issues/57390): What about SubscriptExpr and KeyPathExpr arg labels?
   if (auto CallE = dyn_cast_or_null<CallExpr>(Parent.getAsExpr())) {
     if (!passCallArgNames(CallE->getFn(), ArgList))
       return Action::Stop();
@@ -590,6 +591,16 @@ ASTWalker::PreWalkResult<Expr *> SemaAnnotator::walkToExprPre(Expr *E) {
       return Action::Stop();
     // We already visited the children.
     return doSkipChildren();
+  } else if (auto ME = dyn_cast<MacroExpansionExpr>(E)) {
+    // Add a reference to the macro
+    auto macroRef = ME->getMacroRef();
+    if (auto *macroDecl = dyn_cast_or_null<MacroDecl>(macroRef.getDecl())) {
+      auto macroRefType = macroDecl->getDeclaredInterfaceType();
+      if (!passReference(
+              macroDecl, macroRefType, ME->getMacroNameLoc(),
+              ReferenceMetaData(SemaReferenceKind::DeclRef, None)))
+        return Action::Stop();
+    }
   }
 
   return Action::Continue(E);
@@ -610,7 +621,7 @@ ASTWalker::PreWalkAction SemaAnnotator::walkToTypeReprPre(TypeRepr *T) {
   if (!Continue)
     return Action::Stop();
 
-  if (auto IdT = dyn_cast<ComponentIdentTypeRepr>(T)) {
+  if (auto IdT = dyn_cast<IdentTypeRepr>(T)) {
     if (ValueDecl *VD = IdT->getBoundDecl()) {
       if (auto *ModD = dyn_cast<ModuleDecl>(VD)) {
         auto ident = IdT->getNameRef().getBaseIdentifier();
@@ -680,11 +691,37 @@ bool SemaAnnotator::handleCustomAttributes(Decl *D) {
       return true;
     }
   }
-  for (auto *customAttr : D->getAttrs().getAttributes<CustomAttr, true>()) {
+
+  ModuleDecl *MD = D->getModuleContext();
+  for (auto *customAttr :
+       D->getSemanticAttrs().getAttributes<CustomAttr, true>()) {
+    SourceFile *SF =
+        MD->getSourceFileContainingLocation(customAttr->getLocation());
+    ASTNode expansion = SF ? SF->getMacroExpansion() : nullptr;
+    if (!shouldWalkMacroArgumentsAndExpansion().second && expansion)
+      continue;
+
     if (auto *Repr = customAttr->getTypeRepr()) {
-      if (!Repr->walk(*this))
+      // It's a little weird that attached macros have a `TypeRepr` to begin
+      // with, but given they aren't types they then don't get bound. So check
+      // for a macro here and and pass a reference to it, or just walk the
+      // `TypeRepr` where we will then pull out the bound decl otherwise.
+      auto *mutableAttr = const_cast<CustomAttr *>(customAttr);
+      if (auto macroDecl = D->getResolvedMacro(mutableAttr)) {
+        Type macroRefType = macroDecl->getDeclaredInterfaceType();
+        if (!passReference(
+                macroDecl, macroRefType, DeclNameLoc(Repr->getStartLoc()),
+                ReferenceMetaData(
+                    SemaReferenceKind::DeclRef, None,
+                    /*isImplicit=*/false,
+                    std::make_pair(customAttr,
+                                   expansion ? expansion.get<Decl *>() : D))))
+          return false;
+      } else if (!Repr->walk(*this)) {
         return false;
+      }
     }
+
     if (auto *SemaInit = customAttr->getSemanticInit()) {
       if (!SemaInit->isImplicit()) {
         assert(customAttr->hasArgs());
@@ -699,6 +736,7 @@ bool SemaAnnotator::handleCustomAttributes(Decl *D) {
         return false;
     }
   }
+
   return true;
 }
 
@@ -779,7 +817,11 @@ passReference(ValueDecl *D, Type Ty, SourceLoc BaseNameLoc, SourceRange Range,
     if (!CtorRefs.empty() && BaseNameLoc.isValid()) {
       Expr *Fn = CtorRefs.back()->getFn();
       if (Fn->getLoc() == BaseNameLoc) {
-        D = extractDecl(Fn);
+        D = ide::getReferencedDecl(Fn).second.getDecl();
+        if (D == nullptr) {
+          assert(false && "Unhandled constructor reference");
+          return true;
+        }
         CtorTyRef = TD;
       }
     }
@@ -792,12 +834,6 @@ passReference(ValueDecl *D, Type Ty, SourceLoc BaseNameLoc, SourceRange Range,
         ExtDecl = ExtDecls.back();
       }
     }
-  }
-
-  if (D == nullptr) {
-    // FIXME: When does this happen?
-    assert(false && "unhandled reference");
-    return true;
   }
 
   CharSourceRange CharRange =
@@ -818,7 +854,7 @@ bool SemaAnnotator::passReference(ModuleEntity Mod,
 }
 
 bool SemaAnnotator::passCallArgNames(Expr *Fn, ArgumentList *ArgList) {
-  ValueDecl *D = extractDecl(Fn);
+  ValueDecl *D = ide::getReferencedDecl(Fn).second.getDecl();
   if (!D)
     return true; // continue.
 
@@ -841,9 +877,23 @@ bool SemaAnnotator::passCallArgNames(Expr *Fn, ArgumentList *ArgList) {
 }
 
 bool SemaAnnotator::shouldIgnore(Decl *D) {
+  if (!D->isImplicit())
+    return false;
+
   // TODO: There should really be a separate field controlling whether
   //       constructors are visited or not
-  return D->isImplicit() && !isa<ConstructorDecl>(D);
+  if (isa<ConstructorDecl>(D))
+    return false;
+
+  // Walk into missing decls to visit their attributes if they were generated
+  // by a member attribute expansion. Note that we would have already skipped
+  // this decl if we were ignoring expansions, so no need to check that.
+  if (auto *missing = dyn_cast<MissingDecl>(D)) {
+    if (D->isInGeneratedBuffer())
+      return false;
+  }
+
+  return true;
 }
 
 bool SourceEntityWalker::walk(SourceFile &SrcFile) {

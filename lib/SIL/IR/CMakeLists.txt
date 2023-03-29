@@ -28,7 +28,9 @@ target_sources(swiftSIL PRIVATE
   SILPrinter.cpp
   SILProfiler.cpp
   SILSuccessor.cpp
+  SILSymbolVisitor.cpp
   SILType.cpp
+  SILTypeSubstitution.cpp
   SILUndef.cpp
   SILVTable.cpp
   SILValue.cpp

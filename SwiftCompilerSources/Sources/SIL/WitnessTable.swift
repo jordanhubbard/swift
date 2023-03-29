@@ -12,72 +12,56 @@
 
 import SILBridging
 
-public struct WitnessTable : CustomStringConvertible, CustomReflectable {
+public struct WitnessTable : CustomStringConvertible, NoReflectionChildren {
   public let bridged: BridgedWitnessTable
 
   public init(bridged: BridgedWitnessTable) { self.bridged = bridged }
 
-  public struct Entry : CustomStringConvertible, CustomReflectable {
+  public struct Entry : CustomStringConvertible, NoReflectionChildren {
     fileprivate let bridged: BridgedWitnessTableEntry
     
-    public enum Kind {
-      case invalid
-      case method
-      case associatedType
-      case associatedTypeProtocol
-      case baseProtocol
-    }
+    public typealias Kind = swift.SILWitnessTable.WitnessKind
     
     public var kind: Kind {
-      switch SILWitnessTableEntry_getKind(bridged) {
-        case SILWitnessTableEntry_Invalid:                return .invalid
-        case SILWitnessTableEntry_Method:                 return .method
-        case SILWitnessTableEntry_AssociatedType:         return .associatedType
-        case SILWitnessTableEntry_AssociatedTypeProtocol: return .associatedTypeProtocol
-        case SILWitnessTableEntry_BaseProtocol:           return .baseProtocol
-        default:
-          fatalError("unknown witness table kind")
-      }
+      return bridged.getKind()
     }
     
     public var methodFunction: Function? {
-      assert(kind == .method)
-      return SILWitnessTableEntry_getMethodFunction(bridged).function
+      assert(kind == .Method)
+      return bridged.getMethodFunction().function
     }
 
     public var description: String {
-      let stdString = SILWitnessTableEntry_debugDescription(bridged)
+      let stdString = bridged.getDebugDescription()
       return String(_cxxString: stdString)
     }
-
-    public var customMirror: Mirror { Mirror(self, children: []) }
   }
 
   public struct EntryArray : BridgedRandomAccessCollection {
-    fileprivate let bridged: BridgedArrayRef
+    fileprivate let base: BridgedWitnessTableEntry
+    public let count: Int
     
     public var startIndex: Int { return 0 }
-    public var endIndex: Int { return Int(bridged.numElements) }
+    public var endIndex: Int { return count }
     
     public subscript(_ index: Int) -> Entry {
-      assert(index >= 0 && index < endIndex)
-      return Entry(bridged: BridgedWitnessTableEntry(ptr: bridged.data! + index &* BridgedWitnessTableEntrySize))
+      assert(index >= startIndex && index < endIndex)
+      return Entry(bridged: BridgedWitnessTableEntry(entry: base.entry + index))
     }
   }
 
   public var entries: EntryArray {
-    EntryArray(bridged: SILWitnessTable_getEntries(bridged))
+    let entries = bridged.getEntries()
+    return EntryArray(base: entries.base, count: entries.count)
   }
 
   public var description: String {
-    let stdString = SILWitnessTable_debugDescription(bridged)
+    let stdString = bridged.getDebugDescription()
     return String(_cxxString: stdString)
   }
-
-  public var customMirror: Mirror { Mirror(self, children: []) }
 }
 
-public struct DefaultWitnessTable : CustomStringConvertible, CustomReflectable {
+public struct DefaultWitnessTable : CustomStringConvertible, NoReflectionChildren {
   public let bridged: BridgedDefaultWitnessTable
 
   public init(bridged: BridgedDefaultWitnessTable) { self.bridged = bridged }
@@ -86,30 +70,29 @@ public struct DefaultWitnessTable : CustomStringConvertible, CustomReflectable {
   public typealias EntryArray = WitnessTable.EntryArray
 
   public var entries: EntryArray {
-    EntryArray(bridged: SILDefaultWitnessTable_getEntries(bridged))
+    let entries = bridged.getEntries()
+    return EntryArray(base: entries.base, count: entries.count)
   }
 
   public var description: String {
-    let stdString = SILDefaultWitnessTable_debugDescription(bridged)
+    let stdString = bridged.getDebugDescription()
     return String(_cxxString: stdString)
   }
-
-  public var customMirror: Mirror { Mirror(self, children: []) }
 }
 
 extension OptionalBridgedWitnessTable {
-  public var table: WitnessTable? {
-    if let p = ptr {
-      return WitnessTable(bridged: BridgedWitnessTable(ptr: p))
+  public var witnessTable: WitnessTable? {
+    if let table = table {
+      return WitnessTable(bridged: BridgedWitnessTable(table: table))
     }
     return nil
   }
 }
 
 extension OptionalBridgedDefaultWitnessTable {
-  public var table: DefaultWitnessTable? {
-    if let p = ptr {
-      return DefaultWitnessTable(bridged: BridgedDefaultWitnessTable(ptr: p))
+  public var defaultWitnessTable: DefaultWitnessTable? {
+    if let table = table {
+      return DefaultWitnessTable(bridged: BridgedDefaultWitnessTable(table: table))
     }
     return nil
   }

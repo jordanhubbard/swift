@@ -25,6 +25,7 @@
 #include "IRGenModule.h"
 #include "MetadataRequest.h"
 #include "swift/AST/IRGenOptions.h"
+#include "swift/AST/PackConformance.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/SIL/SILModule.h"
 
@@ -288,7 +289,10 @@ LocalTypeDataCache::tryGet(IRGenFunction &IGF, LocalTypeDataKey key,
     auto response = entry->follow(IGF, source, request);
 
     // Following the path automatically caches at every point along it,
-    // including the end.
+    // including the end.  If you hit the second assertion here, it's
+    // probably because MetadataPath::followComponent isn't updating
+    // sourceKey correctly to lead back to the same key you originally
+    // looked up.
     assert(chain.Root->DefinitionPoint == IGF.getActiveDominancePoint());
     assert(isa<ConcreteCacheEntry>(chain.Root));
 
@@ -338,7 +342,7 @@ static void maybeEmitDebugInfoForLocalTypeData(IRGenFunction &IGF,
     return;
   if (!type->isRoot())
     return;
-  if (!isa<PrimaryArchetypeType>(type) && !isa<SequenceArchetypeType>(type))
+  if (!isa<PrimaryArchetypeType>(type) && !isa<PackArchetypeType>(type))
     return;
 
   auto *typeParam = type->getInterfaceType()->castTo<GenericTypeParamType>();
@@ -470,9 +474,8 @@ void IRGenFunction::bindLocalTypeDataFromSelfWitnessTable(
           WitnessIndex wIndex(privateWitnessTableIndexToTableOffset(index),
                               /*prefix*/ false);
 
-          auto table =
-              emitInvariantLoadOfOpaqueWitness(*this, selfTable,
-                                        wIndex.forProtocolWitnessTable());
+          auto table = loadConditionalConformance(*this ,selfTable,
+                                                  wIndex.forProtocolWitnessTable());
           table = Builder.CreateBitCast(table, IGM.WitnessTablePtrTy);
           setProtocolWitnessTableName(IGM, table, archetype, proto);
 
@@ -496,6 +499,9 @@ void LocalTypeDataCache::addAbstractForTypeMetadata(IRGenFunction &IGF,
     }
     bool hasInterestingType(CanType type) const override {
       return true;
+    }
+    bool isInterestingPackExpansion(CanPackExpansionType type) const override {
+      return isa<PackArchetypeType>(type.getPatternType());
     }
     bool hasLimitedInterestingConformances(CanType type) const override {
       return false;
@@ -542,22 +548,16 @@ addAbstractForFulfillments(IRGenFunction &IGF, FulfillmentMap &&fulfillments,
   };
 
   for (auto &fulfillment : fulfillments) {
-    CanType type = CanType(fulfillment.first.first);
+    CanType type = fulfillment.first.getTypeParameter();
     LocalTypeDataKind localDataKind;
 
-    // For now, ignore witness-table fulfillments when they're not for
-    // archetypes.
-    if (ProtocolDecl *protocol = fulfillment.first.second) {
-      if (auto archetype = dyn_cast<ArchetypeType>(type)) {
-        auto conformsTo = archetype->getConformsTo();
-        auto it = std::find(conformsTo.begin(), conformsTo.end(), protocol);
-        if (it == conformsTo.end()) continue;
-        localDataKind = LocalTypeDataKind::forAbstractProtocolWitnessTable(*it);
-      } else {
-        continue;
-      }
-
-    } else {
+    switch (fulfillment.first.getKind()) {
+    case GenericRequirement::Kind::Shape: {
+      localDataKind = LocalTypeDataKind::forPackShapeExpression();
+      break;
+    }
+    case GenericRequirement::Kind::Metadata:
+    case GenericRequirement::Kind::MetadataPack: {
       // Ignore type metadata fulfillments for non-dependent types that
       // we can produce very cheaply.  We don't want to end up emitting
       // the type metadata for Int by chasing through N layers of metadata
@@ -568,6 +568,24 @@ addAbstractForFulfillments(IRGenFunction &IGF, FulfillmentMap &&fulfillments,
       }
 
       localDataKind = LocalTypeDataKind::forFormalTypeMetadata();
+      break;
+    }
+    case GenericRequirement::Kind::WitnessTable:
+    case GenericRequirement::Kind::WitnessTablePack: {
+      // For now, ignore witness-table fulfillments when they're not for
+      // archetypes.
+      ProtocolDecl *protocol = fulfillment.first.getProtocol();
+      if (auto archetype = dyn_cast<ArchetypeType>(type)) {
+        auto conformsTo = archetype->getConformsTo();
+        auto it = std::find(conformsTo.begin(), conformsTo.end(), protocol);
+        if (it == conformsTo.end()) continue;
+        localDataKind = LocalTypeDataKind::forAbstractProtocolWitnessTable(*it);
+      } else {
+        continue;
+      }
+
+      break;
+    }
     }
 
     // Find the chain for the key.
@@ -703,12 +721,20 @@ void LocalTypeDataKind::print(llvm::raw_ostream &out) const {
     out << "AbstractConformance("
         << getAbstractProtocolConformance()->getName()
         << ")";
+  } else if (isPackProtocolConformance()) {
+    out << "PackConformance("
+        << getPackProtocolConformance()->getType()
+        << ":"
+        << getPackProtocolConformance()->getProtocol()->getName()
+        << ")";
   } else if (Value == FormalTypeMetadata) {
     out << "FormalTypeMetadata";
   } else if (Value == RepresentationTypeMetadata) {
     out << "RepresentationTypeMetadata";
   } else if (Value == ValueWitnessTable) {
     out << "ValueWitnessTable";
+  } else if (Value == Shape) {
+    out << "Shape";
   } else {
     assert(isSingletonKind());
     if (Value >= ValueWitnessDiscriminatorBase) {

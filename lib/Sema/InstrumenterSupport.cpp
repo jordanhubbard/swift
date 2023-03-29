@@ -54,6 +54,11 @@ class ErrorFinder : public ASTWalker {
 
 public:
   ErrorFinder() {}
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     if (isa<ErrorExpr>(E) || !E->getType() || E->getType()->hasError())
       error = true;
@@ -132,7 +137,7 @@ bool InstrumenterBase::doTypeCheckImpl(ASTContext &Ctx, DeclContext *DC,
 Expr *InstrumenterBase::buildIDArgumentExpr(Optional<DeclNameRef> name,
                                             SourceRange SR) {
   if (!name)
-    return IntegerLiteralExpr::createFromUnsigned(Context, 0);
+    return IntegerLiteralExpr::createFromUnsigned(Context, 0, SR.End);
 
   return new (Context) UnresolvedDeclRefExpr(*name, DeclRefKind::Ordinary,
                                              DeclNameLoc(SR.End));

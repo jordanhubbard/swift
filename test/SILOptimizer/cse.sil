@@ -1039,7 +1039,7 @@ bb0(%0 : $Airplane):
 sil hidden [transparent] [thunk] @_TTWV2p28AirplaneS_7FlyableS_FS1_3flyuRq_S1__fq_FT_T_ : $@convention(witness_method: Flyable) (@in_guaranteed Airplane) -> () {
 bb0(%0 : $*Airplane):
   %1 = alloc_stack $Airplane                      // users: %2, %6
-  copy_addr %0 to [initialization] %1 : $*Airplane // id: %2
+  copy_addr %0 to [init] %1 : $*Airplane // id: %2
   %3 = struct $Airplane ()                        // user: %5
   // function_ref p2.Airplane.fly (p2.Airplane)() -> ()
   %4 = function_ref @_TFV2p28Airplane3flyfS0_FT_T_ : $@convention(method) (Airplane) -> () // user: %5
@@ -1244,7 +1244,7 @@ bb0(%0 : $Proto, %1 : $Bool):
   return %res : $()
 }
 
-// Check that we don't CSE open_existential_ref if they are not compeltely equal.
+// Check that we don't CSE open_existential_ref if they are not completely equal.
 // CHECK-LABEL: sil @dont_cse_open_existential_ref
 // CHECK: open_existential_ref
 // CHECK: open_existential_ref
@@ -1356,3 +1356,58 @@ bb0:
   %22 = tuple ()
   return %22 : $()
 }
+
+sil @paable : $@convention(thin) (Builtin.Int64) -> ()
+
+final class FC {
+  @_hasStorage @_hasInitialValue final var storage: Optional<Builtin.Int64>
+}
+
+sil @consume_int64 : $@convention(thin) (Builtin.Int64) -> ()
+
+sil [lazy_getter] [ossa] @partial_apply_on_stack_nesting_violator : $@convention(method) (@guaranteed FC) -> Builtin.Int64 {
+entry(%instance : @guaranteed $FC):
+    %storage_addr = ref_element_addr %instance : $FC, #FC.storage
+    %optional = load [trivial] %storage_addr : $*Optional<Builtin.Int64>
+    switch_enum %optional : $Optional<Builtin.Int64>, case #Optional.some!enumelt: some, case #Optional.none!enumelt: none
+none:
+    %one = integer_literal $Builtin.Int64, 1
+    %optone = enum $Optional<Builtin.Int64>, #Optional.some!enumelt, %one : $Builtin.Int64
+    store %optone to [trivial] %storage_addr : $*Optional<Builtin.Int64>
+    br exit(%one : $Builtin.Int64)
+
+some(%value : $Builtin.Int64):
+    %paable = function_ref @paable : $@convention(thin) (Builtin.Int64) -> ()
+    %first = partial_apply [callee_guaranteed] [on_stack] %paable(%value) : $@convention(thin) (Builtin.Int64) -> ()
+    %second = partial_apply [callee_guaranteed] [on_stack] %paable(%value) : $@convention(thin) (Builtin.Int64) -> ()
+    // Note that the destroy_values do not occur in an order which coincides
+    // with stack disciplined dealloc_stacks.
+    destroy_value %first : $@noescape @callee_guaranteed () -> ()
+    destroy_value %second : $@noescape @callee_guaranteed () -> ()
+    br exit(%value : $Builtin.Int64)
+
+exit(%retval : $Builtin.Int64):
+    return %retval : $Builtin.Int64
+}
+
+// Verify that when inlining partial_apply_on_stack_nesting_violator, the stack
+// nesting of the on_stack closures is fixed.
+// CHECK-LABEL: sil @test_inline_stack_violating_ossa_func : {{.*}} {
+// CHECK:         [[PAABLE:%[^,]+]] = function_ref @paable
+// CHECK:         [[FIRST:%[^,]+]] = partial_apply [callee_guaranteed] [on_stack] [[PAABLE]]
+// CHECK:         [[SECOND:%[^,]+]] = partial_apply [callee_guaranteed] [on_stack] [[PAABLE]]
+// CHECK:         dealloc_stack [[SECOND]]
+// CHECK:         dealloc_stack [[FIRST]]
+// CHECK-LABEL: } // end sil function 'test_inline_stack_violating_ossa_func'
+sil @test_inline_stack_violating_ossa_func : $@convention(thin) (FC) -> () {
+entry(%instance : $FC):
+    %callee = function_ref @partial_apply_on_stack_nesting_violator : $@convention(method) (@guaranteed FC) -> Builtin.Int64
+    %consume = function_ref @consume_int64 : $@convention(thin) (Builtin.Int64) -> ()
+    %first = apply %callee(%instance) : $@convention(method) (@guaranteed FC) -> Builtin.Int64
+    apply %consume(%first) : $@convention(thin) (Builtin.Int64) -> ()
+    %second = apply %callee(%instance) : $@convention(method) (@guaranteed FC) -> Builtin.Int64
+    apply %consume(%second) : $@convention(thin) (Builtin.Int64) -> ()
+    %retval = tuple ()
+    return %retval : $()
+}
+

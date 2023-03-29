@@ -236,7 +236,7 @@ func calls(_ i:Int, j:Int, k:Int) {
 
   // CHECK: [[READ:%.*]] = begin_access [read] [unknown] [[PADDR]]
   // CHECK: [[TEMP:%.*]] = alloc_stack $any SomeProtocol
-  // CHECK: copy_addr [[READ]] to [initialization] [[TEMP]]
+  // CHECK: copy_addr [[READ]] to [init] [[TEMP]]
   // CHECK: [[PVALUE:%[0-9]+]] = open_existential_addr immutable_access [[TEMP]] : $*any SomeProtocol to $*[[OPENED:@opened\(.*, any SomeProtocol\) Self]]
   // CHECK: [[READI:%.*]] = begin_access [read] [unknown] [[IADDR]]
   // CHECK: [[I:%[0-9]+]] = load [trivial] [[READI]]
@@ -394,7 +394,7 @@ func testNoReturnAttr() -> Never {}
 // CHECK-LABEL: sil hidden [ossa] @$s9functions20testNoReturnAttrPoly{{[_0-9a-zA-Z]*}}F : $@convention(thin) <T> (@in_guaranteed T) -> Never
 func testNoReturnAttrPoly<T>(_ x: T) -> Never {}
 
-// CHECK-LABEL: sil hidden [ossa] @$s9functions21testNoReturnAttrParam{{[_0-9a-zA-Z]*}}F : $@convention(thin) (@noescape @callee_guaranteed () -> Never) -> ()
+// CHECK-LABEL: sil hidden [ossa] @$s9functions21testNoReturnAttrParam{{[_0-9a-zA-Z]*}}F : $@convention(thin) (@guaranteed @noescape @callee_guaranteed () -> Never) -> ()
 func testNoReturnAttrParam(_ fptr: () -> Never) -> () {}
 
 // CHECK-LABEL: sil hidden [transparent] [ossa] @$s9functions15testTransparent{{[_0-9a-zA-Z]*}}F : $@convention(thin) (Builtin.Int1) -> Builtin.Int1

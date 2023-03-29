@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Core -clang-header-expose-public-decls -emit-clang-header-path %t/core.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Core -clang-header-expose-decls=all-public -emit-clang-header-path %t/core.h
 // RUN: %FileCheck %s < %t/core.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/core.h)
@@ -7,7 +7,7 @@
 
 // CHECK:      #ifndef SWIFT_PRINTED_CORE
 // CHECK-NEXT: #define SWIFT_PRINTED_CORE
-// CHECK-NEXT: namespace swift {
+// CHECK-NEXT: namespace swift SWIFT_PRIVATE_ATTR {
 // CHECK-EMPTY:
 // CHECK-NEXT: namespace _impl {
 // CHECK-EMPTY:
@@ -98,29 +98,18 @@
 // CHECK-NEXT: }
 // CHECK-NEXT: #endif
 // CHECK-EMPTY:
-// CHECK-NEXT: /// Naive exception class that should be thrown
-// CHECK-NEXT: class NaiveException : public swift::Error {
-// CHECK-NEXT: public:
-// CHECK-NEXT: inline NaiveException(const char * _Nonnull msg) noexcept : msg_(msg) { }
-// CHECK-NEXT: inline NaiveException(NaiveException&& other) noexcept : msg_(other.msg_) { other.msg_ = nullptr; }
-// CHECK-NEXT: inline ~NaiveException() noexcept { }
-// CHECK-NEXT: void operator =(NaiveException&& other) noexcept { auto temp = msg_; msg_ = other.msg_; other.msg_ = temp; }
-// CHECK-NEXT: void operator =(const NaiveException&) noexcept = delete;
-// CHECK-NEXT: inline const char * _Nonnull getMessage() const noexcept { return(msg_); }
-// CHECK-NEXT: private:
-// CHECK-NEXT: const char * _Nonnull msg_;
-// CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: } // namespace _impl
 // CHECK-EMPTY:
 // CHECK-EMPTY:
-// CHECK-NEXT: #if __cplusplus > 201402L
+// CHECK-NEXT: #pragma clang diagnostic push
+// CHECK-NEXT: #pragma clang diagnostic ignored "-Wc++17-extensions"
 // CHECK-NEXT: template<>
 // CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<bool> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<bool> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$sSbN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -130,7 +119,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int8_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss4Int8VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -140,7 +129,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint8_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss5UInt8VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -150,7 +139,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int16_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss5Int16VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -160,7 +149,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint16_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss6UInt16VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -170,7 +159,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int32_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss5Int32VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -180,7 +169,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint32_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss6UInt32VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -190,7 +179,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int64_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss5Int64VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -200,7 +189,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint64_t> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss6UInt64VN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -210,7 +199,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<float> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$sSfN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -220,7 +209,7 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<double> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$sSdN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
@@ -230,12 +219,12 @@
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<void *> {
-// CHECK-NEXT:   static inline void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT:   static SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:     return &_impl::$ss13OpaquePointerVN;
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
 // CHECK-EMPTY:
-// CHECK-NEXT: #endif
+// CHECK-NEXT: #pragma clang diagnostic pop
 // CHECK-EMPTY:
 // CHECK-NEXT: } // namespace swift
 // CHECK-EMPTY:

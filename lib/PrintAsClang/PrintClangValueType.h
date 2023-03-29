@@ -14,14 +14,15 @@
 #define SWIFT_PRINTASCLANG_PRINTCLANGVALUETYPE_H
 
 #include "OutputLanguageMode.h"
-#include "swift/AST/GenericRequirement.h"
 #include "swift/AST/Type.h"
 #include "swift/Basic/LLVM.h"
+#include "swift/IRGen/GenericRequirement.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace swift {
 
+class DeclAndTypePrinter;
 class ModuleDecl;
 class NominalTypeDecl;
 class PrimitiveTypeMapping;
@@ -39,7 +40,9 @@ public:
   /// Print the C++ class definition that
   /// corresponds to the given structure or enum declaration.
   void printValueTypeDecl(const NominalTypeDecl *typeDecl,
-                          llvm::function_ref<void(void)> bodyPrinter);
+                          llvm::function_ref<void(void)> bodyPrinter,
+
+                          DeclAndTypePrinter &declAndTypePrinter);
 
   /// Print the use of a C++ struct/enum parameter value as it's passed to the
   /// underlying C function that represents the native Swift function.
@@ -91,22 +94,23 @@ public:
       StringRef vwTableVarName = "vwTable");
 
   static void printTypeGenericTraits(
-      raw_ostream &os, const NominalTypeDecl *typeDecl,
-      StringRef typeMetadataFuncName,
+      raw_ostream &os, const TypeDecl *typeDecl, StringRef typeMetadataFuncName,
       ArrayRef<GenericRequirement> typeMetadataFuncRequirements,
-      const ModuleDecl *moduleContext);
+      const ModuleDecl *moduleContext, DeclAndTypePrinter &declAndTypePrinter);
 
   static void printTypePrecedingGenericTraits(raw_ostream &os,
                                               const NominalTypeDecl *typeDecl,
                                               const ModuleDecl *moduleContext);
 
-  static void forwardDeclType(raw_ostream &os, const NominalTypeDecl *typeDecl);
+  static void forwardDeclType(raw_ostream &os, const NominalTypeDecl *typeDecl,
+                              DeclAndTypePrinter &declAndTypePrinter);
 
   /// Print out the type traits that allow a C++ type be used a Swift generic
   /// context.
-  static void printClangTypeSwiftGenericTraits(raw_ostream &os,
-                                               const NominalTypeDecl *typeDecl,
-                                               const ModuleDecl *moduleContext);
+  static void
+  printClangTypeSwiftGenericTraits(raw_ostream &os, const TypeDecl *typeDecl,
+                                   const ModuleDecl *moduleContext,
+                                   DeclAndTypePrinter &declAndTypePrinter);
 
 private:
   raw_ostream &os;

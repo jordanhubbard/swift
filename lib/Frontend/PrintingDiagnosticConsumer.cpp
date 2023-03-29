@@ -15,7 +15,9 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/Frontend/PrintingDiagnosticConsumer.h"
+#include "swift/AST/CASTBridging.h"
 #include "swift/AST/DiagnosticEngine.h"
+#include "swift/AST/DiagnosticsCommon.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Markup/Markup.h"
@@ -30,6 +32,36 @@
 
 using namespace swift;
 using namespace swift::markup;
+
+extern "C" void *swift_ASTGen_createQueuedDiagnostics();
+extern "C" void swift_ASTGen_destroyQueuedDiagnostics(void *queued);
+extern "C" void swift_ASTGen_addQueuedSourceFile(
+      void *queuedDiagnostics,
+      int bufferID,
+      void *sourceFile,
+      const uint8_t *displayNamePtr,
+      intptr_t displayNameLength,
+      int parentID,
+      int positionInParent);
+extern "C" void swift_ASTGen_addQueuedDiagnostic(
+    void *queued,
+    const char* text, ptrdiff_t textLength,
+    BridgedDiagnosticSeverity severity,
+    const void *sourceLoc,
+    const void **highlightRanges,
+    ptrdiff_t numHighlightRanges
+);
+extern "C" void swift_ASTGen_renderQueuedDiagnostics(
+    void *queued, ptrdiff_t contextSize, ptrdiff_t colorize,
+    char **outBuffer, ptrdiff_t *outBufferLength);
+
+// FIXME: Hack because we cannot easily get to the already-parsed source
+// file from here. Fix this egregious oversight!
+extern "C" void *swift_ASTGen_parseSourceFile(const char *buffer,
+                                              size_t bufferLength,
+                                              const char *moduleName,
+                                              const char *filename);
+extern "C" void swift_ASTGen_destroySourceFile(void *sourceFile);
 
 namespace {
   class ColoredStream : public raw_ostream {
@@ -134,7 +166,7 @@ namespace {
 
       void visitDocument(const Document *D) {
         for (const auto *Child : D->getChildren()) {
-          if (Child->getKind() == ASTNodeKind::Paragraph) {
+          if (Child->getKind() == markup::ASTNodeKind::Paragraph) {
             // Add a newline before top-level paragraphs
             printNewline();
           }
@@ -861,13 +893,14 @@ public:
 
   void render(raw_ostream &Out) {
     // Print the excerpt for each file.
-    unsigned lineNumberIndent =
-        std::max_element(FileExcerpts.begin(), FileExcerpts.end(),
-                         [](auto &a, auto &b) {
-                           return a.second.getPreferredLineNumberIndent() <
-                                  b.second.getPreferredLineNumberIndent();
-                         })
-            ->second.getPreferredLineNumberIndent();
+    unsigned lineNumberIndent = 0;
+    if (!FileExcerpts.empty()) {
+      lineNumberIndent = std::max_element(FileExcerpts.begin(), FileExcerpts.end(),
+          [](auto &a, auto &b) {
+            return a.second.getPreferredLineNumberIndent() <
+              b.second.getPreferredLineNumberIndent();
+          })->second.getPreferredLineNumberIndent();
+    }
     for (auto excerpt : FileExcerpts)
       excerpt.second.render(lineNumberIndent, Out);
 
@@ -930,6 +963,130 @@ static void annotateSnippetWithInfo(SourceManager &SM,
   }
 }
 
+#if SWIFT_SWIFT_PARSER
+/// Enqueue a diagnostic with ASTGen's diagnostic rendering.
+static void enqueueDiagnostic(
+    void *queuedDiagnostics, const DiagnosticInfo &info, SourceManager &SM
+) {
+  llvm::SmallString<256> text;
+  {
+    llvm::raw_svector_ostream out(text);
+    DiagnosticEngine::formatDiagnosticText(out, info.FormatString,
+                                           info.FormatArgs);
+  }
+
+  BridgedDiagnosticSeverity severity;
+  switch (info.Kind) {
+  case DiagnosticKind::Error:
+    severity = BridgedDiagnosticSeverity::BridgedError;
+    break;
+
+  case DiagnosticKind::Warning:
+    severity = BridgedDiagnosticSeverity::BridgedWarning;
+    break;
+
+  case DiagnosticKind::Remark:
+    severity = BridgedDiagnosticSeverity::BridgedRemark;
+    break;
+
+  case DiagnosticKind::Note:
+    severity = BridgedDiagnosticSeverity::BridgedNote;
+    break;
+  }
+
+  // Map the highlight ranges.
+  SmallVector<const void *, 2> highlightRanges;
+  for (const auto &range : info.Ranges) {
+    if (range.isInvalid())
+      continue;
+
+    highlightRanges.push_back(range.getStart().getOpaquePointerValue());
+    highlightRanges.push_back(range.getEnd().getOpaquePointerValue());
+  }
+
+  // FIXME: Translate Fix-Its.
+
+  swift_ASTGen_addQueuedDiagnostic(
+      queuedDiagnostics, text.data(), text.size(), severity,
+      info.Loc.getOpaquePointerValue(),
+      highlightRanges.data(), highlightRanges.size() / 2);
+}
+#endif
+
+/// Retrieve the stack of source buffers from the provided location out to
+/// a physical source file, with source buffer IDs for each step along the way
+/// due to (e.g.) macro expansions or generated code.
+///
+/// The resulting vector will always contain valid source locations. If the
+/// initial location is invalid, the result will be empty.
+static SmallVector<unsigned, 1> getSourceBufferStack(
+    SourceManager &sourceMgr, SourceLoc loc) {
+  SmallVector<unsigned, 1> stack;
+  while (true) {
+    if (loc.isInvalid())
+      return stack;
+
+    unsigned bufferID = sourceMgr.findBufferContainingLoc(loc);
+    stack.push_back(bufferID);
+
+    auto generatedSourceInfo = sourceMgr.getGeneratedSourceInfo(bufferID);
+    if (!generatedSourceInfo)
+      return stack;
+
+    loc = generatedSourceInfo->originalSourceRange.getStart();
+  }
+}
+
+#if SWIFT_SWIFT_PARSER
+void PrintingDiagnosticConsumer::queueBuffer(
+    SourceManager &sourceMgr, unsigned bufferID) {
+  QueuedBuffer knownSourceFile = queuedBuffers[bufferID];
+  if (knownSourceFile)
+    return;
+
+  auto bufferContents = sourceMgr.getEntireTextForBuffer(bufferID);
+  auto sourceFile = swift_ASTGen_parseSourceFile(
+      bufferContents.data(), bufferContents.size(),
+      "module", "file.swift");
+
+  // Find the parent and position in parent, if there is one.
+  int parentID = -1;
+  int positionInParent = 0;
+  std::string displayName;
+  auto generatedSourceInfo = sourceMgr.getGeneratedSourceInfo(bufferID);
+  if (generatedSourceInfo) {
+    SourceLoc parentLoc = generatedSourceInfo->originalSourceRange.getEnd();
+    if (parentLoc.isValid()) {
+      parentID = sourceMgr.findBufferContainingLoc(parentLoc);
+      positionInParent = sourceMgr.getLocOffsetInBuffer(parentLoc, parentID);
+
+      // Queue the parent buffer.
+      queueBuffer(sourceMgr, parentID);
+    }
+
+    if (DeclName macroName =
+            getGeneratedSourceInfoMacroName(*generatedSourceInfo)) {
+      SmallString<64> buffer;
+      if (generatedSourceInfo->attachedMacroCustomAttr)
+        displayName = ("macro expansion @" + macroName.getString(buffer)).str();
+      else
+        displayName = ("macro expansion #" + macroName.getString(buffer)).str();
+    }
+  }
+
+  if (displayName.empty()) {
+    displayName = sourceMgr.getDisplayNameForLoc(
+        sourceMgr.getLocForBufferStart(bufferID)).str();
+  }
+
+  swift_ASTGen_addQueuedSourceFile(
+      queuedDiagnostics, bufferID, sourceFile,
+      (const uint8_t*)displayName.data(), displayName.size(),
+      parentID, positionInParent);
+  queuedBuffers[bufferID] = sourceFile;
+}
+#endif
+
 // MARK: Main DiagnosticConsumer entrypoint.
 void PrintingDiagnosticConsumer::handleDiagnostic(SourceManager &SM,
                                                   const DiagnosticInfo &Info) {
@@ -944,25 +1101,58 @@ void PrintingDiagnosticConsumer::handleDiagnostic(SourceManager &SM,
     return;
 
   switch (FormattingStyle) {
-  case DiagnosticOptions::FormattingStyle::Swift:
-    if (Info.Kind == DiagnosticKind::Note && currentSnippet) {
-      // If this is a note and we have an in-flight message, add it to that
-      // instead of emitting it separately.
-      annotateSnippetWithInfo(SM, Info, *currentSnippet);
-    } else {
-      // If we encounter a new error/warning/remark, flush any in-flight
-      // snippets.
-      flush(/*includeTrailingBreak*/ true);
-      currentSnippet = std::make_unique<AnnotatedSourceSnippet>(SM);
-      annotateSnippetWithInfo(SM, Info, *currentSnippet);
-    }
-    if (PrintEducationalNotes) {
-      for (auto path : Info.EducationalNotePaths) {
-        if (auto buffer = SM.getFileSystem()->getBufferForFile(path))
-          BufferedEducationalNotes.push_back(buffer->get()->getBuffer().str());
+  case DiagnosticOptions::FormattingStyle::Swift: {
+#if SWIFT_SWIFT_PARSER
+    // Use the swift-syntax formatter.
+    auto bufferStack = getSourceBufferStack(SM, Info.Loc);
+    if (!bufferStack.empty()) {
+      // If there are no enqueued diagnostics, or they are from a different
+      // outermost buffer, flush any enqueued diagnostics and start fresh.
+      unsigned outermostBufferID = bufferStack.back();
+      if (!queuedDiagnostics ||
+          outermostBufferID != queuedDiagnosticsOutermostBufferID) {
+        flush(/*includeTrailingBreak*/ true);
+
+        queuedDiagnosticsOutermostBufferID = outermostBufferID;
+        queuedDiagnostics = swift_ASTGen_createQueuedDiagnostics();
       }
+
+      unsigned innermostBufferID = bufferStack.front();
+      queueBuffer(SM, innermostBufferID);
+      enqueueDiagnostic(queuedDiagnostics, Info, SM);
+      break;
     }
-    break;
+#endif
+
+    // Use the C++ formatter.
+    // FIXME: Once the swift-syntax formatter is enabled everywhere, we will
+    // remove this.
+    if (Info.Loc.isValid()) {
+      if (Info.Kind == DiagnosticKind::Note && currentSnippet) {
+        // If this is a note and we have an in-flight message, add it to that
+        // instead of emitting it separately.
+        annotateSnippetWithInfo(SM, Info, *currentSnippet);
+      } else {
+        // If we encounter a new error/warning/remark, flush any in-flight
+        // snippets.
+        flush(/*includeTrailingBreak*/ true);
+        currentSnippet = std::make_unique<AnnotatedSourceSnippet>(SM);
+        annotateSnippetWithInfo(SM, Info, *currentSnippet);
+      }
+      if (PrintEducationalNotes) {
+        for (auto path : Info.EducationalNotePaths) {
+          if (auto buffer = SM.getFileSystem()->getBufferForFile(path))
+            BufferedEducationalNotes.push_back(buffer->get()->getBuffer().str());
+        }
+      }
+      break;
+    }
+
+    // Fall through to print using the LLVM style when there is no source
+    // location.
+    flush(/*includeTrailingBreak*/ false);
+    LLVM_FALLTHROUGH;
+  }
 
   case DiagnosticOptions::FormattingStyle::LLVM:
     printDiagnostic(SM, Info);
@@ -998,6 +1188,28 @@ void PrintingDiagnosticConsumer::flush(bool includeTrailingBreak) {
     }
     currentSnippet.reset();
   }
+
+#if SWIFT_SWIFT_PARSER
+  if (queuedDiagnostics) {
+    char *renderedString = nullptr;
+    ptrdiff_t renderedStringLen = 0;
+    swift_ASTGen_renderQueuedDiagnostics(
+        queuedDiagnostics, /*contextSize=*/2, ForceColors ? 1 : 0,
+        &renderedString, &renderedStringLen);
+    if (renderedString) {
+      Stream.write(renderedString, renderedStringLen);
+    }
+    swift_ASTGen_destroyQueuedDiagnostics(queuedDiagnostics);
+    queuedDiagnostics = nullptr;
+    for (const auto &buffer : queuedBuffers) {
+      swift_ASTGen_destroySourceFile(buffer.second);
+    }
+    queuedBuffers.clear();
+
+    if (includeTrailingBreak)
+      Stream << "\n";
+  }
+#endif
 
   for (auto note : BufferedEducationalNotes) {
     printMarkdown(note, Stream, ForceColors);
@@ -1059,7 +1271,8 @@ void PrintingDiagnosticConsumer::printDiagnostic(SourceManager &SM,
                                            Info.FormatArgs);
   }
 
-  auto Msg = SM.GetMessage(Info.Loc, SMKind, Text, Ranges, FixIts);
+  auto Msg = SM.GetMessage(Info.Loc, SMKind, Text, Ranges, FixIts,
+                           EmitMacroExpansionFiles);
   rawSM.PrintMessage(out, Msg, ForceColors);
 }
 
@@ -1067,7 +1280,8 @@ llvm::SMDiagnostic
 SourceManager::GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
                           const Twine &Msg,
                           ArrayRef<llvm::SMRange> Ranges,
-                          ArrayRef<llvm::SMFixIt> FixIts) const {
+                          ArrayRef<llvm::SMFixIt> FixIts,
+                          bool EmitMacroExpansionFiles) const {
 
   // First thing to do: find the current buffer containing the specified
   // location to pull out the source line.
@@ -1077,7 +1291,7 @@ SourceManager::GetMessage(SourceLoc Loc, llvm::SourceMgr::DiagKind Kind,
   std::string LineStr;
 
   if (Loc.isValid()) {
-    BufferID = getDisplayNameForLoc(Loc);
+    BufferID = getDisplayNameForLoc(Loc, EmitMacroExpansionFiles);
     auto CurMB = LLVMSourceMgr.getMemoryBuffer(findBufferContainingLoc(Loc));
 
     // Scan backward to find the start of the line.

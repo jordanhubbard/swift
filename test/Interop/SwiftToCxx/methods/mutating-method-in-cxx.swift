@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Methods -clang-header-expose-public-decls -emit-clang-header-path %t/methods.h
+// RUN: %target-swift-frontend %s -typecheck -module-name Methods -clang-header-expose-decls=all-public -emit-clang-header-path %t/methods.h
 // RUN: %FileCheck %s < %t/methods.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/methods.h)
@@ -56,18 +56,18 @@ public struct SmallStruct {
 // CHECK: SWIFT_EXTERN struct swift_interop_returnStub_Methods_float_0_4 $s7Methods11SmallStructV5scaleyACSfF(float y, SWIFT_CONTEXT void * _Nonnull _self) SWIFT_NOEXCEPT SWIFT_CALL; // scale(_:)
 // CHECK: SWIFT_EXTERN void $s7Methods11SmallStructV6invertyyF(SWIFT_CONTEXT void * _Nonnull _self) SWIFT_NOEXCEPT SWIFT_CALL; // invert()
 
-// CHECK: class LargeStruct final {
-// CHECK: inline LargeStruct(LargeStruct &&)
-// CHECK-NEXT:   inline void dump() const;
-// CHECK-NEXT:   inline void double_();
-// CHECK-NEXT:   inline LargeStruct scale(swift::Int x, swift::Int y);
+// CHECK: class SWIFT_SYMBOL("s:7Methods11LargeStructV") LargeStruct final {
+// CHECK: SWIFT_INLINE_THUNK LargeStruct(LargeStruct &&)
+// CHECK-NEXT:   SWIFT_INLINE_THUNK void dump() const SWIFT_SYMBOL("s:7Methods11LargeStructV4dumpyyF");
+// CHECK-NEXT:   SWIFT_INLINE_THUNK void double_() SWIFT_SYMBOL("s:7Methods11LargeStructV6doubleyyF");
+// CHECK-NEXT:   SWIFT_INLINE_THUNK LargeStruct scale(swift::Int x, swift::Int y) SWIFT_SYMBOL("s:7Methods11LargeStructV5scaleyACSi_SitF");
 // CHECK-NEXT: private
 
-// CHECK: class SmallStruct final {
-// CHECK:   inline SmallStruct(SmallStruct &&)
-// CHECK-NEXT:   inline void dump() const;
-// CHECK-NEXT:   inline SmallStruct scale(float y);
-// CHECK-NEXT:   inline void invert();
+// CHECK: class SWIFT_SYMBOL("s:7Methods11SmallStructV") SmallStruct final {
+// CHECK:   SWIFT_INLINE_THUNK SmallStruct(SmallStruct &&)
+// CHECK-NEXT:   SWIFT_INLINE_THUNK void dump() const SWIFT_SYMBOL("s:7Methods11SmallStructV4dumpyyF");
+// CHECK-NEXT:   SWIFT_INLINE_THUNK SmallStruct scale(float y) SWIFT_SYMBOL("s:7Methods11SmallStructV5scaleyACSfF");
+// CHECK-NEXT:   SWIFT_INLINE_THUNK void invert() SWIFT_SYMBOL("s:7Methods11SmallStructV6invertyyF");
 // CHECK-NEXT: private:
 
 
@@ -79,26 +79,26 @@ public func createSmallStruct(x: Float) -> SmallStruct {
     return SmallStruct(x: x)
 }
 
-// CHECK:        inline void LargeStruct::dump() const {
+// CHECK:        SWIFT_INLINE_THUNK void LargeStruct::dump() const {
 // CHECK-NEXT:   return _impl::$s7Methods11LargeStructV4dumpyyF(_getOpaquePointer());
 // CHECK-NEXT:   }
-// CHECK-NEXT:   inline void LargeStruct::double_() {
+// CHECK-NEXT:   SWIFT_INLINE_THUNK void LargeStruct::double_() {
 // CHECK-NEXT:   return _impl::$s7Methods11LargeStructV6doubleyyF(_getOpaquePointer());
 // CHECK-NEXT:   }
-// CHECK-NEXT:   inline LargeStruct LargeStruct::scale(swift::Int x, swift::Int y) {
-// CHECK-NEXT:   return _impl::_impl_LargeStruct::returnNewValue([&](char * _Nonnull result) {
+// CHECK-NEXT:   SWIFT_INLINE_THUNK LargeStruct LargeStruct::scale(swift::Int x, swift::Int y) {
+// CHECK-NEXT:   return _impl::_impl_LargeStruct::returnNewValue([&](char * _Nonnull result) SWIFT_INLINE_THUNK_ATTRIBUTES {
 // CHECK-NEXT:     _impl::$s7Methods11LargeStructV5scaleyACSi_SitF(result, x, y, _getOpaquePointer());
 // CHECK-NEXT:   });
 // CHECK-NEXT:   }
 
-// CHECK:        inline void SmallStruct::dump() const {
+// CHECK:        SWIFT_INLINE_THUNK void SmallStruct::dump() const {
 // CHECK-NEXT:   return _impl::$s7Methods11SmallStructV4dumpyyF(_impl::swift_interop_passDirect_Methods_float_0_4(_getOpaquePointer()));
 // CHECK-NEXT:   }
-// CHECK-NEXT:   inline SmallStruct SmallStruct::scale(float y) {
-// CHECK-NEXT:   return _impl::_impl_SmallStruct::returnNewValue([&](char * _Nonnull result) {
+// CHECK-NEXT:   SWIFT_INLINE_THUNK SmallStruct SmallStruct::scale(float y) {
+// CHECK-NEXT:   return _impl::_impl_SmallStruct::returnNewValue([&](char * _Nonnull result) SWIFT_INLINE_THUNK_ATTRIBUTES {
 // CHECK-NEXT:     _impl::swift_interop_returnDirect_Methods_float_0_4(result, _impl::$s7Methods11SmallStructV5scaleyACSfF(y, _getOpaquePointer()));
 // CHECK-NEXT:   });
 // CHECK-NEXT:   }
-// CHECK-NEXT:   inline void SmallStruct::invert() {
+// CHECK-NEXT:   SWIFT_INLINE_THUNK void SmallStruct::invert() {
 // CHECK-NEXT:   return _impl::$s7Methods11SmallStructV6invertyyF(_getOpaquePointer());
 // CHECK-NEXT:   }

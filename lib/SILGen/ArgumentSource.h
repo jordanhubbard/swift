@@ -222,7 +222,16 @@ public:
     return Storage.get<LValueStorage>(StoredKind).Loc;
   }
 
+  /// The kind of operation under which we are querying a storage reference.
+  enum class StorageReferenceOperationKind {
+    Borrow,
+    Consume
+  };
+
   Expr *findStorageReferenceExprForBorrow() &&;
+  Expr *findStorageReferenceExprForMoveOnly(SILGenFunction &SGF,
+                                      StorageReferenceOperationKind refKind) &&;
+  Expr *findStorageReferenceExprForBorrowExpr(SILGenFunction &SGF) &&;
 
   /// Given that this source is an expression, extract and clear
   /// that expression.
@@ -352,7 +361,7 @@ public:
 
   /// Add an arbitrary argument source to these arguments.
   ///
-  /// An argument list with an arbtrary argument source can't generally
+  /// An argument list with an arbitrary argument source can't generally
   /// be copied.
   void addArbitrary(ArgumentSource &&arg) {
     assert(!isNull());

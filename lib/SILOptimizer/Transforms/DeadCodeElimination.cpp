@@ -50,7 +50,8 @@ static bool seemsUseful(SILInstruction *I) {
   // side-effects, they can be DCE'ed if they do not have useful
   // dependencies/reverse dependencies
   if (isa<BeginAccessInst>(I) || isa<CopyValueInst>(I) ||
-      isa<DestroyValueInst>(I) || isa<EndLifetimeInst>(I))
+      isa<DestroyValueInst>(I) || isa<EndLifetimeInst>(I) ||
+      isa<EndBorrowInst>(I))
     return false;
 
   // A load [copy] is okay to be DCE'ed if there are no useful dependencies
@@ -125,13 +126,13 @@ class DCE {
   llvm::DenseMap<SILValue, SmallPtrSet<SILInstruction *, 4>>
       ReverseDependencies;
 
-  // reborrowDependencies tracks the dependency of a reborrowed phiArg with its
-  // renamed base value.
-  // A reborrowed phiArg may have a new base value, if it's original base value
-  // was also passed as a branch operand. The renamed base value should then be
-  // live if the reborrow phiArg was also live.
+  // guaranteedPhiDependencies tracks the dependency of reborrows and
+  // @guaranteed forwarding phis with its base value.
+  // If the base value is also passed along as a phi operand with the reborrow
+  // operand/GuaranteedForwardingPhi operand, we will have a new base value
+  // for the reborrow phi/@guaranteed forwarding phi.
   using BaseValueSet = SmallPtrSet<SILValue, 8>;
-  llvm::DenseMap<SILPhiArgument *, BaseValueSet> reborrowDependencies;
+  llvm::DenseMap<SILPhiArgument *, BaseValueSet> guaranteedPhiDependencies;
 
   /// Tracks if the pass changed branches.
   bool BranchesChanged = false;
@@ -143,9 +144,9 @@ class DCE {
   /// Record a reverse dependency from \p from to \p to meaning \p to is live
   /// if \p from is also live.
   void addReverseDependency(SILValue from, SILInstruction *to);
-  /// Starting from \p borrowInst find all reborrow dependency of its reborrows
-  /// with their renamed base values.
-  void findReborrowDependencies(BeginBorrowInst *borrowInst);
+  /// Starting from \p borrow find all reborrow and guaranteed phi dependencies
+  /// along with their base values.
+  void findGuaranteedPhiDependencies(BorrowedValue borrow);
   bool removeDead();
 
   void computeLevelNumbers(PostDomTreeNode *root);
@@ -214,7 +215,6 @@ void DCE::markInstructionLive(SILInstruction *Inst) {
 
   LLVM_DEBUG(llvm::dbgs() << "Marking as live: " << *Inst);
 
-  markControllingTerminatorsLive(Inst->getParent());
   Worklist.push_back(Inst);
 }
 
@@ -274,7 +274,13 @@ void DCE::markLive() {
         addReverseDependency(beginAccess, &I);
         break;
       }
-      case SILInstructionKind::DestroyValueInst:
+      case SILInstructionKind::DestroyValueInst: {
+        auto phi = PhiValue(I.getOperand(0));
+        if (phi && phi->isLexical()) {
+          markInstructionLive(&I);
+        }
+        break;
+      }
       case SILInstructionKind::EndBorrowInst:
       case SILInstructionKind::EndLifetimeInst: {
         // The instruction is live only if it's operand value is also live
@@ -282,37 +288,38 @@ void DCE::markLive() {
         break;
       }
       case SILInstructionKind::BeginBorrowInst: {
-        // Currently we only support borrows of owned values.
-        // Nested borrow handling can be complex in the presence of reborrows.
-        // So it is not handled currently.
         auto *borrowInst = cast<BeginBorrowInst>(&I);
-        if (borrowInst->getOperand()->getOwnershipKind() ==
-            OwnershipKind::Guaranteed) {
-          markInstructionLive(borrowInst);
-          // Visit the end_borrows of all the borrow scopes that this
-          // begin_borrow could be borrowing.
-          SmallVector<SILValue, 4> roots;
-          findGuaranteedReferenceRoots(borrowInst->getOperand(), roots);
-          for (auto root : roots) {
-            visitTransitiveEndBorrows(root,
-                                      [&](EndBorrowInst *endBorrow) {
-                                        markInstructionLive(endBorrow);
-                                      });
-          }
-          continue;
-        }
-        // Populate reborrowDependencies for this borrow
-        findReborrowDependencies(borrowInst);
-        // Don't optimize a borrow scope if it is lexical or has a pointer
-        // escape.
-        if (borrowInst->isLexical() ||
-            hasPointerEscape(BorrowedValue(borrowInst))) {
-          // Visit all end_borrows and mark them live
-          visitTransitiveEndBorrows(borrowInst, [&](EndBorrowInst *endBorrow) {
+        // Populate guaranteedPhiDependencies for this borrowInst
+        findGuaranteedPhiDependencies(BorrowedValue(borrowInst));
+        auto disableBorrowDCE = [&](SILValue borrow) {
+          visitTransitiveEndBorrows(borrow, [&](EndBorrowInst *endBorrow) {
             markInstructionLive(endBorrow);
           });
-          continue;
+        };
+        // If we have a begin_borrow of a @guaranteed operand, disable DCE'ing
+        // of parent borrow scopes. Dead reborrows needs complex handling, which
+        // is why it is disabled for now.
+        if (borrowInst->getOperand()->getOwnershipKind() ==
+            OwnershipKind::Guaranteed) {
+          SmallVector<SILValue, 4> roots;
+          findGuaranteedReferenceRoots(borrowInst->getOperand(),
+                                       /*lookThroughNestedBorrows=*/false,
+                                       roots);
+          // Visit the end_borrows of all the borrow scopes that this
+          // begin_borrow could be borrowing, and mark them live.
+          for (auto root : roots) {
+            disableBorrowDCE(root);
+          }
         }
+        // If we have a lexical borrow scope or a pointer escape, disable DCE.
+        if (borrowInst->isLexical() ||
+            hasPointerEscape(BorrowedValue(borrowInst))) {
+          disableBorrowDCE(borrowInst);
+        }
+        break;
+      }
+      case SILInstructionKind::LoadBorrowInst: {
+        findGuaranteedPhiDependencies(BorrowedValue(cast<LoadBorrowInst>(&I)));
         break;
       }
       default:
@@ -337,19 +344,23 @@ void DCE::addReverseDependency(SILValue from, SILInstruction *to) {
   ReverseDependencies[from].insert(to);
 }
 
-void DCE::findReborrowDependencies(BeginBorrowInst *borrowInst) {
-  LLVM_DEBUG(llvm::dbgs() << "Finding reborrow dependencies of " << borrowInst
-                          << "\n");
-  BorrowingOperand initialScopedOperand(&borrowInst->getOperandRef());
-  auto visitReborrowBaseValuePair = [&](SILPhiArgument *phiArg,
-                                        SILValue baseValue) {
-    reborrowDependencies[phiArg].insert(baseValue);
+void DCE::findGuaranteedPhiDependencies(BorrowedValue borrow) {
+  assert(borrow.kind == BorrowedValueKind::BeginBorrow ||
+         borrow.kind == BorrowedValueKind::LoadBorrow);
+  LLVM_DEBUG(llvm::dbgs() << "Finding @guaranteed phi dependencies of "
+                          << borrow << "\n");
+  auto visitDependentPhiBaseValuePair = [&](SILPhiArgument *phiArg,
+                                            SILValue baseValue) {
+    guaranteedPhiDependencies[phiArg].insert(baseValue);
   };
-  // Find all reborrow dependencies starting from \p borrowInst and populate
-  // them in reborrowDependencies
-  findTransitiveReborrowBaseValuePairs(initialScopedOperand,
-                                       borrowInst->getOperand(),
-                                       visitReborrowBaseValuePair);
+  // Find all dependencies starting from \p borrowInst and populate
+  // them in guaranteedPhiDependencies
+  if (borrow.kind == BorrowedValueKind::BeginBorrow) {
+    visitExtendedReborrowPhiBaseValuePairs(cast<BeginBorrowInst>(borrow.value),
+                                           visitDependentPhiBaseValuePair);
+  }
+  visitExtendedGuaranteedForwardingPhiBaseValuePairs(
+      borrow, visitDependentPhiBaseValuePair);
 }
 
 // Mark as live the terminator argument at index ArgIndex in Pred that
@@ -429,7 +440,7 @@ void DCE::propagateLiveBlockArgument(SILArgument *Arg) {
   }
 
   if (auto *phi = dyn_cast<SILPhiArgument>(Arg)) {
-    for (auto depVal : reborrowDependencies.lookup(phi)) {
+    for (auto depVal : guaranteedPhiDependencies.lookup(phi)) {
       markValueLive(depVal);
     }
   }
@@ -444,6 +455,8 @@ void DCE::propagateLiveBlockArgument(SILArgument *Arg) {
 // Given an instruction which is considered live, propagate that liveness
 // back to the instructions that produce values it consumes.
 void DCE::propagateLiveness(SILInstruction *I) {
+  markControllingTerminatorsLive(I->getParent());
+
   if (!isa<TermInst>(I)) {
     for (auto &O : I->getAllOperands())
       markValueLive(O.get());
@@ -555,7 +568,8 @@ void DCE::endLifetimeOfLiveValue(SILValue value, SILInstruction *insertPt) {
     builder.emitDestroyOperation(RegularLocation::getAutoGeneratedLocation(),
                                  value);
   }
-  if (value->getOwnershipKind() == OwnershipKind::Guaranteed) {
+  BorrowedValue borrow(value);
+  if (borrow && borrow.isLocalScope()) {
     builder.emitEndBorrowOperation(RegularLocation::getAutoGeneratedLocation(),
                                    value);
   }
@@ -593,7 +607,7 @@ bool DCE::removeDead() {
         if (arg->getOwnershipKind() == OwnershipKind::Owned) {
           auto loc = RegularLocation::getAutoGeneratedLocation();
           // insertPt is non-null because Undef is non-owned.
-          auto insertPt = getInsertAfterPoint(arg).getValue();
+          auto insertPt = getInsertAfterPoint(arg).value();
           SILBuilderWithScope builder(insertPt);
           auto *destroy = builder.createDestroyValue(loc, arg);
           LiveInstructions.insert(destroy);

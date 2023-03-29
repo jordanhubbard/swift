@@ -67,8 +67,8 @@ public:
     return Layout.isEmpty();
   }
 
-  IsPOD_t isPOD() const {
-    return Layout.isPOD();
+  IsTriviallyDestroyable_t isTriviallyDestroyable() const {
+    return Layout.isTriviallyDestroyable();
   }
 
   IsABIAccessible_t isABIAccessible() const {
@@ -170,7 +170,7 @@ public:
       return emitAssignWithCopyCall(IGF, T, dest, src);
     }
 
-    if (isOutlined || T.hasOpenedExistential()) {
+    if (isOutlined || T.hasLocalArchetype()) {
       auto offsets = asImpl().getNonFixedOffsets(IGF, T);
       for (auto &field : getFields()) {
         if (field.isEmpty())
@@ -193,7 +193,7 @@ public:
       return emitAssignWithTakeCall(IGF, T, dest, src);
     }
 
-    if (isOutlined || T.hasOpenedExistential()) {
+    if (isOutlined || T.hasLocalArchetype()) {
       auto offsets = asImpl().getNonFixedOffsets(IGF, T);
       for (auto &field : getFields()) {
         if (field.isEmpty())
@@ -212,7 +212,7 @@ public:
   void initializeWithCopy(IRGenFunction &IGF, Address dest, Address src,
                           SILType T, bool isOutlined) const override {
     // If we're POD, use the generic routine.
-    if (this->isPOD(ResilienceExpansion::Maximal) &&
+    if (this->isTriviallyDestroyable(ResilienceExpansion::Maximal) &&
         isa<LoadableTypeInfo>(this)) {
       return cast<LoadableTypeInfo>(this)->LoadableTypeInfo::initializeWithCopy(
           IGF, dest, src, T, isOutlined);
@@ -223,7 +223,7 @@ public:
       return emitInitializeWithCopyCall(IGF, T, dest, src);
     }
 
-    if (isOutlined || T.hasOpenedExistential()) {
+    if (isOutlined || T.hasLocalArchetype()) {
       auto offsets = asImpl().getNonFixedOffsets(IGF, T);
       for (auto &field : getFields()) {
         if (field.isEmpty())
@@ -255,7 +255,7 @@ public:
       return emitInitializeWithTakeCall(IGF, T, dest, src);
     }
 
-    if (isOutlined || T.hasOpenedExistential()) {
+    if (isOutlined || T.hasLocalArchetype()) {
       auto offsets = asImpl().getNonFixedOffsets(IGF, T);
       for (auto &field : getFields()) {
         if (field.isEmpty())
@@ -278,10 +278,10 @@ public:
       return emitDestroyCall(IGF, T, addr);
     }
 
-    if (isOutlined || T.hasOpenedExistential()) {
+    if (isOutlined || T.hasLocalArchetype()) {
       auto offsets = asImpl().getNonFixedOffsets(IGF, T);
       for (auto &field : getFields()) {
-        if (field.isPOD())
+        if (field.isTriviallyDestroyable())
           continue;
 
         field.getTypeInfo().destroy(IGF,
@@ -295,7 +295,7 @@ public:
 
   // The extra inhabitants of a record are determined from its fields.
   bool mayHaveExtraInhabitants(IRGenModule &IGM) const override {
-    if (!MayHaveExtraInhabitants.hasValue()) {
+    if (!MayHaveExtraInhabitants.has_value()) {
       MayHaveExtraInhabitants = false;
       for (auto &field : asImpl().getFields())
         if (field.getTypeInfo().mayHaveExtraInhabitants(IGM)) {
@@ -422,7 +422,7 @@ public:
 
   const FieldImpl *
   getFixedExtraInhabitantProvidingField(IRGenModule &IGM) const {
-    if (!ExtraInhabitantProvidingField.hasValue()) {
+    if (!ExtraInhabitantProvidingField.has_value()) {
       unsigned mostExtraInhabitants = 0;
       const FieldImpl *fieldWithMost = nullptr;
       const FieldImpl *singleNonFixedField = nullptr;
@@ -542,7 +542,6 @@ public:
   }
 
 private:
-  /// Scan the given field info
   static unsigned findUniqueNonEmptyField(ArrayRef<FieldImpl> fields) {
     unsigned result = 0;
     for (auto &field : fields) {
@@ -605,7 +604,7 @@ public:
         if (field == &otherField)
           continue;
         auto &ti = otherField.getTypeInfo();
-        if (!ti.isPOD(ResilienceExpansion::Maximal)) {
+        if (!ti.isTriviallyDestroyable(ResilienceExpansion::Maximal)) {
           return false;
         }
       }
@@ -630,7 +629,7 @@ public:
     value.appendClearBits(field.getFixedByteOffset().getValueInBits());
     value.append(fieldTI.getFixedExtraInhabitantValue(IGM, fieldSize, index));
     value.padWithClearBitsTo(bits);
-    return value.build().getValue();
+    return value.build().value();
   }
 
   APInt getFixedExtraInhabitantMask(IRGenModule &IGM) const override {
@@ -649,7 +648,7 @@ public:
     mask.appendClearBits(field->getFixedByteOffset().getValueInBits());
     mask.append(fieldTI.getFixedExtraInhabitantMask(IGM));
     mask.padWithClearBitsTo(targetSize);
-    return mask.build().getValue();
+    return mask.build().value();
   }
 
   llvm::Value *getExtraInhabitantIndex(IRGenFunction &IGF,
@@ -741,6 +740,22 @@ private:
     }
   }
 
+  template <void (LoadableTypeInfo::*Op)(IRGenFunction &IGF, Explosion &in,
+                                         Address addr, bool isOutlined,
+                                         SILType T) const>
+  void forAllFields(IRGenFunction &IGF, Explosion &in, Address addr,
+                    bool isOutlined, SILType T) const {
+    auto offsets = asImpl().getNonFixedOffsets(IGF);
+    for (auto &field : getFields()) {
+      if (field.isEmpty()) continue;
+
+      Address fieldAddr = field.projectAddress(IGF, addr, offsets);
+      (cast<LoadableTypeInfo>(field.getTypeInfo()).*Op)(IGF, in, fieldAddr,
+                                                    isOutlined,
+                                                    field.getType(IGF.IGM, T));
+    }
+  }
+
 public:
   using super::getFields;
 
@@ -755,8 +770,8 @@ public:
   }
 
   void assign(IRGenFunction &IGF, Explosion &e, Address addr,
-              bool isOutlined) const override {
-    forAllFields<&LoadableTypeInfo::assign>(IGF, e, addr, isOutlined);
+              bool isOutlined, SILType T) const override {
+    forAllFields<&LoadableTypeInfo::assign>(IGF, e, addr, isOutlined, T);
   }
 
   void initialize(IRGenFunction &IGF, Explosion &e, Address addr,
@@ -782,10 +797,11 @@ public:
   }
 
   void consume(IRGenFunction &IGF, Explosion &src,
-               Atomicity atomicity) const override {
-    for (auto &field : getFields())
+               Atomicity atomicity, SILType T) const override {
+    for (auto &field : getFields()) {
       cast<LoadableTypeInfo>(field.getTypeInfo())
-          .consume(IGF, src, atomicity);
+          .consume(IGF, src, atomicity, field.getType(IGF.IGM, T));
+    }
   }
 
   void fixLifetime(IRGenFunction &IGF, Explosion &src) const override {

@@ -16,20 +16,36 @@ import SIL
 public struct CalleeAnalysis {
   let bridged: BridgedCalleeAnalysis
 
+  static func register() {
+    BridgedCalleeAnalysis.registerAnalysis(
+      // isDeinitBarrierFn:
+      { (inst : BridgedInstruction, bca: BridgedCalleeAnalysis) -> Bool in
+        return inst.instruction.isDeinitBarrier(bca.analysis)
+      },
+      // getMemBehaviorFn
+      { (bridgedCtxt: BridgedPassContext, bridgedApply: BridgedInstruction, observeRetains: Bool) -> swift.MemoryBehavior in
+        let context = FunctionPassContext(_bridged: bridgedCtxt)
+        let apply = bridgedApply.instruction as! ApplySite
+        let e = context.calleeAnalysis.getSideEffects(of: apply)
+        return e.getMemBehavior(observeRetains: observeRetains)
+      }
+    )
+  }
+
   public func getCallees(callee: Value) -> FunctionArray? {
-    let bridgedFuncs = CalleeAnalysis_getCallees(bridged, callee.bridged)
-    if bridgedFuncs.incomplete != 0 {
+    let bridgedFuncs = bridged.getCallees(callee.bridged)
+    if bridgedFuncs.isIncomplete() {
       return nil
     }
     return FunctionArray(bridged: bridgedFuncs)
   }
 
   public func getIncompleteCallees(callee: Value) -> FunctionArray {
-    return FunctionArray(bridged: CalleeAnalysis_getCallees(bridged, callee.bridged))
+    return FunctionArray(bridged: bridged.getCallees(callee.bridged))
   }
 
   public func getDestructor(ofExactType type: Type) -> Function? {
-    let destructors = FunctionArray(bridged: CalleeAnalysis_getDestructors(bridged, type.bridged, /*isExactType*/ 1))
+    let destructors = FunctionArray(bridged: bridged.getDestructors(type.bridged, /*isExactType*/ true))
     if destructors.count == 1 {
       return destructors[0]
     }
@@ -37,21 +53,88 @@ public struct CalleeAnalysis {
   }
 
   public func getDestructors(of type: Type) -> FunctionArray? {
-    let bridgedDtors = CalleeAnalysis_getDestructors(bridged, type.bridged, /*isExactType*/ 0)
-    if bridgedDtors.incomplete != 0 {
+    let bridgedDtors = bridged.getDestructors(type.bridged, /*isExactType*/ false)
+    if bridgedDtors.isIncomplete() {
       return nil
     }
     return FunctionArray(bridged: bridgedDtors)
   }
+
+  /// Returns the global (i.e. not argument specific) side effects of an apply.
+  public func getSideEffects(of apply: ApplySite) -> SideEffects.GlobalEffects {
+    guard let callees = getCallees(callee: apply.callee) else {
+      return .worstEffects
+    }
+
+    var result = SideEffects.GlobalEffects()
+    for callee in callees {
+      let calleeEffects = callee.getSideEffects()
+      result.merge(with: calleeEffects)
+    }
+    return result
+  }
+
+  /// Returns the argument specific side effects of an apply.
+  public func getSideEffects(of apply: ApplySite, forArgument argumentIdx: Int, path: SmallProjectionPath) -> SideEffects.GlobalEffects {
+    let calleeArgIdx = apply.calleeArgIndex(callerArgIndex: argumentIdx)
+    let convention = apply.getArgumentConvention(calleeArgIndex: calleeArgIdx)
+    let argument = apply.arguments[argumentIdx].at(path)
+
+    guard let callees = getCallees(callee: apply.callee) else {
+      return .worstEffects.restrictedTo(argument: argument, withConvention: convention)
+    }
+  
+    var result = SideEffects.GlobalEffects()
+    for callee in callees {
+      let calleeEffects = callee.getSideEffects(forArgument: argument,
+                                                atIndex: calleeArgIdx,
+                                                withConvention: convention)
+      result.merge(with: calleeEffects)
+    }
+    return result.restrictedTo(argument: argument, withConvention: convention)
+  }
+}
+
+extension FullApplySite {
+  fileprivate func isBarrier(_ analysis: CalleeAnalysis) -> Bool {
+    guard let callees = analysis.getCallees(callee: callee) else {
+      return true
+    }
+    return callees.contains { $0.isDeinitBarrier }
+  }
+}
+
+extension Instruction {
+  public final func maySynchronize(_ analysis: CalleeAnalysis) -> Bool {
+    if let site = self as? FullApplySite {
+      return site.isBarrier(analysis)
+    }
+    return maySynchronizeNotConsideringSideEffects
+  }
+
+  /// Whether lifetime ends of lexical values may safely be hoisted over this
+  /// instruction.
+  ///
+  /// Deinitialization barriers constrain variable lifetimes. Lexical
+  /// end_borrow, destroy_value, and destroy_addr cannot be hoisted above them.
+  public final func isDeinitBarrier(_ analysis: CalleeAnalysis) -> Bool {
+    return mayAccessPointer || mayLoadWeakOrUnowned || maySynchronize(analysis)
+  }
 }
 
 public struct FunctionArray : RandomAccessCollection, FormattedLikeArray {
-  fileprivate let bridged: BridgedCalleeList
+  fileprivate let bridged: swift.CalleeList
 
   public var startIndex: Int { 0 }
-  public var endIndex: Int { BridgedFunctionArray_size(bridged) }
+  public var endIndex: Int { Int(bridged.getCount()) }
 
   public subscript(_ index: Int) -> Function {
-    return BridgedFunctionArray_get(bridged, index).function
+    return BridgedCalleeAnalysis.getCallee(bridged, index).function
   }
 }
+// Bridging utilities
+
+extension BridgedCalleeAnalysis {
+  public var analysis: CalleeAnalysis { .init(bridged: self) }
+}
+

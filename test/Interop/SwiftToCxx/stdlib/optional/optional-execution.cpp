@@ -1,8 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: split-file %s %t
 
-// RUN: %target-swift-frontend -parse-as-library %platform-module-dir/Swift.swiftmodule/%module-target-triple.swiftinterface -enable-library-evolution -disable-objc-attr-requires-foundation-module -typecheck -module-name Swift -parse-stdlib -enable-experimental-cxx-interop -emit-clang-header-path %t/Swift.h  -experimental-skip-all-function-bodies
-
 // RUN: %target-swift-frontend -typecheck %t/use-optional.swift -typecheck -module-name UseOptional -enable-experimental-cxx-interop -emit-clang-header-path %t/UseOptional.h
 
 // RUN: %target-interop-build-clangxx -fno-exceptions -std=gnu++20 -c %t/optional-execution.cpp -I %t -o %t/swift-stdlib-execution.o
@@ -77,30 +75,46 @@ public func resetOpt<T>(_ val: inout Optional<T>) {
 //--- optional-execution.cpp
 
 #include <cassert>
-#include "Swift.h"
 #include "UseOptional.h"
 
 int main() {
-  using namespace Swift;
+  using namespace swift;
   using namespace UseOptional;
 
   {
     auto val = createCIntOpt(2);
     takeCIntOpt(val);
+    assert((bool)val);
     assert(val.isSome());
     assert(val.getUnsafelyUnwrapped() == 2);
+    assert(val.get() == 2);
     resetOpt(val);
+    assert(!(bool)val);
     assert(val.isNone());
     takeCIntOpt(val);
   }
 // CHECK: Optional(2)
 // CHECK-NEXT: nil
   {
+    auto val = Optional<int>::some(-97);
+    takeCIntOpt(val);
+    assert((bool)val);
+    assert(val.get() == -97);
+    auto val2 = Optional<int>::none();
+    assert(!(bool)val2);
+    takeCIntOpt(val2);
+  }
+// CHECK-NEXT: Optional(-97)
+// CHECK-NEXT: nil
+  {
     auto val = createSmallStructOpt(0xFA);
     takeSmallStructOpt(val);
+    assert((bool)val);
     assert(val.isSome());
     assert(val.getUnsafelyUnwrapped().getX() == 0xFA);
+    assert(val.get().getX() == 0xFA);
     resetOpt(val);
+    assert(!(bool)val);
     assert(val.isNone());
     takeSmallStructOpt(val);
   }

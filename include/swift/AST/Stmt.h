@@ -34,13 +34,17 @@ class AnyPattern;
 class ASTContext;
 class ASTWalker;
 class Decl;
+class DeclContext;
+class Evaluator;
 class Expr;
 class FuncDecl;
+class AbstractFunctionDecl;
 class Pattern;
 class PatternBindingDecl;
 class VarDecl;
 class CaseStmt;
 class DoCatchStmt;
+class IsSingleValueStmtResult;
 class SwitchStmt;
 
 enum class StmtKind {
@@ -101,7 +105,7 @@ protected:
   /// Return the given value for the 'implicit' flag if present, or if None,
   /// return true if the location is invalid.
   static bool getDefaultImplicitFlag(Optional<bool> implicit, SourceLoc keyLoc){
-    return implicit.hasValue() ? *implicit : keyLoc.isInvalid();
+    return implicit.has_value() ? *implicit : keyLoc.isInvalid();
   }
   
 public:
@@ -120,6 +124,10 @@ public:
   /// to the user of the compiler in any way.
   static StringRef getKindName(StmtKind kind);
 
+  /// Retrieve the descriptive kind name for a given statement. This is suitable
+  /// for use in diagnostics.
+  static StringRef getDescriptiveKindName(StmtKind K);
+
   /// Return the location of the start of the statement.
   SourceLoc getStartLoc() const;
   
@@ -128,7 +136,12 @@ public:
   
   SourceRange getSourceRange() const;
   SourceLoc TrailingSemiLoc;
-  
+
+  /// Whether the statement can produce a single value, and as such may be
+  /// treated as an expression.
+  IsSingleValueStmtResult mayProduceSingleValue(Evaluator &eval) const;
+  IsSingleValueStmtResult mayProduceSingleValue(ASTContext &ctx) const;
+
   /// isImplicit - Determines whether this statement was implicitly-generated,
   /// rather than explicitly written in the AST.
   bool isImplicit() const { return Bits.Stmt.Implicit; }
@@ -171,6 +184,13 @@ public:
   SourceLoc getStartLoc() const;
   SourceLoc getEndLoc() const;
 
+  SourceLoc getContentStartLoc() const;
+  SourceLoc getContentEndLoc() const;
+  /// The range of the brace statement without the braces.
+  SourceRange getContentRange() const {
+    return {getContentStartLoc(), getContentEndLoc()};
+  }
+
   bool empty() const { return getNumElements() == 0; }
   unsigned getNumElements() const { return Bits.BraceStmt.NumElements; }
 
@@ -191,6 +211,10 @@ public:
   }
 
   ASTNode findAsyncNode();
+
+  /// If this brace is wrapping a single expression, returns it. Otherwise
+  /// returns \c nullptr.
+  Expr *getSingleExpressionElement() const;
 
   static bool classof(const Stmt *S) { return S->getKind() == StmtKind::Brace; }
 };
@@ -398,6 +422,7 @@ public:
 class PoundHasSymbolInfo final : public ASTAllocated<PoundHasSymbolInfo> {
   Expr *SymbolExpr;
   ConcreteDeclRef ReferencedDecl;
+  bool Invalid;
 
   SourceLoc PoundLoc;
   SourceLoc LParenLoc;
@@ -405,7 +430,7 @@ class PoundHasSymbolInfo final : public ASTAllocated<PoundHasSymbolInfo> {
 
   PoundHasSymbolInfo(SourceLoc PoundLoc, SourceLoc LParenLoc, Expr *SymbolExpr,
                      SourceLoc RParenLoc)
-      : SymbolExpr(SymbolExpr), ReferencedDecl(), PoundLoc(PoundLoc),
+      : SymbolExpr(SymbolExpr), ReferencedDecl(), Invalid(), PoundLoc(PoundLoc),
         LParenLoc(LParenLoc), RParenLoc(RParenLoc){};
 
 public:
@@ -418,6 +443,10 @@ public:
 
   ConcreteDeclRef getReferencedDecl() { return ReferencedDecl; }
   void setReferencedDecl(ConcreteDeclRef CDR) { ReferencedDecl = CDR; }
+
+  /// Returns true if the referenced decl has been diagnosed as invalid.
+  bool isInvalid() const { return Invalid; }
+  void setInvalid() { Invalid = true; }
 
   SourceLoc getLParenLoc() const { return LParenLoc; }
   SourceLoc getRParenLoc() const { return RParenLoc; }
@@ -630,7 +659,7 @@ public:
 };
 
 /// Either an "if let" case or a simple boolean expression can appear as the
-/// condition of an 'if' or 'while' statement.
+/// condition of an 'if', 'guard', or 'while' statement.
 using StmtCondition = MutableArrayRef<StmtConditionElement>;
 
 /// This is the common base class between statements that can have labels, and
@@ -694,7 +723,14 @@ public:
 
   Stmt *getElseStmt() const { return Else; }
   void setElseStmt(Stmt *s) { Else = s; }
-  
+
+  /// Retrieve the complete set of branches for this if statement, including
+  /// else if statements.
+  ArrayRef<Stmt *> getBranches(SmallVectorImpl<Stmt *> &scratch) const;
+
+  /// Whether the if statement has an unconditional \c else.
+  bool isSyntacticallyExhaustive() const;
+
   // Implement isa/cast/dyncast/etc.
   static bool classof(const Stmt *S) { return S->getKind() == StmtKind::If; }
 };
@@ -1088,7 +1124,7 @@ public:
   void setBody(BraceStmt *body) { BodyAndHasFallthrough.setPointer(body); }
 
   /// True if the case block declares any patterns with local variable bindings.
-  bool hasBoundDecls() const { return CaseBodyVariables.hasValue(); }
+  bool hasBoundDecls() const { return CaseBodyVariables.has_value(); }
 
   /// Get the source location of the 'case', 'default', or 'catch' of the first
   /// label.
@@ -1147,7 +1183,7 @@ public:
     return a;
   }
 
-  bool hasCaseBodyVariables() const { return CaseBodyVariables.hasValue(); }
+  bool hasCaseBodyVariables() const { return CaseBodyVariables.has_value(); }
 
   /// Return an MutableArrayRef containing the case body variables of this
   /// CaseStmt.
@@ -1266,7 +1302,10 @@ public:
   AsCaseStmtRange getCases() const {
     return AsCaseStmtRange(getRawCases(), AsCaseStmtWithSkippingNonCaseStmts());
   }
-  
+
+  /// Retrieve the complete set of branches for this switch statement.
+  ArrayRef<Stmt *> getBranches(SmallVectorImpl<Stmt *> &scratch) const;
+
   static bool classof(const Stmt *S) {
     return S->getKind() == StmtKind::Switch;
   }
@@ -1331,13 +1370,13 @@ class BreakStmt : public Stmt {
   SourceLoc Loc;
   Identifier TargetName; // Named target statement, if specified in the source.
   SourceLoc TargetLoc;
-  LabeledStmt *Target = nullptr;  // Target stmt, wired up by Sema.
+  DeclContext *DC;
+
 public:
   BreakStmt(SourceLoc Loc, Identifier TargetName, SourceLoc TargetLoc,
-            Optional<bool> implicit = None)
+            DeclContext *DC, Optional<bool> implicit = None)
     : Stmt(StmtKind::Break, getDefaultImplicitFlag(implicit, Loc)), Loc(Loc),
-      TargetName(TargetName), TargetLoc(TargetLoc) {
-  }
+      TargetName(TargetName), TargetLoc(TargetLoc), DC(DC) {}
 
   SourceLoc getLoc() const { return Loc; }
 
@@ -1346,15 +1385,15 @@ public:
   SourceLoc getTargetLoc() const { return TargetLoc; }
   void setTargetLoc(SourceLoc L) { TargetLoc = L; }
 
-  // Manipulate the target loop/switch that is bring broken out of.  This is set
-  // by sema during type checking.
-  void setTarget(LabeledStmt *LS) { Target = LS; }
-  LabeledStmt *getTarget() const { return Target; }
+  /// Retrieve the target statement being jumped out of.
+  LabeledStmt *getTarget() const;
 
   SourceLoc getStartLoc() const { return Loc; }
   SourceLoc getEndLoc() const {
     return (TargetLoc.isValid() ? TargetLoc : Loc);
   }
+
+  DeclContext *getDeclContext() const { return DC; }
 
   static bool classof(const Stmt *S) {
     return S->getKind() == StmtKind::Break;
@@ -1366,24 +1405,21 @@ class ContinueStmt : public Stmt {
   SourceLoc Loc;
   Identifier TargetName; // Named target statement, if specified in the source.
   SourceLoc TargetLoc;
-  LabeledStmt *Target = nullptr;
+  DeclContext *DC;
 
 public:
   ContinueStmt(SourceLoc Loc, Identifier TargetName, SourceLoc TargetLoc,
-               Optional<bool> implicit = None)
+               DeclContext *DC, Optional<bool> implicit = None)
     : Stmt(StmtKind::Continue, getDefaultImplicitFlag(implicit, Loc)), Loc(Loc),
-      TargetName(TargetName), TargetLoc(TargetLoc) {
-  }
+      TargetName(TargetName), TargetLoc(TargetLoc), DC(DC) {}
 
   Identifier getTargetName() const { return TargetName; }
   void setTargetName(Identifier N) { TargetName = N; }
   SourceLoc getTargetLoc() const { return TargetLoc; }
   void setTargetLoc(SourceLoc L) { TargetLoc = L; }
 
-  // Manipulate the target loop that is bring continued.  This is set by sema
-  // during type checking.
-  void setTarget(LabeledStmt *LS) { Target = LS; }
-  LabeledStmt *getTarget() const { return Target; }
+  /// Retrieve the target statement being jumped to.
+  LabeledStmt *getTarget() const;
   
   SourceLoc getLoc() const { return Loc; }
   
@@ -1391,6 +1427,8 @@ public:
   SourceLoc getEndLoc() const {
     return (TargetLoc.isValid() ? TargetLoc : Loc);
   }
+
+  DeclContext *getDeclContext() const { return DC; }
 
   static bool classof(const Stmt *S) {
     return S->getKind() == StmtKind::Continue;
@@ -1445,6 +1483,44 @@ public:
   }
 };
 
+/// ForgetStmt - Consumes a noncopyable value and performs memberwise
+/// destruction of unconsumed fields, without invoking its deinit. Only
+/// supported form is "forget self".
+class ForgetStmt : public Stmt {
+  Expr *SubExpr;
+  SourceLoc ForgetLoc;
+  AbstractFunctionDecl *InnermostMethod;
+
+public:
+  explicit ForgetStmt(SourceLoc forgetLoc, Expr *subExpr)
+      : Stmt(StmtKind::Forget, /*Implicit=*/false),
+        SubExpr(subExpr), ForgetLoc(forgetLoc), InnermostMethod(nullptr) {}
+
+  SourceLoc getForgetLoc() const { return ForgetLoc; }
+
+  SourceLoc getStartLoc() const { return ForgetLoc; }
+  SourceLoc getEndLoc() const;
+  SourceRange getSourceRange() const {
+    return SourceRange(ForgetLoc, getEndLoc());
+  }
+
+  Expr *getSubExpr() const { return SubExpr; }
+  void setSubExpr(Expr *subExpr) { SubExpr = subExpr; }
+
+  /// Retrieves the saved innermost method / accessor decl in which this Stmt
+  /// resides. Corresponds to \c DeclContext::getInnermostMethodContext.
+  /// Must be saved with \c setInnermostMethodContext during typechecking.
+  AbstractFunctionDecl *getInnermostMethodContext() { return InnermostMethod; }
+  void setInnermostMethodContext(AbstractFunctionDecl *afd) {
+    assert(afd); // shouldn't be clearing this
+    InnermostMethod = afd;
+  }
+
+  static bool classof(const Stmt *S) {
+    return S->getKind() == StmtKind::Forget;
+  }
+};
+
 /// PoundAssertStmt - Asserts that a condition is true, at compile time.
 class PoundAssertStmt : public Stmt {
   SourceRange Range;
@@ -1470,7 +1546,9 @@ class PoundAssertStmt : public Stmt {
   }
 };
 
-inline void simple_display(llvm::raw_ostream &out, Stmt *S) {
+SourceLoc extractNearestSourceLoc(const Stmt *stmt);
+
+inline void simple_display(llvm::raw_ostream &out, const Stmt *S) {
   if (S)
     out << Stmt::getKindName(S->getKind());
   else

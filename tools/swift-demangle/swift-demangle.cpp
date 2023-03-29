@@ -271,7 +271,7 @@ static bool findMaybeMangled(llvm::StringRef input, llvm::StringRef &match) {
   } state = Start;
   const char *matchStart = nullptr;
 
-  // Find _T, $S, $s, _$S, _$s followed by a valid mangled string
+  // Find _T, $S, $s, _$S, _$s, @__swift_ followed by a valid mangled string
   while (ptr < end) {
     switch (state) {
     case Start:
@@ -285,6 +285,12 @@ static bool findMaybeMangled(llvm::StringRef input, llvm::StringRef &match) {
         } else if (ch == '$') {
           state = SeenDollar;
           matchStart = ptr - 1;
+          break;
+        } else if (ch == '@' &&
+                   llvm::StringRef(ptr, end - ptr).startswith("__swiftmacro_")){
+          matchStart = ptr - 1;
+          ptr = ptr + strlen("__swift_");
+          state = FoundPrefix;
           break;
         }
       }
@@ -391,6 +397,12 @@ int main(int argc, char **argv) {
   } else {
     swift::Demangle::Context DCtx;
     for (llvm::StringRef name : InputNames) {
+      if (name == "_") {
+        llvm::errs() << "warning: input symbol '_' is likely the result of "
+                        "variable expansion by the shell. Ensure the argument "
+                        "is quoted or escaped.\n";
+        continue;
+      }
       if (name.startswith("S") || name.startswith("s") ) {
         std::string correctedName = std::string("$") + name.str();
         demangle(llvm::outs(), correctedName, DCtx, options);

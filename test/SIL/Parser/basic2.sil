@@ -63,34 +63,21 @@ bb0(%0 : @owned $Builtin.NativeObject):
   return %5 : $Builtin.NativeObject
 }
 
-// CHECK-LABEL: sil @test_movevalue_parsing_non_ossa : $@convention(thin) (@owned Builtin.NativeObject) -> @owned Builtin.NativeObject {
-// CHECK: bb0(%0 :
-// CHECK-NEXT: %1 = move_value %0 : $Builtin.NativeObject
-// CHECK-NEXT: %2 = move_value [allows_diagnostics] %1 : $Builtin.NativeObject
-// CHECK-NEXT: return
-// CHECK-NEXT: } // end sil function 'test_movevalue_parsing_non_ossa'
-sil @test_movevalue_parsing_non_ossa : $@convention(thin) (@owned Builtin.NativeObject) -> @owned Builtin.NativeObject {
-bb0(%0 : $Builtin.NativeObject):
-  %1 = move_value %0 : $Builtin.NativeObject
-  %2 = move_value [allows_diagnostics] %1 : $Builtin.NativeObject
-  return %2 : $Builtin.NativeObject
-}
-
 // CHECK-LABEL: sil [ossa] @test_debug_value_alloc_stack_moved : $@convention(thin) (@owned Builtin.NativeObject) -> () {
-// CHECK:  debug_value [moved] %0 : $Builtin.NativeObject
+// CHECK:  debug_value [moveable_value_debuginfo] %0 : $Builtin.NativeObject
 // CHECK:  debug_value [poison] %0 : $Builtin.NativeObject
-// CHECK:  debug_value [poison] [moved] %0 : $Builtin.NativeObject
-// CHECK:  debug_value [poison] [moved] %0 : $Builtin.NativeObject
-// CHECK:  alloc_stack [moved] $Builtin.NativeObject
+// CHECK:  debug_value [poison] [moveable_value_debuginfo] %0 : $Builtin.NativeObject
+// CHECK:  debug_value [poison] [moveable_value_debuginfo] %0 : $Builtin.NativeObject
+// CHECK:  alloc_stack [moveable_value_debuginfo] $Builtin.NativeObject
 // CHECK: } // end sil function 'test_debug_value_alloc_stack_moved'
 sil [ossa] @test_debug_value_alloc_stack_moved : $@convention(thin) (@owned Builtin.NativeObject) -> () {
 bb0(%0 : @owned $Builtin.NativeObject):
-  debug_value [moved] %0 : $Builtin.NativeObject
+  debug_value [moveable_value_debuginfo] %0 : $Builtin.NativeObject
   debug_value [poison] %0 : $Builtin.NativeObject
-  debug_value [moved] [poison] %0 : $Builtin.NativeObject
-  debug_value [poison] [moved] %0 : $Builtin.NativeObject
+  debug_value [moveable_value_debuginfo] [poison] %0 : $Builtin.NativeObject
+  debug_value [poison] [moveable_value_debuginfo] %0 : $Builtin.NativeObject
 
-  %1 = alloc_stack [moved] $Builtin.NativeObject
+  %1 = alloc_stack [moveable_value_debuginfo] $Builtin.NativeObject
   dealloc_stack %1 : $*Builtin.NativeObject
 
   destroy_value %0 : $Builtin.NativeObject
@@ -115,8 +102,8 @@ bb0(%0 : @owned $@moveOnly Builtin.NativeObject):
 }
 
 // CHECK-LABEL: sil [ossa] @test_explicit_copy_addr : $@convention(thin) (@owned Builtin.NativeObject) -> () {
-// CHECK: explicit_copy_addr %{{[0-9]+}} to [initialization] %{{[0-9]+}} :
-// CHECK: explicit_copy_addr [take] %{{[0-9]+}} to [initialization] %{{[0-9]+}} :
+// CHECK: explicit_copy_addr %{{[0-9]+}} to [init] %{{[0-9]+}} :
+// CHECK: explicit_copy_addr [take] %{{[0-9]+}} to [init] %{{[0-9]+}} :
 // CHECK: explicit_copy_addr [take] %{{[0-9]+}} to %{{[0-9]+}} :
 // CHECK: explicit_copy_addr %{{[0-9]+}} to %{{[0-9]+}} :
 // CHECK: } // end sil function 'test_explicit_copy_addr'
@@ -128,8 +115,8 @@ bb0(%0 : @owned $Builtin.NativeObject):
 
   %0a = copy_value %0 : $Builtin.NativeObject
   store %0a to [init] %1 : $*Builtin.NativeObject
-  explicit_copy_addr %1 to [initialization] %2 : $*Builtin.NativeObject  
-  explicit_copy_addr [take] %2 to [initialization] %3 : $*Builtin.NativeObject
+  explicit_copy_addr %1 to [init] %2 : $*Builtin.NativeObject  
+  explicit_copy_addr [take] %2 to [init] %3 : $*Builtin.NativeObject
   explicit_copy_addr [take] %3 to %1 : $*Builtin.NativeObject
 
   store %0 to [init] %2 : $*Builtin.NativeObject
@@ -140,6 +127,17 @@ bb0(%0 : @owned $Builtin.NativeObject):
   dealloc_stack %3 : $*Builtin.NativeObject
   dealloc_stack %2 : $*Builtin.NativeObject
   dealloc_stack %1 : $*Builtin.NativeObject
+  %9999 = tuple()
+  return %9999 : $()
+}
+
+// CHECK-LABEL: sil [ossa] @test_allocbox_moveable_value_debuginfo_flag : $@convention(thin) () -> () {
+// CHECK: alloc_box [moveable_value_debuginfo] ${ var Builtin.NativeObject }
+// CHECK: } // end sil function 'test_allocbox_moveable_value_debuginfo_flag'
+sil [ossa] @test_allocbox_moveable_value_debuginfo_flag : $@convention(thin) () -> () {
+bb0:
+  %0 = alloc_box [moveable_value_debuginfo] ${ var Builtin.NativeObject }
+  dealloc_box %0 : ${ var Builtin.NativeObject }
   %9999 = tuple()
   return %9999 : $()
 }

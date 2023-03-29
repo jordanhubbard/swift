@@ -13,6 +13,16 @@
 import SIL
 import OptimizerBridging
 
+protocol IntrusiveSet : CustomStringConvertible, NoReflectionChildren {
+  associatedtype Element
+
+  init(_ context: some Context)
+  mutating func insert(_ element: Element) -> Bool
+  mutating func erase(_ element: Element)
+  func contains(_ element: Element) -> Bool
+  mutating func deinitialize()
+}
+
 /// A set of basic blocks.
 ///
 /// This is an extremely efficient implementation which does not need memory
@@ -21,42 +31,40 @@ import OptimizerBridging
 /// This type should be a move-only type, but unfortunately we don't have move-only
 /// types yet. Therefore it's needed to call `deinitialize()` explicitly to
 /// destruct this data structure, e.g. in a `defer {}` block.
-struct BasicBlockSet : CustomStringConvertible, CustomReflectable {
+struct BasicBlockSet : IntrusiveSet {
 
-  private let context: PassContext
+  private let context: BridgedPassContext
   private let bridged: BridgedBasicBlockSet
     
-  init(_ context: PassContext) {
-    self.context = context
-    self.bridged = PassContext_allocBasicBlockSet(context._bridged)
+  init(_ context: some Context) {
+    self.context = context._bridged
+    self.bridged = self.context.allocBasicBlockSet()
   }
 
   func contains(_ block: BasicBlock) -> Bool {
-    BasicBlockSet_contains(bridged, block.bridged) != 0
+    bridged.contains(block.bridged)
   }
 
   /// Returns true if `block` was not contained in the set before inserting.
   @discardableResult
   mutating func insert(_ block: BasicBlock) -> Bool {
-    BasicBlockSet_insert(bridged, block.bridged) != 0
+    bridged.insert(block.bridged)
   }
 
   mutating func erase(_ block: BasicBlock) {
-    BasicBlockSet_erase(bridged, block.bridged)
+    bridged.erase(block.bridged)
   }
 
   var description: String {
-    let function = BasicBlockSet_getFunction(bridged).function
+    let function = bridged.getFunction().function
     let blockNames = function.blocks.enumerated().filter { contains($0.1) }
                                                  .map { "bb\($0.0)"}
     return "{" + blockNames.joined(separator: ", ") + "}"
   }
 
-  var customMirror: Mirror { Mirror(self, children: []) }
-
   /// TODO: once we have move-only types, make this a real deinit.
   mutating func deinitialize() {
-    PassContext_freeBasicBlockSet(context._bridged, bridged)
+    context.freeBasicBlockSet(bridged)
   }
 }
 
@@ -68,32 +76,32 @@ struct BasicBlockSet : CustomStringConvertible, CustomReflectable {
 /// This type should be a move-only type, but unfortunately we don't have move-only
 /// types yet. Therefore it's needed to call `deinitialize()` explicitly to
 /// destruct this data structure, e.g. in a `defer {}` block.
-struct ValueSet : CustomStringConvertible, CustomReflectable {
+struct ValueSet : IntrusiveSet {
 
-  private let context: PassContext
+  private let context: BridgedPassContext
   private let bridged: BridgedNodeSet
     
-  init(_ context: PassContext) {
-    self.context = context
-    self.bridged = PassContext_allocNodeSet(context._bridged)
+  init(_ context: some Context) {
+    self.context = context._bridged
+    self.bridged = self.context.allocNodeSet()
   }
 
   func contains(_ value: Value) -> Bool {
-    NodeSet_containsValue(bridged, value.bridged) != 0
+    bridged.containsValue(value.bridged)
   }
 
   /// Returns true if `value` was not contained in the set before inserting.
   @discardableResult
   mutating func insert(_ value: Value) -> Bool {
-    NodeSet_insertValue(bridged, value.bridged) != 0
+    bridged.insertValue(value.bridged)
   }
 
   mutating func erase(_ value: Value) {
-    NodeSet_eraseValue(bridged, value.bridged)
+    bridged.eraseValue(value.bridged)
   }
 
   var description: String {
-    let function = NodeSet_getFunction(bridged).function
+    let function = bridged.getFunction().function
     var d = "{\n"
     for block in function.blocks {
       for arg in block.arguments {
@@ -113,11 +121,9 @@ struct ValueSet : CustomStringConvertible, CustomReflectable {
     return d
   }
 
-  var customMirror: Mirror { Mirror(self, children: []) }
-
   /// TODO: once we have move-only types, make this a real deinit.
   mutating func deinitialize() {
-    PassContext_freeNodeSet(context._bridged, bridged)
+    context.freeNodeSet(bridged)
   }
 }
 
@@ -129,32 +135,32 @@ struct ValueSet : CustomStringConvertible, CustomReflectable {
 /// This type should be a move-only type, but unfortunately we don't have move-only
 /// types yet. Therefore it's needed to call `deinitialize()` explicitly to
 /// destruct this data structure, e.g. in a `defer {}` block.
-struct InstructionSet : CustomStringConvertible, CustomReflectable {
+struct InstructionSet : IntrusiveSet {
 
-  private let context: PassContext
+  private let context: BridgedPassContext
   private let bridged: BridgedNodeSet
     
-  init(_ context: PassContext) {
-    self.context = context
-    self.bridged = PassContext_allocNodeSet(context._bridged)
+  init(_ context: some Context) {
+    self.context = context._bridged
+    self.bridged = self.context.allocNodeSet()
   }
 
   func contains(_ inst: Instruction) -> Bool {
-    NodeSet_containsInstruction(bridged, inst.bridged) != 0
+    bridged.containsInstruction(inst.bridged)
   }
 
   /// Returns true if `inst` was not contained in the set before inserting.
   @discardableResult
   mutating func insert(_ inst: Instruction) -> Bool {
-    NodeSet_insertInstruction(bridged, inst.bridged) != 0
+    bridged.insertInstruction(inst.bridged)
   }
 
   mutating func erase(_ inst: Instruction) {
-    NodeSet_eraseInstruction(bridged, inst.bridged)
+    bridged.eraseInstruction(inst.bridged)
   }
 
   var description: String {
-    let function = NodeSet_getFunction(bridged).function
+    let function = bridged.getFunction().function
     var d = "{\n"
     for inst in function.instructions {
       if contains(inst) {
@@ -165,10 +171,8 @@ struct InstructionSet : CustomStringConvertible, CustomReflectable {
     return d
   }
 
-  var customMirror: Mirror { Mirror(self, children: []) }
-
   /// TODO: once we have move-only types, make this a real deinit.
   mutating func deinitialize() {
-    PassContext_freeNodeSet(context._bridged, bridged)
+    context.freeNodeSet(bridged)
   }
 }

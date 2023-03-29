@@ -284,7 +284,7 @@ void RuleBuilder::addRequirement(const Requirement &req,
     llvm::dbgs() << "\n";
   }
 
-  assert(!substitutions.hasValue() || proto == nullptr && "Can't have both");
+  assert(!substitutions.has_value() || proto == nullptr && "Can't have both");
 
   // Compute the left hand side.
   auto subjectType = CanType(req.getFirstType());
@@ -298,8 +298,25 @@ void RuleBuilder::addRequirement(const Requirement &req,
   MutableTerm constraintTerm;
 
   switch (req.getKind()) {
-  case RequirementKind::SameCount:
-      llvm_unreachable("Same-count requirement not supported here");
+  case RequirementKind::SameShape: {
+    // A same-shape requirement T.shape == U.shape
+    // becomes a rewrite rule:
+    //
+    //    T.[shape] => U.[shape]
+    auto otherType = CanType(req.getSecondType());
+    assert(otherType->isParameterPack());
+
+    constraintTerm = (substitutions
+                      ? Context.getRelativeTermForType(
+                            otherType, *substitutions)
+                      : Context.getMutableTermForType(
+                            otherType, proto));
+
+    // Add the [shape] symbol to both sides.
+    subjectTerm.add(Symbol::forShape(Context));
+    constraintTerm.add(Symbol::forShape(Context));
+    break;
+  }
 
   case RequirementKind::Conformance: {
     // A conformance requirement T : P becomes a rewrite rule
@@ -427,8 +444,8 @@ void RuleBuilder::addReferencedProtocol(const ProtocolDecl *proto) {
 }
 
 /// Compute the transitive closure of the set of all protocols referenced from
-/// the right hand sides of conformance requirements, and convert their
-/// requirements to rewrite rules.
+/// the right hand sides of conformance requirements, and import the rewrite
+/// rules from the requirement machine for each protocol component.
 void RuleBuilder::collectRulesFromReferencedProtocols() {
   // Compute the transitive closure.
   unsigned i = 0;
@@ -445,12 +462,9 @@ void RuleBuilder::collectRulesFromReferencedProtocols() {
   // if this is a rewrite system for a connected component of the protocol
   // dependency graph, add rewrite rules for each referenced protocol not part
   // of this connected component.
-
-  // First, collect all unique requirement machines, one for each connected
-  // component of each referenced protocol.
   llvm::DenseSet<RequirementMachine *> machines;
 
-  // Now visit each subordinate requirement machine pull in its rules.
+  // Now visit each protocol component requirement machine and pull in its rules.
   for (auto *proto : ProtocolsToImport) {
     // This will trigger requirement signature computation for this protocol,
     // if necessary, which will cause us to re-enter into a new RuleBuilder
@@ -461,13 +475,13 @@ void RuleBuilder::collectRulesFromReferencedProtocols() {
 
     auto *machine = Context.getRequirementMachine(proto);
     if (!machines.insert(machine).second) {
-      // We've already seen this connected component.
+      // We've already seen this protocol component.
       continue;
     }
 
     // We grab the machine's local rules, not *all* of its rules, to avoid
     // duplicates in case multiple machines share a dependency on a downstream
-    // protocol connected component.
+    // protocol component.
     auto localRules = machine->getLocalRules();
     ImportedRules.insert(ImportedRules.end(),
                          localRules.begin(),

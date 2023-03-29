@@ -119,6 +119,10 @@ public:
 
   Expr *get() const { return FoundExpr; }
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
+
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     if (TargetRange == E->getSourceRange() && !shouldIgnore(E)) {
       assert(!FoundExpr && "non-nullptr for found expr");
@@ -162,6 +166,10 @@ public:
   bool Removed = false;
 
   CCExprRemover(ASTContext &Ctx) : Ctx(Ctx) {}
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
 
   Expr *visitCallExpr(CallExpr *E) {
     auto *args = E->getArgs()->getOriginalArgs();
@@ -254,8 +262,7 @@ void swift::ide::collectPossibleReturnTypesFromContext(
         } else {
           const auto type = swift::performTypeResolution(
               CE->getExplicitResultTypeRepr(), DC->getASTContext(),
-              /*isSILMode=*/false, /*isSILType=*/false,
-              DC->getGenericSignatureOfContext(), /*GenericParams=*/nullptr,
+              DC->getGenericSignatureOfContext(), /*SILContext=*/nullptr,
               const_cast<DeclContext *>(DC), /*diagnostics=*/false);
 
           if (!type->hasError()) {
@@ -302,6 +309,10 @@ public:
   ExprParentFinder(Expr *ChildExpr,
                    std::function<bool(ParentTy, ParentTy)> Predicate)
       : ChildExpr(ChildExpr), Predicate(Predicate) {}
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::ArgumentsAndExpansion;
+  }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
     // Finish if we found the target. 'ChildExpr' might have been replaced
@@ -882,7 +893,7 @@ class ExprContextAnalyzer {
               *DC, originalArgs, ParsedExpr, typeAndDecl.Type->getParams(),
               /*lenient=*/false);
           posInParams.push_back(pos);
-          found |= pos.hasValue();
+          found |= pos.has_value();
         }
         if (!found) {
           // If applicable overload is not found, retry with considering
@@ -897,7 +908,7 @@ class ExprContextAnalyzer {
       assert(posInParams.size() == Candidates.size());
 
       for (auto i : indices(Candidates)) {
-        if (!posInParams[i].hasValue()) {
+        if (!posInParams[i].has_value()) {
           // If the argument doesn't have a matching position in the parameters,
           // indicate that with optional nullptr param.
           if (seenArgs.insert({Identifier(), CanType()}).second)
@@ -1016,8 +1027,8 @@ class ExprContextAnalyzer {
       }
       break;
     }
-    case ExprKind::If: {
-      auto *IE = cast<IfExpr>(Parent);
+    case ExprKind::Ternary: {
+      auto *IE = cast<TernaryExpr>(Parent);
       if (IE->isFolded() &&
           SM.rangeContains(IE->getCondExpr()->getSourceRange(),
                            ParsedExpr->getSourceRange())) {
@@ -1174,11 +1185,15 @@ class ExprContextAnalyzer {
     switch (P->getKind()) {
     case PatternKind::Expr: {
       auto ExprPat = cast<ExprPattern>(P);
-      if (auto D = ExprPat->getMatchVar()) {
-        if (D->hasInterfaceType())
-          recordPossibleType(
-              D->getDeclContext()->mapTypeIntoContext(D->getInterfaceType()));
-      }
+      if (!ExprPat->isResolved())
+        break;
+
+      auto D = ExprPat->getMatchVar();
+      if (!D || !D->hasInterfaceType())
+        break;
+
+      auto *DC = D->getDeclContext();
+      recordPossibleType(DC->mapTypeIntoContext(D->getInterfaceType()));
       break;
     }
     default:
@@ -1214,6 +1229,11 @@ class ExprContextAnalyzer {
         return;
       auto *var = initDC->getWrappedVar();
       recordPossibleType(AFD->mapTypeIntoContext(var->getInterfaceType()));
+      break;
+    }
+
+    case InitializerKind::RuntimeAttribute: {
+      // This never appears in AST.
       break;
     }
     }
@@ -1291,7 +1311,7 @@ public:
         case ExprKind::PrefixUnary:
         case ExprKind::Assign:
         case ExprKind::Dictionary:
-        case ExprKind::If:
+        case ExprKind::Ternary:
           return true;
         case ExprKind::Array:
           return (!Parent.getAsExpr() ||

@@ -12,6 +12,7 @@
 
 import Swift
 
+#if !SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY
 #if ASYNC_STREAM_STANDALONE
 @_exported import _Concurrency
 import Darwin
@@ -111,7 +112,7 @@ extension AsyncStream {
       let handler = state.onTermination
       state.onTermination = nil
       unlock()
-      
+
       // handler must be invoked before yielding nil for termination
       handler?(.cancelled)
 
@@ -123,7 +124,7 @@ extension AsyncStream {
       lock()
       let limit = state.limit
       let count = state.pending.count
-      
+
       if !state.continuations.isEmpty {
         let continuation = state.continuations.removeFirst()
         if count > 0 {
@@ -169,7 +170,7 @@ extension AsyncStream {
           case .bufferingOldest(let limit):
             result = .enqueued(remaining: limit)
           }
-          
+
           unlock()
           continuation.resume(returning: value)
         }
@@ -204,7 +205,7 @@ extension AsyncStream {
       }
       return result
     }
-    
+
     func finish() {
       lock()
       let handler = state.onTermination
@@ -248,9 +249,9 @@ extension AsyncStream {
       } else {
         unlock()
       }
-      
+
     }
-    
+
     func next() async -> Element? {
       await withTaskCancellationHandler { [cancel] in
         cancel()
@@ -288,7 +289,7 @@ extension AsyncThrowingStream {
       case finished
       case failed(Failure)
     }
-    
+
     struct State {
       var continuation: UnsafeContinuation<Element?, Error>?
       var pending = _Deque<Element>()
@@ -344,7 +345,7 @@ extension AsyncThrowingStream {
       let handler = state.onTermination
       state.onTermination = nil
       unlock()
-      
+
       // handler must be invoked before yielding nil for termination
       handler?(.cancelled)
 
@@ -408,7 +409,7 @@ extension AsyncThrowingStream {
           case .bufferingNewest(let limit):
             result = .enqueued(remaining: limit)
           }
-          
+
           state.continuation = nil
           unlock()
           continuation.resume(returning: value)
@@ -444,7 +445,7 @@ extension AsyncThrowingStream {
       }
       return result
     }
-    
+
     func finish(throwing error: __owned Failure? = nil) {
       lock()
       let handler = state.onTermination
@@ -509,7 +510,7 @@ extension AsyncThrowingStream {
         fatalError("attempt to await next() on more than one task")
       }
     }
-    
+
     func next() async throws -> Element? {
       try await withTaskCancellationHandler { [cancel] in
         cancel()
@@ -545,7 +546,7 @@ final class _AsyncStreamCriticalStorage<Contents>: @unchecked Sendable {
   private init(_doNotCallMe: ()) {
     fatalError("_AsyncStreamCriticalStorage must be initialized by create")
   }
-  
+
   private func lock() {
     let ptr =
       UnsafeRawPointer(Builtin.projectTailElems(self, UnsafeRawPointer.self))
@@ -557,7 +558,7 @@ final class _AsyncStreamCriticalStorage<Contents>: @unchecked Sendable {
       UnsafeRawPointer(Builtin.projectTailElems(self, UnsafeRawPointer.self))
     _unlock(ptr)
   }
-  
+
   var value: Contents {
     get {
       lock()
@@ -565,7 +566,7 @@ final class _AsyncStreamCriticalStorage<Contents>: @unchecked Sendable {
       unlock()
       return contents
     }
-    
+
     set {
       lock()
       withExtendedLifetime(_value) {
@@ -574,7 +575,7 @@ final class _AsyncStreamCriticalStorage<Contents>: @unchecked Sendable {
       }
     }
   }
-  
+
   static func create(_ initial: Contents) -> _AsyncStreamCriticalStorage {
     let minimumCapacity = _lockWordCount()
     let storage = Builtin.allocWithTailElems_1(
@@ -592,3 +593,4 @@ final class _AsyncStreamCriticalStorage<Contents>: @unchecked Sendable {
     return storage
   }
 }
+#endif

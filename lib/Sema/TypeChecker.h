@@ -57,7 +57,7 @@ namespace constraints {
   enum class ConstraintKind : char;
   class ConstraintSystem;
   class Solution;
-  class SolutionApplicationTarget;
+  class SyntacticElementTarget;
   class SolutionResult;
 }
 
@@ -138,6 +138,9 @@ enum class TypeCheckExprFlags {
 
   /// Don't type check expressions for correct availability.
   DisableExprAvailabilityChecking = 0x08,
+
+  /// Don't expand macros.
+  DisableMacroExpansions = 0x10,
 };
 
 using TypeCheckExprOptions = OptionSet<TypeCheckExprFlags>;
@@ -253,7 +256,7 @@ public:
   const RequirementFailureInfo &getRequirementFailureInfo() const {
     assert(Knd == RequirementFailure);
 
-    return ReqFailureInfo.getValue();
+    return ReqFailureInfo.value();
   }
 
   operator Kind() const { return Knd; }
@@ -341,8 +344,7 @@ Type substMemberTypeWithBase(ModuleDecl *module, TypeDecl *member, Type baseTy,
 /// typealias GX2<A> = X<A, A>
 /// typealias GX3<A, B> = X<B, A>
 /// \endcode
-bool isPassThroughTypealias(TypeAliasDecl *typealias, Type underlyingType,
-                            NominalTypeDecl *nominal);
+bool isPassThroughTypealias(TypeAliasDecl *typealias, NominalTypeDecl *nominal);
 
 /// Determine whether one type is a subtype of another.
 ///
@@ -441,6 +443,10 @@ Expr *substituteInputSugarTypeForResult(ApplyExpr *E);
 bool typeCheckStmtConditionElement(StmtConditionElement &elt, bool &isFalsable,
                                    DeclContext *dc);
 
+/// Returns the unique decl ref identified by the expr according to the
+/// requirements of the \c #_hasSymbol() condition type.
+ConcreteDeclRef getReferencedDeclForHasSymbolCondition(Expr *E);
+
 void typeCheckASTNode(ASTNode &node, DeclContext *DC,
                       bool LeaveBodyUnchecked = false);
 
@@ -451,8 +457,9 @@ void typeCheckASTNode(ASTNode &node, DeclContext *DC,
 /// e.g., because of a \c return statement. Otherwise, returns either the
 /// fully type-checked body of the function (on success) or a \c nullptr
 /// value if an error occurred while type checking the transformed body.
-Optional<BraceStmt *> applyResultBuilderBodyTransform(FuncDecl *func,
-                                                        Type builderType);
+Optional<BraceStmt *> applyResultBuilderBodyTransform(
+    FuncDecl *func, Type builderType,
+    bool ClosuresInResultBuilderDontParticipateInInference = true);
 
 /// Find the return statements within the body of the given function.
 std::vector<ReturnStmt *> findReturnStatements(AnyFunctionRef fn);
@@ -559,7 +566,7 @@ checkGenericArguments(ModuleDecl *module, ArrayRef<Requirement> requirements,
 /// \param module The module to use for conformance lookup.
 /// \param contextSig The generic signature that should be used to map
 /// \p parentTy into context. We pass a generic signature to secure on-demand
-/// computation of the associated generic enviroment.
+/// computation of the associated generic environment.
 ///
 /// \returns \c true on success.
 bool checkContextualRequirements(GenericTypeDecl *decl, Type parentTy,
@@ -597,12 +604,12 @@ Type typeCheckExpression(Expr *&expr, DeclContext *dc,
                          constraints::ContextualTypeInfo contextualInfo = {},
                          TypeCheckExprOptions options = TypeCheckExprOptions());
 
-Optional<constraints::SolutionApplicationTarget>
-typeCheckExpression(constraints::SolutionApplicationTarget &target,
+Optional<constraints::SyntacticElementTarget>
+typeCheckExpression(constraints::SyntacticElementTarget &target,
                     TypeCheckExprOptions options = TypeCheckExprOptions());
 
-Optional<constraints::SolutionApplicationTarget>
-typeCheckTarget(constraints::SolutionApplicationTarget &target,
+Optional<constraints::SyntacticElementTarget>
+typeCheckTarget(constraints::SyntacticElementTarget &target,
                 TypeCheckExprOptions options = TypeCheckExprOptions());
 
 /// Return the type of operator function for specified LHS, or a null
@@ -629,7 +636,7 @@ void filterSolutionsForCodeCompletion(
 /// \returns `true` if target was applicable and it was possible to infer
 /// types for code completion, `false` otherwise.
 bool typeCheckForCodeCompletion(
-    constraints::SolutionApplicationTarget &target, bool needsPrecheck,
+    constraints::SyntacticElementTarget &target, bool needsPrecheck,
     llvm::function_ref<void(const constraints::Solution &)> callback);
 
 /// Check the key-path expression.
@@ -644,6 +651,12 @@ Optional<Type> checkObjCKeyPathExpr(DeclContext *dc, KeyPathExpr *expr,
 /// \param decl The declaration to be type-checked. This process will not
 /// modify the declaration.
 void checkDeclCircularity(NominalTypeDecl *decl);
+
+/// Type check whether an extension matches its Objective-C interface, if it
+/// has one.
+///
+/// \param ED The extension to check.
+void checkObjCImplementation(ExtensionDecl *ED);
 
 /// Type check whether the given switch statement exhaustively covers
 /// its domain.
@@ -720,12 +733,6 @@ Type typeCheckPattern(ContextualPattern pattern);
 Pattern *coercePatternToType(ContextualPattern pattern, Type type,
                              TypeResolutionOptions options);
 bool typeCheckExprPattern(ExprPattern *EP, DeclContext *DC, Type type);
-
-/// Synthesize ~= operator application used to infer enum members
-/// in `case` patterns.
-Optional<std::pair<VarDecl *, BinaryExpr *>>
-synthesizeTildeEqualsOperatorApplication(ExprPattern *EP, DeclContext *DC,
-                                         Type enumType);
 
 /// Coerce the specified parameter list of a ClosureExpr to the specified
 /// contextual type.
@@ -911,6 +918,10 @@ lookupPrecedenceGroupForInfixOperator(DeclContext *dc, Expr *op, bool diagnose);
 PrecedenceGroupLookupResult
 lookupPrecedenceGroup(DeclContext *dc, Identifier name, SourceLoc nameLoc);
 
+SmallVector<MacroDecl *, 1>
+lookupMacros(DeclContext *dc, DeclNameRef macroName, SourceLoc loc,
+             MacroRoles contexts);
+
 enum class UnsupportedMemberTypeAccessKind : uint8_t {
   None,
   TypeAliasOfUnboundGeneric,
@@ -924,7 +935,8 @@ enum class UnsupportedMemberTypeAccessKind : uint8_t {
 /// member of the given base type.
 UnsupportedMemberTypeAccessKind
 isUnsupportedMemberTypeAccess(Type type, TypeDecl *typeDecl,
-                              bool hasUnboundOpener);
+                              bool hasUnboundOpener,
+                              bool isExtensionBinding = false);
 
 /// @}
 
@@ -1285,6 +1297,11 @@ bool diagnoseInvalidFunctionType(FunctionType *fnTy, SourceLoc loc,
 /// type repr. \param inferredType The type inferred by the type checker.
 void notePlaceholderReplacementTypes(Type writtenType, Type inferredType);
 
+/// Check whether the given extension introduces a conformance
+/// to a protocol annotated with reflection metadata attribute(s).
+/// If that's the case, conforming type supposed to match attribute
+/// requirements.
+void checkReflectionMetadataAttributes(ExtensionDecl *extension);
 } // namespace TypeChecker
 
 /// Returns the protocol requirement kind of the given declaration.
@@ -1493,6 +1510,26 @@ diagnoseAndRemoveAttr(const Decl *D, const DeclAttribute *attr,
 
   return diagnoseAttrWithRemovalFixIt(D, attr, std::forward<ArgTypes>(Args)...);
 }
+
+/// Look for closure discriminators within an AST.
+class DiscriminatorFinder : public ASTWalker {
+  unsigned FirstDiscriminator = AbstractClosureExpr::InvalidDiscriminator;
+  unsigned NextDiscriminator = 0;
+
+public:
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
+  PostWalkResult<Expr *> walkToExprPost(Expr *E) override;
+
+  // Get the next available closure discriminator.
+  unsigned getNextDiscriminator();
+
+  unsigned getFirstDiscriminator() const {
+    return FirstDiscriminator;
+  }
+};
 
 } // end namespace swift
 

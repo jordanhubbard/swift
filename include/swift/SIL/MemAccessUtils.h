@@ -206,7 +206,12 @@ SILValue findOwnershipReferenceRoot(SILValue ref);
 
 /// Look through all ownership forwarding instructions to find the values which
 /// were originally borrowed.
-void findGuaranteedReferenceRoots(SILValue value,
+///
+/// Note: This treats guaranteed forwarding phis like roots even though they do
+/// not introduce the borrow scope. This ensures that all roots dominate \p
+/// reference Value. But the client will need to handle forwarding phis.
+void findGuaranteedReferenceRoots(SILValue referenceValue,
+                                  bool lookThroughNestedBorrows,
                                   SmallVectorImpl<SILValue> &roots);
 
 /// Find the aggregate containing the first owned root of the
@@ -232,11 +237,24 @@ inline bool accessKindMayConflict(SILAccessKind a, SILAccessKind b) {
   return !(a == SILAccessKind::Read && b == SILAccessKind::Read);
 }
 
-/// Return true if \p instruction is a deinitialization barrier.
+/// Whether \p instruction accesses storage whose representation is unidentified
+/// such as by reading a pointer.
+bool mayAccessPointer(SILInstruction *instruction);
+
+/// Whether this instruction loads or copies a value whose storage does not
+/// increment the stored value's reference count.
+bool mayLoadWeakOrUnowned(SILInstruction* instruction);
+
+/// Conservatively, whether this instruction could involve a synchronization
+/// point like a memory barrier, lock or syscall.
+bool maySynchronizeNotConsideringSideEffects(SILInstruction* instruction);
+
+/// Conservatively, whether this instruction could be a barrier to hoisting
+/// destroys.
 ///
-/// Deinitialization barriers constrain variable lifetimes. Lexical end_borrow,
-/// destroy_value, and destroy_addr cannot be hoisted above them.
-bool isDeinitBarrier(SILInstruction *instruction);
+/// Does not consider function so effects, so every apply is treated as a
+/// barrier.
+bool mayBeDeinitBarrierNotConsideringSideEffects(SILInstruction *instruction);
 
 } // end namespace swift
 
@@ -1114,6 +1132,8 @@ public:
     // Precondition: this != subNode
     PathNode findPrefix(PathNode subNode) const;
 
+    bool isPrefixOf(PathNode other) { return node->isPrefixOf(other.node); }
+
     bool operator==(PathNode other) const { return node == other.node; }
     bool operator!=(PathNode other) const { return node != other.node; }
   };
@@ -1233,6 +1253,8 @@ struct AccessPathWithBase {
   AccessBase getAccessBase() const {
     return AccessBase(base, accessPath.getStorage().getKind());
   }
+
+  bool isValid() const { return base && accessPath.isValid(); }
 
   bool operator==(AccessPathWithBase other) const {
     return accessPath == other.accessPath && base == other.base;
@@ -1376,6 +1398,12 @@ bool visitAccessStorageUses(AccessUseVisitor &visitor, AccessStorage storage,
 /// visitor's visitUse method returns true.
 bool visitAccessPathUses(AccessUseVisitor &visitor, AccessPath accessPath,
                          SILFunction *function);
+
+/// Similar to visitAccessPathUses, but the visitor is restricted to a specific
+/// access base, such as a particular ref_element_addr.
+bool visitAccessPathBaseUses(AccessUseVisitor &visitor,
+                             AccessPathWithBase accessPathWithBase,
+                             SILFunction *function);
 
 } // end namespace swift
 
@@ -1604,6 +1632,7 @@ inline bool isAccessStorageIdentityCast(SingleValueInstruction *svi) {
   // Simply pass-thru the incoming address.
   case SILInstructionKind::MarkUninitializedInst:
   case SILInstructionKind::MarkMustCheckInst:
+  case SILInstructionKind::MarkUnresolvedReferenceBindingInst:
   case SILInstructionKind::MarkDependenceInst:
   case SILInstructionKind::CopyValueInst:
     return true;

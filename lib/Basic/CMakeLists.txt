@@ -45,7 +45,9 @@ add_swift_host_library(swiftBasic STATIC
   BasicBridging.cpp
   BasicSourceInfo.cpp
   Cache.cpp
+  CBasicBridging.cpp
   ClusteredBitVector.cpp
+  CBasicBridging.cpp
   DiverseStack.cpp
   Edit.cpp
   EditorPlaceholder.cpp
@@ -65,6 +67,7 @@ add_swift_host_library(swiftBasic STATIC
   PrimitiveParsing.cpp
   Program.cpp
   QuotedString.cpp
+  Sandbox.cpp
   SourceLoc.cpp
   StableHasher.cpp
   Statistic.cpp
@@ -98,6 +101,7 @@ target_link_libraries(swiftBasic PUBLIC
 target_link_libraries(swiftBasic PRIVATE
   ${UUID_LIBRARIES})
 
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/SwiftVersion.cmake)
 message(STATUS "Swift version: ${SWIFT_VERSION}")
 message(STATUS "Swift vendor: ${SWIFT_VENDOR}")
 

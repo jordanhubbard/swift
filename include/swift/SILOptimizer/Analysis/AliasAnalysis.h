@@ -20,9 +20,6 @@
 
 namespace swift {
 
-class SideEffectAnalysis;
-class EscapeAnalysis;
-
 /// This class is a simple wrapper around an alias analysis cache. This is
 /// needed since we do not have an "analysis" infrastructure.
 class AliasAnalysis {
@@ -74,8 +71,7 @@ private:
 
   using TBAACacheKey = std::pair<SILType, SILType>;
 
-  SideEffectAnalysis *SEA;
-  EscapeAnalysis *EA;
+  SILPassManager *PM;
 
   /// A cache for the computation of TBAA. True means that the types may
   /// alias. False means that the types must not alias.
@@ -89,7 +85,7 @@ private:
   /// The alias() method uses this map to cache queries.
   llvm::DenseMap<AliasCacheKey, AliasResult> AliasCache;
 
-  using MemoryBehavior = SILInstruction::MemoryBehavior;
+  using MemoryBehavior = MemoryBehavior;
 
   /// MemoryBehavior value cache.
   ///
@@ -98,7 +94,7 @@ private:
 
   /// Set of instructions inside immutable-scopes.
   ///
-  /// Contains pairs of intructions: the first instruction is the begin-scope
+  /// Contains pairs of instructions: the first instruction is the begin-scope
   /// instruction (e.g. begin_access), the second instruction is an
   /// instruction inside the scope (only may-write instructions are considered).
   llvm::DenseSet<ScopeCacheKey> instsInImmutableScopes;
@@ -108,6 +104,12 @@ private:
   /// Contains the begin-scope instructions (e.g. begin_access) of all computed
   /// scopes.
   llvm::SmallPtrSet<SILInstruction *, 16> immutableScopeComputed;
+
+  /// Used to limit complexity.
+  /// The side is computed lazily. Therefore the actual value depends on what
+  /// SIL modifications an optimization pass already performed when the size
+  /// is requested.
+  int estimatedFunctionSize = -1;
 
   AliasResult aliasAddressProjection(SILValue V1, SILValue V2,
                                      SILValue O1, SILValue O2);
@@ -125,8 +127,7 @@ private:
   bool isInImmutableScope(SILInstruction *inst, SILValue V);
 
 public:
-  AliasAnalysis(SideEffectAnalysis *SEA, EscapeAnalysis *EA)
-    : SEA(SEA), EA(EA) {}
+  AliasAnalysis(SILPassManager *PM) : PM(PM) {}
 
   static SILAnalysisKind getAnalysisKind() { return SILAnalysisKind::Alias; }
 
@@ -158,11 +159,6 @@ public:
     return alias(V1, V2, TBAAType1, TBAAType2) == AliasResult::MayAlias;
   }
 
-  /// \returns True if the release of the \p releasedReference can access or
-  /// free memory accessed by \p User.
-  bool mayValueReleaseInterfereWithInstruction(SILInstruction *User,
-                                               SILValue releasedReference);
-
   /// Use the alias analysis to determine the memory behavior of Inst with
   /// respect to V.
   MemoryBehavior computeMemoryBehavior(SILInstruction *Inst, SILValue V);
@@ -173,7 +169,7 @@ public:
 
   /// Returns true if \p Inst may read from memory at address \p V.
   ///
-  /// For details see SILInstruction::MemoryBehavior::MayRead.
+  /// For details see MemoryBehavior::MayRead.
   bool mayReadFromMemory(SILInstruction *Inst, SILValue V) {
     auto B = computeMemoryBehavior(Inst, V);
     return B == MemoryBehavior::MayRead ||
@@ -184,7 +180,7 @@ public:
   /// Returns true if \p Inst may write to memory or deinitialize memory at
   /// address \p V.
   ///
-  /// For details see SILInstruction::MemoryBehavior::MayWrite.
+  /// For details see MemoryBehavior::MayWrite.
   bool mayWriteToMemory(SILInstruction *Inst, SILValue V) {
     auto B = computeMemoryBehavior(Inst, V);
     return B == MemoryBehavior::MayWrite ||
@@ -195,7 +191,7 @@ public:
   /// Returns true if \p Inst may read from memory, write to memory or
   /// deinitialize memory at address \p V.
   ///
-  /// For details see SILInstruction::MemoryBehavior.
+  /// For details see MemoryBehavior.
   bool mayReadOrWriteMemory(SILInstruction *Inst, SILValue V) {
     auto B = computeMemoryBehavior(Inst, V);
     return MemoryBehavior::None != B;
@@ -206,6 +202,21 @@ public:
 
   /// Returns true if \p Ptr may be released by the builtin \p BI.
   bool canBuiltinDecrementRefCount(BuiltinInst *BI, SILValue Ptr);
+
+  /// Returns true if the address(es of) `addr` can escape to `toInst`.
+  MemoryBehavior getMemoryBehaviorOfInst(SILValue addr, SILInstruction *toInst);
+
+  /// Returns true if the object(s of) `obj` can escape to `toInst`.
+  bool isObjectReleasedByInst(SILValue obj, SILInstruction *toInst);
+
+  /// Is the `addr` within all reachable objects/addresses, when start walking
+  /// from `obj`?
+  bool isAddrVisibleFromObject(SILValue addr, SILValue obj);
+
+  /// Returns true if `lhs` can reference the same field as `rhs`.
+  bool canReferenceSameField(SILValue lhs, SILValue rhs);
+
+  int getEstimatedFunctionSize(SILValue valueInFunction);
 };
 
 

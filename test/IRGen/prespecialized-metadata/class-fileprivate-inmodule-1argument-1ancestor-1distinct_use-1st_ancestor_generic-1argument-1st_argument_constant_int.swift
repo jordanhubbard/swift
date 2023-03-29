@@ -121,9 +121,9 @@
 //         CHECK-SAME:  i32 {{(40|24)}},
 //         CHECK-SAME:  i16 {{(7|3)}},
 //         CHECK-SAME:  i16 0,
-//   CHECK-apple-SAME:  i32 {{(144|84)}},
-// CHECK-unknown-SAME:  i32 120,
-//         CHECK-SAME:  i32 {{(16|8)}},
+//   CHECK-apple-SAME:  i32 {{(152|88)}},
+// CHECK-unknown-SAME:  i32 128,
+//         CHECK-SAME:  i32 {{(24|12)}},
 //                   :  %swift.type_descriptor* bitcast (
 //                   :    <{
 //                   :      i32,
@@ -206,7 +206,7 @@ doit()
 //              CHECK: }
 
 //              CHECK: ; Function Attrs: noinline nounwind readnone
-//              CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CySSGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]+}} {
+//              CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]CySSGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]+}} {{(section)?.*}}{
 //         CHECK-NEXT: entry:
 //              CHECK:   [[SUPER_CLASS_METADATA:%[0-9]+]] = call swiftcc %swift.metadata_response @"$s4main9Ancestor1[[UNIQUE_ID_1]]CySiGMb"([[INT]] 0)
 //      CHECK-unknown:  ret

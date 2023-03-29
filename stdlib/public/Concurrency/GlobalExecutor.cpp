@@ -23,7 +23,7 @@
 /// resource or memory.  Concurrent executors are usually used to
 /// manage a pool of threads and prevent the number of allocated
 /// threads from growing without limit.
-/// 
+///
 /// Second, executors may own dedicated threads, or they may schedule
 /// work onto some underlying executor.  Dedicated threads can
 /// improve the responsiveness of a subsystem *locally*, but they impose
@@ -41,7 +41,7 @@
 /// of threads.  Having multiple independent concurrent executors
 /// with their own dedicated threads would undermine that.
 /// Therefore, it is sensible to have a single, global executor
-/// that will ultimately schedule most of the work in the system.  
+/// that will ultimately schedule most of the work in the system.
 /// With that as a baseline, special needs can be recognized and
 /// carved out from the global executor with its cooperation.
 ///
@@ -78,6 +78,13 @@ void (*swift::swift_task_enqueueGlobalWithDeadline_hook)(
     long long tnsec,
     int clock, Job *job,
     swift_task_enqueueGlobalWithDeadline_original original) = nullptr;
+
+SWIFT_CC(swift)
+bool (*swift::swift_task_isOnExecutor_hook)(
+    HeapObject *executor,
+    const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable,
+    swift_task_isOnExecutor_original original) = nullptr;
 
 SWIFT_CC(swift)
 void (*swift::swift_task_enqueueMainExecutor_hook)(
@@ -124,6 +131,52 @@ void swift::swift_task_enqueueGlobalWithDeadline(
   else
     swift_task_enqueueGlobalWithDeadlineImpl(sec, nsec, tsec, tnsec, clock, job);
 }
+
+// Implemented in Swift because we need to obtain the user-defined flags on the executor ref.
+//
+// We could inline this with effort, though.
+extern "C" SWIFT_CC(swift)
+ExecutorRef _task_serialExecutor_getExecutorRef(
+    HeapObject *executor,
+    const Metadata *selfType,
+    const SerialExecutorWitnessTable *wtable);
+
+SWIFT_CC(swift)
+static bool swift_task_isOnExecutorImpl(HeapObject *executor,
+                                        const Metadata *selfType,
+                                        const SerialExecutorWitnessTable *wtable) {
+  auto executorRef = _task_serialExecutor_getExecutorRef(executor, selfType, wtable);
+  return swift_task_isCurrentExecutor(executorRef);
+}
+
+bool swift::swift_task_isOnExecutor(HeapObject *executor,
+                                    const Metadata *selfType,
+                                    const SerialExecutorWitnessTable *wtable) {
+  if (swift_task_isOnExecutor_hook)
+    return swift_task_isOnExecutor_hook(
+        executor, selfType, wtable, swift_task_isOnExecutorImpl);
+  else
+    return swift_task_isOnExecutorImpl(executor, selfType, wtable);
+}
+
+bool swift::swift_executor_isComplexEquality(ExecutorRef ref) {
+  return ref.isComplexEquality();
+}
+
+uint64_t swift::swift_task_getJobTaskId(Job *job) {
+  if (auto task = dyn_cast<AsyncTask>(job)) {
+    // TaskID is actually:
+    //   32bits of Job's Id
+    // + 32bits stored in the AsyncTask
+    return task->getTaskId();
+  } else {
+    return job->getJobId();
+  }
+}
+
+/*****************************************************************************/
+/****************************** MAIN EXECUTOR  *******************************/
+/*****************************************************************************/
 
 void swift::swift_task_enqueueMainExecutor(Job *job) {
   concurrency::trace::job_enqueue_main_executor(job);

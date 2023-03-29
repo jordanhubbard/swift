@@ -64,7 +64,7 @@ case _ where x % 2 == 0,
   x = 1
 case var y where y % 2 == 0:
   x = y + 1
-case _ where 0: // expected-error {{type 'Int' cannot be used as a boolean; test for '!= 0' instead}}
+case _ where 0: // expected-error {{integer literal value '0' cannot be used as a boolean; did you mean 'false'?}}
   x = 0
 default:
   x = 1
@@ -336,9 +336,9 @@ func f1(x: String, y: Whichever) {
         break
     case Whichever.buzz: // expected-error {{type 'Whichever' has no member 'buzz'}}
         break
+    // expected-note @+1 {{overloads for '~=' exist with these partially matching parameter lists: (Substring, String)}}
     case Whichever.alias: // expected-error {{expression pattern of type 'Whichever' cannot match values of type 'String'}}
-    // expected-note@-1 {{overloads for '~=' exist}}
-    // expected-error@-2 {{'case' label in a 'switch' must have at least one executable statement}}
+    // expected-error@-1 {{'case' label in a 'switch' must have at least one executable statement}}
     default:
       break
   }

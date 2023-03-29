@@ -14,14 +14,13 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "swift/Subsystems.h"
-#include "TypeChecker.h"
-#include "TypeCheckObjC.h"
-#include "TypeCheckType.h"
 #include "CodeSynthesis.h"
 #include "MiscDiagnostics.h"
-#include "swift/AST/ASTWalker.h"
+#include "TypeCheckObjC.h"
+#include "TypeCheckType.h"
+#include "TypeChecker.h"
 #include "swift/AST/ASTVisitor.h"
+#include "swift/AST/ASTWalker.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/DiagnosticSuppression.h"
 #include "swift/AST/ExistentialLayout.h"
@@ -37,13 +36,15 @@
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/Basic/Defer.h"
-#include "swift/Basic/Statistic.h"
 #include "swift/Basic/STLExtras.h"
+#include "swift/Basic/Statistic.h"
+#include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Parse/Lexer.h"
-#include "swift/Sema/IDETypeChecking.h"
-#include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/CompletionContextFinder.h"
+#include "swift/Sema/ConstraintSystem.h"
+#include "swift/Sema/IDETypeChecking.h"
 #include "swift/Strings.h"
+#include "swift/Subsystems.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/SmallSet.h"
@@ -114,6 +115,10 @@ class SanitizeExpr : public ASTWalker {
 public:
   SanitizeExpr(ASTContext &C)
     : C(C) { }
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Arguments;
+  }
 
   PreWalkResult<ArgumentList *>
   walkToArgumentListPre(ArgumentList *argList) override {
@@ -307,7 +312,9 @@ getTypeOfExpressionWithoutApplying(Expr *&expr, DeclContext *dc,
 
   ConstraintSystemOptions options;
   options |= ConstraintSystemFlags::SuppressDiagnostics;
-  options |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
+  if (!Context.CompletionCallback) {
+    options |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
+  }
 
   // Construct a constraint system from this expression.
   ConstraintSystem cs(dc, options);
@@ -324,8 +331,8 @@ getTypeOfExpressionWithoutApplying(Expr *&expr, DeclContext *dc,
   // re-check.
   if (needClearType)
     expr->setType(Type());
-  SolutionApplicationTarget target(
-      expr, dc, CTP_Unused, Type(), /*isDiscarded=*/false);
+  SyntacticElementTarget target(expr, dc, CTP_Unused, Type(),
+                                /*isDiscarded=*/false);
   auto viable = cs.solve(target, allowFreeTypeVariables);
   if (!viable) {
     recoverOriginalType();
@@ -400,7 +407,6 @@ getTypeOfCompletionOperatorImpl(DeclContext *DC, Expr *expr,
 
   ConstraintSystemOptions options;
   options |= ConstraintSystemFlags::SuppressDiagnostics;
-  options |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
 
   // Construct a constraint system from this expression.
   ConstraintSystem CS(DC, options);
@@ -410,8 +416,10 @@ getTypeOfCompletionOperatorImpl(DeclContext *DC, Expr *expr,
 
   if (CS.isDebugMode()) {
     auto &log = llvm::errs();
-    log << "---Initial constraints for the given expression---\n";
-    expr->dump(log);
+    auto indent = CS.solverState ? CS.solverState->getCurrentIndent() : 0;
+    log.indent(indent)
+        << "---Initial constraints for the given expression---\n";
+    expr->dump(log, indent);
     log << "\n";
     CS.print(log);
   }
@@ -424,8 +432,9 @@ getTypeOfCompletionOperatorImpl(DeclContext *DC, Expr *expr,
   auto &solution = viable[0];
   if (CS.isDebugMode()) {
     auto &log = llvm::errs();
-    log << "---Solution---\n";
-    solution.dump(log);
+    auto indent = CS.solverState ? CS.solverState->getCurrentIndent() : 0;
+    log.indent(indent) << "---Solution---\n";
+    solution.dump(log, indent);
   }
 
   // Fill the results.
@@ -552,7 +561,7 @@ void TypeChecker::filterSolutionsForCodeCompletion(
 }
 
 bool TypeChecker::typeCheckForCodeCompletion(
-    SolutionApplicationTarget &target, bool needsPrecheck,
+    SyntacticElementTarget &target, bool needsPrecheck,
     llvm::function_ref<void(const Solution &)> callback) {
   auto *DC = target.getDeclContext();
   auto &Context = DC->getASTContext();
@@ -561,7 +570,7 @@ bool TypeChecker::typeCheckForCodeCompletion(
   {
     auto range = target.getSourceRange();
     if (range.isInvalid() ||
-        !Context.SourceMgr.rangeContainsCodeCompletionLoc(range))
+        !containsIDEInspectionTarget(range, Context.SourceMgr))
       return false;
   }
 
@@ -604,13 +613,14 @@ bool TypeChecker::typeCheckForCodeCompletion(
   enum class CompletionResult { Ok, NotApplicable, Fallback };
 
   auto solveForCodeCompletion =
-      [&](SolutionApplicationTarget &target) -> CompletionResult {
+      [&](SyntacticElementTarget &target) -> CompletionResult {
     ConstraintSystemOptions options;
     options |= ConstraintSystemFlags::AllowFixes;
     options |= ConstraintSystemFlags::SuppressDiagnostics;
     options |= ConstraintSystemFlags::ForCodeCompletion;
-    options |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
-
+    if (!Context.CompletionCallback) {
+      options |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
+    }
 
     ConstraintSystem cs(DC, options);
 
@@ -618,6 +628,7 @@ bool TypeChecker::typeCheckForCodeCompletion(
 
     // If solve failed to generate constraints or with some other
     // issue, we need to fallback to type-checking a sub-expression.
+    cs.setTargetFor(target.getAsExpr(), target);
     if (!cs.solveForCodeCompletion(target, solutions))
       return CompletionResult::Fallback;
 
@@ -625,23 +636,6 @@ bool TypeChecker::typeCheckForCodeCompletion(
     // to type-checking a sub-expression in isolation.
     if (solutions.empty())
       return CompletionResult::Fallback;
-
-    // If code completion expression resides inside of multi-statement
-    // closure body it could either be type-checked together with the context
-    // or not, it's impossible to say without checking.
-    if (contextAnalyzer.locatedInMultiStmtClosure()) {
-      if (!hasTypeForCompletion(solutions.front(), contextAnalyzer)) {
-        // At this point we know the code completion node wasn't checked with
-        // the closure's surrounding context, so can defer to regular
-        // type-checking for the current call to typeCheckExpression. If that
-        // succeeds we will get a second call to typeCheckExpression for the
-        // body of the closure later and can gather completions then. If it
-        // doesn't we rely on the fallback typechecking in the subclasses of
-        // TypeCheckCompletionCallback that considers in isolation a
-        // sub-expression of the closure that contains the completion location.
-        return CompletionResult::NotApplicable;
-      }
-    }
 
     // FIXME: instead of filtering, expose the score and viability to clients.
     // Remove solutions that skipped over/ignored the code completion point
@@ -670,10 +664,10 @@ bool TypeChecker::typeCheckForCodeCompletion(
       assert(fallback->E != expr);
       (void)expr;
     }
-    SolutionApplicationTarget completionTarget(fallback->E,
-                                               fallback->DC, CTP_Unused,
-                                               /*contextualType=*/Type(),
-                                               /*isDiscarded=*/true);
+    SyntacticElementTarget completionTarget(fallback->E, fallback->DC,
+                                            CTP_Unused,
+                                            /*contextualType=*/Type(),
+                                            /*isDiscarded=*/true);
     typeCheckForCodeCompletion(completionTarget, fallback->SeparatePrecheck,
                                callback);
   }

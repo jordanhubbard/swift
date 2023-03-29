@@ -25,12 +25,14 @@ class ArgumentTypeCheckCompletionCallback : public TypeCheckCompletionCallback {
   struct Result {
     /// The type associated with the code completion expression itself.
     Type ExpectedType;
+    /// The expected return type of the function call.
+    Type ExpectedCallType;
     /// True if this is a subscript rather than a function call.
     bool IsSubscript;
     /// The FuncDecl or SubscriptDecl associated with the call.
     ValueDecl *FuncD;
     /// The type of the function being called.
-    Type FuncTy;
+    AnyFunctionType *FuncTy;
     /// The index of the argument containing the completion location
     unsigned ArgIdx;
     /// The index of the parameter corresponding to the completion argument.
@@ -69,6 +71,11 @@ class ArgumentTypeCheckCompletionCallback : public TypeCheckCompletionCallback {
                          SmallVectorImpl<Type> &Types);
 
   void sawSolutionImpl(const constraints::Solution &solution) override;
+
+  /// Populates \p ShadowedDecls with all \c FuncD in \p Results that are
+  /// defined in protocol extensions but redeclared on a nominal type and thus
+  /// cannot be accessed
+  void computeShadowedDecls(SmallPtrSetImpl<ValueDecl *> &ShadowedDecls);
 
 public:
   ArgumentTypeCheckCompletionCallback(CodeCompletionExpr *CompletionExpr,

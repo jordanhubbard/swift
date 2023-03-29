@@ -33,25 +33,31 @@ namespace swift {
       Identifier moduleName;
 
       /// Scan the given interface file to determine dependencies.
-      llvm::ErrorOr<ModuleDependencies> scanInterfaceFile(
+      llvm::ErrorOr<ModuleDependencyInfo> scanInterfaceFile(
           Twine moduleInterfacePath, bool isFramework);
 
       InterfaceSubContextDelegate &astDelegate;
-    public:
-      Optional<ModuleDependencies> dependencies;
 
-      ModuleDependencyScanner(
-          ASTContext &ctx, ModuleLoadingMode LoadMode, Identifier moduleName,
-          InterfaceSubContextDelegate &astDelegate,
-          ScannerKind kind = MDS_plain)
+      /// Location where pre-built moduels are to be built into.
+      std::string moduleCachePath;
+    public:
+      Optional<ModuleDependencyInfo> dependencies;
+
+      ModuleDependencyScanner(ASTContext &ctx, ModuleLoadingMode LoadMode,
+                              Identifier moduleName,
+                              InterfaceSubContextDelegate &astDelegate,
+                              ScannerKind kind = MDS_plain)
           : SerializedModuleLoaderBase(ctx, nullptr, LoadMode,
                                        /*IgnoreSwiftSourceInfoFile=*/true),
-            kind(kind), moduleName(moduleName), astDelegate(astDelegate) {}
+            kind(kind), moduleName(moduleName), astDelegate(astDelegate),
+            moduleCachePath(getModuleCachePathFromClang(
+                ctx.getClangModuleLoader()->getClangInstance())) {}
 
       std::error_code findModuleFilesInDirectory(
           ImportPath::Element ModuleID,
           const SerializedModuleBaseName &BaseName,
           SmallVectorImpl<char> *ModuleInterfacePath,
+          SmallVectorImpl<char> *ModuleInterfaceSourcePath,
           std::unique_ptr<llvm::MemoryBuffer> *ModuleBuffer,
           std::unique_ptr<llvm::MemoryBuffer> *ModuleDocBuffer,
           std::unique_ptr<llvm::MemoryBuffer> *ModuleSourceInfoBuffer,
@@ -78,8 +84,10 @@ namespace swift {
       /// Scan the given placeholder module map
       void parsePlaceholderModuleMap(StringRef fileName) {
         ExplicitModuleMapParser parser(Allocator);
+        llvm::StringMap<ExplicitClangModuleInputInfo> ClangDependencyModuleMap;
         auto result =
-          parser.parseSwiftExplicitModuleMap(fileName, PlaceholderDependencyModuleMap);
+          parser.parseSwiftExplicitModuleMap(fileName, PlaceholderDependencyModuleMap,
+                                             ClangDependencyModuleMap);
         if (result == std::errc::invalid_argument) {
           Ctx.Diags.diagnose(SourceLoc(),
                              diag::placeholder_dependency_module_map_corrupted,
@@ -92,7 +100,7 @@ namespace swift {
         }
       }
 
-      llvm::StringMap<ExplicitModuleInfo> PlaceholderDependencyModuleMap;
+      llvm::StringMap<ExplicitSwiftModuleInputInfo> PlaceholderDependencyModuleMap;
       llvm::BumpPtrAllocator Allocator;
 
     public:
@@ -113,6 +121,7 @@ namespace swift {
       virtual bool
       findModule(ImportPath::Element moduleID,
                  SmallVectorImpl<char> *moduleInterfacePath,
+                 SmallVectorImpl<char> *moduleInterfaceSourcePath,
                  std::unique_ptr<llvm::MemoryBuffer> *moduleBuffer,
                  std::unique_ptr<llvm::MemoryBuffer> *moduleDocBuffer,
                  std::unique_ptr<llvm::MemoryBuffer> *moduleSourceInfoBuffer,

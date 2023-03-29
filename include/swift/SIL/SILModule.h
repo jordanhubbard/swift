@@ -217,7 +217,7 @@ private:
   /// This avoids dangling instruction pointers within the run of a pass and in
   /// analysis caches. Note that the analysis invalidation mechanism ensures
   /// that analysis caches are invalidated before flushDeletedInsts().
-  llvm::iplist<SILInstruction> scheduledForDeletion;
+  std::vector<SILInstruction*> scheduledForDeletion;
 
   /// The swift Module associated with this SILModule.
   ModuleDecl *TheSwiftModule;
@@ -279,7 +279,7 @@ private:
   llvm::DenseMap<const NominalTypeDecl *, SILMoveOnlyDeinit *>
       MoveOnlyDeinitMap;
 
-  /// The list of SILVTables in the module.
+  /// The list of move only deinits in the module.
   std::vector<SILMoveOnlyDeinit *> moveOnlyDeinits;
 
   /// Declarations which are externally visible.
@@ -345,22 +345,22 @@ private:
   /// projections, shared between all functions in the module.
   std::unique_ptr<IndexTrieNode> indexTrieRoot;
 
-  /// A mapping from root opened archetypes to the instructions which define
+  /// A mapping from root local archetypes to the instructions which define
   /// them.
   ///
-  /// The value is either a SingleValueInstruction or a PlaceholderValue, in case
-  /// an opened archetype definition is looked up during parsing or
-  /// deserializing SIL, where opened archetypes can be forward referenced.
+  /// The value is either a SingleValueInstruction or a PlaceholderValue,
+  /// in case a local archetype definition is looked up during parsing or
+  /// deserializing SIL, where local archetypes can be forward referenced.
   ///
   /// In theory we wouldn't need to have the SILFunction in the key, because
-  /// opened archetypes \em should be unique across the module. But currently
-  /// in some rare cases SILGen re-uses the same opened archetype for multiple
+  /// local archetypes \em should be unique across the module. But currently
+  /// in some rare cases SILGen re-uses the same local archetype for multiple
   /// functions.
-  using OpenedArchetypeKey = std::pair<OpenedArchetypeType *, SILFunction *>;
-  llvm::DenseMap<OpenedArchetypeKey, SILValue> RootOpenedArchetypeDefs;
+  using LocalArchetypeKey = std::pair<LocalArchetypeType *, SILFunction *>;
+  llvm::DenseMap<LocalArchetypeKey, SILValue> RootLocalArchetypeDefs;
 
-  /// The number of PlaceholderValues in RootOpenedArchetypeDefs.
-  int numUnresolvedOpenedArchetypes = 0;
+  /// The number of PlaceholderValues in RootLocalArchetypeDefs.
+  int numUnresolvedLocalArchetypes = 0;
 
   /// The options passed into this SILModule.
   const SILOptions &Options;
@@ -444,31 +444,31 @@ public:
     regDeserializationNotificationHandlerForAllFuncOME = true;
   }
 
-  /// Returns the instruction which defines the given root opened archetype,
+  /// Returns the instruction which defines the given root local archetype,
   /// e.g. an open_existential_addr.
   ///
-  /// In case the opened archetype is not defined yet (e.g. during parsing or
+  /// In case the local archetype is not defined yet (e.g. during parsing or
   /// deserialization), a PlaceholderValue is returned. This should not be the
   /// case outside of parsing or deserialization.
-  SILValue getRootOpenedArchetypeDef(CanOpenedArchetypeType archetype,
-                                     SILFunction *inFunction);
+  SILValue getRootLocalArchetypeDef(CanLocalArchetypeType archetype,
+                                    SILFunction *inFunction);
 
-  /// Returns the instruction which defines the given root opened archetype,
+  /// Returns the instruction which defines the given root local archetype,
   /// e.g. an open_existential_addr.
   ///
-  /// In contrast to getOpenedArchetypeDef, it is required that all opened
+  /// In contrast to getLocalArchetypeDef, it is required that all local
   /// archetypes are resolved.
   SingleValueInstruction *
-  getRootOpenedArchetypeDefInst(CanOpenedArchetypeType archetype,
-                                SILFunction *inFunction) {
+  getRootLocalArchetypeDefInst(CanLocalArchetypeType archetype,
+                               SILFunction *inFunction) {
     return cast<SingleValueInstruction>(
-        getRootOpenedArchetypeDef(archetype, inFunction));
+        getRootLocalArchetypeDef(archetype, inFunction));
   }
 
-  /// Returns true if there are unresolved opened archetypes in the module.
+  /// Returns true if there are unresolved local archetypes in the module.
   ///
   /// This should only be the case during parsing or deserialization.
-  bool hasUnresolvedOpenedArchetypeDefinitions();
+  bool hasUnresolvedLocalArchetypeDefinitions();
 
   /// Get a unique index for a struct or class field in layout order.
   ///
@@ -874,7 +874,12 @@ public:
   /// True if SIL conventions force address-only to be passed by address.
   bool useLoweredAddresses() const { return loweredAddresses; }
 
-  void setLoweredAddresses(bool val) { loweredAddresses = val; }
+  void setLoweredAddresses(bool val) {
+    loweredAddresses = val;
+    if (val) {
+      Types.setLoweredAddresses();
+    }
+  }
 
   llvm::IndexedInstrProfReader *getPGOReader() const { return PGOReader.get(); }
 
@@ -899,7 +904,17 @@ public:
 
   /// Run the SIL verifier to make sure that all Functions follow
   /// invariants.
-  void verify() const;
+  void verify(bool isCompleteOSSA = true,
+              bool checkLinearLifetime = true) const;
+
+  /// Run the SIL verifier without assuming OSSA lifetimes end at dead end
+  /// blocks.
+  void verifyIncompleteOSSA() const {
+    verify(/*isCompleteOSSA=*/false);
+  }
+
+  /// Check linear OSSA lifetimes, assuming complete OSSA.
+  void verifyOwnership() const;
 
   /// Check if there are any leaking instructions.
   ///
@@ -1063,8 +1078,22 @@ namespace Lowering {
 /// Determine whether the given class will be allocated/deallocated using the
 /// Objective-C runtime, i.e., +alloc and -dealloc.
 LLVM_LIBRARY_VISIBILITY bool usesObjCAllocator(ClassDecl *theClass);
+
+/// Returns true if SIL/IR lowering for the given declaration should be skipped.
+/// A declaration may not require lowering if, for example, it is annotated as
+/// unavailable and optimization settings allow it to be omitted.
+LLVM_LIBRARY_VISIBILITY bool shouldSkipLowering(Decl *D);
 } // namespace Lowering
 
+/// Apply the given function to each ABI member of \c D skipping the members
+/// that should be skipped according to \c shouldSkipLowering()
+template <typename F>
+void forEachMemberToLower(IterableDeclContext *D, F &&f) {
+  for (auto *member : D->getABIMembers()) {
+    if (!Lowering::shouldSkipLowering(member))
+      f(member);
+  }
+}
 } // namespace swift
 
 #endif

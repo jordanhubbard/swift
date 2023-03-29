@@ -1,5 +1,5 @@
-// RUN: %swift -typecheck %s -verify -target aarch64-none-linux-android -disable-objc-interop -parse-stdlib
-// RUN: %swift-ide-test -test-input-complete -source-filename=%s -target aarch64-none-linux-android
+// RUN: %swift -typecheck %s -verify -target aarch64-unknown-linux-android -disable-objc-interop -parse-stdlib
+// RUN: %swift-ide-test -test-input-complete -source-filename=%s -target aarch64-unknown-linux-android
 
 #if os(Linux)
 // This block should not parse.
@@ -7,7 +7,7 @@
 let i: Int = "Hello"
 #endif
 
-#if arch(arm64) && os(Android) && _runtime(_Native) && _endian(little)
+#if arch(arm64) && os(Android) && _runtime(_Native) && _endian(little) && _pointerBitWidth(_64)
 class C {}
 var x = C()
 #endif

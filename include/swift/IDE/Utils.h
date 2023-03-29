@@ -13,21 +13,21 @@
 #ifndef SWIFT_IDE_UTILS_H
 #define SWIFT_IDE_UTILS_H
 
-#include "llvm/ADT/PointerIntPair.h"
-#include "swift/Basic/LLVM.h"
 #include "swift/AST/ASTNode.h"
+#include "swift/AST/ASTPrinter.h"
 #include "swift/AST/DeclNameLoc.h"
 #include "swift/AST/Effects.h"
 #include "swift/AST/Module.h"
-#include "swift/AST/ASTPrinter.h"
-#include "swift/Frontend/FrontendOptions.h"
+#include "swift/AST/Expr.h"
+#include "swift/Basic/LLVM.h"
 #include "swift/IDE/SourceEntityWalker.h"
 #include "swift/Parse/Token.h"
+#include "llvm/ADT/PointerIntPair.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/VirtualFileSystem.h"
+#include <functional>
 #include <memory>
 #include <string>
-#include <functional>
 #include <vector>
 
 namespace llvm {
@@ -41,10 +41,8 @@ namespace clang {
 }
 
 namespace swift {
-  class ModuleDecl;
   class ValueDecl;
   class ASTContext;
-  class CompilerInvocation;
   class SourceFile;
   class TypeDecl;
   class SourceLoc;
@@ -83,20 +81,6 @@ struct SourceCompleteResult {
 SourceCompleteResult
 isSourceInputComplete(std::unique_ptr<llvm::MemoryBuffer> MemBuf, SourceFileKind SFKind);
 SourceCompleteResult isSourceInputComplete(StringRef Text, SourceFileKind SFKind);
-
-bool initCompilerInvocation(
-    CompilerInvocation &Invocation, ArrayRef<const char *> OrigArgs,
-    FrontendOptions::ActionType Action, DiagnosticEngine &Diags,
-    StringRef UnresolvedPrimaryFile,
-    llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
-    const std::string &swiftExecutablePath,
-    const std::string &runtimeResourcePath,
-    const std::string &diagnosticDocumentationPath, time_t sessionTimestamp,
-    std::string &Error);
-
-bool initInvocationByClangArguments(ArrayRef<const char *> ArgList,
-                                    CompilerInvocation &Invok,
-                                    std::string &Error);
 
 /// Visits all overridden declarations exhaustively from VD, including protocol
 /// conformances and clang declarations.
@@ -145,38 +129,28 @@ enum class CursorInfoKind {
   StmtStart,
 };
 
-struct ResolvedCursorInfo {
+/// Base class of more specialized \c ResolvedCursorInfos that also represents
+/// and \c Invalid cursor info.
+struct ResolvedCursorInfo : public llvm::RefCountedBase<ResolvedCursorInfo> {
+protected:
   CursorInfoKind Kind = CursorInfoKind::Invalid;
   SourceFile *SF = nullptr;
   SourceLoc Loc;
-  ValueDecl *ValueD = nullptr;
-  TypeDecl *CtorTyRef = nullptr;
-  ExtensionDecl *ExtTyRef = nullptr;
-  /// Declarations that were shadowed by \c ValueD using a shorthand syntax that
-  /// names both the newly declared variable and the referenced variable by the
-  /// same identifier in the source text. This includes shorthand closure
-  /// captures (`[foo]`) and shorthand if captures
-  /// (`if let foo {`).
-  /// Decls that are shadowed using shorthand syntax should be reported as
-  /// additional cursor info results.
-  SmallVector<ValueDecl *, 2> ShorthandShadowedDecls;
-  ModuleEntity Mod;
-  bool IsRef = true;
-  bool IsKeywordArgument = false;
-  Type Ty;
-  Type ContainerType;
-  Stmt *TrailingStmt = nullptr;
-  Expr *TrailingExpr = nullptr;
-  /// It this is a ref, whether it is "dynamic". See \c ide::isDynamicRef.
-  bool IsDynamic = false;
-  /// If this is a dynamic ref, the types of the base (multiple in the case of
-  /// protocol composition).
-  SmallVector<NominalTypeDecl *, 1> ReceiverTypes;
 
+protected:
+  ResolvedCursorInfo(CursorInfoKind Kind, SourceFile *SF, SourceLoc Loc)
+      : Kind(Kind), SF(SF), Loc(Loc) {}
+
+public:
   ResolvedCursorInfo() = default;
   ResolvedCursorInfo(SourceFile *SF) : SF(SF) {}
 
-  ValueDecl *typeOrValue() { return CtorTyRef ? CtorTyRef : ValueD; }
+  CursorInfoKind getKind() const { return Kind; }
+
+  SourceFile *getSourceFile() const { return SF; }
+
+  SourceLoc getLoc() const { return Loc; }
+  void setLoc(SourceLoc Loc) { this->Loc = Loc; }
 
   friend bool operator==(const ResolvedCursorInfo &lhs,
                          const ResolvedCursorInfo &rhs) {
@@ -184,35 +158,145 @@ struct ResolvedCursorInfo {
       lhs.Loc.getOpaquePointerValue() == rhs.Loc.getOpaquePointerValue();
   }
 
-  void setValueRef(ValueDecl *ValueD, TypeDecl *CtorTyRef,
-                   ExtensionDecl *ExtTyRef, bool IsRef,
-                   Type Ty, Type ContainerType) {
-    Kind = CursorInfoKind::ValueRef;
-    this->ValueD = ValueD;
-    this->CtorTyRef = CtorTyRef;
-    this->ExtTyRef = ExtTyRef;
-    this->IsRef = IsRef;
-    this->Ty = Ty;
-    this->ContainerType = ContainerType;
-  }
-  void setModuleRef(ModuleEntity Mod) {
-    Kind = CursorInfoKind::ModuleRef;
-    this->Mod = Mod;
-  }
-  void setTrailingStmt(Stmt *TrailingStmt) {
-    Kind = CursorInfoKind::StmtStart;
-    this->TrailingStmt = TrailingStmt;
-  }
-  void setTrailingExpr(Expr* TrailingExpr) {
-    Kind = CursorInfoKind::ExprStart;
-    this->TrailingExpr = TrailingExpr;
-  }
-
   bool isValid() const { return !isInvalid(); }
   bool isInvalid() const { return Kind == CursorInfoKind::Invalid; }
 };
 
-void simple_display(llvm::raw_ostream &out, const ResolvedCursorInfo &info);
+typedef llvm::IntrusiveRefCntPtr<ResolvedCursorInfo> ResolvedCursorInfoPtr;
+
+struct ResolvedValueRefCursorInfo : public ResolvedCursorInfo {
+private:
+  ValueDecl *ValueD = nullptr;
+  TypeDecl *CtorTyRef = nullptr;
+  ExtensionDecl *ExtTyRef = nullptr;
+  bool IsRef = true;
+  Type Ty;
+  Type ContainerType;
+  Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef = None;
+
+  bool IsKeywordArgument = false;
+  /// It this is a ref, whether it is "dynamic". See \c ide::isDynamicRef.
+  bool IsDynamic = false;
+  /// If this is a dynamic ref, the types of the base (multiple in the case of
+  /// protocol composition).
+  SmallVector<NominalTypeDecl *> ReceiverTypes;
+  /// Declarations that were shadowed by \c ValueD using a shorthand syntax
+  /// that names both the newly declared variable and the referenced variable
+  /// by the same identifier in the source text. This includes shorthand
+  /// closure captures (`[foo]`) and shorthand if captures
+  /// (`if let foo {`). Ordered from innermost to outermost shadows.
+  ///
+  /// Decls that are shadowed using shorthand syntax should be reported as
+  /// additional cursor info results.
+  SmallVector<ValueDecl *> ShorthandShadowedDecls;
+
+public:
+  ResolvedValueRefCursorInfo() = default;
+  explicit ResolvedValueRefCursorInfo(
+      SourceFile *SF, SourceLoc Loc, ValueDecl *ValueD, TypeDecl *CtorTyRef,
+      ExtensionDecl *ExtTyRef, bool IsRef, Type Ty, Type ContainerType,
+      Optional<std::pair<const CustomAttr *, Decl *>> CustomAttrRef,
+      bool IsKeywordArgument, bool IsDynamic,
+      SmallVector<NominalTypeDecl *> ReceiverTypes,
+      SmallVector<ValueDecl *> ShorthandShadowedDecls)
+      : ResolvedCursorInfo(CursorInfoKind::ValueRef, SF, Loc), ValueD(ValueD),
+        CtorTyRef(CtorTyRef), ExtTyRef(ExtTyRef), IsRef(IsRef), Ty(Ty),
+        ContainerType(ContainerType), CustomAttrRef(CustomAttrRef),
+        IsKeywordArgument(IsKeywordArgument), IsDynamic(IsDynamic),
+        ReceiverTypes(ReceiverTypes),
+        ShorthandShadowedDecls(ShorthandShadowedDecls) {}
+
+  ValueDecl *getValueD() const { return ValueD; }
+
+  ExtensionDecl *getExtTyRef() const { return ExtTyRef; }
+
+  TypeDecl *getCtorTyRef() const { return CtorTyRef; }
+
+  bool isRef() const { return IsRef; }
+
+  Type getType() const { return Ty; }
+
+  Type getContainerType() const { return ContainerType; }
+
+  bool isKeywordArgument() const { return IsKeywordArgument; }
+  void setIsKeywordArgument(bool IsKeywordArgument) {
+    this->IsKeywordArgument = IsKeywordArgument;
+  }
+
+  bool isDynamic() const { return this->IsDynamic; }
+
+  ArrayRef<NominalTypeDecl *> getReceiverTypes() const {
+    return this->ReceiverTypes;
+  }
+
+  ArrayRef<ValueDecl *> getShorthandShadowedDecls() const {
+    return this->ShorthandShadowedDecls;
+  };
+  void setShorthandShadowedDecls(
+      const SmallVector<ValueDecl *> &ShorthandShadowedDecls) {
+    this->ShorthandShadowedDecls = ShorthandShadowedDecls;
+  };
+
+  ValueDecl *typeOrValue() { return CtorTyRef ? CtorTyRef : ValueD; }
+
+  Optional<std::pair<const CustomAttr *, Decl *>> getCustomAttrRef() const {
+    return CustomAttrRef;
+  }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::ValueRef;
+  }
+};
+
+typedef llvm::IntrusiveRefCntPtr<ResolvedValueRefCursorInfo>
+    ResolvedValueRefCursorInfoPtr;
+
+struct ResolvedModuleRefCursorInfo : public ResolvedCursorInfo {
+private:
+  ModuleEntity Mod;
+
+public:
+  ResolvedModuleRefCursorInfo(SourceFile *SF, SourceLoc Loc, ModuleEntity Mod)
+      : ResolvedCursorInfo(CursorInfoKind::ModuleRef, SF, Loc), Mod(Mod) {}
+
+  ModuleEntity getMod() const { return Mod; }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::ModuleRef;
+  }
+};
+
+struct ResolvedExprStartCursorInfo : public ResolvedCursorInfo {
+private:
+  Expr *TrailingExpr = nullptr;
+
+public:
+  ResolvedExprStartCursorInfo(SourceFile *SF, SourceLoc Loc, Expr *TrailingExpr)
+      : ResolvedCursorInfo(CursorInfoKind::ExprStart, SF, Loc),
+        TrailingExpr(TrailingExpr) {}
+
+  Expr *getTrailingExpr() const { return TrailingExpr; }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::ExprStart;
+  }
+};
+
+struct ResolvedStmtStartCursorInfo : public ResolvedCursorInfo {
+  Stmt *TrailingStmt = nullptr;
+
+  ResolvedStmtStartCursorInfo(SourceFile *SF, SourceLoc Loc, Stmt *TrailingStmt)
+      : ResolvedCursorInfo(CursorInfoKind::StmtStart, SF, Loc),
+        TrailingStmt(TrailingStmt) {}
+
+  Stmt *getTrailingStmt() const { return TrailingStmt; }
+
+  static bool classof(const ResolvedCursorInfo *Info) {
+    return Info->getKind() == CursorInfoKind::StmtStart;
+  }
+};
+
+void simple_display(llvm::raw_ostream &out, ResolvedCursorInfoPtr info);
 
 struct UnresolvedLoc {
   SourceLoc Loc;
@@ -283,6 +367,10 @@ class NameMatcher: public ASTWalker {
                   Optional<unsigned> FirstTrailingLabel);
   bool handleCustomAttrs(Decl *D);
   ArgumentList *getApplicableArgsFor(Expr* E);
+
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Arguments;
+  }
 
   PreWalkResult<Expr *> walkToExprPre(Expr *E) override;
   PostWalkResult<Expr *> walkToExprPost(Expr *E) override;
@@ -467,7 +555,15 @@ struct NoteRegion {
 };
 
 struct Replacement {
+  /// If the edit is outside of the originally request source file, the path
+  /// to the file it is editing.
+  StringRef Path;
+  /// Range to apply the replacement to, zero-width if making an addition.
   CharSourceRange Range;
+  /// If the edit is actually a file (which could be generated/from an
+  /// expansion), the name (or path) of that buffer.
+  StringRef BufferName;
+  /// The text to replace \c Range with.
   StringRef Text;
   ArrayRef<NoteRegion> RegionsWorthNote;
 };
@@ -628,7 +724,7 @@ bool isDeclOverridable(ValueDecl *D);
 /// one in `SomeType`. Contrast that to `type(of: foo).classMethod()` where
 /// `classMethod` could be any `classMethod` up or down the hierarchy from the
 /// type of the \p Base expression.
-bool isDynamicRef(Expr *Base, ValueDecl *D);
+bool isDynamicRef(Expr *Base, ValueDecl *D, llvm::function_ref<Type(Expr *)> getType = [](Expr *E) { return E->getType(); });
 
 /// Adds the resolved nominal types of \p Base to \p Types.
 void getReceiverType(Expr *Base,

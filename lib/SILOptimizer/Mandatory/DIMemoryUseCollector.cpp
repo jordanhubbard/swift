@@ -255,7 +255,7 @@ SILType DIMemoryObjectInfo::getElementType(unsigned EltNo) const {
 /// resigning the identity requires a call into the \p actorSystem.
 /// Since deinitialization consistently happens in-order, according to the
 /// listing returned by \p NominalTypeDecl::getStoredProperties
-/// it is important the the VarDecl for the \p id is synthesized before
+/// it is important the VarDecl for the \p id is synthesized before
 /// the \p actorSystem so that we get the right ordering in DI and deinits.
 ///
 /// \param nomDecl a distributed actor decl
@@ -473,14 +473,15 @@ bool DIMemoryObjectInfo::isElementLetProperty(unsigned Element) const {
   if (!isNonDelegatingInit())
     return IsLet;
 
-  auto &Module = MemoryInst->getModule();
+  auto NTD = MemorySILType.getNominalOrBoundGenericNominal();
 
-  auto *NTD = MemorySILType.getNominalOrBoundGenericNominal();
   if (!NTD) {
     // Otherwise, we miscounted elements?
     assert(Element == 0 && "Element count problem");
     return false;
   }
+
+  auto &Module = MemoryInst->getModule();
 
   auto expansionContext = TypeExpansionContext(*MemoryInst->getFunction());
   for (auto *VD : NTD->getStoredProperties()) {
@@ -924,11 +925,13 @@ void ElementUseCollector::collectUses(SILValue Pointer, unsigned BaseEltNo) {
       case ParameterConvention::Direct_Owned:
       case ParameterConvention::Direct_Unowned:
       case ParameterConvention::Direct_Guaranteed:
+      case ParameterConvention::Pack_Guaranteed:
+      case ParameterConvention::Pack_Owned:
+      case ParameterConvention::Pack_Inout:
         llvm_unreachable("address value passed to indirect parameter");
 
       // If this is an in-parameter, it is like a load.
       case ParameterConvention::Indirect_In:
-      case ParameterConvention::Indirect_In_Constant:
       case ParameterConvention::Indirect_In_Guaranteed:
         addElementUses(BaseEltNo, PointeeType, User, DIUseKind::IndirectIn);
         continue;

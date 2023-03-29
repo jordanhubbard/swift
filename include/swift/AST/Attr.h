@@ -33,6 +33,7 @@
 #include "swift/AST/ConcreteDeclRef.h"
 #include "swift/AST/DeclNameLoc.h"
 #include "swift/AST/KnownProtocols.h"
+#include "swift/AST/MacroDeclaration.h"
 #include "swift/AST/Ownership.h"
 #include "swift/AST/PlatformKind.h"
 #include "swift/AST/Requirement.h"
@@ -57,6 +58,7 @@ class ClassDecl;
 class GenericFunctionType;
 class LazyConformanceLoader;
 class LazyMemberLoader;
+class ModuleDecl;
 class PatternBindingInitializer;
 class TrailingWhereClause;
 class TypeExpr;
@@ -167,10 +169,12 @@ protected:
       kind : 1
     );
 
-    SWIFT_INLINE_BITFIELD(SynthesizedProtocolAttr, DeclAttribute,
-                          NumKnownProtocolKindBits+1,
-      kind : NumKnownProtocolKindBits,
+    SWIFT_INLINE_BITFIELD(SynthesizedProtocolAttr, DeclAttribute, 1,
       isUnchecked : 1
+    );
+
+    SWIFT_INLINE_BITFIELD(ObjCImplementationAttr, DeclAttribute, 1,
+      isCategoryNameInvalid : 1
     );
   } Bits;
 
@@ -1360,22 +1364,22 @@ public:
 /// synthesized conformances.
 class SynthesizedProtocolAttr : public DeclAttribute {
   LazyConformanceLoader *Loader;
+  ProtocolDecl *protocol;
 
 public:
-  SynthesizedProtocolAttr(KnownProtocolKind protocolKind,
+  SynthesizedProtocolAttr(ProtocolDecl *protocol,
                           LazyConformanceLoader *Loader,
                           bool isUnchecked)
     : DeclAttribute(DAK_SynthesizedProtocol, SourceLoc(), SourceRange(),
-                    /*Implicit=*/true), Loader(Loader)
+                    /*Implicit=*/true), Loader(Loader), protocol(protocol)
   {
-    Bits.SynthesizedProtocolAttr.kind = unsigned(protocolKind);
     Bits.SynthesizedProtocolAttr.isUnchecked = unsigned(isUnchecked);
   }
 
   /// Retrieve the known protocol kind naming the protocol to be
   /// synthesized.
-  KnownProtocolKind getProtocolKind() const {
-    return KnownProtocolKind(Bits.SynthesizedProtocolAttr.kind);
+  ProtocolDecl *getProtocol() const {
+    return protocol;
   }
 
   bool isUnchecked() const {
@@ -2190,20 +2194,6 @@ public:
   }
 };
 
-/// The @_typeSequence attribute, which treats a generic param decl as a variadic
-/// sequence of value/type pairs.
-class TypeSequenceAttr : public DeclAttribute {
-  TypeSequenceAttr(SourceLoc atLoc, SourceRange Range);
-
-public:
-  static TypeSequenceAttr *create(ASTContext &Ctx, SourceLoc atLoc,
-                                  SourceRange Range);
-
-  static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_TypeSequence;
-  }
-};
-
 /// The @_unavailableFromAsync attribute, used to make function declarations
 /// unavailable from async contexts.
 class UnavailableFromAsyncAttr : public DeclAttribute {
@@ -2226,15 +2216,12 @@ public:
 
 /// The @_backDeploy(...) attribute, used to make function declarations available
 /// for back deployment to older OSes via emission into the client binary.
-class BackDeployAttr: public DeclAttribute {
+class BackDeployedAttr : public DeclAttribute {
 public:
-  BackDeployAttr(SourceLoc AtLoc, SourceRange Range,
-                 PlatformKind Platform,
-                 const llvm::VersionTuple Version,
-                 bool Implicit)
-    : DeclAttribute(DAK_BackDeploy, AtLoc, Range, Implicit),
-      Platform(Platform),
-      Version(Version) {}
+  BackDeployedAttr(SourceLoc AtLoc, SourceRange Range, PlatformKind Platform,
+                   const llvm::VersionTuple Version, bool Implicit)
+      : DeclAttribute(DAK_BackDeployed, AtLoc, Range, Implicit),
+        Platform(Platform), Version(Version) {}
 
   /// The platform the symbol is available for back deployment on.
   const PlatformKind Platform;
@@ -2246,7 +2233,7 @@ public:
   bool isActivePlatform(const ASTContext &ctx) const;
 
   static bool classof(const DeclAttribute *DA) {
-    return DA->getKind() == DAK_BackDeploy;
+    return DA->getKind() == DAK_BackDeployed;
   }
 };
 
@@ -2286,6 +2273,84 @@ public:
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DAK_Documentation;
+  }
+};
+
+class ObjCImplementationAttr final : public DeclAttribute {
+public:
+  Identifier CategoryName;
+
+  ObjCImplementationAttr(Identifier CategoryName, SourceLoc AtLoc,
+                         SourceRange Range, bool Implicit = false,
+                         bool isCategoryNameInvalid = false)
+    : DeclAttribute(DAK_ObjCImplementation, AtLoc, Range, Implicit),
+      CategoryName(CategoryName) {
+    Bits.ObjCImplementationAttr.isCategoryNameInvalid = isCategoryNameInvalid;
+  }
+
+  bool isCategoryNameInvalid() const {
+    return Bits.ObjCImplementationAttr.isCategoryNameInvalid;
+  }
+
+  void setCategoryNameInvalid(bool newValue = true) {
+    Bits.ObjCImplementationAttr.isCategoryNameInvalid = newValue;
+  }
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_ObjCImplementation;
+  }
+};
+
+/// A macro role attribute, spelled with either @attached or @freestanding,
+/// which declares one of the roles that a given macro can inhabit.
+class MacroRoleAttr final
+    : public DeclAttribute,
+      private llvm::TrailingObjects<MacroRoleAttr, MacroIntroducedDeclName> {
+  friend TrailingObjects;
+
+  MacroSyntax syntax;
+  MacroRole role;
+  unsigned numNames;
+  SourceLoc lParenLoc, rParenLoc;
+
+  MacroRoleAttr(SourceLoc atLoc, SourceRange range, MacroSyntax syntax,
+                SourceLoc lParenLoc, MacroRole role,
+                ArrayRef<MacroIntroducedDeclName> names,
+                SourceLoc rParenLoc, bool implicit);
+
+public:
+  static MacroRoleAttr *create(ASTContext &ctx, SourceLoc atLoc,
+                               SourceRange range, MacroSyntax syntax,
+                               SourceLoc lParenLoc, MacroRole role,
+                               ArrayRef<MacroIntroducedDeclName> names,
+                               SourceLoc rParenLoc, bool implicit);
+
+  size_t numTrailingObjects(OverloadToken<MacroIntroducedDeclName>) const {
+    return numNames;
+  }
+
+  SourceLoc getLParenLoc() const { return lParenLoc; }
+  SourceLoc getRParenLoc() const { return rParenLoc; }
+
+  MacroSyntax getMacroSyntax() const { return syntax; }
+  MacroRole getMacroRole() const { return role; }
+  ArrayRef<MacroIntroducedDeclName> getNames() const;
+  bool hasNameKind(MacroIntroducedDeclNameKind kind) const;
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DAK_MacroRole;
+  }
+};
+
+/// Predicate used to filter MatchingAttributeRange.
+template <typename ATTR, bool AllowInvalid> struct ToAttributeKind {
+  ToAttributeKind() {}
+
+  Optional<const ATTR *>
+  operator()(const DeclAttribute *Attr) const {
+    if (isa<ATTR>(Attr) && (Attr->isValid() || AllowInvalid))
+      return cast<ATTR>(Attr);
+    return None;
   }
 };
 
@@ -2354,6 +2419,10 @@ public:
   /// otherwise.
   const AvailableAttr *getNoAsync(const ASTContext &ctx) const;
 
+  /// Returns the `@backDeployed` attribute that is active for the current
+  /// platform.
+  const BackDeployedAttr *getBackDeployed(const ASTContext &ctx) const;
+
   SWIFT_DEBUG_DUMPER(dump(const Decl *D = nullptr));
   void print(ASTPrinter &Printer, const PrintOptions &Options,
              const Decl *D = nullptr) const;
@@ -2362,9 +2431,15 @@ public:
                     const Decl *D = nullptr);
 
   template <typename T, typename DERIVED>
-  class iterator_base : public std::iterator<std::forward_iterator_tag, T *> {
+  class iterator_base {
     T *Impl;
   public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = T*;
+    using difference_type = std::ptrdiff_t;
+    using pointer = value_type*;
+    using reference = value_type&;    
+
     explicit iterator_base(T *Impl) : Impl(Impl) {}
     DERIVED &operator++() { Impl = Impl->Next; return (DERIVED&)*this; }
     bool operator==(const iterator_base &X) const { return X.Impl == Impl; }
@@ -2452,19 +2527,6 @@ public:
          const_cast<const DeclAttributes *>(this)->getEffectiveSendableAttr());
   }
 
-private:
-  /// Predicate used to filter MatchingAttributeRange.
-  template <typename ATTR, bool AllowInvalid> struct ToAttributeKind {
-    ToAttributeKind() {}
-
-    Optional<const ATTR *>
-    operator()(const DeclAttribute *Attr) const {
-      if (isa<ATTR>(Attr) && (Attr->isValid() || AllowInvalid))
-        return cast<ATTR>(Attr);
-      return None;
-    }
-  };
-
 public:
   template <typename ATTR, bool AllowInvalid>
   using AttributeKindRange =
@@ -2518,6 +2580,59 @@ public:
   }
 
   SourceLoc getStartLoc(bool forModifiers = false) const;
+};
+
+/// Attributes applied directly to the declaration.
+///
+/// We should really just have \c DeclAttributes and \c SemanticDeclAttributes,
+/// but currently almost all callers expect the latter. Instead of changing all
+/// callers of \c getAttrs, instead provide a way to retrieive the original
+/// attributes.
+class OrigDeclAttributes {
+  SmallVector<DeclAttribute *> attributes;
+  using AttrListTy = SmallVectorImpl<DeclAttribute *>;
+
+public:
+  OrigDeclAttributes() = default;
+
+  OrigDeclAttributes(DeclAttributes semanticAttrs, ModuleDecl *mod);
+
+
+  using iterator = AttrListTy::iterator;
+  using const_iterator = AttrListTy::const_iterator;
+
+  iterator begin() { return attributes.begin(); }
+  iterator end() { return attributes.end(); }
+  const_iterator begin() const { return attributes.begin(); }
+  const_iterator end() const { return attributes.end(); }
+
+  template <typename AttrType, bool AllowInvalid>
+  using AttributeKindRange =
+  OptionalTransformRange<iterator_range<const_iterator>,
+  ToAttributeKind<AttrType, AllowInvalid>, const_iterator>;
+
+  template <typename AttrType, bool AllowInvalid = false>
+  AttributeKindRange<AttrType, AllowInvalid> getAttributes() const {
+    return AttributeKindRange<AttrType, AllowInvalid>(make_range(begin(), end()), ToAttributeKind<AttrType, AllowInvalid>());
+  }
+
+  /// Retrieve the first attribute of the given attribute class.
+  template <typename AttrType>
+  const AttrType *getAttribute(bool allowInvalid = false) const {
+    for (auto *attr : attributes) {
+      if (auto *specificAttr = dyn_cast<AttrType>(attr)) {
+        if (specificAttr->isValid() || allowInvalid)
+          return specificAttr;
+      }
+    }
+    return nullptr;
+  }
+
+  /// Determine whether there is an attribute with the given attribute class.
+  template <typename AttrType>
+  bool hasAttribute(bool allowInvalid = false) const {
+    return getAttribute<AttrType>(allowInvalid) != nullptr;
+  }
 };
 
 /// TypeAttributes - These are attributes that may be applied to types.
@@ -2613,13 +2728,13 @@ public:
     return true;
   }
 
-  bool hasConvention() const { return ConventionArguments.hasValue(); }
+  bool hasConvention() const { return ConventionArguments.has_value(); }
 
   /// Returns the primary calling convention string.
   ///
   /// Note: For C conventions, this may not represent the full convention.
   StringRef getConventionName() const {
-    return ConventionArguments.getValue().Name;
+    return ConventionArguments.value().Name;
   }
 
   /// Show the string enclosed between @convention(..)'s parentheses.
@@ -2643,10 +2758,10 @@ public:
 #include "swift/AST/ReferenceStorage.def"
   }
 
-  bool hasOpenedID() const { return OpenedID.hasValue(); }
+  bool hasOpenedID() const { return OpenedID.has_value(); }
   UUID getOpenedID() const { return *OpenedID; }
 
-  bool hasConstraintType() const { return ConstraintType.hasValue(); }
+  bool hasConstraintType() const { return ConstraintType.has_value(); }
   TypeRepr *getConstraintType() const { return *ConstraintType; }
 
   /// Given a name like "autoclosure", return the type attribute ID that
@@ -2663,11 +2778,16 @@ public:
   }
 
   // Iterator for the custom type attributes.
-  class iterator
-      : public std::iterator<std::forward_iterator_tag, CustomAttr *> {
+  class iterator {
     CustomAttr *attr;
 
   public:
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = CustomAttr*;
+    using difference_type = std::ptrdiff_t;
+    using pointer = value_type*;
+    using reference = value_type&;    
+
     iterator() : attr(nullptr) { }
     explicit iterator(CustomAttr *attr) : attr(attr) { }
 

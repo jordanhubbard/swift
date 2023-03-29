@@ -30,7 +30,7 @@ template <class Impl, class T> class SILBitfield {
   /// that the bits of that block are not initialized yet.
   /// See also: SILBasicBlock::lastInitializedBitfieldID,
   ///           SILFunction::currentBitfieldID
-  uint64_t bitfieldID;
+  int64_t bitfieldID;
 
   short startBit;
   short endBit;
@@ -84,6 +84,9 @@ public:
            "value too large for BasicBlockBitfield");
     unsigned clearMask = mask;
     if (bitfieldID > entity->lastInitializedBitfieldID) {
+
+      if (entity->isMarkedAsDeleted())
+        return;
 
       // The bitfield is not initialized yet in this block.
       // Initialize the bitfield, and also initialize all parent bitfields,
@@ -144,6 +147,55 @@ public:
   bool empty() const { return numElements == 0; }
   
   size_t size() const { return numElements; }
+};
+
+/// Embed a reference to a Bitfield container inside a longer-lived object so
+/// the bitfield container can be stack allocated with a properly nested minimal
+/// lifetime. Accessing the container outside the scope of it's stack allocation
+/// results in a nullptr dereference.
+///
+///     struct Parent {
+///       BitfieldRef<Container> container;
+///
+///       void performWithContainer(SILFunction *function) {
+///          BitfieldRef<Container>::StackState state(container, functon);
+///
+///          assert(container->isValid());
+///       }
+///     };
+///
+/// TODO: give this variadic template parameters to support a BitfieldContainer
+/// whose constructor takes more than a single SILFunction argument.
+template <typename BitfieldContainer> struct BitfieldRef {
+  BitfieldContainer *ref = nullptr;
+
+  BitfieldRef() {}
+
+  BitfieldContainer &operator*() const {
+    assert(ref);
+    return *ref;
+  }
+
+  BitfieldContainer *operator->() const {
+    assert(ref);
+    return ref;
+  }
+
+  // Stack-allocated state must be nested relative to other node bitfields.
+  struct StackState {
+    BitfieldRef &ref;
+    BitfieldContainer container;
+
+    StackState(BitfieldRef &ref, SILFunction *function)
+        : ref(ref), container(function) {
+      ref.ref = &container;
+    }
+
+    ~StackState() { ref.ref = nullptr; }
+  };
+
+private:
+  BitfieldRef(const BitfieldRef &) = delete;
 };
 
 } // namespace swift

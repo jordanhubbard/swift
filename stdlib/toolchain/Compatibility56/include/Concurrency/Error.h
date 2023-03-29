@@ -17,12 +17,13 @@
 #ifndef SWIFT_CONCURRENCY_ERROR_BACKDEPLOY56_H
 #define SWIFT_CONCURRENCY_ERROR_BACKDEPLOY56_H
 
-#include "swift/shims/Visibility.h"
+#include "public/SwiftShims/swift/shims/Visibility.h"
 #include <cstdint>
 #include <stdlib.h>
 
 namespace swift {
 
+__attribute__((visibility("hidden")))
 SWIFT_NORETURN void swift_Concurrency_fatalError(uint32_t flags, const char *format, ...);
 
 } // namespace swift

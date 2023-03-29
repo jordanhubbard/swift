@@ -1,6 +1,4 @@
-
 // RUN: %target-swift-emit-silgen -module-name objc_protocols -sdk %S/Inputs -I %S/Inputs -enable-source-import %s -disable-objc-attr-requires-foundation-module | %FileCheck %s
-
 // REQUIRES: objc_interop
 
 import gizmo
@@ -50,7 +48,7 @@ func objc_generic_partial_apply<T : NSRuncing>(_ x: T) {
   // CHECK:   [[FN:%.*]] = function_ref @$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxcfu1_
   _ = T.runce
 
-  // CHECK:   [[FN:%.*]] = function_ref @$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxmcfu3_
+  // CHECK:   [[FN:%.*]] = function_ref @$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycfu3_
   _ = T.mince
   // CHECK-NOT:   destroy_value [[ARG]]
 }
@@ -75,13 +73,9 @@ func objc_generic_partial_apply<T : NSRuncing>(_ x: T) {
 // CHECK: } // end sil function '$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxcfu1_AEycfu2_'
 
 
-// CHECK-LABEL: sil private [ossa] @$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxmcfu3_ : $@convention(thin) <T where T : NSRuncing> (@thick T.Type) -> @owned @callee_guaranteed () -> @owned NSObject
-// CHECK: function_ref @$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxmcfu3_AEycfu4_ : $@convention(thin) <τ_0_0 where τ_0_0 : NSRuncing> (@thick τ_0_0.Type) -> @owned NSObject
-// CHECK: } // end sil function '$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxmcfu3_'
-
-// CHECK-LABEL: sil private [ossa] @$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxmcfu3_AEycfu4_ : $@convention(thin) <T where T : NSRuncing> (@thick T.Type) -> @owned NSObject
+// CHECK-LABEL: sil private [ossa] @$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycfu3_ : $@convention(thin) <T where T : NSRuncing> (@thick T.Type) -> @owned NSObject
 // CHECK: objc_method %2 : $@objc_metatype T.Type, #NSRuncing.mince!foreign : <Self where Self : NSRuncing> (Self.Type) -> () -> NSObject, $@convention(objc_method) <τ_0_0 where τ_0_0 : NSRuncing> (@objc_metatype τ_0_0.Type) -> @autoreleased NSObject
-// CHECK: } // end sil function '$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycxmcfu3_AEycfu4_'
+// CHECK: } // end sil function '$s14objc_protocols0A22_generic_partial_applyyyxAA9NSRuncingRzlFSo8NSObjectCycfu3_'
 
 
 // CHECK-LABEL: sil hidden [ossa] @$s14objc_protocols0A9_protocol{{[_0-9a-zA-Z]*}}F
@@ -296,8 +290,9 @@ public protocol DangerousEscaper {
 // CHECK:  [[OE:%.*]] = open_existential_ref [[SELF]]
 // CHECK:  [[CLOSURE_COPY1:%.*]]  = copy_value [[CLOSURE_ARG]]
 // CHECK:  [[NOESCAPE:%.*]] = convert_escape_to_noescape [not_guaranteed] [[CLOSURE_COPY1]]
-// CHECK:  [[WITHOUT_ACTUALLY_ESCAPING_THUNK:%.*]] = function_ref @$sIg_Ieg_TR : $@convention(thin) (@noescape @callee_guaranteed () -> ()) -> ()
-// CHECK:  [[WITHOUT_ACTUALLY_ESCAPING_SENTINEL:%.*]] = partial_apply [callee_guaranteed] [[WITHOUT_ACTUALLY_ESCAPING_THUNK]]([[NOESCAPE]])
+// CHECK:  [[NOESCAPEC:%.*]] = copy_value [[NOESCAPE]]
+// CHECK:  [[WITHOUT_ACTUALLY_ESCAPING_THUNK:%.*]] = function_ref @$sIg_Ieg_TR : $@convention(thin) (@guaranteed @noescape @callee_guaranteed () -> ()) -> ()
+// CHECK:  [[WITHOUT_ACTUALLY_ESCAPING_SENTINEL:%.*]] = partial_apply [callee_guaranteed] [[WITHOUT_ACTUALLY_ESCAPING_THUNK]]([[NOESCAPEC]])
 // CHECK:  [[WITHOUT_ESCAPING:%.*]] = mark_dependence [[WITHOUT_ACTUALLY_ESCAPING_SENTINEL]] : $@callee_guaranteed () -> () on [[NOESCAPE]]
 // CHECK:  [[WITHOUT_ESCAPING_COPY:%.*]] = copy_value [[WITHOUT_ESCAPING]] : $@callee_guaranteed () -> ()
 // CHECK:  [[BLOCK:%.*]] = alloc_stack $@block_storage @callee_guaranteed () -> ()
@@ -314,7 +309,7 @@ public protocol DangerousEscaper {
 // CHECK:  destroy_value [[BLOCK_CLOSURE_COPY]] : $@convention(block) @noescape () -> ()
 // CHECK:  return {{.*}} : $()
 
-public func couldActuallyEscape(_ closure: @escaping () -> (), _ villian: DangerousEscaper) {
-  villian.malicious(closure)
+public func couldActuallyEscape(_ closure: @escaping () -> (), _ villain: DangerousEscaper) {
+  villain.malicious(closure)
 }
 

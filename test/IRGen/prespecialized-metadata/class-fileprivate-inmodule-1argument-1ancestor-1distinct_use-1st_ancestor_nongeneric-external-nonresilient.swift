@@ -90,9 +90,9 @@ import TestModule
 //         CHECK-SAME:  i32 {{(32|16)}},
 //         CHECK-SAME:  i16 {{(7|3)}},
 //         CHECK-SAME:  i16 0,
-//   CHECK-apple-SAME:  i32 {{(136|80)}},
-// CHECK-unknown-SAME:  i32 112,
-//         CHECK-SAME:  i32 {{(16|8)}},
+//   CHECK-apple-SAME:  i32 {{(144|84)}},
+// CHECK-unknown-SAME:  i32 120,
+//         CHECK-SAME:  i32 {{(24|12)}},
 //         CHECK-SAME:  %swift.type_descriptor* bitcast (
 //                   :    <{
 //                   :      i32,
@@ -165,7 +165,7 @@ doit()
 //              CHECK: }
 
 //              CHECK: ; Function Attrs: noinline nounwind readnone
-//              CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]LLCySiGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]+}} {
+//              CHECK: define linkonce_odr hidden swiftcc %swift.metadata_response @"$s4main5Value[[UNIQUE_ID_1]]LLCySiGMb"([[INT]] {{%[0-9]+}}) {{#[0-9]+}} {{(section)?.*}}{
 //         CHECK-NEXT: entry:
 //              CHECK:   [[SUPERCLASS_METADATA:%[0-9]+]] = call swiftcc %swift.metadata_response @"$s10TestModule9Ancestor1CMa"([[INT]] 0)
 //      CHECK-unknown:   ret

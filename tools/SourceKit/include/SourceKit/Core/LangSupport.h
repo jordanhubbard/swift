@@ -31,12 +31,6 @@ namespace llvm {
   class MemoryBuffer;
 }
 
-namespace swift {
-namespace syntax {
-class SourceFileSyntax;
-} // namespace syntax
-} // namespace swift
-
 namespace SourceKit {
 class GlobalConfig;
 
@@ -252,13 +246,6 @@ struct SourceFileRange {
   uintptr_t End;
 };
 
-enum class SyntaxTreeTransferMode {
-  /// Don't transfer the syntax tree
-  Off,
-  /// Transfer the entire syntax tree
-  Full
-};
-
 class EditorConsumer {
   virtual void anchor();
 public:
@@ -311,13 +298,6 @@ public:
                                 UIdent DiagStage) = 0;
 
   virtual void handleSourceText(StringRef Text) = 0;
-
-  virtual void
-  handleSyntaxTree(const swift::syntax::SourceFileSyntax &SyntaxTree) = 0;
-  virtual bool syntaxTreeEnabled() {
-    return syntaxTreeTransferMode() != SyntaxTreeTransferMode::Off;
-  }
-  virtual SyntaxTreeTransferMode syntaxTreeTransferMode() = 0;
 
   virtual void finished() {}
 };
@@ -383,6 +363,7 @@ public:
     return RequestResult();
   }
 
+  bool isValue() const { return type == Value; }
   const T &value() const {
     assert(type == Value);
     return *data;
@@ -406,6 +387,15 @@ struct RefactoringInfo {
 
   RefactoringInfo(UIdent Kind, StringRef KindName, StringRef UnavailableReason)
       : Kind(Kind), KindName(KindName), UnavailableReason(UnavailableReason) {}
+
+  void print(llvm::raw_ostream &OS, std::string Indentation) const {
+    OS << Indentation << "RefactoringInfo" << '\n';
+    OS << Indentation << "  Kind: " << Kind.getName() << '\n';
+    OS << Indentation << "  KindName: " << KindName << '\n';
+    OS << Indentation << "  UnavailableReason: " << UnavailableReason << '\n';
+  }
+
+  SWIFT_DEBUG_DUMP { print(llvm::errs(), ""); }
 };
 
 struct ParentInfo {
@@ -415,6 +405,15 @@ struct ParentInfo {
 
   ParentInfo(StringRef Title, StringRef KindName, StringRef USR)
       : Title(Title), KindName(KindName), USR(USR) {}
+
+  void print(llvm::raw_ostream &OS, std::string Indentation) const {
+    OS << Indentation << "ParentInfo" << '\n';
+    OS << Indentation << "  Title: " << Title << '\n';
+    OS << Indentation << "  KindName: " << KindName << '\n';
+    OS << Indentation << "  USR: " << USR << '\n';
+  }
+
+  SWIFT_DEBUG_DUMP { print(llvm::errs(), ""); }
 };
 
 struct ReferencedDeclInfo {
@@ -433,6 +432,24 @@ struct ReferencedDeclInfo {
       : USR(USR), DeclarationLang(DeclLang), AccessLevel(AccessLevel),
         FilePath(FilePath), ModuleName(ModuleName), IsSystem(System),
         IsSPI(SPI), ParentContexts(Parents) {}
+
+  void print(llvm::raw_ostream &OS, std::string Indentation) const {
+    OS << Indentation << "ReferencedDeclInfo" << '\n';
+    OS << Indentation << "  USR: " << USR << '\n';
+    OS << Indentation << "  DeclarationLang: " << DeclarationLang.getName()
+       << '\n';
+    OS << Indentation << "  AccessLevel: " << AccessLevel << '\n';
+    OS << Indentation << "  FilePath: " << FilePath << '\n';
+    OS << Indentation << "  ModuleName: " << ModuleName << '\n';
+    OS << Indentation << "  IsSystem: " << IsSystem << '\n';
+    OS << Indentation << "  IsSPI: " << IsSPI << '\n';
+    OS << Indentation << "  ParentContexts:" << '\n';
+    for (auto ParentCtx : ParentContexts) {
+      ParentCtx.print(OS, Indentation + "   ");
+    }
+  }
+
+  SWIFT_DEBUG_DUMP { print(llvm::errs(), ""); }
 };
 
 struct LocationInfo {
@@ -441,6 +458,17 @@ struct LocationInfo {
   unsigned Length = 0;
   unsigned Line = 0;
   unsigned Column = 0;
+
+  void print(llvm::raw_ostream &OS, std::string Indentation) const {
+    OS << Indentation << "LocationInfo" << '\n';
+    OS << Indentation << "  Filename: " << Filename << '\n';
+    OS << Indentation << "  Offset: " << Offset << '\n';
+    OS << Indentation << "  Length: " << Length << '\n';
+    OS << Indentation << "  Line: " << Line << '\n';
+    OS << Indentation << "  Column: " << Column << '\n';
+  }
+
+  SWIFT_DEBUG_DUMP { print(llvm::errs(), ""); }
 };
 
 struct CursorSymbolInfo {
@@ -490,6 +518,67 @@ struct CursorSymbolInfo {
   bool IsSynthesized = false;
 
   llvm::Optional<unsigned> ParentNameOffset;
+
+  void print(llvm::raw_ostream &OS, std::string Indentation) const {
+    OS << Indentation << "CursorSymbolInfo" << '\n';
+    OS << Indentation << "  Kind: " << Kind.getName() << '\n';
+    OS << Indentation << "  DeclarationLang: " << DeclarationLang.getName()
+       << '\n';
+    OS << Indentation << "  Name: " << Name << '\n';
+    OS << Indentation << "  USR: " << USR << '\n';
+    OS << Indentation << "  TypeName: " << TypeName << '\n';
+    OS << Indentation << "  TypeUSR: " << TypeUSR << '\n';
+    OS << Indentation << "  ContainerTypeUSR: " << ContainerTypeUSR << '\n';
+    OS << Indentation << "  DocComment: " << DocComment << '\n';
+    OS << Indentation << "  GroupName: " << GroupName << '\n';
+    OS << Indentation << "  LocalizationKey: " << LocalizationKey << '\n';
+    OS << Indentation << "  AnnotatedDeclaration: " << AnnotatedDeclaration
+       << '\n';
+    OS << Indentation
+       << "  FullyAnnotatedDeclaration: " << FullyAnnotatedDeclaration << '\n';
+    OS << Indentation << "  SymbolGraph: " << SymbolGraph << '\n';
+    OS << Indentation << "  ModuleName: " << ModuleName << '\n';
+    OS << Indentation << "  ModuleInterfaceName: " << ModuleInterfaceName
+       << '\n';
+    Location.print(OS, Indentation + "  ");
+    OS << Indentation << "  OverrideUSRs:" << '\n';
+    for (auto OverrideUSR : OverrideUSRs) {
+      OS << Indentation << "    " << OverrideUSR << '\n';
+    }
+    OS << Indentation << "  AnnotatedRelatedDeclarations:" << '\n';
+    for (auto AnnotatedRelatedDeclaration : AnnotatedRelatedDeclarations) {
+      OS << Indentation << "    " << AnnotatedRelatedDeclaration << '\n';
+    }
+    OS << Indentation << "  ModuleGroupArray:" << '\n';
+    for (auto ModuleGroup : ModuleGroupArray) {
+      OS << Indentation << "    " << ModuleGroup << '\n';
+    }
+    OS << Indentation << "  ParentContexts:" << '\n';
+    for (auto ParentContext : ParentContexts) {
+      ParentContext.print(OS, Indentation + "    ");
+    }
+
+    llvm::SmallVector<ReferencedDeclInfo> SortedReferencedSymbols(
+        ReferencedSymbols.begin(), ReferencedSymbols.end());
+    std::sort(SortedReferencedSymbols.begin(), SortedReferencedSymbols.end(),
+              [](const ReferencedDeclInfo &LHS, const ReferencedDeclInfo &RHS) {
+                return LHS.USR < RHS.USR;
+              });
+    OS << Indentation << "ReferencedSymbols:" << '\n';
+    for (auto ReferencedSymbol : SortedReferencedSymbols) {
+      ReferencedSymbol.print(OS, Indentation + "    ");
+    }
+    OS << Indentation << "ReceiverUSRs:" << '\n';
+    for (auto ReceiverUSR : ReceiverUSRs) {
+      OS << Indentation << "    " << ReceiverUSR << '\n';
+    }
+    OS << Indentation << "IsSystem: " << IsSystem << '\n';
+    OS << Indentation << "IsDynamic: " << IsDynamic << '\n';
+    OS << Indentation << "IsSynthesized: " << IsSynthesized << '\n';
+    OS << Indentation << "ParentNameOffset: " << ParentNameOffset << '\n';
+  }
+
+  SWIFT_DEBUG_DUMP { print(llvm::errs(), ""); }
 };
 
 struct CursorInfoData {
@@ -497,9 +586,29 @@ struct CursorInfoData {
   // will be empty). Clients can potentially use this to show a diagnostic
   // message to the user in lieu of using the empty response.
   StringRef InternalDiagnostic;
-  llvm::ArrayRef<CursorSymbolInfo> Symbols;
+  llvm::SmallVector<CursorSymbolInfo, 1> Symbols;
   /// All available actions on the code under cursor.
-  llvm::ArrayRef<RefactoringInfo> AvailableActions;
+  llvm::SmallVector<RefactoringInfo, 8> AvailableActions;
+  /// Whether the ASTContext was reused for this cursor info.
+  bool DidReuseAST = false;
+  /// An allocator that can be used to allocate data that is referenced by this
+  /// \c CursorInfoData.
+  llvm::BumpPtrAllocator Allocator;
+
+  void print(llvm::raw_ostream &OS, std::string Indentation) const {
+    OS << Indentation << "CursorInfoData" << '\n';
+    OS << Indentation << "  Symbols:" << '\n';
+    for (auto Symbol : Symbols) {
+      Symbol.print(OS, Indentation + "    ");
+    }
+    OS << Indentation << "  AvailableActions:" << '\n';
+    for (auto AvailableAction : AvailableActions) {
+      AvailableAction.print(OS, Indentation + "    ");
+    }
+    OS << Indentation << "DidReuseAST: " << DidReuseAST << '\n';
+  }
+
+  SWIFT_DEBUG_DUMP { print(llvm::errs(), ""); }
 };
 
 /// The result type of `LangSupport::getDiagnostics`
@@ -526,11 +635,15 @@ struct NameTranslatingInfo {
 enum class SemanticRefactoringKind {
   None,
 #define SEMANTIC_REFACTORING(KIND, NAME, ID) KIND,
-#include "swift/IDE/RefactoringKinds.def"
+#include "swift/Refactoring/RefactoringKinds.def"
 };
 
 struct SemanticRefactoringInfo {
   SemanticRefactoringKind Kind;
+  // The name of the input buffer to start the refactoring in. This must either
+  // be empty (in which case the primary file for the AST is used), or exactly
+  // match the buffer identifier stored in the source manager.
+  StringRef InputBufferName;
   unsigned Line;
   unsigned Column;
   unsigned Length;
@@ -540,6 +653,20 @@ struct SemanticRefactoringInfo {
 struct RelatedIdentsInfo {
   /// (Offset,Length) pairs.
   ArrayRef<std::pair<unsigned, unsigned>> Ranges;
+};
+
+/// Represent one branch of an if config.
+/// Either `#if`, `#else` or `#elseif`.
+struct IfConfigInfo {
+  unsigned Offset;
+  bool IsActive;
+
+  IfConfigInfo(unsigned Offset, bool IsActive)
+      : Offset(Offset), IsActive(IsActive) {}
+};
+
+struct ActiveRegionsInfo {
+  ArrayRef<IfConfigInfo> Configs;
 };
 
 /// Filled out by LangSupport::findInterfaceDocument().
@@ -602,10 +729,16 @@ struct NoteRegion {
 };
 
 struct Edit {
+  /// If the edit is outside of the originally request source file, the path
+  /// to the file it is editing.
+  std::string Path;
   unsigned StartLine;
   unsigned StartColumn;
   unsigned EndLine;
   unsigned EndColumn;
+  /// If the edit is actually a file (which could be generated/from an
+  /// expansion), the name (or path) of that buffer.
+  std::string BufferName;
   std::string NewText;
   SmallVector<NoteRegion, 2> RegionsWithNote;
 };
@@ -750,6 +883,16 @@ public:
 
   virtual void dependencyUpdated() {}
 
+  virtual void demangleNames(
+      ArrayRef<const char *> MangledNames, bool Simplified,
+      std::function<void(const RequestResult<ArrayRef<std::string>> &)>
+          Receiver) = 0;
+
+  virtual void mangleSimpleClassNames(
+      ArrayRef<std::pair<StringRef, StringRef>> ModuleClassPairs,
+      std::function<void(const RequestResult<ArrayRef<std::string>> &)>
+          Receiver) = 0;
+
   virtual void indexSource(StringRef Filename,
                            IndexingConsumer &Consumer,
                            ArrayRef<const char *> Args) = 0;
@@ -839,14 +982,15 @@ public:
                                        EditorConsumer &Consumer) = 0;
 
   virtual void getCursorInfo(
-      StringRef Filename, unsigned Offset, unsigned Length, bool Actionables,
-      bool SymbolGraph, bool CancelOnSubsequentRequest,
-      ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
+      StringRef PrimaryFilePath, StringRef InputBufferName, unsigned Offset,
+      unsigned Length, bool Actionables, bool SymbolGraph,
+      bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
+      Optional<VFSOptions> vfsOptions,
       SourceKitCancellationToken CancellationToken,
       std::function<void(const RequestResult<CursorInfoData> &)> Receiver) = 0;
 
   virtual void
-  getDiagnostics(StringRef InputFile, ArrayRef<const char *> Args,
+  getDiagnostics(StringRef PrimaryFilePath, ArrayRef<const char *> Args,
                  Optional<VFSOptions> VfsOptions,
                  SourceKitCancellationToken CancellationToken,
                  std::function<void(const RequestResult<DiagnosticsResult> &)>
@@ -860,21 +1004,29 @@ public:
                   Receiver) = 0;
 
   virtual void getRangeInfo(
-      StringRef Filename, unsigned Offset, unsigned Length,
-      bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
-      SourceKitCancellationToken CancellationToken,
+      StringRef PrimaryFilePath, StringRef InputBufferName, unsigned Offset,
+      unsigned Length, bool CancelOnSubsequentRequest,
+      ArrayRef<const char *> Args, SourceKitCancellationToken CancellationToken,
       std::function<void(const RequestResult<RangeInfo> &)> Receiver) = 0;
 
   virtual void getCursorInfoFromUSR(
-      StringRef Filename, StringRef USR, bool CancelOnSubsequentRequest,
-      ArrayRef<const char *> Args, Optional<VFSOptions> vfsOptions,
+      StringRef PrimaryFilePath, StringRef InputBufferName, StringRef USR,
+      bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
+      Optional<VFSOptions> vfsOptions,
       SourceKitCancellationToken CancellationToken,
       std::function<void(const RequestResult<CursorInfoData> &)> Receiver) = 0;
 
   virtual void findRelatedIdentifiersInFile(
-      StringRef Filename, unsigned Offset, bool CancelOnSubsequentRequest,
-      ArrayRef<const char *> Args, SourceKitCancellationToken CancellationToken,
+      StringRef PrimaryFilePath, StringRef InputBufferName, unsigned Offset,
+      bool CancelOnSubsequentRequest, ArrayRef<const char *> Args,
+      SourceKitCancellationToken CancellationToken,
       std::function<void(const RequestResult<RelatedIdentsInfo> &)>
+          Receiver) = 0;
+
+  virtual void findActiveRegionsInFile(
+      StringRef PrimaryFilePath, StringRef InputBufferName,
+      ArrayRef<const char *> Args, SourceKitCancellationToken CancellationToken,
+      std::function<void(const RequestResult<ActiveRegionsInfo> &)>
           Receiver) = 0;
 
   virtual llvm::Optional<std::pair<unsigned, unsigned>>
@@ -903,15 +1055,16 @@ public:
                         SourceKitCancellationToken CancellationToken,
                         CategorizedRenameRangesReceiver Receiver) = 0;
 
-  virtual void semanticRefactoring(StringRef Filename,
+  virtual void semanticRefactoring(StringRef PrimaryFilePath,
                                    SemanticRefactoringInfo Info,
                                    ArrayRef<const char *> Args,
                                    SourceKitCancellationToken CancellationToken,
                                    CategorizedEditsReceiver Receiver) = 0;
 
   virtual void collectExpressionTypes(
-      StringRef FileName, ArrayRef<const char *> Args,
-      ArrayRef<const char *> ExpectedProtocols, bool CanonicalType,
+      StringRef PrimaryFilePath, StringRef InputBufferName,
+      ArrayRef<const char *> Args, ArrayRef<const char *> ExpectedProtocols,
+      bool FullyQualified, bool CanonicalType,
       SourceKitCancellationToken CancellationToken,
       std::function<void(const RequestResult<ExpressionTypesInFile> &)>
           Receiver) = 0;
@@ -920,8 +1073,9 @@ public:
   /// the source file. If `Offset` or `Length` are empty, variable types for
   /// the entire document are collected.
   virtual void collectVariableTypes(
-      StringRef FileName, ArrayRef<const char *> Args,
-      Optional<unsigned> Offset, Optional<unsigned> Length,
+      StringRef PrimaryFilePath, StringRef InputBufferName,
+      ArrayRef<const char *> Args, Optional<unsigned> Offset,
+      Optional<unsigned> Length, bool FullyQualified,
       SourceKitCancellationToken CancellationToken,
       std::function<void(const RequestResult<VariableTypesInFile> &)>
           Receiver) = 0;

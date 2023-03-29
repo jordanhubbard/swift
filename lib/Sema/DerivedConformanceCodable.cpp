@@ -65,8 +65,8 @@ static Identifier getVarNameForCoding(VarDecl *var,
   if (auto originalVar = var->getOriginalWrappedProperty())
     identifier = originalVar->getName();
 
-  if (identifier.empty() && paramIndex.hasValue())
-    return C.getIdentifier("_" + std::to_string(paramIndex.getValue()));
+  if (identifier.empty() && paramIndex.has_value())
+    return C.getIdentifier("_" + std::to_string(paramIndex.value()));
 
   return identifier;
 }
@@ -702,8 +702,8 @@ static ThrowStmt *createThrowCodingErrorStmt(ASTContext &C, Expr *containerExpr,
   auto *contextInitCallExpr = CallExpr::createImplicit(C, contextInitCall,
                                                        initArgList);
   llvm::SmallVector<Expr *, 2> arguments;
-  if (argument.hasValue()) {
-    arguments.push_back(argument.getValue());
+  if (argument.has_value()) {
+    arguments.push_back(argument.value());
   }
   arguments.push_back(contextInitCallExpr);
 
@@ -976,7 +976,7 @@ createEnumSwitch(ASTContext &C, DeclContext *DC, Expr *expr, EnumDecl *enumDecl,
               DC->mapTypeIntoContext(
                   targetElt->getParentEnum()->getDeclaredInterfaceType()),
               C),
-          SourceLoc(), DeclNameLoc(), DeclNameRef(), targetElt, subpattern);
+          SourceLoc(), DeclNameLoc(), DeclNameRef(), targetElt, subpattern, DC);
       pat->setImplicit();
 
       auto labelItem = CaseLabelItem(pat);
@@ -1650,7 +1650,8 @@ deriveBodyDecodable_enum_init(AbstractFunctionDecl *initDecl, void *) {
           C, UnresolvedDotExpr::createImplicit(C, allKeysExpr, C.Id_popFirst));
 
       auto *theKeyPattern = BindingPattern::createImplicit(
-          C, /*isLet=*/true, NamedPattern::createImplicit(C, theKeyDecl));
+          C, VarDecl::Introducer::Let,
+          NamedPattern::createImplicit(C, theKeyDecl));
 
       guardElements.emplace_back(SourceLoc(), theKeyPattern,
                                  allKeysPopFirstCallExpr);

@@ -1,4 +1,6 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking -warn-redundant-requirements  -enable-experimental-implicit-some
+// RUN: %target-typecheck-verify-swift -disable-availability-checking -warn-redundant-requirements  -enable-experimental-feature ImplicitSome
+
+// REQUIRES: asserts
 
 protocol Eatery {
   func lunch()
@@ -71,8 +73,8 @@ func inspect( _ snack: some Snack) -> some Snack {
 // tuple type alias
 func highestRated() -> (some Snack, some Snack) { } // expected-error {{function declares an opaque return type, but has no return statements in its body from which to infer an underlying type}}
 
-// TO-DO: Fix type alias for plain protocols; resolves as an existential type
-func list(_: (Meal, Meal)) -> (Meal, Meal){ }
+func list(_: (Meal, Meal)) -> (Meal, Meal){ } // expected-error {{function declares an opaque return type, but has no return statements in its body from which to infer an underlying type}}
+
 func find() -> Snack { }
 
 // opaque compostion types
@@ -103,3 +105,34 @@ func eat(_ myfruit: inout Basket) -> Basket {
   return myfruit
 }
 
+protocol P {
+  associatedtype A: P
+  var value: A { get }
+}
+
+struct S: P {
+  var value: P { self }
+
+  var asExistential: any P { self }
+}
+
+enum E {
+    func f() -> Int {
+        1
+    }
+}
+
+protocol Q {
+    func f() -> Int
+}
+
+func findBiggerCollection<T : Numeric>( _ first: Collection<T>, _ second: Collection<T>) -> Collection<T> {
+  // expected-error@-1 {{function declares an opaque return type 'Collection<T>', but the return statements in its body do not have matching underlying types}}
+  if (first.count > second.count) { return first } //expected-note {{return statement has underlying type 'Collection<T>'}}
+  return second //expected-note {{return statement has underlying type 'Collection<T>'}}
+}
+
+func createCollection() -> Collection<Int> {
+  let a = [9,2,0]
+  return a
+}

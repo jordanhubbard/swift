@@ -752,16 +752,16 @@ class DeadObjectElimination : public SILFunctionTransform {
 
     for (auto &BB : Fn) {
 
-      for (SILInstruction *inst : deleter.updatingRange(&BB)) {
-        if (auto *A = dyn_cast<AllocRefInstBase>(inst))
+      for (SILInstruction &inst : BB.deletableInstructions()) {
+        if (auto *A = dyn_cast<AllocRefInstBase>(&inst))
           Changed |= processAllocRef(A);
-        else if (auto *A = dyn_cast<AllocStackInst>(inst))
+        else if (auto *A = dyn_cast<AllocStackInst>(&inst))
           Changed |= processAllocStack(A);
-        else if (auto *KPI = dyn_cast<KeyPathInst>(inst))
+        else if (auto *KPI = dyn_cast<KeyPathInst>(&inst))
           Changed |= processKeyPath(KPI);
-        else if (auto *A = dyn_cast<AllocBoxInst>(inst))
+        else if (auto *A = dyn_cast<AllocBoxInst>(&inst))
           Changed |= processAllocBox(A);
-        else if (auto *A = dyn_cast<ApplyInst>(inst))
+        else if (auto *A = dyn_cast<ApplyInst>(&inst))
           Changed |= processAllocApply(A, DEBlocks);
       }
       deleter.cleanupDeadInstructions();
@@ -882,7 +882,7 @@ bool DeadObjectElimination::processKeyPath(KeyPathInst *KPI) {
 
   // For simplicity just bail if the keypath has a non-trivial operands.
   // TODO: don't bail but insert compensating destroys for such operands.
-  for (const Operand &Op : KPI->getAllOperands()) {
+  for (const Operand &Op : KPI->getPatternOperands()) {
     if (!Op.get()->getType().isTrivial(*KPI->getFunction()))
       return false;
   }

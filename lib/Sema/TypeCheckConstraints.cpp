@@ -67,6 +67,8 @@ void TypeVariableType::Implementation::print(llvm::raw_ostream &OS) {
     bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToNoEscape);
   if (canBindToHole())
     bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToHole);
+  if (canBindToPack())
+    bindingOptions.push_back(TypeVariableOptions::TVO_CanBindToPack);
   if (!bindingOptions.empty()) {
     OS << " [allows bindings to: ";
     interleave(bindingOptions, OS,
@@ -144,14 +146,30 @@ bool TypeVariableType::Implementation::isSubscriptResultType() const {
          locator->isLastElement<LocatorPathElt::FunctionResult>();
 }
 
-bool TypeVariableType::Implementation::isTypeSequence() const {
+bool TypeVariableType::Implementation::isParameterPack() const {
   return locator
       && locator->isForGenericParameter()
-      && locator->getGenericParameter()->isTypeSequence();
+      && locator->getGenericParameter()->isParameterPack();
 }
 
 bool TypeVariableType::Implementation::isCodeCompletionToken() const {
   return locator && locator->directlyAt<CodeCompletionExpr>();
+}
+
+bool TypeVariableType::Implementation::isOpaqueType() const {
+  if (!locator)
+    return false;
+
+  auto GP = locator->getLastElementAs<LocatorPathElt::GenericParameter>();
+  if (!GP)
+    return false;
+
+  if (auto *GPT = GP->getType()->getAs<GenericTypeParamType>()) {
+    auto *decl = GPT->getDecl();
+    return decl && decl->isOpaqueType();
+  }
+
+  return false;
 }
 
 void *operator new(size_t bytes, ConstraintSystem& cs,
@@ -159,18 +177,21 @@ void *operator new(size_t bytes, ConstraintSystem& cs,
   return cs.getAllocator().Allocate(bytes, alignment);
 }
 
-bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
-                                      ArrayRef<TupleTypeElt> toTuple,
+bool constraints::computeTupleShuffle(TupleType *fromTuple,
+                                      TupleType *toTuple,
                                       SmallVectorImpl<unsigned> &sources) {
   const unsigned unassigned = -1;
   
-  SmallVector<bool, 4> consumed(fromTuple.size(), false);
+  auto fromElts = fromTuple->getElements();
+  auto toElts = toTuple->getElements();
+
+  SmallVector<bool, 4> consumed(fromElts.size(), false);
   sources.clear();
-  sources.assign(toTuple.size(), unassigned);
+  sources.assign(toElts.size(), unassigned);
 
   // Match up any named elements.
-  for (unsigned i = 0, n = toTuple.size(); i != n; ++i) {
-    const auto &toElt = toTuple[i];
+  for (unsigned i = 0, n = toElts.size(); i != n; ++i) {
+    const auto &toElt = toElts[i];
 
     // Skip unnamed elements.
     if (!toElt.hasName())
@@ -180,7 +201,7 @@ bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
     int matched = -1;
     {
       int index = 0;
-      for (auto field : fromTuple) {
+      for (auto field : fromElts) {
         if (field.getName() == toElt.getName() && !consumed[index]) {
           matched = index;
           break;
@@ -197,14 +218,14 @@ bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
   }  
 
   // Resolve any unmatched elements.
-  unsigned fromNext = 0, fromLast = fromTuple.size();
+  unsigned fromNext = 0, fromLast = fromElts.size();
   auto skipToNextAvailableInput = [&] {
     while (fromNext != fromLast && consumed[fromNext])
       ++fromNext;
   };
   skipToNextAvailableInput();
 
-  for (unsigned i = 0, n = toTuple.size(); i != n; ++i) {
+  for (unsigned i = 0, n = toElts.size(); i != n; ++i) {
     // Check whether we already found a value for this element.
     if (sources[i] != unassigned)
       continue;
@@ -215,11 +236,11 @@ bool constraints::computeTupleShuffle(ArrayRef<TupleTypeElt> fromTuple,
     }
 
     // Otherwise, assign this input to the next output element.
-    const auto &elt2 = toTuple[i];
+    const auto &elt2 = toElts[i];
 
     // Fail if the input element is named and we're trying to match it with
     // something with a different label.
-    if (fromTuple[fromNext].hasName() && elt2.hasName())
+    if (fromElts[fromNext].hasName() && elt2.hasName())
       return true;
 
     sources[i] = fromNext;
@@ -271,6 +292,10 @@ class FunctionSyntacticDiagnosticWalker : public ASTWalker {
 public:
   FunctionSyntacticDiagnosticWalker(DeclContext *dc) { dcStack.push_back(dc); }
 
+  MacroWalking getMacroWalkingBehavior() const override {
+    return MacroWalking::Expansion;
+  }
+
   PreWalkResult<Expr *> walkToExprPre(Expr *expr) override {
     performSyntacticExprDiagnostics(expr, dcStack.back(), /*isExprStmt=*/false);
 
@@ -313,18 +338,18 @@ public:
 } // end anonymous namespace
 
 void constraints::performSyntacticDiagnosticsForTarget(
-    const SolutionApplicationTarget &target,
-    bool isExprStmt, bool disableExprAvailabilityChecking) {
+    const SyntacticElementTarget &target, bool isExprStmt,
+    bool disableExprAvailabilityChecking) {
   auto *dc = target.getDeclContext();
   switch (target.kind) {
-  case SolutionApplicationTarget::Kind::expression: {
+  case SyntacticElementTarget::Kind::expression: {
     // First emit diagnostics for the main expression.
     performSyntacticExprDiagnostics(target.getAsExpr(), dc,
                                     isExprStmt, disableExprAvailabilityChecking);
     return;
   }
 
-  case SolutionApplicationTarget::Kind::forEachStmt: {
+  case SyntacticElementTarget::Kind::forEachStmt: {
     auto *stmt = target.getAsForEachStmt();
 
     // First emit diagnostics for the main expression.
@@ -337,16 +362,16 @@ void constraints::performSyntacticDiagnosticsForTarget(
     return;
   }
 
-  case SolutionApplicationTarget::Kind::function: {
+  case SyntacticElementTarget::Kind::function: {
     FunctionSyntacticDiagnosticWalker walker(dc);
     target.getFunctionBody()->walk(walker);
     return;
   }
-  case SolutionApplicationTarget::Kind::closure:
-  case SolutionApplicationTarget::Kind::stmtCondition:
-  case SolutionApplicationTarget::Kind::caseLabelItem:
-  case SolutionApplicationTarget::Kind::patternBinding:
-  case SolutionApplicationTarget::Kind::uninitializedVar:
+  case SyntacticElementTarget::Kind::closure:
+  case SyntacticElementTarget::Kind::stmtCondition:
+  case SyntacticElementTarget::Kind::caseLabelItem:
+  case SyntacticElementTarget::Kind::patternBinding:
+  case SyntacticElementTarget::Kind::uninitializedVar:
     // Nothing to do for these.
     return;
   }
@@ -357,7 +382,7 @@ void constraints::performSyntacticDiagnosticsForTarget(
 Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
                                       ContextualTypeInfo contextualInfo,
                                       TypeCheckExprOptions options) {
-  SolutionApplicationTarget target(
+  SyntacticElementTarget target(
       expr, dc, contextualInfo.purpose, contextualInfo.getType(),
       options.contains(TypeCheckExprFlags::IsDiscarded));
   auto resultTarget = typeCheckExpression(target, options);
@@ -373,8 +398,8 @@ Type TypeChecker::typeCheckExpression(Expr *&expr, DeclContext *dc,
 /// FIXME: In order to remote this function both \c FrontendStatsTracer
 /// and \c PrettyStackTrace* have to be updated to accept `ASTNode`
 // instead of each individual syntactic element types.
-Optional<SolutionApplicationTarget>
-TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
+Optional<SyntacticElementTarget>
+TypeChecker::typeCheckExpression(SyntacticElementTarget &target,
                                  TypeCheckExprOptions options) {
   DeclContext *dc = target.getDeclContext();
   auto &Context = dc->getASTContext();
@@ -385,8 +410,8 @@ TypeChecker::typeCheckExpression(SolutionApplicationTarget &target,
   return typeCheckTarget(target, options);
 }
 
-Optional<SolutionApplicationTarget>
-TypeChecker::typeCheckTarget(SolutionApplicationTarget &target,
+Optional<SyntacticElementTarget>
+TypeChecker::typeCheckTarget(SyntacticElementTarget &target,
                              TypeCheckExprOptions options) {
   DeclContext *dc = target.getDeclContext();
   auto &Context = dc->getASTContext();
@@ -418,6 +443,9 @@ TypeChecker::typeCheckTarget(SolutionApplicationTarget &target,
 
   if (options.contains(TypeCheckExprFlags::LeaveClosureBodyUnchecked))
     csOptions |= ConstraintSystemFlags::LeaveClosureBodyUnchecked;
+
+  if (options.contains(TypeCheckExprFlags::DisableMacroExpansions))
+    csOptions |= ConstraintSystemFlags::DisableMacroExpansions;
 
   ConstraintSystem cs(dc, csOptions);
 
@@ -480,7 +508,7 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
 
   // First, let's try to type-check default expression using interface
   // type of the parameter, if that succeeds - we are done.
-  SolutionApplicationTarget defaultExprTarget(
+  SyntacticElementTarget defaultExprTarget(
       defaultValue, DC,
       isAutoClosure ? CTP_AutoclosureDefaultParameter : CTP_DefaultParameter,
       paramType, /*isDiscarded=*/false);
@@ -649,8 +677,8 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
       auto &requirement = requirements[reqIdx];
 
       switch (requirement.getKind()) {
-      case RequirementKind::SameCount:
-        llvm_unreachable("Same-count requirement not supported here");
+      case RequirementKind::SameShape:
+        llvm_unreachable("Same-shape requirement not supported here");
 
       case RequirementKind::SameType: {
         auto lhsTy = requirement.getFirstType();
@@ -729,6 +757,8 @@ Type TypeChecker::typeCheckParameterDefault(Expr *&defaultValue,
   cs.applySolution(solution);
 
   if (auto result = cs.applySolution(solution, defaultExprTarget)) {
+    // Perform syntactic diagnostics on the type-checked target.
+    performSyntacticDiagnosticsForTarget(*result, /*isExprStmt=*/false);
     defaultValue = result->getAsExpr();
     return defaultValue->getType();
   }
@@ -741,23 +771,13 @@ bool TypeChecker::typeCheckBinding(Pattern *&pattern, Expr *&initializer,
                                    PatternBindingDecl *PBD,
                                    unsigned patternNumber,
                                    TypeCheckExprOptions options) {
-  SolutionApplicationTarget target =
-    PBD ? SolutionApplicationTarget::forInitialization(
-            initializer, DC, patternType, PBD, patternNumber,
-            /*bindPatternVarsOneWay=*/false)
-        : SolutionApplicationTarget::forInitialization(
-            initializer, DC, patternType, pattern,
-            /*bindPatternVarsOneWay=*/false);
-
-  if (DC->getASTContext().LangOpts.CheckAPIAvailabilityOnly &&
-      PBD && !DC->getAsDecl()) {
-    // Skip checking the initializer for non-public decls when
-    // checking the API only.
-    auto VD = PBD->getAnchoringVarDecl(0);
-    if (!swift::shouldCheckAvailability(VD)) {
-      options |= TypeCheckExprFlags::DisableExprAvailabilityChecking;
-    }
-  }
+  SyntacticElementTarget target =
+      PBD ? SyntacticElementTarget::forInitialization(
+                initializer, DC, patternType, PBD, patternNumber,
+                /*bindPatternVarsOneWay=*/false)
+          : SyntacticElementTarget::forInitialization(
+                initializer, DC, patternType, pattern,
+                /*bindPatternVarsOneWay=*/false);
 
   // Type-check the initializer.
   auto resultTarget = typeCheckExpression(target, options);
@@ -859,7 +879,7 @@ bool TypeChecker::typeCheckForEachBinding(DeclContext *dc, ForEachStmt *stmt) {
     return true;
   };
 
-  auto target = SolutionApplicationTarget::forForEachStmt(
+  auto target = SyntacticElementTarget::forForEachStmt(
       stmt, dc, /*bindPatternVarsOneWay=*/false);
   if (!typeCheckTarget(target))
     return failed();
@@ -891,7 +911,7 @@ bool TypeChecker::typeCheckCondition(Expr *&expr, DeclContext *dc) {
   return !resultTy;
 }
 
-/// Find the '~=` operator that can compare an expression inside a pattern to a
+/// Find the `~=` operator that can compare an expression inside a pattern to a
 /// value of a given type.
 bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
                                        Type rhsType) {
@@ -900,86 +920,19 @@ bool TypeChecker::typeCheckExprPattern(ExprPattern *EP, DeclContext *DC,
                                   "typecheck-expr-pattern", EP);
   PrettyStackTracePattern stackTrace(Context, "type-checking", EP);
 
-  auto tildeEqualsApplication =
-      synthesizeTildeEqualsOperatorApplication(EP, DC, rhsType);
-
-  if (!tildeEqualsApplication)
-    return true;
-
-  VarDecl *matchVar;
-  Expr *matchCall;
-
-  std::tie(matchVar, matchCall) = *tildeEqualsApplication;
-
-  matchVar->setInterfaceType(rhsType->mapTypeOutOfContext());
-
-  // Result of `~=` should always be a boolean.
-  auto contextualTy = Context.getBoolDecl()->getDeclaredInterfaceType();
-  auto target = SolutionApplicationTarget::forExprPattern(matchCall, DC, EP,
-                                                          contextualTy);
+  EP->getMatchVar()->setInterfaceType(rhsType->mapTypeOutOfContext());
 
   // Check the expression as a condition.
+  auto target = SyntacticElementTarget::forExprPattern(EP);
   auto result = typeCheckExpression(target);
   if (!result)
     return true;
 
-  // Save the synthesized $match variable in the pattern.
-  EP->setMatchVar(matchVar);
   // Save the type-checked expression in the pattern.
   EP->setMatchExpr(result->getAsExpr());
   // Set the type on the pattern.
   EP->setType(rhsType);
   return false;
-}
-
-Optional<std::pair<VarDecl *, BinaryExpr *>>
-TypeChecker::synthesizeTildeEqualsOperatorApplication(ExprPattern *EP,
-                                                      DeclContext *DC,
-                                                      Type enumType) {
-  auto &Context = DC->getASTContext();
-  // Create a 'let' binding to stand in for the RHS value.
-  auto *matchVar =
-      new (Context) VarDecl(/*IsStatic*/ false, VarDecl::Introducer::Let,
-                            EP->getLoc(), Context.Id_PatternMatchVar, DC);
-
-  matchVar->setImplicit();
-
-  // Find '~=' operators for the match.
-  auto matchLookup =
-      lookupUnqualified(DC->getModuleScopeContext(),
-                        DeclNameRef(Context.Id_MatchOperator),
-                        SourceLoc(), defaultUnqualifiedLookupOptions);
-  auto &diags = DC->getASTContext().Diags;
-  if (!matchLookup) {
-    diags.diagnose(EP->getLoc(), diag::no_match_operator);
-    return None;
-  }
-
-  SmallVector<ValueDecl*, 4> choices;
-  for (auto &result : matchLookup) {
-    choices.push_back(result.getValueDecl());
-  }
-
-  if (choices.empty()) {
-    diags.diagnose(EP->getLoc(), diag::no_match_operator);
-    return None;
-  }
-
-  // Build the 'expr ~= var' expression.
-  // FIXME: Compound name locations.
-  auto *matchOp =
-      TypeChecker::buildRefExpr(choices, DC, DeclNameLoc(EP->getLoc()),
-                                /*Implicit=*/true, FunctionRefKind::Compound);
-
-  // Note we use getEndLoc here to have the BinaryExpr source range be the same
-  // as the expr pattern source range.
-  auto *matchVarRef = new (Context) DeclRefExpr(matchVar,
-                                                DeclNameLoc(EP->getEndLoc()),
-                                                /*Implicit=*/true);
-  auto *matchCall = BinaryExpr::create(Context, EP->getSubExpr(), matchOp,
-                                       matchVarRef, /*implicit*/ true);
-
-  return std::make_pair(matchVar, matchCall);
 }
 
 static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
@@ -993,17 +946,12 @@ static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
         return found->second;
 
       if (auto archetypeType = dyn_cast<ArchetypeType>(origType)) {
-        // We leave opaque types and their nested associated types alone here.
-        // They're globally available.
-        if (isa<OpaqueTypeArchetypeType>(archetypeType))
-          return origType;
-
         auto root = archetypeType->getRoot();
         // For other nested types, fail here so the default logic in subst()
         // for nested types applies.
         if (root != archetypeType)
           return Type();
-        
+
         auto locator = cs.getConstraintLocator({});
         auto replacement = cs.createTypeVariable(locator,
                                                  TVO_CanBindToNoEscape);
@@ -1028,7 +976,8 @@ static Type replaceArchetypesWithTypeVariables(ConstraintSystem &cs,
       types[origType] = replacement;
       return replacement;
     },
-    MakeAbstractConformanceForGenericType());
+    MakeAbstractConformanceForGenericType(),
+    SubstFlags::SubstituteOpaqueArchetypes);
 }
 
 bool TypeChecker::typesSatisfyConstraint(Type type1, Type type2,
@@ -1136,6 +1085,10 @@ TypeChecker::addImplicitLoadExpr(ASTContext &Context, Expr *expr,
         setType(E, ParenType::get(Ctx, getType(PE->getSubExpr())));
 
       return Action::Continue(E);
+    }
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::ArgumentsAndExpansion;
     }
 
   private:
@@ -1267,23 +1220,26 @@ void OverloadChoice::dump(Type adjustedOpenedType, SourceManager *sm,
     out << "tuple " << getBaseType()->getString(PO) << " index "
         << getTupleIndex();
     break;
+
+  case OverloadChoiceKind::MaterializePack:
+    out << "materialize pack from tuple " << getBaseType()->getString(PO);
+    break;
   }
 }
 
-void Solution::dump() const {
-  dump(llvm::errs());
-}
+void Solution::dump() const { dump(llvm::errs(), 0); }
 
-void Solution::dump(raw_ostream &out) const {
+void Solution::dump(raw_ostream &out, unsigned indent) const {
   PrintOptions PO;
   PO.PrintTypesForDebugging = true;
 
   SourceManager *sm = &getConstraintSystem().getASTContext().SourceMgr;
 
-  out << "Fixed score:";
+  out.indent(indent) << "Fixed score:";
   FixedScore.print(out);
 
-  out << "\nType variables:\n";
+  out << "\n";
+  out.indent(indent) << "Type variables:\n";
   std::vector<std::pair<TypeVariableType *, Type>> bindings(
       typeBindings.begin(), typeBindings.end());
   llvm::sort(bindings, [](const std::pair<TypeVariableType *, Type> &lhs,
@@ -1292,7 +1248,7 @@ void Solution::dump(raw_ostream &out) const {
   });
   for (auto binding : bindings) {
     auto &typeVar = binding.first;
-    out.indent(2);
+    out.indent(indent + 2);
     Type(typeVar).print(out, PO);
     out << " as ";
     binding.second.print(out, PO);
@@ -1304,11 +1260,12 @@ void Solution::dump(raw_ostream &out) const {
   }
 
   if (!overloadChoices.empty()) {
-    out << "\nOverload choices:";
+    out << "\n";
+    out.indent(indent) << "Overload choices:";
     for (auto ovl : overloadChoices) {
       if (ovl.first) {
         out << "\n";
-        out.indent(2);
+        out.indent(indent + 2);
         ovl.first->dump(sm, out);
       }
 
@@ -1320,18 +1277,18 @@ void Solution::dump(raw_ostream &out) const {
 
 
   if (!ConstraintRestrictions.empty()) {
-    out << "\nConstraint restrictions:\n";
+    out.indent(indent) << "Constraint restrictions:\n";
     for (auto &restriction : ConstraintRestrictions) {
-      out.indent(2) << restriction.first.first
-                    << " to " << restriction.first.second
-                    << " is " << getName(restriction.second) << "\n";
+      out.indent(indent + 2)
+          << restriction.first.first << " to " << restriction.first.second
+          << " is " << getName(restriction.second) << "\n";
     }
   }
 
   if (!argumentMatchingChoices.empty()) {
-    out << "\nTrailing closure matching:\n";
+    out.indent(indent) << "Trailing closure matching:\n";
     for (auto &argumentMatching : argumentMatchingChoices) {
-      out.indent(2);
+      out.indent(indent + 2);
       argumentMatching.first->dump(sm, out);
       switch (argumentMatching.second.trailingClosureMatching) {
       case TrailingClosureMatching::Forward:
@@ -1345,18 +1302,18 @@ void Solution::dump(raw_ostream &out) const {
   }
 
   if (!DisjunctionChoices.empty()) {
-    out << "\nDisjunction choices:\n";
+    out.indent(indent) << "Disjunction choices:\n";
     for (auto &choice : DisjunctionChoices) {
-      out.indent(2);
+      out.indent(indent + 2);
       choice.first->dump(sm, out);
       out << " is #" << choice.second << "\n";
     }
   }
 
   if (!OpenedTypes.empty()) {
-    out << "\nOpened types:\n";
+    out.indent(indent) << "Opened types:\n";
     for (const auto &opened : OpenedTypes) {
-      out.indent(2);
+      out.indent(indent + 2);
       opened.first->dump(sm, out);
       out << " opens ";
       llvm::interleave(
@@ -1388,9 +1345,9 @@ void Solution::dump(raw_ostream &out) const {
   }
 
   if (!OpenedExistentialTypes.empty()) {
-    out << "\nOpened existential types:\n";
+    out.indent(indent) << "Opened existential types:\n";
     for (const auto &openedExistential : OpenedExistentialTypes) {
-      out.indent(2);
+      out.indent(indent + 2);
       openedExistential.first->dump(sm, out);
       out << " opens to " << openedExistential.second->getString(PO);
       out << "\n";
@@ -1398,18 +1355,19 @@ void Solution::dump(raw_ostream &out) const {
   }
 
   if (!DefaultedConstraints.empty()) {
-    out << "\nDefaulted constraints: ";
+    out.indent(indent) << "Defaulted constraints: ";
     interleave(DefaultedConstraints, [&](ConstraintLocator *locator) {
       locator->dump(sm, out);
     }, [&] {
       out << ", ";
     });
+    out << "\n";
   }
 
   if (!Fixes.empty()) {
-    out << "\nFixes:\n";
+    out.indent(indent) << "Fixes:\n";
     for (auto *fix : Fixes) {
-      out.indent(2);
+      out.indent(indent + 2);
       fix->print(out);
       out << "\n";
     }
@@ -1441,7 +1399,8 @@ void ConstraintSystem::print(raw_ostream &out, Expr *E) const {
     return Type();
   };
 
-  E->dump(out, getTypeOfExpr, getTypeOfTypeRepr, getTypeOfKeyPathComponent);
+  E->dump(out, getTypeOfExpr, getTypeOfTypeRepr, getTypeOfKeyPathComponent,
+          solverState ? solverState->getCurrentIndent() : 0);
   out << "\n";
 }
 
@@ -1450,21 +1409,28 @@ void ConstraintSystem::print(raw_ostream &out) const {
   PrintOptions PO;
   PO.PrintTypesForDebugging = true;
 
-  out << "Score:";
+  auto indent = solverState ? solverState->getCurrentIndent() : 0;
+  out.indent(indent) << "Score:";
   CurrentScore.print(out);
 
   for (const auto &contextualTypeEntry : contextualTypes) {
     auto info = contextualTypeEntry.second.first;
     if (!info.getType().isNull()) {
-      out << "\nContextual Type: " << info.getType().getString(PO);
+      out << "\n";
+      out.indent(indent) << "Contextual Type: " << info.getType().getString(PO);
+      out << " at ";
+
+      auto &SM = getASTContext().SourceMgr;
       if (TypeRepr *TR = info.typeLoc.getTypeRepr()) {
-        out << " at ";
-        TR->getSourceRange().print(out, getASTContext().SourceMgr, /*text*/false);
+        TR->getSourceRange().print(out, SM, /*text*/ false);
+      } else {
+        dumpAnchor(contextualTypeEntry.first, &SM, out);
       }
     }
   }
 
-  out << "\nType Variables:\n";
+  out << "\n";
+  out.indent(indent) << "Type Variables:\n";
   std::vector<TypeVariableType *> typeVariables(getTypeVariables().begin(),
                                                 getTypeVariables().end());
   llvm::sort(typeVariables,
@@ -1472,7 +1438,7 @@ void ConstraintSystem::print(raw_ostream &out) const {
                return lhs->getID() < rhs->getID();
              });
   for (auto tv : typeVariables) {
-    out.indent(2);
+    out.indent(indent + 2);
     auto rep = getRepresentative(tv);
     if (rep == tv) {
       if (auto fixed = getFixedType(tv)) {
@@ -1497,34 +1463,34 @@ void ConstraintSystem::print(raw_ostream &out) const {
   }
 
   if (!ActiveConstraints.empty()) {
-    out << "\nActive Constraints:\n";
+    out.indent(indent) << "Active Constraints:\n";
     for (auto &constraint : ActiveConstraints) {
-      out.indent(2);
+      out.indent(indent + 2);
       constraint.print(out, &getASTContext().SourceMgr);
       out << "\n";
     }
   }
 
   if (!InactiveConstraints.empty()) {
-    out << "\nInactive Constraints:\n";
-     for (auto &constraint : InactiveConstraints) {
-       out.indent(2);
-       constraint.print(out, &getASTContext().SourceMgr);
-       out << "\n";
-     }
+    out.indent(indent) << "Inactive Constraints:\n";
+    for (auto &constraint : InactiveConstraints) {
+      out.indent(indent + 2);
+      constraint.print(out, &getASTContext().SourceMgr);
+      out << "\n";
+    }
   }
 
   if (solverState && solverState->hasRetiredConstraints()) {
-    out << "\nRetired Constraints:\n";
+    out.indent(indent) << "Retired Constraints:\n";
     solverState->forEachRetired([&](Constraint &constraint) {
-      out.indent(2);
+      out.indent(indent + 2);
       constraint.print(out, &getASTContext().SourceMgr);
       out << "\n";
     });
   }
 
   if (!ResolvedOverloads.empty()) {
-    out << "\nResolved overloads:\n";
+    out.indent(indent) << "Resolved overloads:\n";
 
     // Otherwise, report the resolved overloads.
     for (auto elt : ResolvedOverloads) {
@@ -1559,6 +1525,11 @@ void ConstraintSystem::print(raw_ostream &out) const {
         out << "tuple " << choice.getBaseType()->getString(PO) << " index "
             << choice.getTupleIndex();
         break;
+
+      case OverloadChoiceKind::MaterializePack:
+        out << "materialize pack from tuple "
+            << choice.getBaseType()->getString(PO);
+        break;
       }
       out << " for ";
       elt.first->dump(&getASTContext().SourceMgr, out);
@@ -1567,18 +1538,18 @@ void ConstraintSystem::print(raw_ostream &out) const {
   }
 
   if (!DisjunctionChoices.empty()) {
-    out << "\nDisjunction choices:\n";
+    out.indent(indent) << "Disjunction choices:\n";
     for (auto &choice : DisjunctionChoices) {
-      out.indent(2);
+      out.indent(indent + 2);
       choice.first->dump(&getASTContext().SourceMgr, out);
       out << " is #" << choice.second << "\n";
     }
   }
 
   if (!OpenedTypes.empty()) {
-    out << "\nOpened types:\n";
+    out.indent(indent) << "Opened types:\n";
     for (const auto &opened : OpenedTypes) {
-      out.indent(2);
+      out.indent(indent + 2);
       opened.first->dump(&getASTContext().SourceMgr, out);
       out << " opens ";
       llvm::interleave(
@@ -1598,9 +1569,9 @@ void ConstraintSystem::print(raw_ostream &out) const {
   }
 
   if (!OpenedExistentialTypes.empty()) {
-    out << "\nOpened existential types:\n";
+    out.indent(indent) << "Opened existential types:\n";
     for (const auto &openedExistential : OpenedExistentialTypes) {
-      out.indent(2);
+      out.indent(indent + 2);
       openedExistential.first->dump(&getASTContext().SourceMgr, out);
       out << " opens to " << openedExistential.second->getString(PO);
       out << "\n";
@@ -1608,7 +1579,7 @@ void ConstraintSystem::print(raw_ostream &out) const {
   }
 
   if (!DefaultedConstraints.empty()) {
-    out << "\nDefaulted constraints:\n";
+    out.indent(indent) << "Defaulted constraints:\n";
     interleave(DefaultedConstraints, [&](ConstraintLocator *locator) {
       locator->dump(&getASTContext().SourceMgr, out);
     }, [&] {
@@ -1618,16 +1589,16 @@ void ConstraintSystem::print(raw_ostream &out) const {
   }
 
   if (failedConstraint) {
-    out << "\nFailed constraint:\n";
-    out.indent(2);
-    failedConstraint->print(out, &getASTContext().SourceMgr);
+    out.indent(indent) << "Failed constraint:\n";
+    failedConstraint->print(out.indent(indent + 2), &getASTContext().SourceMgr,
+                            indent + 2);
     out << "\n";
   }
 
   if (!Fixes.empty()) {
-    out << "\nFixes:\n";
+    out.indent(indent) << "Fixes:\n";
     for (auto *fix : Fixes) {
-      out.indent(2);
+      out.indent(indent + 2);
       fix->print(out);
       out << "\n";
     }
@@ -1646,6 +1617,27 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
        !unwrappedIUO)) {
     return CheckedCastKind::Coercion;
   }
+
+  // Since move-only types currently cannot conform to protocols, nor be a class
+  // type, the subtyping hierarchy is a bit bizarre as of now:
+  //
+  //              noncopyable
+  //           structs and enums
+  //                   |
+  //       +--------- Any
+  //       |           |
+  //   AnyObject    protocol
+  //       |       existentials
+  //       |            |   \
+  //       +---------+  |    +-- structs/enums
+  //                 |  |
+  //                classes
+  //           (and their subtyping)
+  //
+  //
+  // Thus, right now, a move-only type is only a subtype of itself.
+  if (fromType->isPureMoveOnly() || toType->isPureMoveOnly())
+    return CheckedCastKind::Unresolved;
   
   // Check for a bridging conversion.
   // Anything bridges to AnyObject.
@@ -1736,7 +1728,8 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
     case CheckedCastKind::Unresolved:
       // Even though we know the elements cannot be downcast, we cannot return
       // Unresolved here as it's possible for an empty Array, Set or Dictionary
-      // to be cast to any element type at runtime (SR-6192). The one exception
+      // to be cast to any element type at runtime
+      // (https://github.com/apple/swift/issues/48744). The one exception
       // to this is when we're checking whether we can treat a coercion as a
       // checked cast because we don't want to tell the user to use as!, as it's
       // probably the wrong suggestion.
@@ -1748,9 +1741,9 @@ TypeChecker::typeCheckCheckedCast(Type fromType, Type toType,
   };
 
   // Check for casts between specific concrete types that cannot succeed.
-  if (auto toElementType = ConstraintSystem::isArrayType(toType)) {
-    if (auto fromElementType = ConstraintSystem::isArrayType(fromType)) {
-      return checkElementCast(*fromElementType, *toElementType,
+  if (auto toElementType = toType->isArrayType()) {
+    if (auto fromElementType = fromType->isArrayType()) {
+      return checkElementCast(fromElementType, toElementType,
                               CheckedCastKind::ArrayDowncast);
     }
   }
@@ -2256,6 +2249,10 @@ void ConstraintSystem::forEachExpr(
     ChildWalker(ConstraintSystem &CS,
                 llvm::function_ref<Expr *(Expr *)> callback)
         : CS(CS), callback(callback) {}
+
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
     PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
       auto *NewE = callback(E);

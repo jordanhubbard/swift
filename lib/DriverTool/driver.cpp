@@ -145,7 +145,7 @@ static bool shouldDisallowNewDriver(DiagnosticEngine &diags,
   StringRef disableArg = "-disallow-use-new-driver";
   StringRef disableEnv = "SWIFT_USE_OLD_DRIVER";
   auto shouldWarn = !llvm::sys::Process::
-    GetEnv("SWIFT_AVOID_WARNING_USING_OLD_DRIVER").hasValue();
+    GetEnv("SWIFT_AVOID_WARNING_USING_OLD_DRIVER").has_value();
   // If user specified using the old driver, don't forward.
   if (llvm::find_if(argv, [&](const char* arg) {
     return StringRef(arg) == disableArg;
@@ -154,7 +154,7 @@ static bool shouldDisallowNewDriver(DiagnosticEngine &diags,
       diags.diagnose(SourceLoc(), diag::old_driver_deprecated, disableArg);
     return true;
   }
-  if (llvm::sys::Process::GetEnv(disableEnv).hasValue()) {
+  if (llvm::sys::Process::GetEnv(disableEnv).has_value()) {
     if (shouldWarn)
       diags.diagnose(SourceLoc(), diag::old_driver_deprecated, disableEnv);
     return true;
@@ -193,6 +193,7 @@ static int run_driver(StringRef ExecName,
   bool isRepl = false;
 
   // Handle integrated tools.
+  StringRef DriverModeArg;
   if (argv.size() > 1) {
     StringRef FirstArg(argv[1]);
 
@@ -219,6 +220,8 @@ static int run_driver(StringRef ExecName,
     if (FirstArg == "repl") {
       isRepl = true;
       argv = argv.drop_front();
+    } else if (FirstArg.startswith("--driver-mode=")) {
+      DriverModeArg = FirstArg;
     }
   }
 
@@ -239,7 +242,9 @@ static int run_driver(StringRef ExecName,
       std::vector<const char *> subCommandArgs;
       // Rewrite the program argument.
       subCommandArgs.push_back(NewDriverPath.c_str());
-      if (ExecName == "swiftc") {
+      if (!DriverModeArg.empty()) {
+        subCommandArgs.push_back(DriverModeArg.data());
+      } else if (ExecName == "swiftc") {
         subCommandArgs.push_back("--driver-mode=swiftc");
       } else {
         assert(ExecName == "swift");

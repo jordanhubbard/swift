@@ -30,16 +30,18 @@
 #include "swift/AST/IRGenOptions.h"
 #include "swift/SIL/SILModule.h"
 
+#include "ClassTypeInfo.h"
 #include "ConstantBuilder.h"
 #include "Explosion.h"
 #include "GenClass.h"
+#include "GenMeta.h"
 #include "GenPointerAuth.h"
 #include "GenProto.h"
 #include "GenType.h"
+#include "HeapTypeInfo.h"
 #include "IRGenDebugInfo.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
-#include "HeapTypeInfo.h"
 #include "IndirectTypeInfo.h"
 #include "MetadataRequest.h"
 
@@ -55,9 +57,15 @@ namespace {
                                 FixedTypeInfo> { \
     llvm::PointerIntPair<llvm::Type*, 1, bool> ValueTypeAndIsOptional; \
   public: \
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM, \
-                                        SILType T) const override { \
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T); \
+    TypeLayoutEntry \
+    *buildTypeLayoutEntry(IRGenModule &IGM, \
+                          SILType T, \
+                          bool useStructLayouts) const override { \
+      if (!useStructLayouts) { \
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T); \
+      } \
+      return IGM.typeLayoutCache.getOrCreateScalarEntry( \
+          *this, T, ScalarKind::Nativeness##Name##Reference); \
     } \
     Nativeness##Name##ReferenceTypeInfo(llvm::Type *valueType, \
                                     llvm::Type *type, \
@@ -65,7 +73,7 @@ namespace {
                                     SpareBitVector &&spareBits, \
                                     bool isOptional) \
       : IndirectTypeInfo(type, size, std::move(spareBits), alignment, \
-                         IsNotPOD, IsNotBitwiseTakable, IsFixedSize), \
+                         IsNotTriviallyDestroyable, IsNotBitwiseTakable, IsCopyable, IsFixedSize), \
         ValueTypeAndIsOptional(valueType, isOptional) {} \
     void initializeWithCopy(IRGenFunction &IGF, Address destAddr, \
                             Address srcAddr, SILType T, \
@@ -140,18 +148,26 @@ namespace {
                                               SpareBitVector &&spareBits, \
                                               bool isOptional) \
       : SingleScalarTypeInfo(type, size, std::move(spareBits), \
-                             alignment, IsNotPOD, IsFixedSize), \
+                             alignment, IsNotTriviallyDestroyable, \
+                             IsCopyable, \
+                             IsFixedSize), \
         ValueTypeAndIsOptional(valueType, isOptional) {} \
-    enum { IsScalarPOD = false }; \
-    TypeLayoutEntry *buildTypeLayoutEntry(IRGenModule &IGM,                    \
-                                          SILType T) const override {          \
-      return IGM.typeLayoutCache.getOrCreateScalarEntry(*this, T);             \
+    enum { IsScalarTriviallyDestroyable = false }; \
+    TypeLayoutEntry \
+    *buildTypeLayoutEntry(IRGenModule &IGM, \
+                          SILType T, \
+                          bool useStructLayouts) const override { \
+      if (!useStructLayouts) { \
+        return IGM.typeLayoutCache.getOrCreateTypeInfoBasedEntry(*this, T); \
+      } \
+      return IGM.typeLayoutCache.getOrCreateScalarEntry( \
+          *this, T, ScalarKind::Nativeness##Name##Reference); \
     } \
     llvm::Type *getScalarType() const { \
       return ValueTypeAndIsOptional.getPointer(); \
     } \
     Address projectScalar(IRGenFunction &IGF, Address addr) const { \
-      return IGF.Builder.CreateBitCast(addr, getScalarType()->getPointerTo()); \
+      return IGF.Builder.CreateElementBitCast(addr, getScalarType()); \
     } \
     void emitScalarRetain(IRGenFunction &IGF, llvm::Value *value, \
                           Atomicity atomicity) const { \
@@ -370,7 +386,7 @@ void irgen::emitDeallocateHeapObject(IRGenFunction &IGF,
                                      llvm::Value *alignMask) {
   // FIXME: We should call a fast deallocator for heap objects with
   // known size.
-  IGF.Builder.CreateCall(IGF.IGM.getDeallocObjectFn(),
+  IGF.Builder.CreateCall(IGF.IGM.getDeallocObjectFunctionPointer(),
                          {object, size, alignMask});
 }
 
@@ -378,7 +394,7 @@ void emitDeallocateUninitializedHeapObject(IRGenFunction &IGF,
                                            llvm::Value *object,
                                            llvm::Value *size,
                                            llvm::Value *alignMask) {
-  IGF.Builder.CreateCall(IGF.IGM.getDeallocUninitializedObjectFn(),
+  IGF.Builder.CreateCall(IGF.IGM.getDeallocUninitializedObjectFunctionPointer(),
                          {object, size, alignMask});
 }
 
@@ -388,7 +404,7 @@ void irgen::emitDeallocateClassInstance(IRGenFunction &IGF,
                                         llvm::Value *alignMask) {
   // FIXME: We should call a fast deallocator for heap objects with
   // known size.
-  IGF.Builder.CreateCall(IGF.IGM.getDeallocClassInstanceFn(),
+  IGF.Builder.CreateCall(IGF.IGM.getDeallocClassInstanceFunctionPointer(),
                          {object, size, alignMask});
 }
 
@@ -399,8 +415,9 @@ void irgen::emitDeallocatePartialClassInstance(IRGenFunction &IGF,
                                                llvm::Value *alignMask) {
   // FIXME: We should call a fast deallocator for heap objects with
   // known size.
-  IGF.Builder.CreateCall(IGF.IGM.getDeallocPartialClassInstanceFn(),
-                         {object, metadata, size, alignMask});
+  IGF.Builder.CreateCall(
+      IGF.IGM.getDeallocPartialClassInstanceFunctionPointer(),
+      {object, metadata, size, alignMask});
 }
 
 /// Create the destructor function for a layout.
@@ -438,7 +455,7 @@ static llvm::Function *createDtorFn(IRGenModule &IGM,
   for (unsigned i : indices(layout.getElements())) {
     auto &field = layout.getElement(i);
     auto fieldTy = layout.getElementTypes()[i];
-    if (field.isPOD())
+    if (field.isTriviallyDestroyable())
       continue;
 
     field.getType().destroy(
@@ -516,8 +533,8 @@ static llvm::Constant *buildPrivateMetadata(IRGenModule &IGM,
     llvm::ConstantInt::get(IGM.Int32Ty, 0),
     llvm::ConstantInt::get(IGM.Int32Ty, 2)
   };
-  return llvm::ConstantExpr::getInBoundsGetElementPtr(
-      var->getType()->getPointerElementType(), var, indices);
+  return llvm::ConstantExpr::getInBoundsGetElementPtr(var->getValueType(), var,
+                                                      indices);
 }
 
 llvm::Constant *
@@ -557,7 +574,8 @@ namespace {
     BuiltinNativeObjectTypeInfo(llvm::PointerType *storage,
                                  Size size, SpareBitVector spareBits,
                                  Alignment align)
-    : HeapTypeInfo(storage, size, spareBits, align) {}
+    : HeapTypeInfo(ReferenceCounting::Native, storage, size, spareBits,
+                   align) {}
 
     /// Builtin.NativeObject uses Swift native reference-counting.
     ReferenceCounting getReferenceCounting() const {
@@ -761,18 +779,16 @@ void IRGenFunction::storeReferenceStorageExtraInhabitant(llvm::Value *index,
     switch (style) {                                                           \
     case ReferenceCounting::Native:                                            \
       return new Native##Name##ReferenceTypeInfo(                              \
-          valueType, IGM.Name##ReferencePtrTy->getPointerElementType(),        \
-          IGM.getPointerSize(), IGM.getPointerAlignment(),                     \
-          std::move(spareBits), isOptional);                                   \
+          valueType, IGM.Name##ReferenceStructTy, IGM.getPointerSize(),        \
+          IGM.getPointerAlignment(), std::move(spareBits), isOptional);        \
     case ReferenceCounting::ObjC:                                              \
     case ReferenceCounting::None:                                              \
     case ReferenceCounting::Custom:                                            \
     case ReferenceCounting::Block:                                             \
     case ReferenceCounting::Unknown:                                           \
       return new Unknown##Name##ReferenceTypeInfo(                             \
-          valueType, IGM.Name##ReferencePtrTy->getPointerElementType(),        \
-          IGM.getPointerSize(), IGM.getPointerAlignment(),                     \
-          std::move(spareBits), isOptional);                                   \
+          valueType, IGM.Name##ReferenceStructTy, IGM.getPointerSize(),        \
+          IGM.getPointerAlignment(), std::move(spareBits), isOptional);        \
     case ReferenceCounting::Bridge:                                            \
     case ReferenceCounting::Error:                                             \
       llvm_unreachable("not supported!");                                      \
@@ -825,35 +841,28 @@ static bool doesNotRequireRefCounting(llvm::Value *value) {
   return isa<llvm::ConstantPointerNull>(value);
 }
 
-static llvm::FunctionType *getTypeOfFunction(llvm::Constant *fn) {
-  return cast<llvm::FunctionType>(fn->getType()->getPointerElementType());
-}
-
 /// Emit a unary call to perform a ref-counting operation.
 ///
 /// \param fn - expected signature 'void (T)' or 'T (T)'
 static void emitUnaryRefCountCall(IRGenFunction &IGF,
                                   llvm::Constant *fn,
                                   llvm::Value *value) {
-  auto cc = IGF.IGM.DefaultCC;
-  auto fun = dyn_cast<llvm::Function>(fn);
-  if (fun)
-    cc = fun->getCallingConv();
+  auto fun = cast<llvm::Function>(fn);
+  auto cc = fun->getCallingConv();
 
   // Instead of casting the input, we cast the function type.
   // This tends to produce less IR, but might be evil.
-  auto origFnType = getTypeOfFunction(fn);
-  if (value->getType() != origFnType->getParamType(0)) {
-    auto resultTy = origFnType->getReturnType() == IGF.IGM.VoidTy
+  auto fnType = cast<llvm::FunctionType>(fun->getValueType());
+  if (value->getType() != fnType->getParamType(0)) {
+    auto resultTy = fnType->getReturnType() == IGF.IGM.VoidTy
                         ? IGF.IGM.VoidTy
                         : value->getType();
-    llvm::FunctionType *fnType =
-      llvm::FunctionType::get(resultTy, value->getType(), false);
+    fnType = llvm::FunctionType::get(resultTy, value->getType(), false);
     fn = llvm::ConstantExpr::getBitCast(fn, fnType->getPointerTo());
   }
-  
+
   // Emit the call.
-  llvm::CallInst *call = IGF.Builder.CreateCall(fn, value);
+  llvm::CallInst *call = IGF.Builder.CreateCallWithoutDbgLoc(fnType, fn, value);
   if (fun && fun->hasParamAttribute(0, llvm::Attribute::Returned))
     call->addParamAttr(0, llvm::Attribute::Returned);
   call->setCallingConv(cc);
@@ -870,26 +879,23 @@ static void emitCopyLikeCall(IRGenFunction &IGF,
   assert(dest->getType() == src->getType() &&
          "type mismatch in binary refcounting operation");
 
-  auto cc = IGF.IGM.DefaultCC;
-  auto fun = dyn_cast<llvm::Function>(fn);
-  if (fun)
-    cc = fun->getCallingConv();
+  auto fun = cast<llvm::Function>(fn);
+  auto cc = fun->getCallingConv();
 
   // Instead of casting the inputs, we cast the function type.
   // This tends to produce less IR, but might be evil.
-  auto origFnType = getTypeOfFunction(fn);
-  if (dest->getType() != origFnType->getParamType(0)) {
+  auto fnType = cast<llvm::FunctionType>(fun->getValueType());
+  if (dest->getType() != fnType->getParamType(0)) {
     llvm::Type *paramTypes[] = { dest->getType(), dest->getType() };
-    auto resultTy = origFnType->getReturnType() == IGF.IGM.VoidTy
-                        ? IGF.IGM.VoidTy
-                        : dest->getType();
-    llvm::FunctionType *fnType =
-      llvm::FunctionType::get(resultTy, paramTypes, false);
+    auto resultTy = fnType->getReturnType() == IGF.IGM.VoidTy ? IGF.IGM.VoidTy
+                                                              : dest->getType();
+    fnType = llvm::FunctionType::get(resultTy, paramTypes, false);
     fn = llvm::ConstantExpr::getBitCast(fn, fnType->getPointerTo());
   }
-  
+
   // Emit the call.
-  llvm::CallInst *call = IGF.Builder.CreateCall(fn, {dest, src});
+  llvm::CallInst *call =
+      IGF.Builder.CreateCallWithoutDbgLoc(fnType, fn, {dest, src});
   if (fun && fun->hasParamAttribute(0, llvm::Attribute::Returned))
     call->addParamAttr(0, llvm::Attribute::Returned);
   call->setCallingConv(cc);
@@ -907,22 +913,20 @@ static llvm::Value *emitLoadWeakLikeCall(IRGenFunction &IGF,
           addr->getType() == IGF.IGM.UnownedReferencePtrTy) &&
          "address is not of a weak or unowned reference");
 
-  auto cc = IGF.IGM.DefaultCC;
-  if (auto fun = dyn_cast<llvm::Function>(fn))
-    cc = fun->getCallingConv();
-
+  auto fun = cast<llvm::Function>(fn);
+  auto cc = fun->getCallingConv();
 
   // Instead of casting the output, we cast the function type.
   // This tends to produce less IR, but might be evil.
-  if (resultType != getTypeOfFunction(fn)->getReturnType()) {
+  auto fnType = cast<llvm::FunctionType>(fun->getValueType());
+  if (resultType != fnType->getReturnType()) {
     llvm::Type *paramTypes[] = { addr->getType() };
-    llvm::FunctionType *fnType =
-      llvm::FunctionType::get(resultType, paramTypes, false);
+    fnType = llvm::FunctionType::get(resultType, paramTypes, false);
     fn = llvm::ConstantExpr::getBitCast(fn, fnType->getPointerTo());
   }
 
   // Emit the call.
-  llvm::CallInst *call = IGF.Builder.CreateCall(fn, addr);
+  llvm::CallInst *call = IGF.Builder.CreateCallWithoutDbgLoc(fnType, fn, addr);
   call->setCallingConv(cc);
   call->setDoesNotThrow();
 
@@ -940,26 +944,23 @@ static void emitStoreWeakLikeCall(IRGenFunction &IGF,
           addr->getType() == IGF.IGM.UnownedReferencePtrTy) &&
          "address is not of a weak or unowned reference");
 
-  auto cc = IGF.IGM.DefaultCC;
-  auto fun = dyn_cast<llvm::Function>(fn);
-  if (fun)
-    cc = fun->getCallingConv();
+  auto fun = cast<llvm::Function>(fn);
+  auto cc = fun->getCallingConv();
 
   // Instead of casting the inputs, we cast the function type.
   // This tends to produce less IR, but might be evil.
-  auto origFnType = getTypeOfFunction(fn);
-  if (value->getType() != origFnType->getParamType(1)) {
+  auto fnType = cast<llvm::FunctionType>(fun->getValueType());
+  if (value->getType() != fnType->getParamType(1)) {
     llvm::Type *paramTypes[] = { addr->getType(), value->getType() };
-    auto resultTy = origFnType->getReturnType() == IGF.IGM.VoidTy
-                        ? IGF.IGM.VoidTy
-                        : addr->getType();
-    llvm::FunctionType *fnType =
-      llvm::FunctionType::get(resultTy, paramTypes, false);
+    auto resultTy = fnType->getReturnType() == IGF.IGM.VoidTy ? IGF.IGM.VoidTy
+                                                              : addr->getType();
+    fnType = llvm::FunctionType::get(resultTy, paramTypes, false);
     fn = llvm::ConstantExpr::getBitCast(fn, fnType->getPointerTo());
   }
 
   // Emit the call.
-  llvm::CallInst *call = IGF.Builder.CreateCall(fn, {addr, value});
+  llvm::CallInst *call =
+      IGF.Builder.CreateCallWithoutDbgLoc(fnType, fn, {addr, value});
   if (fun && fun->hasParamAttribute(0, llvm::Attribute::Returned))
     call->addParamAttr(0, llvm::Attribute::Returned);
   call->setCallingConv(cc);
@@ -978,8 +979,9 @@ void IRGenFunction::emitNativeStrongRetain(llvm::Value *value,
 
   // Emit the call.
   llvm::CallInst *call = Builder.CreateCall(
-      (atomicity == Atomicity::Atomic) ? IGM.getNativeStrongRetainFn()
-                                       : IGM.getNativeNonAtomicStrongRetainFn(),
+      (atomicity == Atomicity::Atomic)
+          ? IGM.getNativeStrongRetainFunctionPointer()
+          : IGM.getNativeNonAtomicStrongRetainFunctionPointer(),
       value);
   call->setDoesNotThrow();
   call->addParamAttr(0, llvm::Attribute::Returned);
@@ -1273,28 +1275,26 @@ llvm::Constant *IRGenModule::getFixLifetimeFn() {
   return fixLifetime;
 }
 
-llvm::Constant *IRGenModule::getFixedClassInitializationFn() {
+FunctionPointer IRGenModule::getFixedClassInitializationFn() {
   if (FixedClassInitializationFn)
     return *FixedClassInitializationFn;
   
   // If ObjC interop is disabled, we don't need to do fixed class
   // initialization.
-  llvm::Constant *fn;
-  if (!ObjCInterop) {
-    fn = nullptr;
-  } else {
+  FunctionPointer fn;
+  if (ObjCInterop) {
     // In new enough ObjC runtimes, objc_opt_self provides a direct fast path
     // to realize a class.
     if (getAvailabilityContext()
          .isContainedIn(Context.getSwift51Availability())) {
-      fn = getObjCOptSelfFn();
+      fn = getObjCOptSelfFunctionPointer();
     }
     // Otherwise, the Swift runtime always provides a `get
     else {
-      fn = getGetInitializedObjCClassFn();
+      fn = getGetInitializedObjCClassFunctionPointer();
     }
   }
-  
+
   FixedClassInitializationFn = fn;
   return fn;
 }
@@ -1360,45 +1360,56 @@ void IRGenFunction::emitErrorStrongRelease(llvm::Value *value) {
 
 llvm::Value *IRGenFunction::emitLoadRefcountedPtr(Address addr,
                                                   ReferenceCounting style) {
-  Address src =
-    Builder.CreateBitCast(addr, IGM.getReferenceType(style)->getPointerTo());
+  Address src = Builder.CreateElementBitCast(addr, IGM.getReferenceType(style));
   return Builder.CreateLoad(src);
 }
 
 llvm::Value *IRGenFunction::
-emitIsUniqueCall(llvm::Value *value, SourceLoc loc, bool isNonNull) {
-  llvm::Constant *fn;
+emitIsUniqueCall(llvm::Value *value, ReferenceCounting style, SourceLoc loc, bool isNonNull) {
+  FunctionPointer fn;
   bool nonObjC = !IGM.getAvailabilityContext().isContainedIn(
       IGM.Context.getObjCIsUniquelyReferencedAvailability());
-
-  if (value->getType() == IGM.RefCountedPtrTy) {
+  switch (style) {
+  case ReferenceCounting::Native: {
     if (isNonNull)
-      fn = IGM.getIsUniquelyReferenced_nonNull_nativeFn();
+      fn = IGM.getIsUniquelyReferenced_nonNull_nativeFunctionPointer();
     else
-      fn = IGM.getIsUniquelyReferenced_nativeFn();
-  } else if (value->getType() == IGM.UnknownRefCountedPtrTy) {
-    if (nonObjC) {
-      if (isNonNull)
-        fn = IGM.getIsUniquelyReferencedNonObjC_nonNullFn();
-      else
-        fn = IGM.getIsUniquelyReferencedNonObjCFn();
-    } else {
-      if (isNonNull)
-        fn = IGM.getIsUniquelyReferenced_nonNullFn();
-      else
-        fn = IGM.getIsUniquelyReferencedFn();
-    }
-  } else if (value->getType() == IGM.BridgeObjectPtrTy) {
+      fn = IGM.getIsUniquelyReferenced_nativeFunctionPointer();
+  }
+  break;
+  case ReferenceCounting::Bridge: {
     if (!isNonNull)
       unimplemented(loc, "optional bridge ref");
 
     if (nonObjC)
-      fn = IGM.getIsUniquelyReferencedNonObjC_nonNull_bridgeObjectFn();
+      fn =
+          IGM.getIsUniquelyReferencedNonObjC_nonNull_bridgeObjectFunctionPointer();
     else
-      fn = IGM.getIsUniquelyReferenced_nonNull_bridgeObjectFn();
-  } else {
+      fn = IGM.getIsUniquelyReferenced_nonNull_bridgeObjectFunctionPointer();
+  }
+  break;
+  case ReferenceCounting::ObjC:
+  case ReferenceCounting::Unknown: {
+    if (nonObjC) {
+      if (isNonNull)
+        fn = IGM.getIsUniquelyReferencedNonObjC_nonNullFunctionPointer();
+      else
+        fn = IGM.getIsUniquelyReferencedNonObjCFunctionPointer();
+    } else {
+      if (isNonNull)
+        fn = IGM.getIsUniquelyReferenced_nonNullFunctionPointer();
+      else
+        fn = IGM.getIsUniquelyReferencedFunctionPointer();
+    }
+  }
+  break;
+  case ReferenceCounting::Error:
+  case ReferenceCounting::Block:
+  case ReferenceCounting::Custom:
+  case ReferenceCounting::None:
     llvm_unreachable("Unexpected LLVM type for a refcounted pointer.");
   }
+
   llvm::CallInst *call = Builder.CreateCall(fn, value);
   call->setDoesNotThrow();
   return call;
@@ -1418,9 +1429,9 @@ llvm::Value *IRGenFunction::emitIsEscapingClosureCall(
   auto filenameLength =
       llvm::ConstantInt::get(IGM.Int32Ty, loc.filename.size());
   auto type = llvm::ConstantInt::get(IGM.Int32Ty, verificationType);
-  llvm::CallInst *call =
-      Builder.CreateCall(IGM.getIsEscapingClosureAtFileLocationFn(),
-                         {value, filename, filenameLength, line, col, type});
+  llvm::CallInst *call = Builder.CreateCall(
+      IGM.getIsEscapingClosureAtFileLocationFunctionPointer(),
+      {value, filename, filenameLength, line, col, type});
   call->setDoesNotThrow();
   return call;
 }
@@ -1430,8 +1441,9 @@ namespace {
 class BoxTypeInfo : public HeapTypeInfo<BoxTypeInfo> {
 public:
   BoxTypeInfo(IRGenModule &IGM)
-    : HeapTypeInfo(IGM.RefCountedPtrTy, IGM.getPointerSize(),
-                   IGM.getHeapObjectSpareBits(), IGM.getPointerAlignment())
+    : HeapTypeInfo(ReferenceCounting::Native, IGM.RefCountedPtrTy,
+                   IGM.getPointerSize(), IGM.getHeapObjectSpareBits(),
+                   IGM.getPointerAlignment())
   {}
 
   ReferenceCounting getReferenceCounting() const {
@@ -1537,6 +1549,19 @@ public:
       boxedInterfaceType = boxedType.mapTypeOutOfContext();
     }
 
+    {
+      // FIXME: This seems wrong. We used to just mangle opened archetypes as
+      // their interface type. Let's make that explicit now.
+      auto astType = boxedInterfaceType.getASTType();
+      astType = astType.transformRec([](Type t) -> Optional<Type> {
+        if (auto *openedExistential = t->getAs<OpenedArchetypeType>())
+          return openedExistential->getInterfaceType();
+        return None;
+      })->getCanonicalType();
+      boxedInterfaceType = SILType::getPrimitiveType(
+          astType, boxedInterfaceType.getCategory());
+    }
+
     auto boxDescriptor = IGF.IGM.getAddrOfBoxDescriptor(
         boxedInterfaceType,
         env ? env->getGenericSignature().getCanonicalSignature()
@@ -1562,8 +1587,7 @@ public:
     Address rawAddr = layout.emitCastTo(IGF, box);
     rawAddr = layout.getElement(0).project(IGF, rawAddr, None);
     auto &ti = IGF.getTypeInfo(boxedType);
-    return IGF.Builder.CreateBitCast(rawAddr,
-                                     ti.getStorageType()->getPointerTo());
+    return IGF.Builder.CreateElementBitCast(rawAddr, ti.getStorageType());
   }
 };
 
@@ -1618,11 +1642,11 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   // For fixed-sized types, we can emit concrete box metadata.
   auto &fixedTI = cast<FixedTypeInfo>(eltTI);
 
-  // Because we assume in enum's that payloads with a Builtin.NativeObject which
-  // is also the type for indirect enum cases have extra inhabitants of pointers
-  // we can't have a nil pointer as a representation for an empty box type --
-  // nil conflicts with the extra inhabitants. We return a static singleton
-  // empty box object instead.
+  // Because we assume in enum's that payloads with a Builtin.NativeReference
+  // which is also the type for indirect enum cases have extra inhabitants of
+  // pointers we can't have a nil pointer as a representation for an empty box
+  // type -- nil conflicts with the extra inhabitants. We return a static
+  // singleton empty box object instead.
   if (fixedTI.isKnownEmpty(ResilienceExpansion::Maximal)) {
     if (!EmptyBoxTI)
       EmptyBoxTI = new EmptyBoxTypeInfo(IGM);
@@ -1630,7 +1654,8 @@ const TypeInfo *TypeConverter::convertBoxType(SILBoxType *T) {
   }
 
   // We can share box info for all similarly-shaped POD types.
-  if (fixedTI.isPOD(ResilienceExpansion::Maximal)) {
+  if (fixedTI.isTriviallyDestroyable(ResilienceExpansion::Maximal)
+      && fixedTI.isCopyable(ResilienceExpansion::Maximal)) {
     auto stride = fixedTI.getFixedStride();
     auto align = fixedTI.getFixedAlignment();
     auto foundPOD = PODBoxTI.find({stride.getValue(),align.getValue()});
@@ -1713,6 +1738,7 @@ Address irgen::emitAllocateExistentialBoxInBuffer(
                    Address(IGF.Builder.CreateBitCast(
                                destBuffer.getAddress(),
                                owned.getOwner()->getType()->getPointerTo()),
+                           owned.getOwner()->getType(),
                            destBuffer.getAlignment()),
                    isOutlined);
   return owned.getAddress();
@@ -1827,8 +1853,8 @@ llvm::Value *irgen::emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
   if (IGF.IGM.TargetInfo.hasISAMasking()) {
     object = IGF.Builder.CreateBitCast(object,
                                        IGF.IGM.IntPtrTy->getPointerTo());
-    llvm::Value *metadata =
-      IGF.Builder.CreateLoad(Address(object, IGF.IGM.getPointerAlignment()));
+    llvm::Value *metadata = IGF.Builder.CreateLoad(
+        Address(object, IGF.IGM.IntPtrTy, IGF.IGM.getPointerAlignment()));
     llvm::Value *mask = IGF.Builder.CreateLoad(IGF.IGM.getAddrOfObjCISAMask());
     metadata = IGF.Builder.CreateAnd(metadata, mask);
     metadata = IGF.Builder.CreateIntToPtr(metadata, IGF.IGM.TypeMetadataPtrTy);
@@ -1838,8 +1864,8 @@ llvm::Value *irgen::emitLoadOfObjCHeapMetadataRef(IRGenFunction &IGF,
   } else {
     object = IGF.Builder.CreateBitCast(object,
                                   IGF.IGM.TypeMetadataPtrTy->getPointerTo());
-    llvm::Value *metadata =
-      IGF.Builder.CreateLoad(Address(object, IGF.IGM.getPointerAlignment()));
+    llvm::Value *metadata = IGF.Builder.CreateLoad(Address(
+        object, IGF.IGM.TypeMetadataPtrTy, IGF.IGM.getPointerAlignment()));
     return metadata;
   }
 }
@@ -1852,47 +1878,10 @@ static llvm::Value *emitLoadOfHeapMetadataRef(IRGenFunction &IGF,
                                               bool suppressCast) {
   switch (isaEncoding) {
   case IsaEncoding::Pointer: {
-    // Drill into the object pointer.  Rather than bitcasting, we make
-    // an effort to do something that should explode if we get something
-    // mistyped.
-    llvm::StructType *structTy =
-      cast<llvm::StructType>(
-        cast<llvm::PointerType>(object->getType())->getPointerElementType());
-
-    llvm::Value *slot;
-
-    // We need a bitcast if we're dealing with an opaque class.
-    if (structTy->isOpaque()) {
-      auto metadataPtrPtrTy = IGF.IGM.TypeMetadataPtrTy->getPointerTo();
-      slot = IGF.Builder.CreateBitCast(object, metadataPtrPtrTy);
-
-    // Otherwise, make a GEP.
-    } else {
-      auto zero = llvm::ConstantInt::get(IGF.IGM.Int32Ty, 0);
-
-      SmallVector<llvm::Value*, 4> indexes;
-      indexes.push_back(zero);
-      do {
-        indexes.push_back(zero);
-
-        // Keep drilling down to the first element type.
-        auto eltTy = structTy->getElementType(0);
-        assert(isa<llvm::StructType>(eltTy) || eltTy == IGF.IGM.TypeMetadataPtrTy);
-        structTy = dyn_cast<llvm::StructType>(eltTy);
-      } while (structTy != nullptr);
-
-      slot = IGF.Builder.CreateInBoundsGEP(
-          object->getType()->getScalarType()->getPointerElementType(), object,
-          indexes);
-
-      if (!suppressCast) {
-        slot = IGF.Builder.CreateBitCast(slot,
-                                    IGF.IGM.TypeMetadataPtrTy->getPointerTo());
-      }
-    }
-
-    auto metadata = IGF.Builder.CreateLoad(Address(slot,
-                                               IGF.IGM.getPointerAlignment()));
+    llvm::Value *slot =
+        IGF.Builder.CreateBitCast(object, IGF.IGM.TypeMetadataPtrPtrTy);
+    auto metadata = IGF.Builder.CreateLoad(Address(
+        slot, IGF.IGM.TypeMetadataPtrTy, IGF.IGM.getPointerAlignment()));
     if (IGF.IGM.EnableValueNames && object->hasName())
       metadata->setName(llvm::Twine(object->getName()) + ".metadata");
     return metadata;
@@ -1920,9 +1909,7 @@ llvm::Value *irgen::emitHeapMetadataRefForHeapObject(IRGenFunction &IGF,
   if ((theClass && isKnownNotTaggedPointer(IGF.IGM, theClass)) ||
       !IGF.IGM.ObjCInterop) {
     auto isaEncoding = getIsaEncodingForType(IGF.IGM, objectType, sig);
-    return emitLoadOfHeapMetadataRef(IGF, object,
-                                     isaEncoding,
-                                     suppressCast);
+    return emitLoadOfHeapMetadataRef(IGF, object, isaEncoding, suppressCast);
   }
 
   // OK, ask the runtime for the class pointer of this potentially-ObjC object.
@@ -1966,14 +1953,14 @@ static llvm::Value *emitDynamicTypeOfOpaqueHeapObject(IRGenFunction &IGF,
   
   switch (repr) {
   case MetatypeRepresentation::ObjC:
-    metadata = IGF.Builder.CreateCall(IGF.IGM.getGetObjCClassFromObjectFn(),
-                                      object,
-                                      object->getName() + ".Type");
+    metadata = IGF.Builder.CreateCall(
+        IGF.IGM.getGetObjCClassFromObjectFunctionPointer(), object);
+    metadata->setName(object->getName() + ".Type");
     break;
   case MetatypeRepresentation::Thick:
-    metadata = IGF.Builder.CreateCall(IGF.IGM.getGetObjectTypeFn(),
-                                      object,
-                                      object->getName() + ".Type");
+    metadata = IGF.Builder.CreateCall(IGF.IGM.getGetObjectTypeFunctionPointer(),
+                                      object);
+    metadata->setName(object->getName() + ".Type");
     break;
   case MetatypeRepresentation::Thin:
     llvm_unreachable("class metadata can't be thin");
@@ -1988,9 +1975,9 @@ llvm::Value *irgen::
 emitHeapMetadataRefForUnknownHeapObject(IRGenFunction &IGF,
                                         llvm::Value *object) {
   object = IGF.Builder.CreateBitCast(object, IGF.IGM.ObjCPtrTy);
-  auto metadata = IGF.Builder.CreateCall(IGF.IGM.getGetObjectClassFn(),
-                                         object,
-                                         object->getName() + ".Type");
+  auto metadata = IGF.Builder.CreateCall(
+      IGF.IGM.getGetObjectClassFunctionPointer(), object);
+  metadata->setName(object->getName() + ".Type");
   metadata->setCallingConv(llvm::CallingConv::C);
   metadata->setDoesNotThrow();
   metadata->addFnAttr(llvm::Attribute::ReadOnly);
