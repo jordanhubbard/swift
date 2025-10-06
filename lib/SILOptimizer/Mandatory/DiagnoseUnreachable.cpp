@@ -16,6 +16,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Stmt.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/Projection.h"
@@ -24,6 +25,7 @@
 #include "swift/SIL/SILUndef.h"
 #include "swift/SIL/TerminatorUtils.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
+#include "swift/SIL/OwnershipUtils.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/BasicBlockOptUtils.h"
@@ -51,6 +53,7 @@ enum class UnreachableKind {
   FoldedBranch,
   FoldedSwitchEnum,
   NoreturnCall,
+  UnavailableEnumElement,
 };
 
 /// Information about a folded conditional branch instruction: it's location
@@ -189,7 +192,12 @@ static void propagateBasicBlockArgs(SILBasicBlock &BB) {
     SILArgument *Arg = *AI;
 
     // We were able to fold, so all users should use the new folded value.
-    Arg->replaceAllUsesWith(Args[Idx]);
+    if (auto *bfi = getBorrowedFromUser(Arg)) {
+      bfi->replaceAllUsesWith(Args[Idx]);
+      bfi->eraseFromParent();
+    } else {
+      Arg->replaceAllUsesWith(Args[Idx]);
+    }
     ++NumBasicBlockArgsPropagated;
   }
 
@@ -647,16 +655,8 @@ static bool isUserCode(const SILInstruction *I) {
   
   // If the instruction corresponds to user-written return or some other
   // statement, we know it corresponds to user code.
-  if (Loc.is<RegularLocation>() || Loc.is<ReturnLocation>()) {
-    if (auto *E = Loc.getAsASTNode<Expr>())
-      return !E->isImplicit();
-    if (auto *D = Loc.getAsASTNode<Decl>())
-      return !D->isImplicit();
-    if (auto *S = Loc.getAsASTNode<Stmt>())
-      return !S->isImplicit();
-    if (auto *P = Loc.getAsASTNode<Pattern>())
-      return !P->isImplicit();
-  }
+  if (Loc.is<RegularLocation>() || Loc.is<ReturnLocation>())
+    return !Loc.isImplicit();
   return false;
 }
 
@@ -665,7 +665,6 @@ static void setOutsideBlockUsesToUndef(SILInstruction *I) {
     return;
 
   SILBasicBlock *BB = I->getParent();
-  auto *F = BB->getParent();
 
   // Replace all uses outside of I's basic block by undef.
   llvm::SmallVector<Operand *, 16> Uses;
@@ -674,7 +673,7 @@ static void setOutsideBlockUsesToUndef(SILInstruction *I) {
 
   for (auto *Use : Uses)
     if (Use->getUser()->getParent() != BB)
-      Use->set(SILUndef::get(Use->get()->getType(), *F));
+      Use->set(SILUndef::get(Use->get()));
 }
 
 static SILInstruction *getAsCallToNoReturn(SILInstruction *I) {
@@ -732,6 +731,14 @@ static SILInstruction *getPrecedingCallToNoReturn(SILBasicBlock &BB) {
   return first;
 }
 
+static bool isUnavailableCodeReachedCall(SILInstruction *I) {
+  if (auto *AI = dyn_cast<ApplyInst>(I))
+    if (AI->hasSemantics(SEMANTICS_UNAVAILABLE_CODE_REACHED))
+      return true;
+
+  return false;
+}
+
 static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
                                      UnreachableUserCodeReportingState *State) {
   auto I = BB.begin(), E = BB.end();
@@ -768,10 +775,34 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
     if (isa<EndBorrowInst>(currInst))
       return false;
 
+    // If we have an ignored use whose operand is our no return call, ignore it.
+    if (auto *i = dyn_cast<IgnoredUseInst>(currInst)) {
+      // This handles try_apply, apply, begin_apply.
+      if (auto *inst = i->getOperand()->getDefiningInstructionOrTerminator();
+          inst && inst == noReturnCall) {
+        return false;
+      }
+    }
+
+    // destroy_value [dead_end] instructions are inserted at the availability
+    // boundary by lifetime completion.  Such instructions correctly mark the
+    // lifetime boundary of the destroyed value and never arise from dead user
+    // code.
+    auto *dvi = dyn_cast<DestroyValueInst>(currInst);
+    if (dvi && dvi->isDeadEnd())
+      return false;
+
     // If no-return instruction is not something we can point in code or
     // it's an explicit cast, skip it.
     if (!noReturnCall->getLoc().is<RegularLocation>() ||
         noReturnCall->getLoc().isASTNode<ExplicitCastExpr>())
+      return false;
+
+    // If the no-return instruction is a call to the unavailable code reached
+    // diagnostic function then we assume that the call was inserted by the
+    // compiler because the function is semantically unavailable. Diagnosing the
+    // user written body of the function as unreachable would be redundant.
+    if (isUnavailableCodeReachedCall(noReturnCall))
       return false;
 
     diagnose(BB.getModule().getASTContext(), currInst->getLoc().getSourceLoc(),
@@ -860,6 +891,93 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
   return true;
 }
 
+/// Replaces  `switch_enum` / `switch_enum_addr` instructions that have cases
+/// matching unavailable enum elements with new instructions that have those
+/// cases removed since unavailable enum elements cannot be instantiated at
+/// run time.
+///
+/// If this pass removes a case, it will add a default case that traps if there
+/// was not already an existing default case. This artificial default case
+/// serves two purposes. The first is to ensure the new switch instruction still
+/// "covers" the entire enum as required by SIL verification (this analysis
+/// could be changed in the future to ignore unavailable elements). Secondly,
+/// the trapping default case may help developers catch issues at runtime where
+/// UB has been invoked and an unavailable element has been instantiated
+/// unexpectedly. Ideally, this debugging aid would be available consistently,
+/// but since we cannot leave any references to the unavailable elements in SIL
+/// it is not possible to transform switch instructions that already have
+/// default cases in such a way that unavailable elements would be detected.
+static bool eliminateSwitchDispatchOnUnavailableElements(
+    SILBasicBlock &BB, UnreachableUserCodeReportingState *State) {
+  SwitchEnumTermInst SWI(BB.getTerminator());
+  if (!SWI)
+    return false;
+
+  EnumDecl *ED = SWI->getOperand(0)->getType().getEnumOrBoundGenericEnum();
+  assert(ED && "operand is not an enum");
+
+  // No need to check the instruction if all elements are available.
+  if (!ED->hasCasesUnavailableDuringLowering())
+    return false;
+
+  SILLocation Loc = SWI->getLoc();
+  bool DidRemoveUnavailableCase = false;
+
+  SmallVector<std::pair<EnumElementDecl *, SILBasicBlock *>, 4> NewCaseBBs;
+  for (unsigned i : range(SWI.getNumCases())) {
+    auto CaseBB = SWI.getCase(i);
+    if (!CaseBB.first->isAvailableDuringLowering()) {
+      // Mark the basic block as potentially unreachable.
+      SILBasicBlock *UnreachableBlock = CaseBB.second;
+      if (!State->PossiblyUnreachableBlocks.contains(UnreachableBlock)) {
+        // If this is the first time we see this unreachable block, store it.
+        State->PossiblyUnreachableBlocks.insert(UnreachableBlock);
+        State->MetaMap.insert(
+            {UnreachableBlock,
+             UnreachableInfo{UnreachableKind::UnavailableEnumElement, Loc,
+                             true}});
+      }
+      DidRemoveUnavailableCase = true;
+    } else {
+      NewCaseBBs.push_back(CaseBB);
+    }
+  }
+
+  if (!DidRemoveUnavailableCase)
+    return false;
+
+  // Since at least one case was removed, we need to add a default case that
+  // traps if there isn't already an existing default case. The resulting SIL
+  // will have a structure that matches what SILGen would have produced for a
+  // switch statment that was written in source with unavailable cases
+  // unhandled.
+  SILBasicBlock *DefaultBB = SWI.getDefaultBBOrNull().getPtrOrNull();
+  bool DidCreateDefault = false;
+  if (!DefaultBB) {
+    DefaultBB = BB.getParent()->createBasicBlock();
+    SILLocation genLoc = Loc.asAutoGenerated();
+    SILBuilder B(DefaultBB);
+    B.createUnconditionalFail(genLoc, "unexpected enum value");
+    B.createUnreachable(genLoc);
+    DidCreateDefault = true;
+  }
+
+  if (isa<SwitchEnumInst>(*SWI)) {
+    auto *SEI = SILBuilderWithScope(SWI).createSwitchEnum(
+        Loc, SWI.getOperand(), DefaultBB, NewCaseBBs);
+
+    if (DidCreateDefault)
+      SEI->createDefaultResult();
+  } else {
+    assert(isa<SwitchEnumAddrInst>(*SWI) && "unknown switch_enum instruction");
+    SILBuilderWithScope(SWI).createSwitchEnumAddr(Loc, SWI.getOperand(),
+                                                  DefaultBB, NewCaseBBs);
+  }
+  SWI->eraseFromParent();
+
+  return true;
+}
+
 /// Issue an "unreachable code" diagnostic if the blocks contains or
 /// leads to another block that contains user code.
 ///
@@ -881,6 +999,15 @@ static bool diagnoseUnreachableBlock(
     // can stop searching for it.
     if (Loc.is<ImplicitReturnLocation>() || Loc.isAutoGenerated())
       return false;
+
+    // Without debug info serialization, source locations are deserialized as
+    // implicit by default and as a result this diagnostic is never produced on
+    // deserialized code.  With support for serializing debug info/source
+    // locations, the implicit flag is deserialized properly .  However, this
+    // creates new diagnostic warnings in many tests. Until these tests are
+    // fixed, we suppress these warnings to match existing behavior.
+    if (Loc.isFilenameAndLocation())
+      continue;
 
     // Check if the instruction corresponds to user-written code, also make
     // sure we don't report an error twice for the same instruction.
@@ -918,13 +1045,19 @@ static bool diagnoseUnreachableBlock(
       case (UnreachableKind::NoreturnCall): {
         // Specialcase when we are warning about unreachable code after a call
         // to a noreturn function.
-        if (!BrInfo.Loc.isASTNode<ExplicitCastExpr>()) {
+        if (!BrInfo.Loc.isASTNode<ExplicitCastExpr>() &&
+            !BrInfo.Loc.isSILFile()) {
           assert(BrInfo.Loc.isASTNode<ApplyExpr>());
           diagnose(M.getASTContext(), Loc.getSourceLoc(),
                    diag::unreachable_code);
           diagnose(M.getASTContext(), BrInfo.Loc.getSourceLoc(),
                    diag::call_to_noreturn_note);
         }
+        break;
+      }
+      case (UnreachableKind::UnavailableEnumElement): {
+        // Don't diagnose blocks removed because they were only reachable from
+        // a case matching an unavailable enum element.
         break;
       }
       }
@@ -1068,6 +1201,11 @@ static void diagnoseUnreachable(SILFunction &Fn) {
     // function.
     if (simplifyBlocksWithCallsToNoReturn(BB, &State))
       continue;
+
+    // Remove the cases of switch_enum / switch_enum_addr instructions that
+    // match unavailable enum elements.
+    if (eliminateSwitchDispatchOnUnavailableElements(BB, &State))
+      continue;
   }
 
   // Remove unreachable blocks.
@@ -1085,6 +1223,10 @@ static void diagnoseUnreachable(SILFunction &Fn) {
     // Remove instructions from the basic block after a call to a noreturn
     // function.
     if (simplifyBlocksWithCallsToNoReturn(BB, &State))
+      continue;
+    // Remove the cases of switch_enum / switch_enum_addr instructions that
+    // match unavailable enum elements.
+    if (eliminateSwitchDispatchOnUnavailableElements(BB, &State))
       continue;
   }
 

@@ -32,6 +32,7 @@ namespace swiftcall {
 namespace swift {
 namespace irgen {
   class EnumPayload;
+  class IRBuilder;
   using clang::CodeGen::swiftcall::SwiftAggLowering;
 
 struct LoadedRef {
@@ -61,11 +62,13 @@ protected:
                    IsTriviallyDestroyable_t pod,
                    IsCopyable_t copy,
                    IsFixedSize_t alwaysFixedSize,
+                   IsABIAccessible_t isABIAccessible,
                    SpecialTypeInfoKind stik = SpecialTypeInfoKind::Loadable)
       : FixedTypeInfo(type, size, spareBits, align, pod,
-                      // All currently implemented loadable types are bitwise-takable.
-                      IsBitwiseTakable,
-                      copy, alwaysFixedSize, stik) {
+                      // All currently implemented loadable types are
+                      // bitwise-takable and -borrowable.
+                      IsBitwiseTakableAndBorrowable,
+                      copy, alwaysFixedSize, isABIAccessible, stik) {
     assert(isLoadable());
   }
 
@@ -75,11 +78,13 @@ protected:
                    IsTriviallyDestroyable_t pod,
                    IsCopyable_t copy,
                    IsFixedSize_t alwaysFixedSize,
+                   IsABIAccessible_t isABIAccessible,
                    SpecialTypeInfoKind stik = SpecialTypeInfoKind::Loadable)
       : FixedTypeInfo(type, size, std::move(spareBits), align, pod,
-                      // All currently implemented loadable types are bitwise-takable.
-                      IsBitwiseTakable,
-                      copy, alwaysFixedSize, stik) {
+                      // All currently implemented loadable types are
+                      // bitwise-takable and borrowable.
+                      IsBitwiseTakableAndBorrowable,
+                      copy, alwaysFixedSize, isABIAccessible, stik) {
     assert(isLoadable());
   }
 
@@ -117,7 +122,7 @@ public:
   /// level and produce them at another.
   ///
   /// Essentially, this is like take-initializing the new explosion.
-  virtual void reexplode(IRGenFunction &IGF, Explosion &sourceExplosion,
+  virtual void reexplode(Explosion &sourceExplosion,
                          Explosion &targetExplosion) const = 0;
 
   /// Shift values from the source explosion to the target explosion
@@ -135,7 +140,8 @@ public:
   virtual void fixLifetime(IRGenFunction &IGF, Explosion &explosion) const = 0;
   
   /// Pack the source explosion into an enum payload.
-  virtual void packIntoEnumPayload(IRGenFunction &IGF,
+  virtual void packIntoEnumPayload(IRGenModule &IGM,
+                                   IRBuilder &builder,
                                    EnumPayload &payload,
                                    Explosion &sourceExplosion,
                                    unsigned offset) const = 0;

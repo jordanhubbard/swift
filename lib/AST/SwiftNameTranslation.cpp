@@ -16,14 +16,23 @@
 
 #include "swift/AST/SwiftNameTranslation.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Attr.h"
+#include "swift/AST/ClangModuleLoader.h"
 #include "swift/AST/Decl.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ParameterList.h"
+#include "swift/AST/Type.h"
+#include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/StringExtras.h"
 
 #include "clang/AST/DeclObjC.h"
+#include "clang/Basic/Module.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
+#include <optional>
 
 using namespace swift;
 
@@ -32,6 +41,10 @@ getNameForObjC(const ValueDecl *VD, CustomNamesOnly_t customNamesOnly) {
   assert(isa<ClassDecl>(VD) || isa<ProtocolDecl>(VD) || isa<StructDecl>(VD) ||
          isa<EnumDecl>(VD) || isa<EnumElementDecl>(VD) ||
          isa<TypeAliasDecl>(VD));
+  auto abiRole = ABIRoleInfo(VD);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return getNameForObjC(abiRole.getCounterpart(), customNamesOnly);
+
   if (auto objc = VD->getAttrs().getAttribute<ObjCAttr>()) {
     if (auto name = objc->getName()) {
       assert(name->getNumSelectorPieces() == 1);
@@ -39,15 +52,25 @@ getNameForObjC(const ValueDecl *VD, CustomNamesOnly_t customNamesOnly) {
     }
   }
 
+  if (auto cdeclAttr = VD->getAttrs().getAttribute<CDeclAttr>())
+    if (!customNamesOnly || !cdeclAttr->Name.empty())
+      return VD->getCDeclName();
+
   if (customNamesOnly)
     return StringRef();
 
   if (auto clangDecl = dyn_cast_or_null<clang::NamedDecl>(VD->getClangDecl())) {
     if (const clang::IdentifierInfo *II = clangDecl->getIdentifier())
       return II->getName();
-    if (auto *anonDecl = dyn_cast<clang::TagDecl>(clangDecl))
+    if (auto *anonDecl = dyn_cast<clang::TagDecl>(clangDecl)) {
       if (auto *anonTypedef = anonDecl->getTypedefNameForAnonDecl())
         return anonTypedef->getIdentifier()->getName();
+      if (auto *cfOptionsTy =
+              VD->getASTContext()
+                  .getClangModuleLoader()
+                  ->getTypeDefForCXXCFOptionsDefinition(anonDecl))
+        return cfOptionsTy->getDecl()->getName();
+    }
   }
 
   return VD->getBaseIdentifier().str();
@@ -58,8 +81,9 @@ getErrorDomainStringForObjC(const EnumDecl *ED) {
   // Should have already been diagnosed as diag::objc_enum_generic.
   assert(!ED->isGenericContext() && "Trying to bridge generic enum error to Obj-C");
 
-  // Clang decls have custom domains, but we shouldn't see them here anyway.
-  assert(!ED->getClangDecl() && "clang decls shouldn't be re-exported");
+  auto abiRole = ABIRoleInfo(ED);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return getErrorDomainStringForObjC(abiRole.getCounterpart());
 
   SmallVector<const NominalTypeDecl *, 4> outerTypes;
   for (const NominalTypeDecl * D = ED;
@@ -84,6 +108,11 @@ getErrorDomainStringForObjC(const EnumDecl *ED) {
 bool swift::objc_translation::
 printSwiftEnumElemNameInObjC(const EnumElementDecl *EL, llvm::raw_ostream &OS,
                              Identifier PreferredName) {
+  auto abiRole = ABIRoleInfo(EL);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return printSwiftEnumElemNameInObjC(abiRole.getCounterpart(), OS,
+                                        PreferredName);
+
   StringRef ElemName = getNameForObjC(EL, CustomNamesOnly);
   if (!ElemName.empty()) {
     OS << ElemName;
@@ -102,6 +131,10 @@ printSwiftEnumElemNameInObjC(const EnumElementDecl *EL, llvm::raw_ostream &OS,
 
 std::pair<Identifier, ObjCSelector> swift::objc_translation::
 getObjCNameForSwiftDecl(const ValueDecl *VD, DeclName PreferredName){
+  auto abiRole = ABIRoleInfo(VD);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return getObjCNameForSwiftDecl(abiRole.getCounterpart(), PreferredName);
+
   ASTContext &Ctx = VD->getASTContext();
   Identifier BaseName;
   if (PreferredName) {
@@ -138,7 +171,7 @@ getObjCNameForSwiftDecl(const ValueDecl *VD, DeclName PreferredName){
 bool swift::objc_translation::
 isVisibleToObjC(const ValueDecl *VD, AccessLevel minRequiredAccess,
                 bool checkParent) {
-  if (!(VD->isObjC() || VD->getAttrs().hasAttribute<CDeclAttr>()))
+  if (!(VD->isObjC() || !VD->getCDeclName().empty()))
     return false;
   if (VD->getFormalAccess() >= minRequiredAccess) {
     return true;
@@ -155,13 +188,27 @@ isVisibleToObjC(const ValueDecl *VD, AccessLevel minRequiredAccess,
 StringRef
 swift::cxx_translation::getNameForCxx(const ValueDecl *VD,
                                       CustomNamesOnly_t customNamesOnly) {
-  if (const auto *Expose = VD->getAttrs().getAttribute<ExposeAttr>()) {
-    if (!Expose->Name.empty())
-      return Expose->Name;
+  auto abiRole = ABIRoleInfo(VD);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return getNameForCxx(abiRole.getCounterpart(), customNamesOnly);
+
+  ASTContext& ctx = VD->getASTContext();
+
+  for (auto *EA : VD->getAttrs().getAttributes<ExposeAttr>()) {
+    if (EA->getExposureKind() == ExposureKind::Cxx && !EA->Name.empty())
+      return EA->Name;
   }
 
   if (customNamesOnly)
     return StringRef();
+
+  if (isa<ConstructorDecl>(VD))
+    return "init";
+
+  if (VD->isOperator()) {
+    std::string name = ("operator" + VD->getBaseIdentifier().str()).str();
+    return ctx.getIdentifier(name).str();
+  }
 
   if (auto *mod = dyn_cast<ModuleDecl>(VD)) {
     if (mod->isStdlibModule())
@@ -184,27 +231,76 @@ swift::cxx_translation::getNameForCxx(const ValueDecl *VD,
         os << char(std::toupper(paramNameStr[0]));
         os << paramNameStr.drop_front(1);
       }
-      auto r = VD->getASTContext().getIdentifier(os.str());
+      auto r = ctx.getIdentifier(os.str());
       return r.str();
-    }
-
-    // FIXME: String.Index should be exposed as String::Index, not
-    // _String_Index.
-    if (VD->getBaseIdentifier().str() == "Index") {
-      return "String_Index";
     }
   }
 
   return VD->getBaseIdentifier().str();
 }
 
+namespace {
+struct ObjCTypeWalker : TypeWalker {
+  bool hadObjCType = false;
+  const ASTContext &ctx;
+  ObjCTypeWalker(const ASTContext &ctx) : ctx(ctx) {}
+  Action walkToTypePre(Type ty) override {
+    if (auto *nominal = ty->getNominalOrBoundGenericNominal()) {
+      if (auto clangDecl = nominal->getClangDecl()) {
+        if (cxx_translation::isObjCxxOnly(clangDecl, ctx)) {
+          hadObjCType = true;
+          return Action::Stop;
+        }
+      }
+    }
+    return Action::Continue;
+  }
+};
+} // namespace
+
+bool swift::cxx_translation::isObjCxxOnly(const ValueDecl *VD) {
+  ObjCTypeWalker walker{VD->getASTContext()};
+  VD->getInterfaceType().walk(walker);
+  return walker.hadObjCType;
+}
+
+bool swift::cxx_translation::isObjCxxOnly(const clang::Decl *D,
+                                          const ASTContext &ctx) {
+  // By default, we import all modules in Obj-C++ mode, so there is no robust
+  // way to tell if something is coming from an Obj-C module. Use the
+  // requirements and the language options to check if we should actually
+  // consider the module to have ObjC constructs.
+  const auto &langOpts = D->getASTContext().getLangOpts();
+  // TODO: have a reasonable guess for headers specified via
+  // `-import-objc-header`.
+  if (!D->hasOwningModule())
+    return false;
+  auto clangModule = D->getOwningModule()->getTopLevelModule();
+  bool requiresObjC = false;
+  for (auto req : clangModule->Requirements)
+    if (req.RequiredState && req.FeatureName == "objc")
+      requiresObjC = true;
+  return langOpts.ObjC &&
+         (requiresObjC ||
+          llvm::any_of(ctx.LangOpts.ModulesRequiringObjC,
+                       [clangModule](StringRef moduleName) {
+                         return clangModule->getFullModuleName() == moduleName;
+                       }));
+}
+
 swift::cxx_translation::DeclRepresentation
-swift::cxx_translation::getDeclRepresentation(const ValueDecl *VD) {
-  if (VD->isObjC())
-    return {Unsupported, UnrepresentableObjC};
+swift::cxx_translation::getDeclRepresentation(
+    const ValueDecl *VD,
+    std::optional<std::function<bool(const NominalTypeDecl *)>> isZeroSized) {
+  auto abiRole = ABIRoleInfo(VD);
+  if (!abiRole.providesAPI() && abiRole.getCounterpart())
+    return getDeclRepresentation(abiRole.getCounterpart(), isZeroSized);
+
   if (getActorIsolation(const_cast<ValueDecl *>(VD)).isActorIsolated())
     return {Unsupported, UnrepresentableIsolatedInActor};
-  Optional<CanGenericSignature> genericSignature;
+  if (isa<MacroDecl>(VD))
+    return {Unsupported, UnrepresentableMacro};
+  GenericSignature genericSignature;
   // Don't expose @_alwaysEmitIntoClient decls as they require their
   // bodies to be emitted into client.
   if (VD->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
@@ -217,15 +313,26 @@ swift::cxx_translation::getDeclRepresentation(const ValueDecl *VD) {
             Feature::GenerateBindingsForThrowingFunctionsInCXX))
       return {Unsupported, UnrepresentableThrows};
     if (AFD->isGeneric())
-      genericSignature = AFD->getGenericSignature().getCanonicalSignature();
+      genericSignature = AFD->getGenericSignature();
   }
   if (const auto *typeDecl = dyn_cast<NominalTypeDecl>(VD)) {
+    if (isa<ProtocolDecl>(typeDecl)) {
+      if (typeDecl->hasClangNode())
+        return {ObjCxxOnly, std::nullopt};
+      return {Unsupported, UnrepresentableProtocol};
+    }
+    // Swift's consume semantics are not yet supported in C++.
+    if (!typeDecl->canBeCopyable())
+      return {Unsupported, UnrepresentableMoveOnly};
+    if (isa<ClassDecl>(VD) && VD->isObjC())
+      return {Unsupported, UnrepresentableObjC};
     if (typeDecl->isGeneric()) {
       if (isa<ClassDecl>(VD))
         return {Unsupported, UnrepresentableGeneric};
-      genericSignature =
-          typeDecl->getGenericSignature().getCanonicalSignature();
+      genericSignature = typeDecl->getGenericSignature();
     }
+    if (!isa<ClassDecl>(typeDecl) && isZeroSized && (*isZeroSized)(typeDecl))
+      return {Unsupported, UnrepresentableZeroSizedValueType};
   }
   if (const auto *varDecl = dyn_cast<VarDecl>(VD)) {
     // Check if any property accessor throws, do not expose it in that case.
@@ -234,10 +341,43 @@ swift::cxx_translation::getDeclRepresentation(const ValueDecl *VD) {
         return {Unsupported, UnrepresentableThrows};
     }
   }
+  if (const auto *enumDecl = dyn_cast<EnumDecl>(VD)) {
+    if (enumDecl->isIndirect())
+      return {Unsupported, UnrepresentableIndirectEnum};
+    for (const auto *enumCase : enumDecl->getAllCases()) {
+      for (const auto *elementDecl : enumCase->getElements()) {
+        if (!elementDecl->hasAssociatedValues())
+          continue;
+        if (elementDecl->isIndirect())
+          return {Unsupported, UnrepresentableIndirectEnum};
+        // Do not expose any enums with > 1
+        // enum parameter, or any enum parameter
+        // whose type we do not yet support.
+        if (auto *params = elementDecl->getParameterList()) {
+          if (params->size() > 1)
+            return {Unsupported, UnrepresentableEnumCaseTuple};
+          for (const auto *param : *params) {
+            auto paramType = param->getInterfaceType();
+            if (!paramType->is<GenericTypeParamType>()) {
+              auto *nominal = paramType->getNominalOrBoundGenericNominal();
+              if (!nominal || isa<ProtocolDecl>(nominal))
+                return {Unsupported, UnrepresentableEnumCaseType};
+            }
+          }
+        }
+      }
+    }
+  }
+
   // Generic requirements are not yet supported in C++.
-  if (genericSignature && !genericSignature->getRequirements().empty())
+  if (!isExposableToCxx(genericSignature)) {
     return {Unsupported, UnrepresentableGenericRequirements};
-  return {Representable, llvm::None};
+  }
+
+  if (isObjCxxOnly(VD))
+    return {ObjCxxOnly, std::nullopt};
+
+  return {Representable, std::nullopt};
 }
 
 bool swift::cxx_translation::isVisibleToCxx(const ValueDecl *VD,
@@ -257,4 +397,84 @@ bool swift::cxx_translation::isVisibleToCxx(const ValueDecl *VD,
     }
   }
   return false;
+}
+
+bool swift::cxx_translation::isExposableToCxx(GenericSignature genericSig) {
+  // If there's no generic signature, it's fine.
+  if (!genericSig)
+    return true;
+
+  // FIXME: This should use getRequirements() and actually
+  // support arbitrary requirements. We don't really want
+  // to use getRequirementsWithInverses() here.
+  //
+  // For now, we use the inverse transform as a quick way to
+  // check for the "default" generic signature where each
+  // generic parameter is Copyable and Escapable, but not
+  // subject to any other requirements; that's exactly the
+  // generic signature that C++ interop supports today.
+  SmallVector<Requirement, 2> reqs;
+  SmallVector<InverseRequirement, 2> inverseReqs;
+  genericSig->getRequirementsWithInverses(reqs, inverseReqs);
+  if (!reqs.empty()) {
+    // Conformance requirements to marker protocols are okay.
+    for (const auto &req: reqs) {
+      if (req.getKind() != RequirementKind::Conformance)
+        return false;
+
+      auto proto = req.getProtocolDecl();
+      if (!proto->isMarkerProtocol() && !proto->hasClangNode())
+        return false;
+    }
+  }
+
+  // Allow Copyable and Escapable.
+  for (const auto &req: inverseReqs) {
+    switch (req.getKind()) {
+    case InvertibleProtocolKind::Copyable:
+      continue;
+
+    case InvertibleProtocolKind::Escapable:
+      continue;
+    }
+
+    return false;
+  }
+
+  return true;
+}
+
+Diagnostic
+swift::cxx_translation::diagnoseRepresenationError(RepresentationError error,
+                                                   ValueDecl *vd) {
+  switch (error) {
+  case UnrepresentableObjC:
+    return Diagnostic(diag::expose_unsupported_objc_decl_to_cxx, vd);
+  case UnrepresentableAsync:
+    return Diagnostic(diag::expose_unsupported_async_decl_to_cxx, vd);
+  case UnrepresentableIsolatedInActor:
+    return Diagnostic(diag::expose_unsupported_actor_isolated_to_cxx, vd);
+  case UnrepresentableRequiresClientEmission:
+    return Diagnostic(diag::expose_unsupported_client_emission_to_cxx, vd);
+  case UnrepresentableGeneric:
+    return Diagnostic(diag::expose_generic_decl_to_cxx, vd);
+  case UnrepresentableGenericRequirements:
+    return Diagnostic(diag::expose_generic_requirement_to_cxx, vd);
+  case UnrepresentableThrows:
+    return Diagnostic(diag::expose_throwing_to_cxx, vd);
+  case UnrepresentableIndirectEnum:
+    return Diagnostic(diag::expose_indirect_enum_cxx, vd);
+  case UnrepresentableEnumCaseType:
+    return Diagnostic(diag::expose_enum_case_type_to_cxx, vd);
+  case UnrepresentableEnumCaseTuple:
+    return Diagnostic(diag::expose_enum_case_tuple_to_cxx, vd);
+  case UnrepresentableProtocol:
+    return Diagnostic(diag::expose_protocol_to_cxx_unsupported, vd);
+  case UnrepresentableMoveOnly:
+    return Diagnostic(diag::expose_move_only_to_cxx, vd);
+  case UnrepresentableMacro:
+    return Diagnostic(diag::expose_macro_to_cxx, vd);
+  case UnrepresentableZeroSizedValueType:
+    return Diagnostic(diag::expose_zero_size_to_cxx, vd);
+  }
 }

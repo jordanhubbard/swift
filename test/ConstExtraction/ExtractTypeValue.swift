@@ -16,7 +16,8 @@ struct TypeValuePropertyStruct : MyProto {
 }
 
 // CHECK:             "label": "birdTypes",
-// CHECK-NEXT:        "type": "Swift.Array<ExtractTypeValue.Bird.Type>",
+// CHECK-NEXT:        "type": "Swift.Array<any ExtractTypeValue.Bird.Type>",
+// CHECK-NEXT:        "mangledTypeName": "n/a - deprecated",
 // CHECK-NEXT:        "isStatic": "false",
 // CHECK-NEXT:        "isComputed": "false",
 // CHECK-NEXT:        "file": "{{.*}}ExtractTypeValue.swift",
@@ -26,22 +27,22 @@ struct TypeValuePropertyStruct : MyProto {
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "valueKind": "Type",
 // CHECK-NEXT:            "value": {
-// CHECK-NEXT:              "type": "ExtractTypeValue.Warbler<Swift.String>.Type",
-// CHECK-NEXT:              "mangledName": "16ExtractTypeValue7WarblerVySSGm"
+// CHECK-NEXT:              "type": "ExtractTypeValue.Warbler<Swift.String>",
+// CHECK-NEXT:              "mangledName": "16ExtractTypeValue7WarblerVySSG"
 // CHECK-NEXT:            }
 // CHECK-NEXT:          },
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "valueKind": "Type",
 // CHECK-NEXT:            "value": {
-// CHECK-NEXT:              "type": "ExtractTypeValue.Avocet.Type",
-// CHECK-NEXT:              "mangledName": "16ExtractTypeValue6AvocetVm"
+// CHECK-NEXT:              "type": "ExtractTypeValue.Avocet",
+// CHECK-NEXT:              "mangledName": "16ExtractTypeValue6AvocetV"
 // CHECK-NEXT:            }
 // CHECK-NEXT:          },
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "valueKind": "Type",
 // CHECK-NEXT:            "value": {
-// CHECK-NEXT:              "type": "ExtractTypeValue.RainbowLorikeet.Type",
-// CHECK-NEXT:              "mangledName": "16ExtractTypeValue15RainbowLorikeetVm"
+// CHECK-NEXT:              "type": "ExtractTypeValue.RainbowLorikeet",
+// CHECK-NEXT:              "mangledName": "16ExtractTypeValue15RainbowLorikeetV"
 // CHECK-NEXT:            }
 // CHECK-NEXT:          }
 // CHECK-NEXT:        ]

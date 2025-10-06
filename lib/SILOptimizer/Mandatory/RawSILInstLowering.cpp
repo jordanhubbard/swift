@@ -11,6 +11,8 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "raw-sil-inst-lowering"
+#include "swift/AST/Decl.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILFunction.h"
 #include "swift/SIL/SILInstruction.h"
@@ -142,6 +144,7 @@ static void getAssignByWrapperArgsRecursively(SmallVectorImpl<SILValue> &args,
       forCleanup.createDestroyValue(loc, src);
       break;
     case SILArgumentConvention::Direct_Unowned:
+    case SILArgumentConvention::Indirect_In_CXX:
     case SILArgumentConvention::Indirect_In:
     case SILArgumentConvention::Direct_Owned:
       break;
@@ -168,66 +171,142 @@ static void getAssignByWrapperArgs(SmallVectorImpl<SILValue> &args,
          "initializer or setter has too many arguments");
 }
 
+static void emitInitAccessorInitialValueArgument(
+    SmallVectorImpl<SILValue> &args, SILValue src,
+    const SILFunctionConventions &convention, SILBuilder &forProjections,
+    SILBuilder &forCleanup) {
+  unsigned argIdx = convention.getSILArgIndexOfFirstParam();
+  getAssignByWrapperArgsRecursively(args, src, argIdx, convention,
+                                    forProjections, forCleanup);
+}
+
 static void
-lowerAssignByWrapperInstruction(SILBuilderWithScope &b,
-                                AssignByWrapperInst *inst,
-                                SmallSetVector<SILValue, 8> &toDelete) {
+lowerAssignOrInitInstruction(SILBuilderWithScope &b,
+                             AssignOrInitInst *inst,
+                             llvm::SmallSetVector<SILValue, 8> &toDelete) {
   LLVM_DEBUG(llvm::dbgs() << "  *** Lowering " << *inst << "\n");
 
   ++numAssignRewritten;
 
   SILValue src = inst->getSrc();
-  SILValue dest = inst->getDest();
   SILLocation loc = inst->getLoc();
   SILBuilderWithScope forCleanup(std::next(inst->getIterator()));
-  
+
   switch (inst->getMode()) {
-    case AssignByWrapperInst::Unknown:
+    case AssignOrInitInst::Unknown:
       assert(b.getModule().getASTContext().hadError() &&
-             "assign_by_wrapper must have a valid mode");
+             "assign_or_init must have a valid mode");
       // In case DefiniteInitialization already gave up with an error, just
-      // treat the assign_by_wrapper as an "init".
+      // treat the assign_or_init with an "init" mode.
       LLVM_FALLTHROUGH;
-    case AssignByWrapperInst::Initialization:
-    case AssignByWrapperInst::Assign: {
+    case AssignOrInitInst::Init: {
       SILValue initFn = inst->getInitializer();
       CanSILFunctionType fTy = initFn->getType().castTo<SILFunctionType>();
       SILFunctionConventions convention(fTy, inst->getModule());
-      SmallVector<SILValue, 4> args;
-      if (convention.hasIndirectSILResults()) {
-        if (inst->getMode() == AssignByWrapperInst::Assign)
-          b.createDestroyAddr(loc, dest);
 
-        args.push_back(dest);
-        getAssignByWrapperArgs(args, src, convention, b, forCleanup);
-        b.createApply(loc, initFn, SubstitutionMap(), args);
-      } else {
-        getAssignByWrapperArgs(args, src, convention, b, forCleanup);
-        SILValue wrappedSrc =
-            b.createApply(loc, initFn, SubstitutionMap(), args);
-        if (inst->getMode() == AssignByWrapperInst::Initialization ||
-            inst->getDest()->getType().isTrivial(*inst->getFunction())) {
-          b.createTrivialStoreOr(loc, wrappedSrc, dest,
-                                 StoreOwnershipQualifier::Init);
+      auto inLocalContext =
+          inst->getProperty()->getDeclContext()->isLocalContext();
+      auto selfOrLocalValue = inst->getSelfOrLocalOperand();
+      bool isRefSelf =
+          selfOrLocalValue->getType().getASTType()->mayHaveSuperclass();
+
+      auto emitFieldReference = [&](SILValue selfRef, VarDecl *field,
+                                    bool emitDestroy = false) -> SILValue {
+        SILValue fieldRef;
+        if (isRefSelf) {
+          fieldRef = b.createRefElementAddr(loc, selfRef, field);
         } else {
-          b.createStore(loc, wrappedSrc, dest, StoreOwnershipQualifier::Assign);
+          fieldRef = b.createStructElementAddr(loc, selfRef, field);
+        }
+
+        if (emitDestroy)
+          b.createDestroyAddr(loc, fieldRef);
+
+        return fieldRef;
+      };
+
+      SmallVector<SILValue> arguments;
+
+      // First, emit all of the properties listed in `initializes`. They
+      // are passed as indirect results.
+      SILValue selfRef = nullptr;
+      bool needInsertEndAccess = false;
+      if (inLocalContext) {
+        // add the local projection which is for the _x backing local storage
+        arguments.push_back(selfOrLocalValue);
+      } else {
+        if (isRefSelf) {
+          selfRef = b.emitBeginBorrowOperation(loc, selfOrLocalValue);
+        } else if (isa<BeginAccessInst>(selfOrLocalValue)) {
+          // Don't insert an access scope if there is already one. This avoids
+          // inserting a dynamic access check when the parent is static (and therefore
+          // can be statically enforced).
+          selfRef = selfOrLocalValue;
+        } 
+        else {
+          selfRef =
+              b.createBeginAccess(loc, selfOrLocalValue, SILAccessKind::Modify,
+                                  SILAccessEnforcement::Dynamic,
+                                  /*noNestedConflict=*/false,
+                                  /*fromBuiltin=*/false);
+          needInsertEndAccess = true;
+        }
+
+        unsigned index = 0;
+        inst->forEachInitializedProperty([&](VarDecl *property) {
+          arguments.push_back(emitFieldReference(
+              selfRef, property,
+              /*emitDestroy=*/inst->isPropertyAlreadyInitialized(index)));
+          index++;
+        });
+      }
+
+      // Now emit `initialValue` which is the only argument specified
+      // by the user.
+      emitInitAccessorInitialValueArgument(arguments, src, convention, b,
+                                           forCleanup);
+
+      // And finally, emit all of the `accesses` properties.
+      for (auto *property : inst->getAccessedProperties())
+        arguments.push_back(emitFieldReference(selfRef, property));
+
+      b.createApply(loc, initFn, SubstitutionMap(), arguments);
+
+      if (selfRef) {
+        if (isRefSelf) {
+          if (selfRef != selfOrLocalValue)
+            b.emitEndBorrowOperation(loc, selfRef);
+        } else if (needInsertEndAccess) {
+          b.createEndAccess(loc, selfRef, /*aborted=*/false);
         }
       }
 
       // The unused partial_apply violates memory lifetime rules in case "self"
       // is an inout. Therefore we cannot keep it as a dead closure to be
       // cleaned up later. We have to delete it in this pass.
-      toDelete.insert(inst->getSetter());
-      
-      // Also the argument of the closure (which usually is a "load") has to be
-      // deleted to avoid memory lifetime violations.
-      auto *setterPA = dyn_cast<PartialApplyInst>(inst->getSetter());
-      if (setterPA && setterPA->getNumArguments() == 1)
-        toDelete.insert(setterPA->getArgument(0));
+      {
+        auto setterRef = inst->getSetter();
+        assert(isa<SILUndef>(setterRef) || isa<PartialApplyInst>(setterRef));
+
+        toDelete.insert(setterRef);
+
+        if (auto *setterPA = dyn_cast<PartialApplyInst>(setterRef)) {
+          // Also the argument of the closure (which usually is a "load") has to
+          // be deleted to avoid memory lifetime violations.
+          if (setterPA->getNumArguments() == 1)
+            toDelete.insert(setterPA->getArgument(0));
+        }
+      }
       break;
     }
-    case AssignByWrapperInst::AssignWrappedValue: {
+    case AssignOrInitInst::Set: {
       SILValue setterFn = inst->getSetter();
+
+      if (isa<SILUndef>(setterFn)) {
+        toDelete.insert(inst->getInitializer());
+        return;
+      }
+
       CanSILFunctionType fTy = setterFn->getType().castTo<SILFunctionType>();
       SILFunctionConventions convention(fTy, inst->getModule());
       assert(!convention.hasIndirectSILResults());
@@ -235,14 +314,7 @@ lowerAssignByWrapperInstruction(SILBuilderWithScope &b,
       getAssignByWrapperArgs(args, src, convention, b, forCleanup);
       b.createApply(loc, setterFn, SubstitutionMap(), args);
 
-      // The destination address is not used. Remove it if it is a dead access
-      // marker. This is important, because also the setter function contains
-      // access marker. In case those markers are dynamic it would cause a
-      // nested access violation.
-      if (isa<BeginAccessInst>(dest))
-        toDelete.insert(dest);
-        
-      // Again, we have to delete the unused dead closure.
+      // Again, we have to delete the unused init accessor reference.
       toDelete.insert(inst->getInitializer());
       break;
     }
@@ -288,7 +360,7 @@ static bool lowerRawSILOperations(SILFunction &fn) {
   bool changed = false;
 
   for (auto &bb : fn) {
-    SmallSetVector<SILValue, 8> toDelete;
+    llvm::SmallSetVector<SILValue, 8> toDelete;
 
     auto i = bb.begin(), e = bb.end();
     while (i != e) {
@@ -316,9 +388,9 @@ static bool lowerRawSILOperations(SILFunction &fn) {
         continue;
       }
 
-      if (auto *ai = dyn_cast<AssignByWrapperInst>(inst)) {
+      if (auto *ai = dyn_cast<AssignOrInitInst>(inst)) {
         SILBuilderWithScope b(ai);
-        lowerAssignByWrapperInstruction(b, ai, toDelete);
+        lowerAssignOrInitInstruction(b, ai, toDelete);
         changed = true;
         continue;
       }

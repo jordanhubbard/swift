@@ -25,7 +25,7 @@ import SIL
 /// ```
 /// The pass does not try to change or re-compute _defined_ effects.
 ///
-let computeEscapeEffects = FunctionPass(name: "compute-escape-effects", {
+let computeEscapeEffects = FunctionPass(name: "compute-escape-effects") {
   (function: Function, context: FunctionPassContext) in
 
   var newEffects = function.effects.escapeEffects.arguments.filter {!$0.isDerived }
@@ -47,8 +47,10 @@ let computeEscapeEffects = FunctionPass(name: "compute-escape-effects", {
     }
 
     // First check: is the argument (or a projected value of it) escaping at all?
-    if !arg.at(.anything).isEscapingWhenWalkingDown(using: IgnoreRecursiveCallVisitor(),
-                                                    context) {
+    if !arg.at(.anything).isEscaping(using: IgnoreRecursiveCallVisitor(),
+                                     initialWalkingDirection: .down,
+                                     context)
+    {
       let effect = EscapeEffects.ArgumentEffect(.notEscaping, argumentIndex: arg.index,
                                                 pathPattern: SmallProjectionPath(.anything))
       newEffects.append(effect)
@@ -70,11 +72,10 @@ let computeEscapeEffects = FunctionPass(name: "compute-escape-effects", {
     return
   }
 
-  context.modifyEffects(in: function) { (effects: inout FunctionEffects) in
+  function.modifyEffects(context) { (effects: inout FunctionEffects) in
     effects.escapeEffects.arguments = newEffects
   }
-})
-
+}
 
 /// Returns true if an argument effect was added.
 private
@@ -85,7 +86,7 @@ func addArgEffects(_ arg: FunctionArgument, argPath ap: SmallProjectionPath,
   // containing one or more references.
   let argPath = arg.type.isClass ? ap : ap.push(.anyValueFields)
   
-  guard let result = arg.at(argPath).visitByWalkingDown(using: ArgEffectsVisitor(), context) else {
+  guard let result = arg.at(argPath).visit(using: ArgEffectsVisitor(), initialWalkingDirection: .down, context) else {
     return false
   }
   
@@ -140,8 +141,8 @@ private func isOperandOfRecursiveCall(_ op: Operand) -> Bool {
   if let applySite = inst as? FullApplySite,
      let callee = applySite.referencedFunction,
      callee == inst.parentFunction,
-     let argIdx = applySite.argumentIndex(of: op),
-     op.value == callee.arguments[argIdx] {
+     let calleeArg = applySite.calleeArgument(of: op, in: callee),
+     op.value == calleeArg {
     return true
   }
   return false

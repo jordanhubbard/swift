@@ -31,9 +31,6 @@
 namespace swift {
 
 enum class LexicalLifetimesOption : uint8_t {
-  // Do not insert lexical markers.
-  Off = 0,
-
   // Insert lexical markers via lexical borrow scopes and the lexical flag on
   // alloc_stacks produced from alloc_boxes, but strip them when lowering out of
   // Raw SIL.
@@ -48,14 +45,17 @@ enum class CopyPropagationOption : uint8_t {
   // Do not add any copy propagation passes.
   Off = 0,
 
-  // Only add the copy propagation passes requested by other flags, currently
-  // just -enable-ossa-modules.
+  // Only add the copy propagation passes requested by other flags.
   RequestedPassesOnly,
 
-  // Add all relevant copy propagation passes.  If a setting, e.g.
-  // -enable-ossa-modules, requests to add copy propagation to the pipeline, do
-  // so.
-  On
+  // Run copy propagation during optimized builds only.
+  //
+  // If a setting, requests to add copy propagation
+  // to the performance pipeline, do so.
+  Optimizing,
+
+  // Run copy propagation during all builds and whenever requested.
+  Always
 };
 
 enum class DestroyHoistingOption : uint8_t {
@@ -69,7 +69,8 @@ enum class DestroyHoistingOption : uint8_t {
 enum class CrossModuleOptimizationMode : uint8_t {
   Off = 0,
   Default = 1,
-  Aggressive = 2
+  Aggressive = 2,
+  Everything = 3,
 };
 
 class SILModule;
@@ -92,11 +93,8 @@ public:
   /// observable end of lexical scope.
   LexicalLifetimesOption LexicalLifetimes = LexicalLifetimesOption::On;
 
-  /// Whether to run SIL copy propagation to shorten object lifetime in whatever
-  /// optimization pipeline is currently used.
-  ///
-  /// When this is 'On' the pipeline has default behavior.
-  CopyPropagationOption CopyPropagation = CopyPropagationOption::On;
+  /// Controls when to run SIL copy propagation, which shortens object lifetimes
+  CopyPropagationOption CopyPropagation = CopyPropagationOption::Optimizing;
 
   /// Whether to run the DestroyAddrHoisting pass.
   ///
@@ -117,6 +115,16 @@ public:
   /// Controls whether to emit actor data-race checks.
   bool EnableActorDataRaceChecks = false;
 
+  /// Controls whether to run async demotion pass.
+  bool EnableAsyncDemotion = false;
+
+  /// Controls whether to always assume that functions rarely throw an Error
+  /// within the optimizer. This influences static branch prediction.
+  bool EnableThrowsPrediction = false;
+
+  /// Controls whether to say that blocks ending in an 'unreachable' are cold.
+  bool EnableNoReturnCold = false;
+
   /// Should we run any SIL performance optimizations
   ///
   /// Useful when you want to enable -O LLVM opts but not -O SIL opts.
@@ -125,8 +133,11 @@ public:
   /// Controls whether cross module optimization is enabled.
   CrossModuleOptimizationMode CMOMode = CrossModuleOptimizationMode::Off;
 
-  /// Enables experimental performance annotations.
-  bool EnablePerformanceAnnotations = false;
+  /// Optimization to perform default mode CMO within a package boundary.
+  /// Package CMO can be performed for resiliently built modules as package
+  /// modules are required to be built together in the same project. To enable
+  /// this optimization, the module also needs -allow-non-resilient-access.
+  bool EnableSerializePackage = false;
 
   /// Enables the emission of stack protectors in functions.
   bool EnableStackProtection = true;
@@ -139,8 +150,20 @@ public:
   /// function pointers.
   bool EnableImportPtrauthFieldFunctionPointers = false;
 
+  /// Enables SIL-level diagnostics for NonescapableTypes.
+  bool EnableLifetimeDependenceDiagnostics = true;
+
+  /// Enable diagnostics requiring WMO (for @noLocks, @noAllocation
+  /// annotations, Embedded Swift, and class specialization). SourceKit is the
+  /// only consumer that has this disabled today (as it disables WMO
+  /// explicitly).
+  bool EnableWMORequiredDiagnostics = true;
+
   /// Controls whether or not paranoid verification checks are run.
   bool VerifyAll = false;
+
+  /// Verify ownership after every pass.
+  bool VerifyOwnershipAll = false;
 
   /// If true, no SIL verification is done at all.
   bool VerifyNone = false;
@@ -165,19 +188,30 @@ public:
   /// and go from OSSA to non-ownership SIL.
   bool StopOptimizationBeforeLoweringOwnership = false;
 
-  /// Do we always serialize SIL in OSSA form?
-  ///
-  /// If this is disabled we do not serialize in OSSA form when optimizing.
-  bool EnableOSSAModules = false;
+  /// Allow recompilation of a non-OSSA module to an OSSA module when imported
+  /// from another OSSA module.
+  bool EnableRecompilationToOSSAModule = false;
 
   /// If set to true, compile with the SIL Opaque Values enabled.
   bool EnableSILOpaqueValues = false;
 
-  /// Require linear OSSA lifetimes after SILGen
-  bool OSSACompleteLifetimes = false;
+  /// Introduce linear OSSA lifetimes after SILGen
+  bool OSSACompleteLifetimes = true;
 
-  // The kind of function bodies to skip emitting.
+  /// Verify linear OSSA lifetimes throughout OSSA pipeline.
+  bool OSSAVerifyComplete = false;
+
+  /// Enable pack metadata stack "promotion".
+  ///
+  /// More accurately, enable skipping mandatory heapification of pack metadata
+  /// when possible.
+  bool EnablePackMetadataStackPromotion = true;
+
+  /// The kind of function bodies to skip emitting.
   FunctionBodySkipping SkipFunctionBodies = FunctionBodySkipping::None;
+
+  /// Whether to skip declarations that are internal to the module.
+  bool SkipNonExportableDecls = false;
 
   /// Optimization mode being used.
   OptimizationMode OptMode = OptimizationMode::NotSet;
@@ -263,15 +297,23 @@ public:
   /// Are we parsing the stdlib, i.e. -parse-stdlib?
   bool ParseStdlib = false;
 
-  /// If true, check for leaking instructions when the SILModule is destructed.
-  ///
-  /// Warning: this is not thread safe. It can only be enabled in case there
-  /// is a single SILModule in a single thread.
-  bool checkSILModuleLeaks = false;
+  /// Are we building in embedded Swift mode?
+  bool EmbeddedSwift = false;
+
+  /// Are we building in embedded Swift + -no-allocations?
+  bool NoAllocations = false;
+
+  /// Should we use the experimental Swift based closure-specialization
+  /// optimization pass instead of the existing C++ one.
+  bool EnableExperimentalSwiftBasedClosureSpecialization = false;
 
   /// The name of the file to which the backend should save optimization
   /// records.
   std::string OptRecordFile;
+
+  /// The names of the auxiliar files to which the backend should save optimization
+  /// records for the remaining (other than the main one) LLVMModules.
+  std::vector<std::string> AuxOptRecordFiles;
 
   /// The regex that filters the passes that should be saved to the optimization
   /// records.
@@ -279,6 +321,28 @@ public:
 
   /// The format used for serializing remarks (default: YAML)
   llvm::remarks::Format OptRecordFormat = llvm::remarks::Format::YAML;
+
+  /// Whether to apply _assemblyVision to all functions.
+  bool EnableGlobalAssemblyVision = false;
+
+  /// Are there any options that indicate that functions should not be preserved
+  /// for the debugger?
+  bool ShouldFunctionsBePreservedToDebugger = true;
+
+  /// Block expanding and register promotion more aggressively throughout the
+  /// optimizer.
+  bool UseAggressiveReg2MemForCodeSize = true;
+
+  /// Enable enforcement of lifetime dependencies on addressable arguments.
+  /// Temporarily used to bootstrap the AddressableParameters feature.
+  bool EnableAddressDependencies = true;
+
+  // Whether to allow merging traps and cond_fails.
+  bool MergeableTraps = false;
+
+  /// Whether the @yield_once_2 convention is used by accessors added with the
+  /// CoroutineAccessors feature (i.e. read2/modify2).
+  bool CoroutineAccessorsUseYieldOnce2 = false;
 
   SILOptions() {}
 

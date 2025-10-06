@@ -17,7 +17,6 @@
 #include "swift/Demangling/ManglingMacros.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/ConvertUTF.h"
@@ -29,9 +28,10 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/Signals.h"
-#include "llvm/Support/thread.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/thread.h"
 #include <fstream>
+#include <optional>
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
 #include <sys/param.h>
 #include <unistd.h>
@@ -260,7 +260,7 @@ static void skt_main(skt_args *args) {
   // A test invocation may initialize the options to be used for subsequent
   // invocations.
   TestOptions InitOpts;
-  auto Args = llvm::makeArrayRef(argv+1, argc-1);
+  auto Args = llvm::ArrayRef(argv + 1, argc - 1);
   bool firstInvocation = true;
   while (1) {
     unsigned i = 0;
@@ -319,7 +319,7 @@ static int printDiags();
 
 static void getSemanticInfo(sourcekitd_variant_t Info, StringRef Filename);
 
-static Optional<int64_t> getReqOptValueAsInt(StringRef Value) {
+static std::optional<int64_t> getReqOptValueAsInt(StringRef Value) {
   if (Value.equals_insensitive("true"))
     return 1;
   if (Value.equals_insensitive("false"))
@@ -327,21 +327,22 @@ static Optional<int64_t> getReqOptValueAsInt(StringRef Value) {
   int64_t Ret;
   if (Value.find_first_not_of("-0123456789") != StringRef::npos ||
       Value.getAsInteger(0, Ret)) {
-    return None;
+    return std::nullopt;
   }
   return Ret;
 }
 
-static Optional<sourcekitd_uid_t> getReqOptValueAsUID(StringRef Value) {
-  if (!Value.startswith("uid:"))
-    return None;
+static std::optional<sourcekitd_uid_t> getReqOptValueAsUID(StringRef Value) {
+  if (!Value.starts_with("uid:"))
+    return std::nullopt;
   Value = Value.drop_front(4);
   return sourcekitd_uid_get_from_buf(Value.data(), Value.size());
 }
 
-static Optional<sourcekitd_object_t> getReqOptValueAsArray(StringRef Value) {
-  if (!Value.startswith("[") || !Value.endswith("]"))
-    return None;
+static std::optional<sourcekitd_object_t>
+getReqOptValueAsArray(StringRef Value) {
+  if (!Value.starts_with("[") || !Value.ends_with("]"))
+    return std::nullopt;
   SmallVector<StringRef, 4> Elements;
   Value.drop_front().drop_back().split(Elements, ';');
   auto Array = sourcekitd_request_array_create(nullptr, 0);
@@ -416,6 +417,46 @@ static bool readPopularAPIList(StringRef filename,
   return false;
 }
 
+/// Read '-req-opts' for syntactic macro expansion request and apply it to 'req'
+/// object.
+/// The format of the argument is '-req-opts={line}:{column}:{path}'
+/// where {path} is a path to a JSON file that has macro roles and definition.
+/// {line} and {column} is resolved to 'offset' using \p inputBuf .
+static bool setSyntacticMacroExpansions(sourcekitd_object_t req,
+                                        TestOptions &opts,
+                                        llvm::MemoryBuffer *inputBuf) {
+  SmallVector<sourcekitd_object_t, 4> expansions;
+  for (std::string &opt : opts.RequestOptions) {
+    SmallVector<StringRef, 3> args;
+    StringRef(opt).split(args, ":", /*maxSplits=*/2);
+    unsigned line, column;
+
+    if (args.size() != 3 || args[0].getAsInteger(10, line) ||
+        args[1].getAsInteger(10, column)) {
+      llvm::errs() << "-req-opts should be {line}:{column}:{json-path}";
+      return true;
+    }
+    unsigned offset = resolveFromLineCol(line, column, inputBuf);
+
+    auto Buffer = getBufferForFilename(args[2], opts.VFSFiles)->getBuffer();
+    char *Err = nullptr;
+    auto expansion = sourcekitd_request_create_from_yaml(Buffer.data(), &Err);
+    if (!expansion) {
+      assert(Err);
+      llvm::errs() << Err;
+      free(Err);
+      return true;
+    }
+    sourcekitd_request_dictionary_set_int64(expansion, KeyOffset,
+                                            int64_t(offset));
+    expansions.push_back(expansion);
+  }
+  sourcekitd_request_dictionary_set_value(
+      req, KeyExpansions,
+      sourcekitd_request_array_create(expansions.data(), expansions.size()));
+  return false;
+}
+
 namespace {
 class PrintingTimer {
   std::string desc;
@@ -438,7 +479,7 @@ static sourcekitd_response_t sendRequestSync(sourcekitd_object_t req,
                                              const TestOptions &opts) {
   if (opts.PrintRequest)
     sourcekitd_request_description_dump(req);
-  Optional<PrintingTimer> timer;
+  std::optional<PrintingTimer> timer;
   if (opts.timeRequest)
     timer.emplace("request time");
   return sourcekitd_send_request_sync(req);
@@ -693,6 +734,9 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
     sourcekitd_request_dictionary_set_string(Req, KeyName, SemaName.c_str());
     // Default to sort by name.
     Opts.RequestOptions.insert(Opts.RequestOptions.begin(), "sort.byname=1");
+    // Default to verifying USR to Decl conversion to cover many use cases
+    Opts.RequestOptions.insert(Opts.RequestOptions.begin(),
+                               "verifyusrtodecl=1");
     addRequestOptions(Req, Opts, KeyCodeCompleteOptions, "key.codecomplete.");
     break;
 
@@ -774,6 +818,12 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
                                           RequestConformingMethodList);
     sourcekitd_request_dictionary_set_int64(Req, KeyOffset, ByteOffset);
     addRequestOptionsDirect(Req, Opts);
+    break;
+
+  case SourceKitRequest::SignatureHelp:
+    sourcekitd_request_dictionary_set_uid(Req, KeyRequest,
+                                          RequestSignatureHelp);
+    sourcekitd_request_dictionary_set_int64(Req, KeyOffset, ByteOffset);
     break;
 
   case SourceKitRequest::CursorInfo:
@@ -1028,6 +1078,9 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
                                                Opts.InterestedUSR.c_str());
     if (!Opts.USR.empty())
       sourcekitd_request_dictionary_set_string(Req, KeyUSR, Opts.USR.c_str());
+
+    // add possible EnableDeclarations in particular
+    addRequestOptionsDirect(Req, Opts);
     break;
 
   case SourceKitRequest::FindInterfaceDoc:
@@ -1062,13 +1115,9 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
     sourcekitd_request_dictionary_set_int64(Req, KeyLength, Opts.Length);
     break;
 
-  case SourceKitRequest::SyntacticRename:
   case SourceKitRequest::FindRenameRanges: {
-    if (Opts.Request == SourceKitRequest::SyntacticRename) {
-      sourcekitd_request_dictionary_set_uid(Req, KeyRequest, RequestSyntacticRename);
-    } else {
-      sourcekitd_request_dictionary_set_uid(Req, KeyRequest, RequestFindRenameRanges);
-    }
+    sourcekitd_request_dictionary_set_uid(Req, KeyRequest,
+                                          RequestFindRenameRanges);
     if (Opts.RenameSpecPath.empty()) {
       llvm::errs() << "Missing '-rename-spec <file path>'\n";
       return 1;
@@ -1097,6 +1146,10 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
   case SourceKitRequest::Diagnostics:
     sourcekitd_request_dictionary_set_uid(Req, KeyRequest, RequestDiagnostics);
     break;
+  case SourceKitRequest::SemanticTokens:
+    sourcekitd_request_dictionary_set_uid(Req, KeyRequest,
+                                          RequestSemanticTokens);
+    break;
 
   case SourceKitRequest::Compile:
     sourcekitd_request_dictionary_set_string(Req, KeyName, SemaName.c_str());
@@ -1106,6 +1159,20 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
   case SourceKitRequest::CompileClose:
     sourcekitd_request_dictionary_set_string(Req, KeyName, SemaName.c_str());
     sourcekitd_request_dictionary_set_uid(Req, KeyRequest, RequestCompileClose);
+    break;
+
+  case SourceKitRequest::SyntacticMacroExpansion:
+    sourcekitd_request_dictionary_set_uid(Req, KeyRequest,
+                                          RequestSyntacticMacroExpansion);
+    setSyntacticMacroExpansions(Req, Opts, SourceBuf.get());
+    break;
+
+  case SourceKitRequest::IndexToStore:
+    sourcekitd_request_dictionary_set_string(Req, KeyName, SemaName.c_str());
+    sourcekitd_request_dictionary_set_string(Req, KeyIndexStorePath, Opts.IndexStorePath.c_str());
+    sourcekitd_request_dictionary_set_string(Req, KeyIndexUnitOutputPath, Opts.IndexUnitOutputPath.c_str());
+    sourcekitd_request_dictionary_set_uid(Req, KeyRequest, RequestIndexToStore);
+    addRequestOptionsDirect(Req, Opts);
     break;
   }
 
@@ -1163,20 +1230,6 @@ static int handleTestInvocation(TestOptions Opts, TestOptions &InitOpts) {
                                           "-Xfrontend");
       sourcekitd_request_array_set_string(Args, SOURCEKITD_ARRAY_APPEND,
           "-disable-implicit-string-processing-module-import");
-    }
-    if (Opts.EnableImplicitBacktracingModuleImport &&
-        !compilerArgsAreClang) {
-      sourcekitd_request_array_set_string(Args, SOURCEKITD_ARRAY_APPEND,
-                                          "-Xfrontend");
-      sourcekitd_request_array_set_string(Args, SOURCEKITD_ARRAY_APPEND,
-          "-enable-implicit-backtracing-module-import");
-    }
-    if (Opts.DisableImplicitBacktracingModuleImport &&
-        !compilerArgsAreClang) {
-      sourcekitd_request_array_set_string(Args, SOURCEKITD_ARRAY_APPEND,
-                                          "-Xfrontend");
-      sourcekitd_request_array_set_string(Args, SOURCEKITD_ARRAY_APPEND,
-          "-disable-implicit-backtracing-module-import");
     }
 
     for (auto Arg : Opts.CompilerArgs)
@@ -1333,16 +1386,24 @@ static bool handleResponse(sourcekitd_response_t Resp, const TestOptions &Opts,
       KeepResponseAlive = true;
       break;
 
-    case SourceKitRequest::Edit:
-      if (Opts.Length == 0 && Opts.ReplaceText->empty()) {
-        // Length=0, replace="" is a nop and will not trigger sema.
+    case SourceKitRequest::Edit: {
+      // Length=0, replace="" is a nop and will not trigger sema.
+      bool SyntacticOnly = Opts.Length == 0 && Opts.ReplaceText->empty();
+      for (const std::string &ReqOpt : Opts.RequestOptions) {
+        if (SyntacticOnly)
+          break;
+        if (ReqOpt.find("syntactic_only=1") != std::string::npos) {
+          SyntacticOnly = true;
+        }
+      }
+      if (SyntacticOnly) {
         printRawResponse(Resp);
       } else {
         getSemanticInfo(Info, SourceFile);
         KeepResponseAlive = true;
       }
       break;
-
+    }
     case SourceKitRequest::DemangleNames:
       printDemangleResults(sourcekitd_response_get_value(Resp), outs());
       break;
@@ -1364,8 +1425,10 @@ static bool handleResponse(sourcekitd_response_t Resp, const TestOptions &Opts,
     case SourceKitRequest::CodeCompleteSetPopularAPI:
     case SourceKitRequest::TypeContextInfo:
     case SourceKitRequest::ConformingMethodList:
+    case SourceKitRequest::SignatureHelp:
     case SourceKitRequest::DependencyUpdated:
     case SourceKitRequest::Diagnostics:
+    case SourceKitRequest::SemanticTokens:
       printRawResponse(Resp);
       break;
     case SourceKitRequest::Compile:
@@ -1520,7 +1583,7 @@ static bool handleResponse(sourcekitd_response_t Resp, const TestOptions &Opts,
         break;
 #define SEMANTIC_REFACTORING(KIND, NAME, ID) case SourceKitRequest::KIND:
 #include "swift/Refactoring/RefactoringKinds.def"
-      case SourceKitRequest::SyntacticRename:
+      case SourceKitRequest::SyntacticMacroExpansion:
         printSyntacticRenameEdits(Info, llvm::outs());
         break;
       case SourceKitRequest::FindRenameRanges:
@@ -1529,6 +1592,9 @@ static bool handleResponse(sourcekitd_response_t Resp, const TestOptions &Opts,
         break;
       case SourceKitRequest::Statistics:
         printStatistics(Info, llvm::outs());
+        break;
+      case SourceKitRequest::IndexToStore:
+        printRawResponse(Resp);
         break;
     }
   }
@@ -1741,6 +1807,7 @@ struct ResponseSymbolInfo {
   const char *TypeUSR = nullptr;
   const char *ContainerTypeUSR = nullptr;
   const char *DocComment = nullptr;
+  const char *DocCommentAsXML = nullptr;
   const char *GroupName = nullptr;
   const char *LocalizationKey = nullptr;
   const char *AnnotatedDeclaration = nullptr;
@@ -1789,6 +1856,8 @@ struct ResponseSymbolInfo {
         sourcekitd_variant_dictionary_get_string(Info, KeyContainerTypeUsr);
 
     Symbol.DocComment =
+        sourcekitd_variant_dictionary_get_string(Info, KeyDocComment);
+    Symbol.DocCommentAsXML =
         sourcekitd_variant_dictionary_get_string(Info, KeyDocFullAsXML);
     Symbol.GroupName =
         sourcekitd_variant_dictionary_get_string(Info, KeyGroupName);
@@ -1890,7 +1959,8 @@ struct ResponseSymbolInfo {
     }
     OS << ")" << '\n';
 
-    OS << Name << '\n';
+    if (Name)
+      OS << Name << '\n';
     if (USR)
       OS << USR << '\n';
     if (Lang)
@@ -1913,8 +1983,12 @@ struct ResponseSymbolInfo {
       OS << AnnotatedDeclaration << '\n';
     if (FullyAnnotatedDeclaration)
       OS << FullyAnnotatedDeclaration << '\n';
+    OS << "DOC COMMENT\n";
     if (DocComment)
       OS << DocComment << '\n';
+    OS << "DOC COMMENT XML\n";
+    if (DocCommentAsXML)
+      OS << DocCommentAsXML << '\n';
     if (LocalizationKey) {
       OS << "<LocalizationKey>" << LocalizationKey;
       OS << "</LocalizationKey>" << '\n';
@@ -2058,7 +2132,7 @@ static void printRangeInfo(sourcekitd_variant_t Info, StringRef FilenameIn,
 
   sourcekitd_variant_t OffsetObj =
     sourcekitd_variant_dictionary_get_value(Info, KeyOffset);
-  llvm::Optional<int64_t> Offset;
+  std::optional<int64_t> Offset;
   if (sourcekitd_variant_get_type(OffsetObj) != SOURCEKITD_VARIANT_TYPE_NULL) {
     Offset = sourcekitd_variant_int64_get_value(OffsetObj);
   }
@@ -2156,7 +2230,7 @@ static void printFoundUSR(sourcekitd_variant_t Info,
                           llvm::raw_ostream &OS) {
   sourcekitd_variant_t OffsetObj =
       sourcekitd_variant_dictionary_get_value(Info, KeyOffset);
-  llvm::Optional<int64_t> Offset;
+  std::optional<int64_t> Offset;
   if (sourcekitd_variant_get_type(OffsetObj) != SOURCEKITD_VARIANT_TYPE_NULL)
     Offset = sourcekitd_variant_int64_get_value(OffsetObj);
 
@@ -2378,6 +2452,12 @@ static void printInterfaceGen(sourcekitd_variant_t Info, bool CheckASCII) {
   sourcekitd_variant_t structure =
       sourcekitd_variant_dictionary_get_value(Info, KeySubStructure);
   printRawVariant(structure);
+  sourcekitd_variant_t declarations =
+      sourcekitd_variant_dictionary_get_value(Info, KeyDeclarations);
+  // only output declarations if there are any (because this might have been
+  // disabled in the request itself)
+  if (sourcekitd_variant_get_type(declarations) != SOURCEKITD_VARIANT_TYPE_NULL)
+    printRawVariant(declarations);
 }
 
 static void printRelatedIdents(sourcekitd_variant_t Info, StringRef Filename,
@@ -2390,10 +2470,13 @@ static void printRelatedIdents(sourcekitd_variant_t Info, StringRef Filename,
     sourcekitd_variant_t Range = sourcekitd_variant_array_get_value(Res, i);
     int64_t Offset = sourcekitd_variant_dictionary_get_int64(Range, KeyOffset);
     int64_t Length = sourcekitd_variant_dictionary_get_int64(Range, KeyLength);
+    auto Usage = sourcekitd_variant_dictionary_get_uid(Range, KeyNameType);
     auto LineCol = resolveToLineCol(Offset, Filename, VFSFiles);
-    OS << LineCol.first << ':' << LineCol.second << " - " << Length << '\n';
+    OS << LineCol.first << ':' << LineCol.second << " - " << Length << " - "
+       << sourcekitd_uid_get_string_ptr(Usage) << '\n';
   }
   OS << "END RANGES\n";
+  OS << "NAME: " << sourcekitd_variant_dictionary_get_string(Info, KeyName);
 }
 
 static void printActiveRegions(sourcekitd_variant_t Info, StringRef Filename,
@@ -2551,7 +2634,7 @@ static std::string initializeSource(StringRef Input) {
   return result;
 }
 
-static Optional<std::pair<unsigned, unsigned>>
+static std::optional<std::pair<unsigned, unsigned>>
 firstPlaceholderRange(StringRef Source, unsigned from) {
   const char *StartPtr = Source.data();
   Source = Source.drop_front(from);
@@ -2562,7 +2645,7 @@ firstPlaceholderRange(StringRef Source, unsigned from) {
       break;
     unsigned OffsetStart = Source.data() + Pos - StartPtr;
     Source = Source.substr(Pos+2);
-    if (Source.startswith("__skip__") || Source.startswith("T##__skip__"))
+    if (Source.starts_with("__skip__") || Source.starts_with("T##__skip__"))
       continue;
     Pos = Source.find("#>");
     if (Pos == StringRef::npos)
@@ -2571,7 +2654,7 @@ firstPlaceholderRange(StringRef Source, unsigned from) {
     Source = Source.substr(Pos+2);
     return std::make_pair(OffsetStart, OffsetEnd-OffsetStart);
   }
-  return llvm::None;
+  return std::nullopt;
 }
 
 static void expandPlaceholders(llvm::MemoryBuffer *SourceBuf,

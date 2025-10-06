@@ -12,10 +12,12 @@
 
 #include "swift/IDE/CursorInfo.h"
 #include "ExprContextAnalysis.h"
+#include "ReadyForTypeCheckingCallback.h"
 #include "swift/AST/ASTDemangler.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/USRGeneration.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IDE/SelectedOverloadInfo.h"
 #include "swift/IDE/TypeCheckCompletionCallback.h"
 #include "swift/Parse/IDEInspectionCallbacks.h"
@@ -174,30 +176,35 @@ private:
   }
 
   PreWalkAction walkToDeclPre(Decl *D) override {
-    if (!rangeContainsLocToResolve(D->getSourceRangeIncludingAttrs())) {
-      return PreWalkAction::SkipChildren;
+    // If the decl doesn't contain the location to resolve, we can skip walking
+    // it. One exception to this is for VarDecls, they can contain accessors
+    // which are not included in their SourceRange. For e.g `var x: Int { 0 }`,
+    // the VarDecl's range is just `x`, but the location may be in the accessor.
+    if (!isa<VarDecl>(D) &&
+        !rangeContainsLocToResolve(D->getSourceRangeIncludingAttrs())) {
+      return Action::SkipNode();
     }
 
     if (auto *newDC = dyn_cast<DeclContext>(D)) {
       DeclContextStack.push_back(newDC);
     }
 
-    if (D->getLoc() != LocToResolve) {
+    auto *VD = dyn_cast<ValueDecl>(D);
+    if (!VD)
       return Action::Continue();
-    }
 
-    if (auto VD = dyn_cast<ValueDecl>(D)) {
-      // FIXME: ParamDecls might be closure parameters that can have ambiguous
-      // types. The current infrastructure of just asking for the VD's type
-      // doesn't work here. We need to inspect the constraints system solution.
-      if (VD->hasName() && !isa<ParamDecl>(D)) {
-        assert(Result == nullptr);
-        Result = std::make_unique<NodeFinderDeclResult>(VD);
-        return Action::Stop();
-      }
-    }
+    // FIXME: ParamDecls might be closure parameters that can have ambiguous
+    // types. The current infrastructure of just asking for the VD's type
+    // doesn't work here. We need to inspect the constraints system solution.
+    if (isa<ParamDecl>(VD))
+      return Action::Continue();
 
-    return Action::Continue();
+    if (!VD->hasName() || VD->getNameLoc() != LocToResolve)
+      return Action::Continue();
+
+    assert(Result == nullptr);
+    Result = std::make_unique<NodeFinderDeclResult>(VD);
+    return Action::Stop();
   }
 
   PostWalkAction walkToDeclPost(Decl *D) override {
@@ -224,25 +231,13 @@ private:
       }
     }
 
-    if (E->getLoc() != LocToResolve) {
+    if (E->getNameLoc().getBaseNameLoc() != LocToResolve)
       return Action::Continue(E);
-    }
 
-    switch (E->getKind()) {
-    case ExprKind::DeclRef:
-    case ExprKind::UnresolvedDot:
-    case ExprKind::UnresolvedDeclRef:
-    case ExprKind::OverloadedDeclRef: {
-      assert(Result == nullptr);
-      Result =
-          std::make_unique<NodeFinderExprResult>(E, getCurrentDeclContext());
-      return Action::Stop();
-    }
-    default:
-      break;
-    }
-
-    return Action::Continue(E);
+    assert(Result == nullptr);
+    Result =
+        std::make_unique<NodeFinderExprResult>(E, getCurrentDeclContext());
+    return Action::Stop();
   }
 
   PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
@@ -277,6 +272,18 @@ public:
     bool IsDynamicRef;
     /// The declaration that is being referenced. Will never be \c nullptr.
     ValueDecl *ReferencedDecl;
+    /// The interface type of the referenced declaration. This might not be
+    /// stored in `ReferencedDecl->getInterfaceType()` if the declaration's
+    /// type hasn't been applied to the AST.
+    Type SolutionSpecificInterfaceType;
+
+    bool operator==(const CursorInfoDeclReference &Other) const {
+      return nullableTypesEqual(BaseType, Other.BaseType) &&
+             IsDynamicRef == Other.IsDynamicRef &&
+             ReferencedDecl == Other.ReferencedDecl &&
+             nullableTypesEqual(SolutionSpecificInterfaceType,
+                                Other.SolutionSpecificInterfaceType);
+    }
   };
 
 private:
@@ -291,27 +298,46 @@ private:
 
   SmallVector<CursorInfoDeclReference, 1> Results;
 
-  Expr *getExprToResolve() {
+  void sawSolutionImpl(const Solution &S) override {
     NodeFinder Finder(DC, ResolveLoc);
     Finder.resolve();
     auto Result = Finder.takeResult();
-    if (!Result || Result->getKind() != NodeFinderResultKind::Expr) {
-      return nullptr;
-    }
-    return cast<NodeFinderExprResult>(Result.get())->getExpr();
-  }
-
-  void sawSolutionImpl(const Solution &S) override {
-    auto &CS = S.getConstraintSystem();
-    auto ResolveExpr = getExprToResolve();
-    if (!ResolveExpr) {
+    if (!Result) {
       return;
     }
+    switch (Result->getKind()) {
+    case NodeFinderResultKind::Decl: {
+      ValueDecl *DeclToResolve =
+          cast<NodeFinderDeclResult>(Result.get())->getDecl();
+      addCursorInfoResultForDecl(DeclToResolve, S);
+      break;
+    }
+    case NodeFinderResultKind::Expr: {
+      Expr *ExprToResolve = cast<NodeFinderExprResult>(Result.get())->getExpr();
+      addCursorInfoResultForExpr(ExprToResolve, S);
+      break;
+    }
+    }
+  }
 
-    auto Locator = CS.getConstraintLocator(ResolveExpr);
+  void addCursorInfoResultForDecl(ValueDecl *DeclToResolve, const Solution &S) {
+    if (!S.hasType(DeclToResolve)) {
+      return;
+    }
+    Type SolutionInterfaceTy =
+        S.simplifyType(S.getType(DeclToResolve))->mapTypeOutOfContext();
+
+    addResult({/*BaseType=*/nullptr, /*IsDynamicRef=*/false, DeclToResolve,
+               SolutionInterfaceTy});
+  }
+
+  void addCursorInfoResultForExpr(Expr *ExprToResolve, const Solution &S) {
+    auto &CS = S.getConstraintSystem();
+
+    auto Locator = CS.getConstraintLocator(ExprToResolve);
     auto CalleeLocator = S.getCalleeLocator(Locator);
     auto OverloadInfo = getSelectedOverloadInfo(S, CalleeLocator);
-    if (!OverloadInfo.Value) {
+    if (!OverloadInfo.ValueRef) {
       // We could not resolve the referenced declaration. Skip the solution.
       return;
     }
@@ -322,11 +348,22 @@ private:
     if (auto BaseExpr =
             simplifyLocatorToAnchor(BaseLocator).dyn_cast<Expr *>()) {
       IsDynamicRef =
-          ide::isDynamicRef(BaseExpr, OverloadInfo.Value,
+          ide::isDynamicRef(BaseExpr, OverloadInfo.getValue(),
                             [&S](Expr *E) { return S.getResolvedType(E); });
     }
 
-    Results.push_back({OverloadInfo.BaseTy, IsDynamicRef, OverloadInfo.Value});
+    addResult({OverloadInfo.BaseTy, IsDynamicRef, OverloadInfo.getValue(),
+               /*SolutionSpecificInterfaceType=*/Type()});
+  }
+
+  void addResult(const CursorInfoDeclReference &NewResult) {
+    if (llvm::any_of(Results, [&](const CursorInfoDeclReference &R) {
+          return R == NewResult;
+        })) {
+      return;
+    }
+
+    Results.push_back(NewResult);
   }
 
 public:
@@ -338,45 +375,31 @@ public:
 
 // MARK: - CursorInfoDoneParsingCallback
 
-class CursorInfoDoneParsingCallback : public DoneParsingCallback {
+class CursorInfoDoneParsingCallback : public ReadyForTypeCheckingCallback {
   CursorInfoConsumer &Consumer;
   SourceLoc RequestedLoc;
 
 public:
   CursorInfoDoneParsingCallback(Parser &P, CursorInfoConsumer &Consumer,
                                 SourceLoc RequestedLoc)
-      : DoneParsingCallback(), Consumer(Consumer), RequestedLoc(RequestedLoc) {}
+      : Consumer(Consumer), RequestedLoc(RequestedLoc) {}
 
-  std::vector<ResolvedCursorInfoPtr>
-  getDeclResult(NodeFinderDeclResult *DeclResult, SourceFile *SrcFile,
-                NodeFinder &Finder) const {
-    typeCheckDeclAndParentClosures(DeclResult->getDecl());
-    auto CursorInfo = new ResolvedValueRefCursorInfo(
-        SrcFile, RequestedLoc, DeclResult->getDecl(),
-        /*CtorTyRef=*/nullptr,
-        /*ExtTyRef=*/nullptr, /*IsRef=*/false, /*Ty=*/Type(),
-        /*ContainerType=*/Type(),
-        /*CustomAttrRef=*/None,
-        /*IsKeywordArgument=*/false,
-        /*IsDynamic=*/false,
-        /*ReceiverTypes=*/{},
-        Finder.getShorthandShadowedDecls(DeclResult->getDecl()));
-    return {CursorInfo};
-  }
-
-  std::vector<ResolvedCursorInfoPtr>
-  getExprResult(NodeFinderExprResult *ExprResult, SourceFile *SrcFile,
-                NodeFinder &Finder) const {
-    Expr *E = ExprResult->getExpr();
-    DeclContext *DC = ExprResult->getDeclContext();
-
+private:
+  /// Shared core of `getExprResult` and `getDeclResult`.
+  std::vector<ResolvedCursorInfoPtr> getResult(ASTNode Node, DeclContext *DC,
+                                               SourceFile *SrcFile,
+                                               NodeFinder &Finder) const {
     // Type check the statemnt containing E and listen for solutions.
     CursorInfoTypeCheckSolutionCallback Callback(*DC, RequestedLoc);
     {
       llvm::SaveAndRestore<TypeCheckCompletionCallback *> CompletionCollector(
           DC->getASTContext().SolutionCallback, &Callback);
-      typeCheckASTNodeAtLoc(TypeCheckASTNodeAtLocContext::declContext(DC),
-                            E->getLoc());
+      if (ValueDecl *VD = getAsDecl<ValueDecl>(Node)) {
+        typeCheckDeclAndParentClosures(VD);
+      } else {
+        typeCheckASTNodeAtLoc(TypeCheckASTNodeAtLocContext::declContext(DC),
+                              Node.getStartLoc());
+      }
     }
 
     if (Callback.getResults().empty()) {
@@ -384,10 +407,15 @@ public:
       return {};
     }
 
-    for (auto Info : Callback.getResults()) {
-      // Type check the referenced decls so that all their parent closures are
-      // type-checked (see comment in typeCheckDeclAndParentClosures).
-      typeCheckDeclAndParentClosures(Info.ReferencedDecl);
+    if (isa<Expr *>(Node)) {
+      // If we are performing cursor info on an expression, type check the
+      // referenced decls so that all their parent closures are type-checked
+      // (see comment in typeCheckDeclAndParentClosures).
+      // When doing cursor info on a declaration, we already type checked the
+      // decl above while listening to the solution callbacks.
+      for (auto Info : Callback.getResults()) {
+        typeCheckDeclAndParentClosures(Info.ReferencedDecl);
+      }
     }
 
     // Deliver results
@@ -414,9 +442,10 @@ public:
       auto CursorInfo = new ResolvedValueRefCursorInfo(
           SrcFile, RequestedLoc, Res.ReferencedDecl,
           /*CtorTyRef=*/nullptr,
-          /*ExtTyRef=*/nullptr, /*IsRef=*/true, /*Ty=*/Type(),
+          /*ExtTyRef=*/nullptr, /*IsRef=*/true,
+          Res.SolutionSpecificInterfaceType,
           /*ContainerType=*/Res.BaseType,
-          /*CustomAttrRef=*/None,
+          /*CustomAttrRef=*/std::nullopt,
           /*IsKeywordArgument=*/false, Res.IsDynamicRef, ReceiverTypes,
           Finder.getShorthandShadowedDecls(Res.ReferencedDecl));
       Results.push_back(CursorInfo);
@@ -424,7 +453,44 @@ public:
     return Results;
   }
 
-  void doneParsing(SourceFile *SrcFile) override {
+public:
+  std::vector<ResolvedCursorInfoPtr>
+  getDeclResult(NodeFinderDeclResult *DeclResult, SourceFile *SrcFile,
+                NodeFinder &Finder) const {
+    std::vector<ResolvedCursorInfoPtr> Results =
+        getResult(DeclResult->getDecl(),
+                  DeclResult->getDecl()->getDeclContext(), SrcFile, Finder);
+
+    if (!Results.empty()) {
+      return Results;
+    }
+
+    // If we didn't get any solution from the constraint system, try getting the
+    // type from the decl itself. This may happen if the decl is in an inactive
+    // branch of a `#if` clause.
+    auto CursorInfo = new ResolvedValueRefCursorInfo(
+        SrcFile, RequestedLoc, DeclResult->getDecl(),
+        /*CtorTyRef=*/nullptr,
+        /*ExtTyRef=*/nullptr,
+        /*IsRef=*/false,
+        /*SolutionSpecificInterfaceType=*/Type(),
+        /*ContainerType=*/Type(),
+        /*CustomAttrRef=*/std::nullopt,
+        /*IsKeywordArgument=*/false,
+        /*IsDynamic=*/false,
+        /*ReceiverTypes=*/{},
+        Finder.getShorthandShadowedDecls(DeclResult->getDecl()));
+    return {CursorInfo};
+  }
+
+  std::vector<ResolvedCursorInfoPtr>
+  getExprResult(NodeFinderExprResult *ExprResult, SourceFile *SrcFile,
+                NodeFinder &Finder) const {
+    return getResult(ExprResult->getExpr(), ExprResult->getDeclContext(),
+                     SrcFile, Finder);
+  }
+
+  void readyForTypeChecking(SourceFile *SrcFile) override {
     if (!SrcFile) {
       return;
     }

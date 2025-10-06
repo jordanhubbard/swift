@@ -1,5 +1,4 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 //===--- Helper types that are used in this test
 
@@ -206,3 +205,32 @@ func test_cc_in_pattern(subject: IntHolder, i1: Int) {
 }
 
 // CC_IN_PATTERN_1-DAG: Decl[LocalVar]/Local/TypeRelation[Convertible]: i1[#Int#]; name=i1
+
+func testCompleteAfterPatternInClosure() {
+  func takeClosure(_ x: () -> Void) {}
+
+  enum MyEnum {
+    case failure(Int)
+  }
+
+  func test(value: MyEnum) {
+    takeClosure {
+      switch value {
+      case let .failure(error)#^AFTER_PATTERN_IN_CLOSURE^#:
+        break
+      }
+    }
+  }
+
+  // AFTER_PATTERN_IN_CLOSURE-NOT: Begin completions
+}
+
+func testIfLetInClosure(foo: Int?) {
+  func takeClosure(_ x: () -> Void) {}
+
+  takeClosure {
+    if let items#^IF_LET_IN_CLOSURE^# = foo {
+    }
+  }
+  // IF_LET_IN_CLOSURE-NOT: Begin completions
+}

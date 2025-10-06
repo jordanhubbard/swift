@@ -7,9 +7,9 @@
 // UNSUPPORTED: back_deployment_runtime
 // REQUIRES: executable_test
 // REQUIRES: backtracing
-// REQUIRES: OS=macosx
+// REQUIRES: OS=macosx || OS=linux-gnu
 
-import _Backtracing
+import Runtime
 
 func doFrames(_ count: Int, limit: Int, top: Int) {
   if count <= 0 {

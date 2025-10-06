@@ -194,6 +194,16 @@ inline Operand *getSingleDebugUse(SILValue value) {
   return *ii;
 }
 
+/// If \p value has any debug user(s), return the operand associated with some
+/// use. Otherwise, returns nullptr.
+inline Operand *getAnyDebugUse(SILValue value) {
+  auto range = getDebugUses(value);
+  auto ii = range.begin(), ie = range.end();
+  if (ii == ie)
+    return nullptr;
+  return *ii;
+}
+
 /// Erases the instruction \p I from it's parent block and deletes it, including
 /// all debug instructions which use \p I.
 /// Precondition: The instruction may only have debug instructions as uses.
@@ -427,16 +437,24 @@ struct DebugVarCarryingInst : VarDeclCarryingInst {
 
   Kind getKind() const { return Kind(VarDeclCarryingInst::getKind()); }
 
-  Optional<SILDebugVariable> getVarInfo() const {
+  /// Returns the debug variable information attached to the instruction.
+  ///
+  /// \param complete If true, always retrieve the complete variable with
+  /// location and scope, and the type if possible. If false, only return the
+  /// values if they are stored (if they are different from the instruction's
+  /// location, scope, and type). This should only be set to false in
+  /// SILPrinter. Incomplete var info is unpredictable, as it will sometimes
+  /// have location and scope and sometimes not.
+  std::optional<SILDebugVariable> getVarInfo(bool complete = true) const {
     switch (getKind()) {
     case Kind::Invalid:
       llvm_unreachable("Invalid?!");
     case Kind::DebugValue:
-      return cast<DebugValueInst>(**this)->getVarInfo();
+      return cast<DebugValueInst>(**this)->getVarInfo(complete);
     case Kind::AllocStack:
-      return cast<AllocStackInst>(**this)->getVarInfo();
+      return cast<AllocStackInst>(**this)->getVarInfo(complete);
     case Kind::AllocBox:
-      return cast<AllocBoxInst>(**this)->getVarInfo();
+      return cast<AllocBoxInst>(**this)->getVarInfo(complete);
     }
     llvm_unreachable("covered switch");
   }
@@ -478,11 +496,11 @@ struct DebugVarCarryingInst : VarDeclCarryingInst {
     case Kind::Invalid:
       llvm_unreachable("Invalid?!");
     case Kind::DebugValue:
-      return cast<DebugValueInst>(**this)->getUsesMoveableValueDebugInfo();
+      return cast<DebugValueInst>(**this)->usesMoveableValueDebugInfo();
     case Kind::AllocStack:
-      return cast<AllocStackInst>(**this)->getUsesMoveableValueDebugInfo();
+      return cast<AllocStackInst>(**this)->usesMoveableValueDebugInfo();
     case Kind::AllocBox:
-      return cast<AllocBoxInst>(**this)->getUsesMoveableValueDebugInfo();
+      return cast<AllocBoxInst>(**this)->usesMoveableValueDebugInfo();
     }
   }
 
@@ -521,6 +539,19 @@ struct DebugVarCarryingInst : VarDeclCarryingInst {
     return varName;
   }
 
+  std::optional<StringRef> maybeGetName() const {
+    assert(getKind() != Kind::Invalid);
+    if (auto varInfo = getVarInfo()) {
+      return varInfo->Name;
+    }
+
+    if (auto *decl = getDecl()) {
+      return decl->getBaseName().userFacingName();
+    }
+
+    return {};
+  }
+
   /// Take in \p inst, a potentially invalid DebugVarCarryingInst, and returns a
   /// name for it. If we have an invalid value or don't find var info or a decl,
   /// return "unknown".
@@ -533,29 +564,6 @@ struct DebugVarCarryingInst : VarDeclCarryingInst {
     return inst.getName();
   }
 };
-
-inline DebugVarCarryingInst DebugVarCarryingInst::getFromValue(SILValue value) {
-  if (auto *svi = dyn_cast<SingleValueInstruction>(value)) {
-    if (auto result = VarDeclCarryingInst(svi)) {
-      switch (result.getKind()) {
-      case VarDeclCarryingInst::Kind::Invalid:
-        llvm_unreachable("ShouldKind have never seen this");
-      case VarDeclCarryingInst::Kind::DebugValue:
-      case VarDeclCarryingInst::Kind::AllocStack:
-      case VarDeclCarryingInst::Kind::AllocBox:
-        return DebugVarCarryingInst(svi);
-      case VarDeclCarryingInst::Kind::GlobalAddr:
-      case VarDeclCarryingInst::Kind::RefElementAddr:
-        return DebugVarCarryingInst();
-      }
-    }
-  }
-
-  if (auto *use = getSingleDebugUse(value))
-    return DebugVarCarryingInst(use->getUser());
-
-  return DebugVarCarryingInst();
-}
 
 static_assert(sizeof(DebugVarCarryingInst) == sizeof(VarDeclCarryingInst) &&
                   alignof(DebugVarCarryingInst) == alignof(VarDeclCarryingInst),

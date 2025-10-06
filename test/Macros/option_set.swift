@@ -1,8 +1,13 @@
-// RUN: %target-run-simple-swift(-Xfrontend -plugin-path -Xfrontend %swift-host-lib-dir/plugins -emit-tbd -emit-tbd-path %t.tbd)
-// REQUIRES: executable_test
-// REQUIRES: OS=macosx
+// REQUIRES: swift_swift_parser, executable_test
+
+// RUN: %target-run-simple-swift(-Xfrontend -plugin-path -Xfrontend %swift-plugin-dir -emit-tbd -emit-tbd-path %t.tbd)
 
 import Swift
+
+@attached(member, names: named(RawValue), named(rawValue), named(`init`), arbitrary)
+@attached(extension, conformances: OptionSet)
+public macro OptionSet<RawType>() =
+  #externalMacro(module: "SwiftMacros", type: "OptionSetMacro")
 
 @OptionSet<UInt8>
 struct ShippingOptions {

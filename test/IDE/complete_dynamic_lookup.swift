@@ -2,7 +2,7 @@
 // RUN: %target-swift-frontend -emit-module -disable-objc-attr-requires-foundation-module -o %t %S/Inputs/AnyObject/foo_swift_module.swift
 // RUN: %target-swift-frontend -emit-module -disable-objc-attr-requires-foundation-module -o %t %S/Inputs/AnyObject/bar_swift_module.swift
 // RUN: cp %S/Inputs/AnyObject/baz_clang_module.h %t
-// RUN: cp %S/Inputs/AnyObject/module.map %t
+// RUN: cp %S/Inputs/AnyObject/module.modulemap %t
 
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -I %t -disable-objc-attr-requires-foundation-module -code-completion-token=DL_FUNC_PARAM_NO_DOT_1 > %t.dl.txt
 // RUN: %FileCheck %s -check-prefix=DL_INSTANCE_NO_DOT < %t.dl.txt
@@ -113,13 +113,13 @@ protocol Bar { func bar() }
 // DL_INSTANCE_NO_DOT-DAG: Decl[InstanceMethod]/OtherModule[swift_ide_test]:   .topLevelObjcProtocol_InstanceFunc1!()[#Void#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[InstanceVar]/OtherModule[swift_ide_test]:      .topLevelObjcProtocol_Property1[#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[bar_swift_module]:      [{#(i): Bar_ImportedObjcClass#}][#Int?#]{{; name=.+$}}
-// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[foo_swift_module]:      [{#(i): Foo_TopLevelObjcProtocol#}][#Int?#]{{; name=.+$}}
+// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[foo_swift_module]:      [{#(i): any Foo_TopLevelObjcProtocol#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#(i): Int16#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[foo_swift_module]:      [{#(i): Int32#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[foo_swift_module]:      [{#(i): Int64#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#(i): Int8#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#(i): TopLevelObjcClass#}][#Int?#]{{; name=.+$}}
-// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#(i): TopLevelObjcProtocol#}][#Int?#]{{; name=.+$}}
+// DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[swift_ide_test]:        [{#(i): any TopLevelObjcProtocol#}][#Int?#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[baz_clang_module]:      [{#(idx): Int32#}][#Any??#]{{; name=.+$}}
 // DL_INSTANCE_NO_DOT-DAG: Decl[Subscript]/OtherModule[baz_clang_module]:      [{#(key): Any!#}][#Any??#]{{; name=.+$}}
 // GLOBAL_NEGATIVE-NOT:.objectAtIndexedSubscript

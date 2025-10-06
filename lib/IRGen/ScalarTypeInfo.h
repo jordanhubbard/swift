@@ -68,7 +68,7 @@ public:
     asDerived().Derived::assign(IGF, temp, dest, isOutlined, T);
   }
 
-  void reexplode(IRGenFunction &IGF, Explosion &in,
+  void reexplode(Explosion &in,
                  Explosion &out) const override {
     unsigned size = asDerived().Derived::getExplosionSize();
     in.transferInto(out, size);
@@ -128,8 +128,7 @@ public:
       auto nextByteSizedIntTy =
           llvm::IntegerType::get(IGM.getLLVMContext(), nextByteSize);
       auto newAddr =
-          Address(Builder.CreatePointerCast(addr.getAddress(),
-                                            nextByteSizedIntTy->getPointerTo()),
+          Address(Builder.CreatePointerCast(addr.getAddress(), IGF.IGM.PtrTy),
                   nextByteSizedIntTy, addr.getAlignment());
       auto newValue = Builder.CreateZExt(src.claimNext(), nextByteSizedIntTy);
       Builder.CreateStore(newValue, newAddr);
@@ -207,11 +206,12 @@ public:
     }
   }
   
-  void packIntoEnumPayload(IRGenFunction &IGF,
+  void packIntoEnumPayload(IRGenModule &IGM,
+                           IRBuilder &builder,
                            EnumPayload &payload,
                            Explosion &src,
                            unsigned offset) const override {
-    payload.insertValue(IGF, src.claimNext(), offset);
+    payload.insertValue(IGM, builder, src.claimNext(), offset);
   }
   
   void unpackFromEnumPayload(IRGenFunction &IGF,
@@ -279,6 +279,7 @@ protected:
                                           IsTriviallyDestroyable,
                                           IsCopyable,
                                           IsFixedSize,
+                                          IsABIAccessible,
                                           ::std::forward<T>(args)...) {}
 
   const Derived &asDerived() const {

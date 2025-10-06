@@ -1,5 +1,4 @@
-// RUN: %swift-ide-test -code-completion -source-filename %s -code-completion-token=STRINGLITERAL | %FileCheck %s
-// RUN: %swift-ide-test -code-completion -source-filename %s -code-completion-token=NORMAL | %FileCheck %s
+// RUN: %batch-code-completion
 
 protocol View {}
 
@@ -25,11 +24,11 @@ struct Value {
 func test(values: [Value]) {
   _ = ForEach(values) { value in
     Text("foobar")
-    Text("value \(value.#^STRINGLITERAL^#)")
+    Text("value \(value.#^STRINGLITERAL?check=CHECK^#)")
   }
   _ = ForEach(values) { value in
     Text("foobar")
-    Text(value.#^NORMAL^#)
+    Text(value.#^NORMAL?check=CHECK^#)
   }
 }
 // CHECK: Begin completions, 2 items

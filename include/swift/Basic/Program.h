@@ -14,10 +14,10 @@
 #define SWIFT_BASIC_PROGRAM_H
 
 #include "llvm/ADT/ArrayRef.h"
-#include "llvm/ADT/Optional.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/Program.h"
+#include <optional>
 
 namespace swift {
 
@@ -40,14 +40,12 @@ int ExecuteInPlace(const char *Program, const char **args,
                    const char **env = nullptr);
 
 struct ChildProcessInfo {
-  llvm::sys::procid_t Pid;
-  int WriteFileDescriptor;
-  int ReadFileDescriptor;
+  llvm::sys::ProcessInfo ProcessInfo;
+  int Write;
+  int Read;
 
-  ChildProcessInfo(llvm::sys::procid_t Pid, int WriteFileDescriptor,
-                   int ReadFileDescriptor)
-      : Pid(Pid), WriteFileDescriptor(WriteFileDescriptor),
-        ReadFileDescriptor(ReadFileDescriptor) {}
+  ChildProcessInfo(llvm::sys::ProcessInfo ProcessInfo, int Write, int Read)
+      : ProcessInfo(ProcessInfo), Write(Write), Read(Read) {}
 };
 
 /// This function executes the program using the argument provided.
@@ -62,7 +60,7 @@ struct ChildProcessInfo {
 /// environment.
 llvm::ErrorOr<swift::ChildProcessInfo> ExecuteWithPipe(
     llvm::StringRef program, llvm::ArrayRef<llvm::StringRef> args,
-    llvm::Optional<llvm::ArrayRef<llvm::StringRef>> env = llvm::None);
+    std::optional<llvm::ArrayRef<llvm::StringRef>> env = std::nullopt);
 
 } // end namespace swift
 

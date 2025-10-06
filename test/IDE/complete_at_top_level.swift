@@ -1,5 +1,4 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 // NORESULT: Token
 
@@ -40,7 +39,7 @@ func resyncParser1() {}
 fooObject#^TYPE_CHECKED_EXPR_1^#
 // TYPE_CHECKED_EXPR_1-DAG: Decl[InstanceVar]/CurrNominal:      .instanceVar[#Int#]{{; name=.+$}}
 // TYPE_CHECKED_EXPR_1-DAG: Decl[InstanceMethod]/CurrNominal:   .instanceFunc({#(a): Int#})[#Void#]{{; name=.+$}}
-// TYPE_CHECKED_EXPR_1-DAG: BuiltinOperator/None:               = {#FooStruct#}[#Void#]{{; name=.+$}}
+// TYPE_CHECKED_EXPR_1-DAG: BuiltinOperator/None:               = {#FooStruct#}{{; name=.+$}}
 // TYPE_CHECKED_EXPR_1-DAG: Keyword[self]/CurrNominal:          .self[#FooStruct#]{{; name=.+$}}
 
 func resyncParser2() {}
@@ -51,7 +50,7 @@ var _tmpVar1 : FooStruct
 fooObject#^TYPE_CHECKED_EXPR_2^#
 // TYPE_CHECKED_EXPR_2-DAG: Decl[InstanceVar]/CurrNominal: .instanceVar[#Int#]{{; name=.+$}}
 // TYPE_CHECKED_EXPR_2-DAG: Decl[InstanceMethod]/CurrNominal: .instanceFunc({#(a): Int#})[#Void#]{{; name=.+$}}
-// TYPE_CHECKED_EXPR_2-DAG: BuiltinOperator/None:                     = {#FooStruct#}[#Void#]{{; name=.+$}}
+// TYPE_CHECKED_EXPR_2-DAG: BuiltinOperator/None:                     = {#FooStruct#}{{; name=.+$}}
 // TYPE_CHECKED_EXPR_2-DAG: Keyword[self]/CurrNominal: .self[#FooStruct#]{{; name=.+$}}
 
 func resyncParser3() {}
@@ -59,7 +58,7 @@ func resyncParser3() {}
 fooObject#^TYPE_CHECKED_EXPR_3^#.bar
 // TYPE_CHECKED_EXPR_3-DAG: Decl[InstanceVar]/CurrNominal: .instanceVar[#Int#]{{; name=.+$}}
 // TYPE_CHECKED_EXPR_3-DAG: Decl[InstanceMethod]/CurrNominal: .instanceFunc({#(a): Int#})[#Void#]{{; name=.+$}}
-// TYPE_CHECKED_EXPR_3-DAG: BuiltinOperator/None:                     = {#FooStruct#}[#Void#]{{; name=.+$}}
+// TYPE_CHECKED_EXPR_3-DAG: BuiltinOperator/None:                     = {#FooStruct#}{{; name=.+$}}
 // TYPE_CHECKED_EXPR_3-DAG: Keyword[self]/CurrNominal: .self[#FooStruct#]{{; name=.+$}}
 
 func resyncParser4() {}
@@ -80,7 +79,7 @@ func resyncParser6() {}
 
 fooObject.instanceFunc(#^TYPE_CHECKED_EXPR_6?check=PLAIN_TOP_LEVEL^#
 
-func resyncParser6() {}
+func resyncParser6b() {}
 
 fooObject.is#^TYPE_CHECKED_EXPR_KW_1?check=NORESULT^#
 
@@ -105,7 +104,7 @@ var topLevelVar1 = #^TOP_LEVEL_VAR_INIT_1?check=TOP_LEVEL_VAR_INIT_1;check=TOP_L
 // Check that the variable itself does not show up.
 // TOP_LEVEL_VAR_INIT_1_NEGATIVE-NOT: topLevelVar1
 
-func resyncParser7() {}
+func resyncParser7a() {}
 
 var topLevelVar2 = FooStruct#^TOP_LEVEL_VAR_INIT_2^#
 // TOP_LEVEL_VAR_INIT_2-DAG: Decl[InstanceMethod]/CurrNominal: .instanceFunc({#(self): FooStruct#})[#(Int) -> Void#]{{; name=.+$}}
@@ -214,7 +213,7 @@ func resyncParserB5() {}
 
 for var i = 0; ; {
   #^TOP_LEVEL_STMT_5?check=PLAIN_TOP_LEVEL;check=TOP_LEVEL_STMT_5^#
-// TOP_LEVEL_STMT_5: Decl[LocalVar]/Local: i[#<<error type>>#]{{; name=.+$}}
+// TOP_LEVEL_STMT_5: Decl[LocalVar]/Local: i[#_#]{{; name=.+$}}
 }
 
 func resyncParserB6() {}
@@ -235,7 +234,7 @@ func resyncParserB8() {}
 
 for i in unknown_var {
   #^TOP_LEVEL_STMT_8?check=PLAIN_TOP_LEVEL;check=TOP_LEVEL_STMT_8^#
-// TOP_LEVEL_STMT_8: Decl[LocalVar]/Local: i[#<<error type>>#]{{; name=.+$}}
+// TOP_LEVEL_STMT_8: Decl[LocalVar]/Local: i[#_#]{{; name=.+$}}
 }
 
 func resyncParserB9() {}
@@ -295,11 +294,11 @@ func resyncParserB14() {}
 "\(1) \(#^STRING_INTERP_2?check=STRING_INTERP^#) \(2)"
 var stringInterp = "\(#^STRING_INTERP_3?check=STRING_INTERP^#)"
 _ = "" + "\(#^STRING_INTERP_4?check=STRING_INTERP^#)" + ""
-// STRING_INTERP-DAG: Decl[InstanceMethod]/CurrNominal/Flair[ArgLabels]/IsSystem: ['(']{#(value): T#}[')'][#Void#];
-// STRING_INTERP-DAG: Decl[Struct]/CurrModule: FooStruct[#FooStruct#]; name=FooStruct
-// STRING_INTERP-DAG: Decl[FreeFunction]/CurrModule/TypeRelation[Invalid]: fooFunc1()[#Void#];
-// STRING_INTERP-DAG: Decl[FreeFunction]/CurrModule: optStr()[#String?#];
-// STRING_INTERP-DAG: Decl[GlobalVar]/Local: fooObject[#FooStruct#];
+// STRING_INTERP-DAG: Decl[InstanceMethod]/CurrNominal/Flair[ArgLabels]/IsSystem: ['(']{#(value): any Any.Type#}[')'][#Void#];
+// STRING_INTERP-DAG: Decl[Struct]/CurrModule/TypeRelation[Convertible]: FooStruct[#FooStruct#]; name=FooStruct
+// STRING_INTERP-DAG: Decl[FreeFunction]/CurrModule/TypeRelation[Convertible]: fooFunc1[#() -> ()#]; name=fooFunc1
+// STRING_INTERP-DAG: Decl[FreeFunction]/CurrModule/TypeRelation[Convertible]: optStr()[#String?#]; name=optStr()
+// STRING_INTERP-DAG: Decl[GlobalVar]/Local/TypeRelation[Convertible]: fooObject[#FooStruct#]; name=fooObject
 func resyncParserC1() {}
 
 // FOR_COLLECTION-NOT: forIndex

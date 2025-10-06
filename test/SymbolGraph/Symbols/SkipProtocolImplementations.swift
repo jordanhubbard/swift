@@ -1,6 +1,6 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-swift-frontend %s -module-name SkipProtocolImplementations -emit-module -emit-module-path %t/SkipProtocolImplementations.swiftmodule -emit-symbol-graph -emit-symbol-graph-dir %t/ -skip-protocol-implementations
-// RUN: %{python} -m json.tool %t/SkipProtocolImplementations.symbols.json %t/SkipProtocolImplementations.formatted.symbols.json
+// RUN: %validate-json %t/SkipProtocolImplementations.symbols.json %t/SkipProtocolImplementations.formatted.symbols.json
 // RUN: %FileCheck %s --input-file %t/SkipProtocolImplementations.formatted.symbols.json
 // RUN: %FileCheck %s --input-file %t/SkipProtocolImplementations.formatted.symbols.json --check-prefix COUNT
 
@@ -14,18 +14,32 @@
 // CHECK-NOT: s:27SkipProtocolImplementations04SomeB0PAAE9bonusFuncyyF::SYNTHESIZED::s:27SkipProtocolImplementations10SomeStructV
 // CHECK-NOT: s:27SkipProtocolImplementations10SomeStructV8someFuncyyF
 
+// ...as well as the inner type from `OtherProtocol` on `OtherStruct`
+// CHECK-NOT: "s:27SkipProtocolImplementations11OtherStructV5InnerV"
+
 // CHECK-LABEL: "symbols": [
 
 // SomeStruct.otherFunc() should be present because it has its own doc comment
-// CHECK: s:27SkipProtocolImplementations10SomeStructV9otherFuncyyF
+// CHECK-DAG: s:27SkipProtocolImplementations10SomeStructV9otherFuncyyF
+
+// Same for ExtraStruct.Inner
+// CHECK-DAG: s:27SkipProtocolImplementations11ExtraStructV5InnerV
+
+// HiddenStruct.T should be present because its source protocol is underscored
+// CHECK-DAG: "precise": "s:27SkipProtocolImplementations12HiddenStructV1TV",
 
 // CHECK-LABEL: "relationships": [
 
 // we want to make sure that the conformance relationship itself stays
 // CHECK-DAG: conformsTo
 
-// SomeStruct.otherFunc() should be the only one with sourceOrigin information
-// COUNT-COUNT-1: sourceOrigin
+// There should only be three symbols with sourceOrigin information:
+// - SomeStruct.otherFunc()
+// - ExtraStruct.Inner
+// (ExtraStruct.Inner will have two sourceOrigins because it has two relationships: a memberOf and a
+// conformsTo)
+// COUNT-COUNT-4: sourceOrigin
+// COUNT-NOT: sourceOrigin
 
 public protocol SomeProtocol {
     /// Base docs
@@ -44,4 +58,31 @@ public struct SomeStruct: SomeProtocol {
 
     /// Local docs
     public func otherFunc() {}
+}
+
+// Make sure that protocol conformances added in extensions don't create bogus symbol relationships (rdar://107432084)
+
+public protocol OtherProtocol {
+    associatedtype Inner
+}
+
+public struct OtherStruct: OtherProtocol {
+    public struct Inner {}
+}
+
+extension OtherStruct.Inner: Sendable {}
+
+public struct ExtraStruct: OtherProtocol {
+    /// This time with a doc comment!
+    public struct Inner {}
+}
+
+extension ExtraStruct.Inner: Sendable {}
+
+public protocol _HiddenProtocol {
+    associatedtype T
+}
+
+public struct HiddenStruct: _HiddenProtocol {
+    public struct T {}
 }

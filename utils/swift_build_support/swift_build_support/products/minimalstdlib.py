@@ -67,8 +67,12 @@ class MinimalStdlib(cmake_product.CMakeProduct):
         self.cmake_options.define(
             'SWIFT_FREESTANDING_MODULE_NAME:STRING', 'macos')
         self.cmake_options.define('SWIFT_FREESTANDING_SDK:STRING', 'macosx')
+        self.cmake_options.define('SWIFT_FREESTANDING_DEPLOYMENT_VERSION:STRING',
+                                  '11.0')
         self.cmake_options.define(
             'SWIFT_FREESTANDING_TRIPLE_NAME:STRING', 'macosx11.0')
+        self.cmake_options.define(
+            'SWIFT_FREESTANDING_AVAILABILITY_NAME:STRING', 'macOS')
         self.cmake_options.define(
             'SWIFT_PRIMARY_VARIANT_ARCH:STRING', 'x86_64')
         self.cmake_options.define(
@@ -116,6 +120,7 @@ class MinimalStdlib(cmake_product.CMakeProduct):
         self.cmake_options.define(
             'SWIFT_RUNTIME_STATIC_IMAGE_INSPECTION:BOOL', 'FALSE')
         self.cmake_options.define('SWIFT_STDLIB_BUILD_PRIVATE:BOOL', 'TRUE')
+        self.cmake_options.define('SWIFT_STDLIB_TRACING:BOOL', 'FALSE')
         self.cmake_options.define(
             'SWIFT_STDLIB_CONCURRENCY_TRACING:BOOL', 'FALSE')
         self.cmake_options.define(
@@ -139,7 +144,9 @@ class MinimalStdlib(cmake_product.CMakeProduct):
         self.cmake_options.define(
             'SWIFT_STDLIB_HAS_DARWIN_LIBMALLOC:BOOL', 'FALSE')
         self.cmake_options.define('SWIFT_STDLIB_HAS_DLADDR:BOOL', 'FALSE')
+        self.cmake_options.define('SWIFT_STDLIB_HAS_DLSYM:BOOL', 'FALSE')
         self.cmake_options.define('SWIFT_STDLIB_HAS_ENVIRON:BOOL', 'FALSE')
+        self.cmake_options.define('SWIFT_STDLIB_HAS_FILESYSTEM:BOOL', 'FALSE')
         self.cmake_options.define('SWIFT_STDLIB_HAS_LOCALE:BOOL', 'FALSE')
         self.cmake_options.define('SWIFT_STDLIB_HAS_STDIN:BOOL', 'FALSE')
         self.cmake_options.define(
@@ -164,10 +171,14 @@ class MinimalStdlib(cmake_product.CMakeProduct):
         self.cmake_options.define(
             'SWIFT_STDLIB_USE_RELATIVE_PROTOCOL_WITNESS_TABLES:BOOL', 'TRUE')
         self.cmake_options.define('SWIFT_THREADING_PACKAGE:STRING', 'none')
+        self.cmake_options.define(
+            'SWIFT_STDLIB_OVERRIDABLE_RETAIN_RELEASE:BOOL', 'FALSE')
+        self.cmake_options.define(
+            'SWIFT_STDLIB_TASK_TO_THREAD_MODEL_CONCURRENCY:BOOL', 'TRUE')
 
         # Build!
         self.build_with_cmake(["swift-stdlib-freestanding"], build_variant, [],
-                              prefer_just_built_toolchain=True)
+                              prefer_native_toolchain=True)
 
     def should_test(self, host_target):
         return False

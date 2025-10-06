@@ -18,6 +18,7 @@
 #include "Initialization.h"
 #include "ManagedValue.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/SIL/SILLocation.h"
 #include <memory>
@@ -59,13 +60,15 @@ public:
   gatherIndirectResultAddrs(SILGenFunction &SGF, SILLocation loc,
                             SmallVectorImpl<SILValue> &outList) const = 0;
 
-  virtual Optional<std::pair<ManagedValue, ManagedValue>>
+  virtual std::optional<std::pair<ManagedValue, ManagedValue>>
   emitForeignErrorArgument(SILGenFunction &SGF, SILLocation loc) {
-    return None;
+    return std::nullopt;
   }
 
-  virtual ManagedValue emitForeignAsyncCompletionHandler(
-      SILGenFunction &SGF, AbstractionPattern origFormalType, SILLocation loc) {
+  virtual ManagedValue
+  emitForeignAsyncCompletionHandler(SILGenFunction &SGF,
+                                    AbstractionPattern origFormalType,
+                                    ManagedValue self, SILLocation loc) {
     return {};
   }
 };
@@ -97,10 +100,11 @@ struct ResultPlanBuilder {
                                SILResultInfo result);
   ResultPlanPtr buildForTuple(Initialization *emitInto,
                               AbstractionPattern origType,
-                              CanTupleType substType);
-  ResultPlanPtr buildForPackExpansion(Optional<MutableArrayRef<InitializationPtr>> inits,
-                                      AbstractionPattern origExpansionType,
-                                      CanTupleEltTypeArrayRef substTypes);
+                              CanType substType);
+  ResultPlanPtr
+  buildForPackExpansion(std::optional<ArrayRef<Initialization *>> inits,
+                        AbstractionPattern origExpansionType,
+                        CanTupleEltTypeArrayRef substTypes);
   ResultPlanPtr buildPackExpansionIntoPack(SILValue packAddr,
                                            CanPackType formalPackType,
                                            unsigned componentIndex,

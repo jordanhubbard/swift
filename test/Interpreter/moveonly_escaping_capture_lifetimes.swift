@@ -1,9 +1,9 @@
-// RUN: %target-run-simple-swift(-Xfrontend -enable-experimental-move-only) | %FileCheck %s
+// RUN: %target-run-simple-swift | %FileCheck %s
+// RUN: %target-run-simple-swift(-O -Xfrontend -sil-verify-all) | %FileCheck %s
 
 // REQUIRES: executable_test
 
-@_moveOnly
-struct MO {
+struct MO: ~Copyable {
     var x: Int
     deinit { print("dying \(x)") }
 }

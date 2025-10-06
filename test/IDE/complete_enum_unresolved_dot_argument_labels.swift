@@ -1,5 +1,4 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 enum DragState {
   case inactive
@@ -11,7 +10,7 @@ func testInit() {
   var state = DragState.inactive
   state = .dragging(#^SIGNATURE^#)
   // SIGNATURE: Begin completions, 1 item
-  // SIGNATURE: Pattern/CurrModule/Flair[ArgLabels]/TypeRelation[Convertible]: ['(']{#translationX: Int#}, {#translationY: Int#}[')'][#DragState#];
+  // SIGNATURE: Pattern/CurrNominal/Flair[ArgLabels]: ['(']{#translationX: Int#}, {#translationY: Int#}[')'][#DragState#];
 
   state = .dragging(translationX: 2, #^ARGUMENT^#)
   // ARGUMENT: Begin completions, 1 item
@@ -19,7 +18,7 @@ func testInit() {
 
   state = .defaulted(#^DEFAULTED^#)
   // DEFAULTED: Begin completions, 1 items
-  // DEFAULTED: Pattern/CurrModule/Flair[ArgLabels]/TypeRelation[Convertible]: ['(']{#x: Int#}, {#y: Int#}, {#z: Int#}, {#extra: Int#}[')'][#DragState#];
+  // DEFAULTED: Pattern/CurrNominal/Flair[ArgLabels]: ['(']{#x: Int#}, {#y: Int#}, {#z: Int#}, {#extra: Int#}[')'][#DragState#];
 
   state = .defaulted(x: 1, #^DEFAULTEDARG^#)
   state = .defaulted(x: "Wrong type", #^ERRORTYPE?check=DEFAULTEDARG^#)

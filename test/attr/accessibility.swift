@@ -5,26 +5,26 @@ private // expected-note {{modifier already specified here}}
 private // expected-error {{duplicate modifier}}
 func duplicateAttr() {}
 
-private // expected-note {{modifier already specified here}}
-public // expected-error {{duplicate modifier}}
+private // expected-note {{previous modifier specified here}}
+public // expected-error {{multiple incompatible access-level modifiers specified}}
 func duplicateAttrChanged() {}
 
-private // expected-note 2 {{modifier already specified here}}
-public // expected-error {{duplicate modifier}}
-internal // expected-error {{duplicate modifier}}
+private // expected-note 2 {{previous modifier specified here}}
+public // expected-error {{multiple incompatible access-level modifiers specified}}
+internal // expected-error {{multiple incompatible access-level modifiers specified}}
 func triplicateAttrChanged() {}
 
-private // expected-note 3 {{modifier already specified here}}
-public // expected-error {{duplicate modifier}}
-package // expected-error {{duplicate modifier}}
-internal // expected-error {{duplicate modifier}}
+private // expected-note 3 {{previous modifier specified here}}
+public // expected-error {{multiple incompatible access-level modifiers specified}}
+package // expected-error {{multiple incompatible access-level modifiers specified}}
+internal // expected-error {{multiple incompatible access-level modifiers specified}}
 func quadruplicateAttrChanged() {}
 
-private // expected-note 4 {{modifier already specified here}}
-public // expected-error {{duplicate modifier}}
-package // expected-error {{duplicate modifier}}
-internal // expected-error {{duplicate modifier}}
-fileprivate // expected-error {{duplicate modifier}}
+private // expected-note 4 {{previous modifier specified here}}
+public // expected-error {{multiple incompatible access-level modifiers specified}}
+package // expected-error {{multiple incompatible access-level modifiers specified}}
+internal // expected-error {{multiple incompatible access-level modifiers specified}}
+fileprivate // expected-error {{multiple incompatible access-level modifiers specified}}
 func quintuplicateAttrChanged() {}
 
 private(set)
@@ -51,58 +51,64 @@ internal(set)
 package
 var customSetter6 = 0
 
-private(set) // expected-note {{modifier already specified here}}
-public(set) // expected-error {{duplicate modifier}}
+private(set) // expected-note {{previous modifier specified here}}
+public(set) // expected-error {{multiple incompatible access-level modifiers specified}}
 var customSetterDuplicateAttr = 0
 
-private(set) // expected-note {{modifier already specified here}}
-public // expected-note {{modifier already specified here}}
-public(set) // expected-error {{duplicate modifier}}
-private // expected-error {{duplicate modifier}}
+private(set) // expected-note {{previous modifier specified here}}
+public // expected-note {{previous modifier specified here}}
+public(set) // expected-error {{multiple incompatible access-level modifiers specified}}
+private // expected-error {{multiple incompatible access-level modifiers specified}}
 var customSetterDuplicateAttrsAllAround = 0
 
-private(set) // expected-note {{modifier already specified here}}
-package(set) // expected-error {{duplicate modifier}}
+private(set) // expected-note {{previous modifier specified here}}
+package(set) // expected-error {{multiple incompatible access-level modifiers specified}}
 var customSetterDuplicateAttr2 = 0
 
-package(set) // expected-note {{modifier already specified here}}
-public(set) // expected-error {{duplicate modifier}}
+package(set) // expected-note {{previous modifier specified here}}
+public(set) // expected-error {{multiple incompatible access-level modifiers specified}}
 public var customSetterDuplicateAttr3 = 0
 
-private(get) // expected-error{{expected 'set' as subject of 'private' modifier}}
+private(get) // expected-error{{expected 'set' as subject of 'private' modifier}} {{9-12=set}}
 var invalidSubject = 0
 
-private(42) // expected-error{{expected 'set' as subject of 'private' modifier}}
+private(42) // expected-error{{expected 'set' as subject of 'private' modifier}} {{9-11=set}}
 var invalidSubject2 = 0
 
 private(a bunch of random tokens) // expected-error{{expected 'set' as subject of 'private' modifier}} expected-error{{expected declaration}}
 var invalidSubject3 = 0
 
 
-package(get) // expected-error{{expected 'set' as subject of 'package' modifier}}
+package(get) // expected-error{{expected 'set' as subject of 'package' modifier}} {{9-12=set}}
 var invalidSubject4 = 0
 
-package(42) // expected-error{{expected 'set' as subject of 'package' modifier}}
+package(42) // expected-error{{expected 'set' as subject of 'package' modifier}} {{9-11=set}}
 var invalidSubject5 = 0
 
-private(set // expected-error{{expected ')' in 'private' modifier}}
+private((())) // expected-error{{expected 'set' as subject of 'private' modifier}} expected-error{{expected declaration}}
+var invalidSubject6 = 0
+
+private( missingFunc(_ x: Int) -> Bool // expected-error{{expected 'set' as subject of 'private' modifier}} {{9-9=set)}} expected-error{{expected declaration}}
+let independentVar1 = 0
+
+private(set // expected-error{{expected ')' in 'private' modifier}} {{12-12=)}}
 var unterminatedSubject = 0
 
-private(42 // expected-error{{expected 'set' as subject of 'private' modifier}} expected-error{{expected declaration}}
+private(42 // expected-error{{expected 'set' as subject of 'private' modifier}} {{9-11=set)}}
 var unterminatedInvalidSubject = 0
 
-private() // expected-error{{expected 'set' as subject of 'private' modifier}}
+private() // expected-error{{expected 'set' as subject of 'private' modifier}} {{9-9=set}}
 var emptySubject = 0
 
-private( // expected-error{{expected 'set' as subject of 'private' modifier}}
+private( // expected-error{{expected 'set' as subject of 'private' modifier}} {{9-9=set)}}
 var unterminatedEmptySubject = 0
 
 // Check that the parser made it here.
 duplicateAttr(1) // expected-error{{argument passed to call that takes no arguments}}
 
 // CHECK ALLOWED DECLS
-private import Swift // expected-error {{Access level on imports require '-enable-experimental-feature AccessLevelOnImport}}
-private(set) infix operator ~~~ // expected-error {{'private' modifier cannot be applied to this declaration}} {{1-14=}}
+private import Swift
+private(set) infix operator ~~~ // expected-error {{unexpected attribute 'private' in operator declaration}} {{1-14=}}
 
 private typealias MyInt = Int
 
@@ -341,3 +347,10 @@ package extension PkgGenericStruct where Param: InternalProto {} // expected-err
 extension PkgGenericStruct where Param: InternalProto {
   package func foo() {} // expected-error {{cannot declare a package instance method in an extension with internal requirements}} {{3-10=internal}}
 }
+
+func f() {}
+private( // expected-error{{expected 'set' as subject of 'private' modifier}} {{9-9=set)}}
+if true { // expected-error{{expected declaration}} {{none}}
+  f()
+}
+var unrelatedVar = "Swift"

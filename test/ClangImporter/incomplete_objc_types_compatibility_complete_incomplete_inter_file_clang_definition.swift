@@ -4,11 +4,12 @@
 // RUN: %target-clang %S/Inputs/custom-modules/IncompleteTypes/incomplete-type-library-1.m -c -o %t/incomplete-type-library-1.o
 // RUN: %target-clang %S/Inputs/custom-modules/IncompleteTypes/complete-types.m -c -o %t/complete-types.o
 
-// RUN: %target-build-swift -Xfrontend -enable-import-objc-forward-declarations -Xfrontend -enable-objc-interop -I %S/Inputs/custom-modules/IncompleteTypes %t/full_definition.swift %t/incomplete_definition.swift %t/incomplete-type-library-1.o %t/complete-types.o -Xlinker -framework -Xlinker Foundation -o %t/a.out
+// RUN: %target-build-swift -Xfrontend -enable-upcoming-feature -Xfrontend ImportObjcForwardDeclarations -Xfrontend -enable-objc-interop -I %S/Inputs/custom-modules/IncompleteTypes %t/full_definition.swift %t/incomplete_definition.swift %t/incomplete-type-library-1.o %t/complete-types.o -Xlinker -framework -Xlinker Foundation -o %t/a.out
 // RUN: %target-run %t/a.out
 
 // REQUIRES: executable_test
 // REQUIRES: objc_interop
+// REQUIRES: swift_feature_ImportObjcForwardDeclarations
 
 //--- full_definition.swift
 

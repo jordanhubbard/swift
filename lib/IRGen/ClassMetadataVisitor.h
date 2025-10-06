@@ -19,6 +19,7 @@
 #define SWIFT_IRGEN_CLASSMETADATAVISITOR_H
 
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILModule.h"
@@ -63,10 +64,48 @@ protected:
     : super(IGM), Target(target),
       VTable(IGM.getSILModule().lookUpVTable(target, /*deserialize*/ false)) {}
 
+  ClassMetadataVisitor(IRGenModule &IGM, ClassDecl *target, SILVTable *vtable)
+    : super(IGM), Target(target), VTable(vtable) {}
+
 public:
+  bool isPureObjC() const {
+    return Target->getObjCImplementationDecl();
+  }
+
+  // Layout in embedded mode while considering the class type.
+  // This is important for adding the right superclass pointer.
+  // The regular `layout` method can be used for layout tasks for which the
+  // actual superclass pointer is not relevant.
+  void layoutEmbedded(CanType classTy) {
+    asImpl().noteAddressPoint();
+    asImpl().addEmbeddedSuperclass(classTy);
+    asImpl().addDestructorFunction();
+    asImpl().addIVarDestroyer();
+    addEmbeddedClassMembers(Target);
+  }
+
   void layout() {
     static_assert(MetadataAdjustmentIndex::Class == 3,
                   "Adjustment index must be synchronized with this layout");
+
+    if (IGM.Context.LangOpts.hasFeature(Feature::Embedded)) {
+      asImpl().noteAddressPoint();
+      asImpl().addSuperclass();
+      asImpl().addDestructorFunction();
+      asImpl().addIVarDestroyer();
+      addEmbeddedClassMembers(Target);
+      return;
+    }
+
+    if (isPureObjC()) {
+      assert(IGM.ObjCInterop);
+      asImpl().noteAddressPoint();
+      asImpl().addMetadataFlags();
+      asImpl().addSuperclass();
+      asImpl().addClassCacheData();
+      asImpl().addClassDataPointer();
+      return;
+    }
 
     // Pointer to layout string
     asImpl().addLayoutStringPointer();
@@ -171,7 +210,8 @@ private:
     // whether they need them or not.
     asImpl().noteStartOfFieldOffsets(theClass);
     forEachField(IGM, theClass, [&](Field field) {
-      asImpl().addFieldEntries(field);
+      if (isExportableField(field))
+        asImpl().addFieldEntries(field);
     });
     asImpl().noteEndOfFieldOffsets(theClass);
 
@@ -180,6 +220,21 @@ private:
     if (IGM.hasResilientMetadata(theClass, ResilienceExpansion::Maximal,
                                  rootClass))
       return;
+
+    // Add vtable entries.
+    asImpl().addVTableEntries(theClass);
+  }
+
+  /// Add fields associated with the given class and its bases.
+  void addEmbeddedClassMembers(ClassDecl *theClass) {
+    // Visit the superclass first.
+    if (auto *superclassDecl = theClass->getSuperclassDecl()) {
+      addEmbeddedClassMembers(superclassDecl);
+    }
+
+    // Note that we have to emit a global variable storing the metadata
+    // start offset, or access remaining fields relative to one.
+    asImpl().noteStartOfImmediateMembers(theClass);
 
     // Add vtable entries.
     asImpl().addVTableEntries(theClass);

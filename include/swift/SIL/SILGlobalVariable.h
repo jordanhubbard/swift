@@ -42,6 +42,7 @@ class SILGlobalVariable
   static SwiftMetatype registeredMetatype;
     
 public:
+  using iterator = SILBasicBlock::iterator;
   using const_iterator = SILBasicBlock::const_iterator;
 
 private:
@@ -50,7 +51,11 @@ private:
 
   /// The SIL module that the global variable belongs to.
   SILModule &Module;
-  
+
+  /// The module that defines this global variable. This member should only be
+  /// when a global variable is deserialized to be emitted into another module.
+  ModuleDecl *ParentModule = nullptr;
+
   /// The mangled name of the variable, which will be propagated to the
   /// binary.  A pointer into the module's lookup table.
   StringRef Name;
@@ -68,11 +73,15 @@ private:
   /// The global variable's serialized attribute.
   /// Serialized means that the variable can be "inlined" into another module.
   /// Currently this flag is set for all global variables in the stdlib.
-  unsigned Serialized : 1;
+  unsigned Serialized : 2;
   
   /// Whether this is a 'let' property, which can only be initialized
   /// once (either in its declaration, or once later), making it immutable.
   unsigned IsLet : 1;
+
+  /// Whether this declaration was marked `@_used`, meaning that it should be
+  /// added to the llvm.used list.
+  unsigned IsUsed : 1;
 
   /// Whether or not this is a declaration.
   unsigned IsDeclaration : 1;
@@ -96,24 +105,33 @@ private:
   SILBasicBlock StaticInitializerBlock;
 
   SILGlobalVariable(SILModule &M, SILLinkage linkage,
-                    IsSerialized_t IsSerialized,
-                    StringRef mangledName, SILType loweredType,
-                    Optional<SILLocation> loc, VarDecl *decl);
-  
+                    SerializedKind_t serializedKind, StringRef mangledName,
+                    SILType loweredType, std::optional<SILLocation> loc,
+                    VarDecl *decl);
+
 public:
   static void registerBridgedMetatype(SwiftMetatype metatype) {
     registeredMetatype = metatype;
   }
 
-  static SILGlobalVariable *create(SILModule &Module, SILLinkage Linkage,
-                                   IsSerialized_t IsSerialized,
-                                   StringRef MangledName, SILType LoweredType,
-                                   Optional<SILLocation> Loc = None,
-                                   VarDecl *Decl = nullptr);
+  static SILGlobalVariable *
+  create(SILModule &Module, SILLinkage Linkage, SerializedKind_t serializedKind,
+         StringRef MangledName, SILType LoweredType,
+         std::optional<SILLocation> Loc = std::nullopt,
+         VarDecl *Decl = nullptr);
 
   ~SILGlobalVariable();
 
   SILModule &getModule() const { return Module; }
+
+  /// Returns the module that defines this function.
+  ModuleDecl *getParentModule() const;
+
+  /// Sets \c ParentModule as fallback if \c DeclCtxt is not available to
+  /// provide the parent module.
+  void setParentModule(ModuleDecl *module) {
+    ParentModule = module;
+  }
 
   SILType getLoweredType() const { return LoweredType; }
   CanSILFunctionType getLoweredFunctionType() const {
@@ -146,10 +164,25 @@ public:
   /// might be referenced from outside the current compilation unit.
   bool isPossiblyUsedExternally() const;
 
+  /// True if this variable should have a non-unique definition based on the
+  /// embedded linkage model.
+  bool hasNonUniqueDefinition() const;
+
+  /// Returns true if this global variable should be preserved so it can
+  /// potentially be inspected by the debugger.
+  bool shouldBePreservedForDebugger() const;
+
+  /// Check if this global variable is [serialized]. This does not check
+  /// if it's [serialized_for_package].
+  bool isSerialized() const;
+
+  /// Check if this global variable is [serialized] or [serialized_for_package].
+  bool isAnySerialized() const;
+
   /// Get this global variable's serialized attribute.
-  IsSerialized_t isSerialized() const;
-  void setSerialized(IsSerialized_t isSerialized);
-  
+  SerializedKind_t getSerializedKind() const;
+  void setSerializedKind(SerializedKind_t isSerialized);
+
   /// Is this an immutable 'let' property?
   bool isLet() const { return IsLet; }
   void setLet(bool isLet) { IsLet = isLet; }
@@ -173,6 +206,8 @@ public:
   /// static initializer.
   SILInstruction *getStaticInitializerValue();
 
+  bool mustBeInitializedStatically() const;
+
   /// Returns true if the global is a statically initialized heap object.
   bool isInitializedObject() {
     return dyn_cast_or_null<ObjectInst>(getStaticInitializerValue()) != nullptr;
@@ -180,16 +215,8 @@ public:
 
   const_iterator begin() const { return StaticInitializerBlock.begin(); }
   const_iterator end() const { return StaticInitializerBlock.end(); }
-
-  /// Returns true if \p I is a valid instruction to be contained in the
-  /// static initializer.
-  static bool isValidStaticInitializerInst(const SILInstruction *I,
-                                           SILModule &M);
-
-  /// Returns the usub_with_overflow builtin if \p TE extracts the result of
-  /// such a subtraction, which is required to have an integer_literal as right
-  /// operand.
-  static BuiltinInst *getOffsetSubtract(const TupleExtractInst *TE, SILModule &M);
+  iterator begin() { return StaticInitializerBlock.begin(); }
+  iterator end() { return StaticInitializerBlock.end(); }
 
   void dropAllReferences() {
     StaticInitializerBlock.dropAllReferences();
@@ -198,6 +225,20 @@ public:
   void clear() {
     dropAllReferences();
     StaticInitializerBlock.eraseAllInstructions(Module);
+  }
+
+  /// Returns true if this global variable has `@_used` attribute.
+  bool markedAsUsed() const { return IsUsed; }
+
+  void setMarkedAsUsed(bool used) { IsUsed = used; }
+
+  /// Returns a SectionAttr if this global variable has `@_section` attribute.
+  SectionAttr *getSectionAttr() const {
+    auto *V = getDecl();
+    if (!V)
+      return nullptr;
+
+    return V->getAttrs().getAttribute<SectionAttr>();
   }
 
   /// Return whether this variable corresponds to a Clang node.
@@ -290,10 +331,8 @@ SILFunction *findInitializer(SILFunction *AddrF, BuiltinInst *&CallToOnce);
 ///
 /// Given a global initializer, InitFunc, return the GlobalVariable that it
 /// statically initializes or return nullptr if it isn't an obvious static
-/// initializer. If a global variable is returned, InitVal is initialized to the
-/// the instruction producing the global's initial value.
-SILGlobalVariable *getVariableOfStaticInitializer(
-  SILFunction *InitFunc, SingleValueInstruction *&InitVal);
+/// initializer.
+SILGlobalVariable *getVariableOfStaticInitializer(SILFunction *InitFunc);
 
 } // namespace swift
 

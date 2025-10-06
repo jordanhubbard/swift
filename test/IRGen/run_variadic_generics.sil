@@ -1,17 +1,13 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-build-swift-dylib(%t/%target-library-name(PrintShims)) -parse-stdlib %S/../Inputs/print-shims-stdlib.swift -module-name PrintShims -emit-module -emit-module-path %t/PrintShims.swiftmodule
 // RUN: %target-codesign %t/%target-library-name(PrintShims)
-// RUN: %target-build-swift -enable-experimental-feature VariadicGenerics -g -parse-sil %s -emit-ir -I %t -L %t -lPrintShim | %FileCheck %s --check-prefix=CHECK-LL
-// RUN: %target-build-swift -enable-experimental-feature VariadicGenerics -g -parse-sil %s -module-name main -o %t/main -I %t -L %t -lPrintShims %target-rpath(%t)
+// RUN: %target-build-swift -g -parse-sil %s -emit-ir -I %t -L %t -lPrintShim -Onone | %FileCheck %s --check-prefixes=CHECK-LL,CHECK-LL-UNOPT
+// RUN: %target-build-swift -g -parse-sil %s -emit-ir -I %t -L %t -lPrintShim -O | %FileCheck %s --check-prefixes=CHECK-LL,CHECK-LL-OPT
+// RUN: %target-build-swift -g -parse-sil %s -module-name main -o %t/main -I %t -L %t -lPrintShims %target-rpath(%t)
 // RUN: %target-codesign %t/main
 // RUN: %target-run %t/main %t/%target-library-name(PrintShims) | %FileCheck %s
 
 // REQUIRES: executable_test
-
-// Because of -enable-experimental-feature VariadicGenerics
-// REQUIRES: asserts
-// Because generic specialization does not work yet.
-// REQUIRES: swift_test_mode_optimize_none
 
 import Builtin
 import Swift
@@ -153,8 +149,7 @@ sil_witness_table <T : P> GenFwdP<T>: P module main {
   method #P.static_member_fn: <Self where Self : P> (Self.Type) -> () -> () : @GenFwdP_static_member_fn
 }
 
-sil [ossa] @main : $@convention(c) (Int32, UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>) -> Int32 {
-bb0(%argc : $Int32, %argv : $UnsafeMutablePointer<Optional<UnsafeMutablePointer<Int8>>>):
+sil [ossa] @main : $@convention(c) () -> Int32 {
   %0 = integer_literal $Builtin.Word, 0
   %1 = integer_literal $Builtin.Word, 1
   %2 = integer_literal $Builtin.Word, 2
@@ -572,13 +567,14 @@ entry(%intIndex : $Builtin.Word):
 }
 
 // Verify that we just gep into a parameter pack when that's all that the pack consists of.
-// CHECK-LL: define {{.*}}void @direct_access_from_parameter(i{{(32|64)}} [[INDEX:%[^,]+]], i{{(32|64)}} {{%[^,]+}}, %swift.type** [[PACK:%[^,]+]])
-// CHECK-LL:  [[PACK_ADDR:%.*]] = ptrtoint %swift.type** [[PACK]] to i{{(32|64)}}
+// CHECK-LL: define {{.*}}void @direct_access_from_parameter(i{{(32|64)}} [[INDEX:%[^,]+]], i{{(32|64)}} {{%[^,]+}}, ptr [[PACK:%[^,]+]])
+// CHECK-LL-UNOPT:  [[PACK_ADDR_FOR_DI:%.*]] = ptrtoint ptr [[PACK]] to i{{(32|64)}}
+// CHECK-LL:  [[PACK_ADDR:%.*]] = ptrtoint ptr [[PACK]] to i{{(32|64)}}
 // CHECK-LL:  [[PACK_ADDR2:%.*]] = and i{{(32|64)}} [[PACK_ADDR]], -2
-// CHECK-LL:  [[PACK:%.*]] = inttoptr i{{(32|64)}} [[PACK_ADDR2]] to %swift.type**
-// CHECK-LL:   [[ELEMENT_ADDRESS:%[^,]+]] = getelementptr inbounds %swift.type*, %swift.type** [[PACK]], i{{(32|64)}} [[INDEX]]
-// CHECK-LL:   [[ELEMENT:%[^,]+]] = load %swift.type*, %swift.type** [[ELEMENT_ADDRESS]]
-// CHECK-LL:   call swiftcc void @printGenericType(%swift.type* [[ELEMENT]], %swift.type* [[ELEMENT]])
+// CHECK-LL:  [[PACK:%.*]] = inttoptr i{{(32|64)}} [[PACK_ADDR2]] to ptr
+// CHECK-LL:   [[ELEMENT_ADDRESS:%[^,]+]] = getelementptr inbounds ptr, ptr [[PACK]], i{{(32|64)}} [[INDEX]]
+// CHECK-LL:   [[ELEMENT:%[^,]+]] = load ptr, ptr [[ELEMENT_ADDRESS]]
+// CHECK-LL:   call swiftcc void @printGenericType(ptr [[ELEMENT]], ptr [[ELEMENT]])
 sil @direct_access_from_parameter : $<each T_1> (Builtin.Word) -> () {
 entry(%intIndex : $Builtin.Word):
   %innerIndex = dynamic_pack_index %intIndex of $Pack{repeat each T_1}
@@ -594,19 +590,20 @@ entry(%intIndex : $Builtin.Word):
 // CHECK-LL-LABEL: define {{.*}}@direct_access_from_parameter_with_conformance(
 // CHECK-LL-SAME:        i{{(32|64)}} [[INDEX:%[^,]+]], 
 // CHECK-LL-SAME:        i{{(32|64)}} {{%[^,]+}},
-// CHECK-LL-SAME:        %swift.type** [[METADATA_PACK:%[^,]+]],
-// CHECK-LL-SAME:        i8*** [[WTABLE_PACK:%[^,]+]])
-// CHECK-LL:         [[PACK_ADDR:%.*]] = ptrtoint %swift.type** [[METADATA_PACK]] to i{{(32|64)}}
+// CHECK-LL-SAME:        ptr [[METADATA_PACK:%[^,]+]],
+// CHECK-LL-SAME:        ptr [[WTABLE_PACK:%[^,]+]])
+// CHECK-LL-UNOPT:   [[PACK_ADDR_FOR_DI:%.*]] = ptrtoint ptr [[METADATA_PACK]] to i{{(32|64)}}
+// CHECK-LL:         [[PACK_ADDR:%.*]] = ptrtoint ptr [[METADATA_PACK]] to i{{(32|64)}}
 // CHECK-LL:         [[PACK_ADDR2:%.*]] = and i{{(32|64)}} [[PACK_ADDR]], -2
-// CHECK-LL:         [[METADATA_PACK:%.*]] = inttoptr i{{(32|64)}} [[PACK_ADDR2]] to %swift.type**
-// CHECK-LL:         [[METADATA_ADDRESS:%[^,]+]] = getelementptr inbounds %swift.type*, %swift.type**        [[METADATA_PACK]], i{{(32|64)}} [[INDEX]]
-// CHECK-LL:         [[METADATA:%[^,]+]] = load %swift.type*, %swift.type** [[METADATA_ADDRESS]]
-// CHECK-LL:         [[PACK_ADDR:%.*]] = ptrtoint i8*** [[WTABLE_PACK]] to i{{(32|64)}}
+// CHECK-LL:         [[METADATA_PACK:%.*]] = inttoptr i{{(32|64)}} [[PACK_ADDR2]] to ptr
+// CHECK-LL:         [[METADATA_ADDRESS:%[^,]+]] = getelementptr inbounds ptr, ptr        [[METADATA_PACK]], i{{(32|64)}} [[INDEX]]
+// CHECK-LL:         [[METADATA:%[^,]+]] = load ptr, ptr [[METADATA_ADDRESS]]
+// CHECK-LL:         [[PACK_ADDR:%.*]] = ptrtoint ptr [[WTABLE_PACK]] to i{{(32|64)}}
 // CHECK-LL:         [[PACK_ADDR2:%.*]] = and i{{(32|64)}} [[PACK_ADDR]], -2
-// CHECK-LL:         [[WTABLE_PACK:%.*]] = inttoptr i{{(32|64)}} [[PACK_ADDR2]] to i8***
-// CHECK-LL:         [[WTABLE_ADDRESS:%[^,]+]] = getelementptr inbounds i8**, i8*** [[WTABLE_PACK]], i{{(32|64)}} [[INDEX]]
-// CHECK-LL:         [[WTABLE:%[^,]+]] = load i8**, i8*** [[WTABLE_ADDRESS]], align
-// CHECK-LL:         call swiftcc void @printGenericType(%swift.type* [[METADATA]], %swift.type* [[METADATA]])
+// CHECK-LL:         [[WTABLE_PACK:%.*]] = inttoptr i{{(32|64)}} [[PACK_ADDR2]] to ptr
+// CHECK-LL:         [[WTABLE_ADDRESS:%[^,]+]] = getelementptr inbounds ptr, ptr [[WTABLE_PACK]], i{{(32|64)}} [[INDEX]]
+// CHECK-LL:         [[WTABLE:%[^,]+]] = load ptr, ptr [[WTABLE_ADDRESS]], align
+// CHECK-LL:         call swiftcc void @printGenericType(ptr [[METADATA]], ptr [[METADATA]])
 sil @direct_access_from_parameter_with_conformance : $<each T_1 : P> (Builtin.Word) -> () {
 entry(%intIndex : $Builtin.Word):
   %innerIndex = dynamic_pack_index %intIndex of $Pack{repeat each T_1}
@@ -628,10 +625,10 @@ entry(%intIndex : $Builtin.Word):
   return %t : $()
 }
 
-sil @unwrap_from_PA : $<each T_1 : PA where each T_1.A : P> (Builtin.Word) -> () {
+sil @unwrap_from_PA : $<each T_1 : PA where repeat (each T_1).A : P> (Builtin.Word) -> () {
 entry(%intIndex : $Builtin.Word):
   %direct_access_from_parameter_with_conformance = function_ref @direct_access_from_parameter_with_conformance : $@convention(thin) <each T_1: P> (Builtin.Word) -> ()
-  apply %direct_access_from_parameter_with_conformance<Pack{repeat GenFwdP<each T_1.A>}>(%intIndex) : $@convention(thin) <each T_1: P> (Builtin.Word) -> ()
+  apply %direct_access_from_parameter_with_conformance<Pack{repeat GenFwdP<(each T_1).A>}>(%intIndex) : $@convention(thin) <each T_1: P> (Builtin.Word) -> ()
   %t = tuple ()
   return %t : $()
 }
@@ -639,7 +636,7 @@ entry(%intIndex : $Builtin.Word):
 sil @extract_associatedtype_with_conformance : $<each T_1 : P> (Builtin.Word) -> () {
 entry(%intIndex : $Builtin.Word):
   %innerIndex = dynamic_pack_index %intIndex of $Pack{repeat each T_1}
-  %token = open_pack_element %innerIndex of <each U_1 : PA where each U_1.A : P> at <Pack{repeat GenAssocPA<GenFwdP<each T_1>>}>, shape $U_1, uuid "01234567-89AB-CDEF-0123-000000000005"
+  %token = open_pack_element %innerIndex of <each U_1 : PA where repeat (each U_1).A : P> at <Pack{repeat GenAssocPA<GenFwdP<each T_1>>}>, shape $U_1, uuid "01234567-89AB-CDEF-0123-000000000005"
   %metatype_1 = metatype $@thick (@pack_element("01234567-89AB-CDEF-0123-000000000005") U_1).Type
   %printGenericType = function_ref @printGenericType : $@convention(thin) <T> (@thick T.Type) -> ()
   apply %printGenericType<(@pack_element("01234567-89AB-CDEF-0123-000000000005") U_1)>(%metatype_1) : $@convention(thin) <T> (@thick T.Type) -> ()
@@ -655,7 +652,7 @@ sil @extract_associatedtype_with_conformance2 : $<each T_1 : P, Tee : P, each T_
 entry(%intIndex : $Builtin.Word):
   %innerIndex = dynamic_pack_index %intIndex of $Pack{repeat GenAssocPA<GenAssocPA<GenAssocPA<GenFwdP<each T_1>>>>, repeat GenAssocPA<GenAssocPA<GenAssocPA<GenFwdP<each T_1>>>>}
   %token = open_pack_element %innerIndex 
-    of <each U_1 : PA, Ewe : PA, each U_2 : PA where each U_1.A : PA, each U_1.A.A : PA, each U_1.A.A.A : P, Ewe.A : PA, Ewe.A.A : PA, Ewe.A.A.A : P, each U_2.A : PA, each U_2.A.A : PA, each U_2.A.A.A : P, (repeat (each U_1, each U_2)): Any> 
+    of <each U_1 : PA, Ewe : PA, each U_2 : PA where repeat (each U_1).A : PA, repeat (each U_1).A.A : PA, repeat (each U_1).A.A.A : P, Ewe.A : PA, Ewe.A.A : PA, Ewe.A.A.A : P, repeat (each U_2).A : PA, repeat (each U_2).A.A : PA, repeat (each U_2).A.A.A : P, (repeat (each U_1, each U_2)): Any> 
     at <
         Pack{repeat GenAssocPA<GenAssocPA<GenAssocPA<GenFwdP<each T_1>>>>, repeat GenAssocPA<GenAssocPA<GenAssocPA<GenFwdP<each T_1>>>>}, 
         GenAssocPA<GenAssocPA<GenAssocPA<GenFwdP<Tee>>>>, 

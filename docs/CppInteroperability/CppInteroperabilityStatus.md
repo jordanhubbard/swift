@@ -1,3 +1,5 @@
+[** ‼️ The official C++ interoperability documentation and status page is live at Swift.org and provides an up-to-date guide for mixing Swift and C++ ‼️ **](https://www.swift.org/documentation/cxx-interop/status)
+
 #  C++ Interoperability Status
 
 Swift has some experimental ability to interoperate with C++.
@@ -75,7 +77,7 @@ This status table describes which of the following C++ language features can be 
 | Typedefs / Type aliases                     | Yes    |
 | Global Variables                            | Yes    |
 | Namespaces                                  | Yes    |
-| Inline Namespaces                           | Yes, with some known issues ([#58217](https://github.com/apple/swift/issues/58217)) |
+| Inline Namespaces                           | Yes, with some known issues ([#58217](https://github.com/swiftlang/swift/issues/58217)) |
 | Exceptions                                  | No. Uncaught exceptions that propagate into Swift frames are UB.  |
 | Fields                                      | Yes |
 | Member functions                            | Yes. Some value category overloads aren't imported |
@@ -119,7 +121,7 @@ This status table describes which of the following C++ standard library features
 ## Known Issues
 
 ### Inline Namespaces
-- [#58217](https://github.com/apple/swift/issues/58217): Swift's typechecker currently doesn't allow calling a function from an inline namespace when it's referenced through the parent namespace. Example of a test that fails: https://github.com/apple/swift/blob/main/test/Interop/Cxx/namespace/inline-namespace-function-call-broken.swift
+- [#58217](https://github.com/swiftlang/swift/issues/58217): Swift's typechecker currently doesn't allow calling a function from an inline namespace when it's referenced through the parent namespace. Example of a test that fails: https://github.com/swiftlang/swift/blob/main/test/Interop/Cxx/namespace/inline-namespace-function-call-broken.swift
 
 
 ## Swift to C++ Interoperability Status

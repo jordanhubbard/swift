@@ -39,10 +39,12 @@ private func runMergeCondFails(function: Function, context: FunctionPassContext)
 
     for inst in block.instructions {
       if let cfi = inst as? CondFailInst {
+        let messageIsSame = condFailToMerge.isEmpty || cfi.message == condFailToMerge.first!.message
+        let forceAllowMerge = context.options.enableMergeableTraps
+
         // Do not process arithmetic overflow checks. We typically generate more
         // efficient code with separate jump-on-overflow.
-        if !hasOverflowConditionOperand(cfi) &&
-           (condFailToMerge.isEmpty || cfi.message == condFailToMerge.first!.message) {
+        if !hasOverflowConditionOperand(cfi) && (messageIsSame || forceAllowMerge) {
           condFailToMerge.push(cfi)
         }
       } else if inst.mayHaveSideEffects || inst.mayReadFromMemory {
@@ -86,7 +88,7 @@ private func mergeCondFails(_ condFailToMerge: inout Stack<CondFailInst>,
 
   // Create a new cond_fail using the merged condition.
   _ = builder.createCondFail(condition: mergedCond!,
-                             message: lastCFI.message)
+                             message: lastCFI.message.string)
 
   while let cfi = condFailToMerge.pop() {
     context.erase(instruction: cfi)

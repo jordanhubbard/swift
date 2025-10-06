@@ -1,17 +1,18 @@
-// RUN: %target-typecheck-verify-swift
+// RUN: %target-typecheck-verify-swift -enable-experimental-feature MoveOnlyEnumDeinits
 
 // REQUIRES: objc_interop
+// REQUIRES: swift_feature_MoveOnlyEnumDeinits
 
 // Validate that we can't mark an objc enum as move only.
 
-@_moveOnly
-@objc enum Foo : Int { // expected-error {{@objc enums cannot be marked as move-only}}
+@objc enum Foo : Int, ~Copyable { // expected-error {{noncopyable enums cannot be marked '@objc'}}
+                       // expected-error@-1 {{'Foo' declares raw type 'Int', but cannot yet conform to RawRepresentable because it is noncopyable}}
   case X, Y, Z
-  deinit {} // expected-error {{deinitializers cannot be declared on an @objc enum type}}
+  deinit {}
 }
 
-@_moveOnly
-@objc enum Foo2 : Int { // expected-error {{@objc enums cannot be marked as move-only}}
+@objc enum Foo2 : Int, ~Copyable { // expected-error {{noncopyable enums cannot be marked '@objc'}}
+                        // expected-error@-1 {{'Foo2' declares raw type 'Int', but cannot yet conform to RawRepresentable because it is noncopyable}}
   case X, Y, Z
 }
 

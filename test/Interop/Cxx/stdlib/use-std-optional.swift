@@ -1,7 +1,15 @@
-// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -enable-experimental-cxx-interop -Xcc -std=c++17 -Xfrontend -validate-tbd-against-ir=none)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -cxx-interoperability-mode=swift-5.9)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -cxx-interoperability-mode=swift-6)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -cxx-interoperability-mode=upcoming-swift)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -cxx-interoperability-mode=upcoming-swift -enable-experimental-feature AddressableParameters)
+// RUN: %target-run-simple-swift(-I %S/Inputs -Xfrontend -cxx-interoperability-mode=upcoming-swift -Xcc -std=c++20)
 //
 // REQUIRES: executable_test
-// REQUIRES: OS=macosx
+// REQUIRES: swift_feature_AddressableParameters
+
+// Undefined hidden symbol to C++ voidify in libcxx
+// rdar://121551667
+// XFAIL: OS=freebsd
 
 import StdlibUnittest
 import StdOptional
@@ -13,6 +21,15 @@ StdOptionalTestSuite.test("pointee") {
   let nonNilOpt = getNonNilOptional()
   let pointee = nonNilOpt.pointee
   expectEqual(123, pointee)
+
+#if !os(Linux) && !os(FreeBSD) // crashes on Ubuntu 18.04 (rdar://113414160)
+  var modifiedOpt = getNilOptional()
+  modifiedOpt.pointee = 777
+  expectEqual(777, modifiedOpt.pointee)
+#endif
+
+  let nonNilOptNonCopyable = getNonNilOptionalHasDeletedCopyCtor()
+  expectEqual(654, nonNilOptNonCopyable.pointee.value)
 }
 
 StdOptionalTestSuite.test("std::optional => Swift.Optional") {
@@ -29,10 +46,48 @@ StdOptionalTestSuite.test("std::optional => Swift.Optional") {
 StdOptionalTestSuite.test("std::optional hasValue/value") {
   let nonNilOpt = getNonNilOptional()
   expectTrue(nonNilOpt.hasValue)
-  expectEqual(123, nonNilOpt.value)
+  expectEqual(123, nonNilOpt.value!)
 
   let nilOpt = getNilOptional()
   expectFalse(nilOpt.hasValue)
+  expectNil(nilOpt.value)
+}
+
+StdOptionalTestSuite.test("std::optional as ExpressibleByNilLiteral") {
+  let res1 = takesOptionalInt(nil)
+  expectFalse(res1)
+
+  let res2 = takesOptionalString(nil)
+  expectFalse(res2)
+}
+
+StdOptionalTestSuite.test("std::optional init(_:Wrapped)") {
+  let optInt = StdOptionalInt(123)
+  expectEqual(123, optInt.pointee)
+
+  // FIXME: making these variables immutable triggers a miscompile on Linux
+  // (https://github.com/swiftlang/swift/issues/82765)
+  var optBoolTMutable = StdOptionalBool(true)
+  var optBoolFMutable = StdOptionalBool(false)
+  expectTrue(optBoolTMutable.pointee)
+  expectFalse(optBoolFMutable.pointee)
+
+  // If AddressableParameters are enabled, this issue does not happen.
+#if hasFeature(AddressableParameters)
+  let optBoolT = StdOptionalBool(true)
+  let optBoolF = StdOptionalBool(false)
+  expectTrue(optBoolT.pointee)
+  expectFalse(optBoolF.pointee)
+#endif
+
+  let optString = StdOptionalString(std.string("abc"))
+  expectEqual(std.string("abc"), optString.pointee)
+
+  let optOptInt = StdOptionalOptionalInt(StdOptionalInt(456))
+  expectEqual(456, optOptInt.pointee.pointee)
+
+  let optConstexprCtor = StdOptionalHasConstexprCtor(HasConstexprCtor(321))
+  expectEqual(321, optConstexprCtor.pointee.value)
 }
 
 runAllTests()

@@ -1,15 +1,19 @@
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/DiagnosticEngine.h"
 #include "swift/AST/SearchPathOptions.h"
+#include "swift/Basic/CASOptions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/LLVMInitialize.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/SymbolGraphGen/SymbolGraphOptions.h"
+#include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/VirtualOutputBackends.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/TargetParser/Host.h"
 #include "gtest/gtest.h"
 
 using namespace swift;
@@ -75,16 +79,18 @@ TEST(ClangImporterTest, emitPCHInMemory) {
   INITIALIZE_LLVM();
   swift::SearchPathOptions searchPathOpts;
   swift::symbolgraphgen::SymbolGraphOptions symbolGraphOpts;
+  swift::CASOptions casOpts;
+  swift::SerializationOptions serializationOpts;
   swift::SourceManager sourceMgr;
   swift::DiagnosticEngine diags(sourceMgr);
-  std::unique_ptr<ASTContext> context(
-      ASTContext::get(langOpts, typecheckOpts, silOpts, searchPathOpts, options,
-                      symbolGraphOpts, sourceMgr, diags));
+  std::unique_ptr<ASTContext> context(ASTContext::get(
+      langOpts, typecheckOpts, silOpts, searchPathOpts, options,
+      symbolGraphOpts, casOpts, serializationOpts, sourceMgr, diags));
   auto importer = ClangImporter::create(*context);
 
   std::string PCH = createFilename(cache, "bridging.h.pch");
   ASSERT_FALSE(importer->canReadPCH(PCH));
-  ASSERT_FALSE(importer->emitBridgingPCH(options.BridgingHeader, PCH));
+  ASSERT_FALSE(importer->emitBridgingPCH(options.BridgingHeader, PCH, true));
   ASSERT_TRUE(importer->canReadPCH(PCH));
 
   // Overwrite the PCH with garbage.  We should still be able to read it from
@@ -155,8 +161,7 @@ struct LibStdCxxInjectionVFS {
 
   // Add a libstdc++ modulemap that's part of Swift's distribution.
   LibStdCxxInjectionVFS &libstdCxxModulemap(StringRef contents = "") {
-    newFile("/usr/lib/swift/" + osString + "/" + archString +
-                "/libstdcxx.modulemap",
+    newFile("/usr/lib/swift/" + osString + "/libstdcxx.modulemap",
             contents.empty() ? getLibstdcxxModulemapContents() : contents);
     return *this;
   }
@@ -181,6 +186,8 @@ TEST(ClangImporterTest, libStdCxxInjectionTest) {
   swift::LangOptions langOpts;
   langOpts.EnableCXXInterop = true;
   langOpts.Target = llvm::Triple("x86_64", "unknown", "linux", "gnu");
+  langOpts.CXXStdlib = CXXStdlibKind::Libstdcxx;
+  langOpts.PlatformDefaultCXXStdlib = CXXStdlibKind::Libstdcxx;
   swift::SILOptions silOpts;
   swift::TypeCheckerOptions typecheckOpts;
   INITIALIZE_LLVM();
@@ -190,14 +197,16 @@ TEST(ClangImporterTest, libStdCxxInjectionTest) {
   swift::SourceManager sourceMgr;
   swift::DiagnosticEngine diags(sourceMgr);
   ClangImporterOptions options;
+  CASOptions casOpts;
+  SerializationOptions serializationOpts;
   options.clangPath = "/usr/bin/clang";
   options.ExtraArgs.push_back(
       (llvm::Twine("--gcc-toolchain=") + "/opt/rh/devtoolset-9/root/usr")
           .str());
   options.ExtraArgs.push_back("--gcc-toolchain");
-  std::unique_ptr<ASTContext> context(
-      ASTContext::get(langOpts, typecheckOpts, silOpts, searchPathOpts, options,
-                      symbolGraphOpts, sourceMgr, diags));
+  std::unique_ptr<ASTContext> context(ASTContext::get(
+      langOpts, typecheckOpts, silOpts, searchPathOpts, options,
+      symbolGraphOpts, casOpts, serializationOpts, sourceMgr, diags));
 
   {
     LibStdCxxInjectionVFS vfs;
@@ -208,11 +217,11 @@ TEST(ClangImporterTest, libStdCxxInjectionTest) {
     EXPECT_EQ(paths.redirectedFiles[0].first,
               "/opt/rh/devtoolset-9/root/usr/include/c++/9/libstdcxx.h");
     EXPECT_EQ(paths.redirectedFiles[0].second,
-              "/usr/lib/swift/linux/x86_64/libstdcxx.h");
+              "/usr/lib/swift/linux/libstdcxx.h");
     EXPECT_EQ(paths.redirectedFiles[1].first,
               "/opt/rh/devtoolset-9/root/usr/include/c++/9/module.modulemap");
     EXPECT_EQ(paths.redirectedFiles[1].second,
-              "/usr/lib/swift/linux/x86_64/libstdcxx.modulemap");
+              "/usr/lib/swift/linux/libstdcxx.modulemap");
   }
 
   {
@@ -224,7 +233,7 @@ TEST(ClangImporterTest, libStdCxxInjectionTest) {
     EXPECT_EQ(paths.redirectedFiles[0].first,
               "/opt/rh/devtoolset-9/root/usr/include/c++/9/libstdcxx.h");
     EXPECT_EQ(paths.redirectedFiles[0].second,
-              "/usr/lib/swift/linux/x86_64/libstdcxx.h");
+              "/usr/lib/swift/linux/libstdcxx.h");
     EXPECT_EQ(paths.overridenFiles[0].first,
               "/opt/rh/devtoolset-9/root/usr/include/c++/9/module.modulemap");
     EXPECT_NE(paths.overridenFiles[0].second.find(
@@ -250,7 +259,7 @@ TEST(ClangImporterTest, libStdCxxInjectionTest) {
     EXPECT_EQ(paths.redirectedFiles[0].first,
               "/opt/rh/devtoolset-9/root/usr/include/c++/9/libstdcxx.h");
     EXPECT_EQ(paths.redirectedFiles[0].second,
-              "/usr/lib/swift/linux/x86_64/libstdcxx.h");
+              "/usr/lib/swift/linux/libstdcxx.h");
     EXPECT_EQ(paths.overridenFiles[0].first,
               "/opt/rh/devtoolset-9/root/usr/include/c++/9/module.modulemap");
     EXPECT_NE(

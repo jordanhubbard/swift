@@ -45,19 +45,20 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::ApplyFunction:
   case ConstraintLocator::SequenceElementType:
   case ConstraintLocator::ClosureResult:
+  case ConstraintLocator::ClosureThrownError:
   case ConstraintLocator::ClosureBody:
   case ConstraintLocator::ConstructorMember:
   case ConstraintLocator::ConstructorMemberType:
   case ConstraintLocator::ResultBuilderBodyResult:
   case ConstraintLocator::InstanceType:
   case ConstraintLocator::AutoclosureResult:
-  case ConstraintLocator::OptionalPayload:
+  case ConstraintLocator::OptionalInjection:
   case ConstraintLocator::Member:
   case ConstraintLocator::MemberRefBase:
   case ConstraintLocator::UnresolvedMember:
   case ConstraintLocator::ParentType:
   case ConstraintLocator::ExistentialConstraintType:
-  case ConstraintLocator::ProtocolCompositionSuperclassType:
+  case ConstraintLocator::ProtocolCompositionMemberType:
   case ConstraintLocator::LValueConversion:
   case ConstraintLocator::DynamicType:
   case ConstraintLocator::SubscriptMember:
@@ -90,6 +91,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::ImplicitCallAsFunction:
   case ConstraintLocator::TernaryBranch:
   case ConstraintLocator::PatternMatch:
+  case ConstraintLocator::EnumPatternImplicitCastMatch:
   case ConstraintLocator::ArgumentAttribute:
   case ConstraintLocator::UnresolvedMemberChainResult:
   case ConstraintLocator::PlaceholderType:
@@ -102,10 +104,15 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
   case ConstraintLocator::PackExpansionPattern:
   case ConstraintLocator::PatternBindingElement:
   case ConstraintLocator::NamedPatternDecl:
-  case ConstraintLocator::SingleValueStmtBranch:
+  case ConstraintLocator::SingleValueStmtResult:
   case ConstraintLocator::AnyPatternDecl:
   case ConstraintLocator::GlobalActorType:
   case ConstraintLocator::CoercionOperand:
+  case ConstraintLocator::PackExpansionType:
+  case ConstraintLocator::ThrownErrorType:
+  case ConstraintLocator::FallbackType:
+  case ConstraintLocator::KeyPathSubscriptIndex:
+  case ConstraintLocator::ExistentialMemberAccessConversion:
     return 0;
 
   case ConstraintLocator::FunctionArgument:
@@ -122,8 +129,7 @@ unsigned LocatorPathElt::getNewSummaryFlags() const {
 }
 
 void LocatorPathElt::dump(raw_ostream &out) const {
-  PrintOptions PO;
-  PO.PrintTypesForDebugging = true;
+  PrintOptions PO = PrintOptions::forDebugging();
 
   auto dumpReqKind = [&out](RequirementKind kind) {
     out << " (";
@@ -169,8 +175,8 @@ void LocatorPathElt::dump(raw_ostream &out) const {
     out << "apply function";
     break;
 
-  case ConstraintLocator::OptionalPayload:
-    out << "optional payload";
+  case ConstraintLocator::OptionalInjection:
+    out << "optional injection";
     break;
 
   case ConstraintLocator::ApplyArgToParam: {
@@ -183,6 +189,10 @@ void LocatorPathElt::dump(raw_ostream &out) const {
   }
   case ConstraintLocator::ClosureResult:
     out << "closure result";
+    break;
+
+  case ConstraintLocator::ClosureThrownError:
+    out << "closure thrown error";
     break;
 
   case ConstraintLocator::ClosureBody:
@@ -267,9 +277,11 @@ void LocatorPathElt::dump(raw_ostream &out) const {
     out << "existential constraint type";
     break;
 
-  case ConstraintLocator::ProtocolCompositionSuperclassType:
-    out << "protocol composition superclass type";
+  case ConstraintLocator::ProtocolCompositionMemberType: {
+    auto memberElt = elt.castTo<LocatorPathElt::ProtocolCompositionMemberType>();
+    out << "protocol composition member " << llvm::utostr(memberElt.getIndex());
     break;
+  }
 
   case ConstraintLocator::LValueConversion:
     out << "@lvalue-to-inout conversion";
@@ -294,9 +306,7 @@ void LocatorPathElt::dump(raw_ostream &out) const {
     break;
   }
   case ConstraintLocator::ProtocolRequirement: {
-    auto reqElt = elt.castTo<LocatorPathElt::ProtocolRequirement>();
-    out << "protocol requirement ";
-    reqElt.getDecl()->dumpRef(out);
+    out << "protocol requirement";
     break;
   }
   case ConstraintLocator::Witness: {
@@ -391,15 +401,19 @@ void LocatorPathElt::dump(raw_ostream &out) const {
     break;
   }
 
-  case ConstraintLocator::SingleValueStmtBranch: {
-    auto branch = elt.castTo<LocatorPathElt::SingleValueStmtBranch>();
-    out << "expr branch [" << branch.getExprBranchIndex() << "] of "
+  case ConstraintLocator::SingleValueStmtResult: {
+    auto branch = elt.castTo<LocatorPathElt::SingleValueStmtResult>();
+    out << "result [" << branch.getIndex() << "] of "
            "single value stmt";
     break;
   }
 
   case ConstraintLocator::PatternMatch:
     out << "pattern match";
+    break;
+
+  case ConstraintLocator::EnumPatternImplicitCastMatch:
+    out << "enum pattern implicit cast match";
     break;
 
   case ConstraintLocator::ArgumentAttribute: {
@@ -501,7 +515,28 @@ void LocatorPathElt::dump(raw_ostream &out) const {
   case ConstraintLocator::CoercionOperand: {
     out << "coercion operand";
     break;
+
+  case ConstraintLocator::PackExpansionType:
+    auto expansionElt = elt.castTo<LocatorPathElt::PackExpansionType>();
+    out << "pack expansion type ("
+        << expansionElt.getOpenedType()->getString(PO) << ")";
+    break;
   }
+  case ConstraintLocator::ThrownErrorType: {
+    out << "thrown error type";
+    break;
+  }
+  case ConstraintLocator::FallbackType: {
+    out << "fallback type";
+    break;
+
+  case ConstraintLocator::KeyPathSubscriptIndex:
+    out << "key path subscript index parameter";
+    break;
+  }
+  case ConstraintLocator::ExistentialMemberAccessConversion:
+    out << "existential member access conversion";
+    break;
   }
 }
 
@@ -509,9 +544,17 @@ void LocatorPathElt::dump(raw_ostream &out) const {
 /// e.g. `foo[0]` or `\Foo.[0]`
 bool ConstraintLocator::isSubscriptMemberRef() const {
   auto anchor = getAnchor();
-  auto path = getPath();
+  if (!anchor)
+    return false;
 
-  if (!anchor || path.empty())
+  // Look through dynamic member lookup since for a subscript reference the
+  // dynamic member lookup is also a subscript reference.
+  auto path = getPath();
+  using KPDynamicMemberElt = LocatorPathElt::KeyPathDynamicMember;
+  while (!path.empty() && path.back().is<KPDynamicMemberElt>())
+    path = path.drop_back();
+
+  if (path.empty())
     return false;
 
   return path.back().getKind() == ConstraintLocator::SubscriptMember;
@@ -552,22 +595,41 @@ bool ConstraintLocator::isResultOfKeyPathDynamicMemberLookup() const {
   });
 }
 
-bool ConstraintLocator::isKeyPathSubscriptComponent() const {
-  auto *anchor = getAsExpr(getAnchor());
-  auto *KPE = dyn_cast_or_null<KeyPathExpr>(anchor);
+static bool hasKeyPathComponent(
+    const ConstraintLocator *loc,
+    llvm::function_ref<bool(KeyPathExpr::Component::Kind)> predicate) {
+  auto *KPE = getAsExpr<KeyPathExpr>(loc->getAnchor());
   if (!KPE)
     return false;
 
-  using ComponentKind = KeyPathExpr::Component::Kind;
-  return llvm::any_of(getPath(), [&](const LocatorPathElt &elt) {
+  return llvm::any_of(loc->getPath(), [&](const LocatorPathElt &elt) {
     auto keyPathElt = elt.getAs<LocatorPathElt::KeyPathComponent>();
     if (!keyPathElt)
       return false;
 
-    auto index = keyPathElt->getIndex();
-    auto &component = KPE->getComponents()[index];
-    return component.getKind() == ComponentKind::Subscript ||
-           component.getKind() == ComponentKind::UnresolvedSubscript;
+    auto &component = KPE->getComponents()[keyPathElt->getIndex()];
+    return predicate(component.getKind());
+  });
+}
+
+bool ConstraintLocator::isKeyPathSubscriptComponent() const {
+  return hasKeyPathComponent(this, [](auto kind) {
+    return kind == KeyPathExpr::Component::Kind::Subscript ||
+           kind == KeyPathExpr::Component::Kind::UnresolvedSubscript;
+  });
+}
+
+bool ConstraintLocator::isKeyPathMemberComponent() const {
+  return hasKeyPathComponent(this, [](auto kind) {
+    return kind == KeyPathExpr::Component::Kind::Member ||
+           kind == KeyPathExpr::Component::Kind::UnresolvedMember;
+  });
+}
+
+bool ConstraintLocator::isKeyPathApplyComponent() const {
+  return hasKeyPathComponent(this, [](auto kind) {
+    return kind == KeyPathExpr::Component::Kind::Apply ||
+           kind == KeyPathExpr::Component::Kind::UnresolvedApply;
   });
 }
 
@@ -586,6 +648,10 @@ bool ConstraintLocator::isForKeyPathComponentResult() const {
   return isLastElement<LocatorPathElt::KeyPathComponentResult>();
 }
 
+bool ConstraintLocator::isForKeyPathComponent() const {
+  return isLastElement<LocatorPathElt::KeyPathComponent>();
+}
+
 bool ConstraintLocator::isForGenericParameter() const {
   return isLastElement<LocatorPathElt::GenericParameter>();
 }
@@ -600,6 +666,11 @@ bool ConstraintLocator::isForSequenceElementType() const {
 
 bool ConstraintLocator::isForContextualType() const {
   return isLastElement<LocatorPathElt::ContextualType>();
+}
+
+bool ConstraintLocator::isForContextualType(ContextualTypePurpose ctp) const {
+  auto elt = getLastElementAs<LocatorPathElt::ContextualType>();
+  return elt && elt->getPurpose() == ctp;
 }
 
 bool ConstraintLocator::isForAssignment() const {
@@ -622,44 +693,84 @@ bool ConstraintLocator::isForMacroExpansion() const {
   return directlyAt<MacroExpansionExpr>();
 }
 
-bool ConstraintLocator::isForSingleValueStmtConjunction() const {
-  auto *SVE = getAsExpr<SingleValueStmtExpr>(getAnchor());
+static bool isForSingleValueStmtConjunction(ASTNode anchor,
+                                            ArrayRef<LocatorPathElt> path) {
+  auto *SVE = getAsExpr<SingleValueStmtExpr>(anchor);
   if (!SVE)
     return false;
 
-  // Ignore a trailing SyntacticElement path element for the statement.
-  auto path = getPath();
-  if (auto elt = getLastElementAs<LocatorPathElt::SyntacticElement>()) {
-    if (elt->getElement() == ASTNode(SVE->getStmt()))
-      path = path.drop_back();
+  if (!path.empty()) {
+    // Ignore a trailing SyntacticElement path element for the statement.
+    if (auto elt = path.back().getAs<LocatorPathElt::SyntacticElement>()) {
+      if (elt->getElement() == ASTNode(SVE->getStmt()))
+        path = path.drop_back();
+    }
   }
 
   // Other than the trailing SyntaticElement, we must be at the anchor.
   return path.empty();
 }
 
-Optional<SingleValueStmtBranchKind>
-ConstraintLocator::isForSingleValueStmtBranch() const {
+bool ConstraintLocator::isForSingleValueStmtConjunction() const {
+  return ::isForSingleValueStmtConjunction(getAnchor(), getPath());
+}
+
+bool ConstraintLocator::isForSingleValueStmtConjunctionOrBrace() const {
+  auto *SVE = getAsExpr<SingleValueStmtExpr>(getAnchor());
+  if (!SVE)
+    return false;
+
+  auto path = getPath();
+  while (!path.empty()) {
+    // Ignore a trailing TernaryBranch locator, which is used for if statements.
+    if (path.back().is<LocatorPathElt::TernaryBranch>()) {
+      path = path.drop_back();
+      continue;
+    }
+
+    // Ignore a SyntaticElement path element for a case statement of a switch,
+    // or the catch of a do-catch, or the brace of a do-statement.
+    if (auto elt = path.back().getAs<LocatorPathElt::SyntacticElement>()) {
+      if (elt->getElement().isStmt(StmtKind::Case)) {
+        path = path.drop_back();
+        break;
+      }
+      if (elt->getElement().isStmt(StmtKind::Brace) &&
+          isa<DoCatchStmt>(SVE->getStmt())) {
+        path = path.drop_back();
+        break;
+      }
+    }
+    break;
+  }
+  return ::isForSingleValueStmtConjunction(getAnchor(), path);
+}
+
+bool ConstraintLocator::isForSingleValueStmtBranch() const {
+  if (!isExpr<SingleValueStmtExpr>(getAnchor()))
+    return false;
+
   // Ignore a trailing ContextualType path element.
   auto path = getPath();
-  if (auto elt = getLastElementAs<LocatorPathElt::ContextualType>())
+  if (isLastElement<LocatorPathElt::ContextualType>())
     path = path.drop_back();
 
   if (path.empty())
-    return None;
+    return false;
 
-  if (!path.back().is<LocatorPathElt::SingleValueStmtBranch>())
-    return None;
+  return path.back().is<LocatorPathElt::SingleValueStmtResult>();
+}
 
-  auto *SVE = getAsExpr<SingleValueStmtExpr>(getAnchor());
-  if (!SVE)
-    return None;
+NullablePtr<Pattern> ConstraintLocator::getPatternMatch() const {
+  auto matchElt = findLast<LocatorPathElt::PatternMatch>();
+  if (!matchElt)
+    return nullptr;
 
-  if (auto *CE = dyn_cast<ClosureExpr>(SVE->getDeclContext())) {
-    if (CE->hasSingleExpressionBody() && !hasExplicitResult(CE))
-      return SingleValueStmtBranchKind::InSingleExprClosure;
-  }
-  return SingleValueStmtBranchKind::Regular;
+  return matchElt->getPattern();
+}
+
+bool ConstraintLocator::isForPatternMatch() const {
+  return getPatternMatch() != nullptr;
 }
 
 bool ConstraintLocator::isMemberRef() const {
@@ -699,15 +810,12 @@ void ConstraintLocator::dump(ConstraintSystem *CS) const {
 
 
 void ConstraintLocator::dump(SourceManager *sm, raw_ostream &out) const {
-  PrintOptions PO;
-  PO.PrintTypesForDebugging = true;
-  
   out << "locator@" << (void*) this << " [";
 
   constraints::dumpAnchor(anchor, sm, out);
 
   for (auto elt : getPath()) {
-    out << " -> ";
+    out << " → ";
     elt.dump(out);
   }
   out << ']';
@@ -731,7 +839,7 @@ void ConstraintLocatorBuilder::dump(SourceManager *SM, llvm::raw_ostream &out) c
     prev->dump(SM, out);
   }
   if (element) {
-    out << " -> ";
+    out << " → ";
     element->dump(out);
   }
 }

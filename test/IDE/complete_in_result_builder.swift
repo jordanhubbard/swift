@@ -1,5 +1,4 @@
-// RUN %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 @resultBuilder
 struct TupleBuilder<T> {
@@ -17,7 +16,10 @@ struct TupleBuilder<T> {
   }
 }
 
-func buildStringTuple<Result>(@TupleBuilder<String> x: () -> Result) {}
+@discardableResult
+func buildStringTuple<Result>(@TupleBuilder<String> x: () -> Result) -> Result {
+  x()
+}
 
 enum StringFactory {
   static func makeString(x: String) -> String { return x }
@@ -40,20 +42,26 @@ func testGlobalLookup() {
 
   @TupleBuilder<String> var x2 {
     if true {
-      #^GLOBAL_LOOKUP_IN_IF_BODY?check=GLOBAL_LOOKUP_NO_TYPE_RELATION^#
-// GLOBAL_LOOKUP_NO_TYPE_RELATION: Decl[GlobalVar]/CurrModule:         MyConstantString[#String#];
+      #^GLOBAL_LOOKUP_IN_IF_BODY^#
+// GLOBAL_LOOKUP_IN_IF_BODY: Decl[GlobalVar]/CurrModule:         MyConstantString[#String#];
     }
   }
 
   @TupleBuilder<String> var x3 {
     if {
-      #^GLOBAL_LOOKUP_IN_IF_BODY_WITHOUT_CONDITION?check=GLOBAL_LOOKUP_NO_TYPE_RELATION^#
+      #^GLOBAL_LOOKUP_IN_IF_BODY_WITHOUT_CONDITION?check=GLOBAL_LOOKUP_IN_IF_BODY^#
+    }
+  }
+
+  buildStringTuple {
+    if {
+      #^GLOBAL_LOOKUP_IN_IF_BODY_WITHOUT_CONDITION_CLOSURE?check=GLOBAL_LOOKUP_IN_IF_BODY^#
     }
   }
 
   @TupleBuilder<String> var x4 {
     guard else {
-      #^GLOBAL_LOOKUP_IN_GUARD_BODY_WITHOUT_CONDITION?check=GLOBAL_LOOKUP_NO_TYPE_RELATION^#
+      #^GLOBAL_LOOKUP_IN_GUARD_BODY_WITHOUT_CONDITION?check=GLOBAL_LOOKUP_IN_IF_BODY^#
     }
   }
 
@@ -85,7 +93,10 @@ func testStaticMemberLookup() {
   }
 
   @TupleBuilder<String> var x3 {
-    "hello: \(StringFactory.#^COMPLETE_STATIC_MEMBER_IN_STRING_LITERAL?check=COMPLETE_STATIC_MEMBER;xfail=rdar78015646^#)"
+    "hello: \(StringFactory.#^COMPLETE_STATIC_MEMBER_IN_STRING_LITERAL^#)"
+// COMPLETE_STATIC_MEMBER_IN_STRING_LITERAL: Begin completions
+// COMPLETE_STATIC_MEMBER_IN_STRING_LITERAL: Decl[StaticMethod]/CurrNominal/TypeRelation[Convertible]:     makeString({#x: String#})[#String#];
+// COMPLETE_STATIC_MEMBER_IN_STRING_LITERAL: End completions
   }
 }
 
@@ -94,6 +105,21 @@ struct FooStruct {
   init(_: Int = 0) { }
   func boolGen() -> Bool { return false }
   func intGen() -> Int { return 1 }
+}
+
+func testReturn() {
+  // Make sure we can still complete even with return.
+  buildStringTuple {
+    StringFactory.#^COMPLETE_STATIC_MEMBER_WITH_RETURN^#
+    // COMPLETE_STATIC_MEMBER_WITH_RETURN: Decl[StaticMethod]/CurrNominal:     makeString({#x: String#})[#String#];
+    return ""
+  }
+
+  buildStringTuple {
+    ""
+    return FooStruct()
+  }.#^COMPLETE_INSTANCE_MEMBER_ON_RETURN_BUILDER^#
+  // COMPLETE_INSTANCE_MEMBER_ON_RETURN_BUILDER: Decl[InstanceVar]/CurrNominal: instanceVar[#Int#]; name=instanceVar
 }
 
 func testPatternMatching() {
@@ -125,6 +151,11 @@ func testPatternMatching() {
   @TupleBuilder<String> var x4 {
     let x: FooStruct? = FooStruct()
     guard case .#^GUARD_CASE_PATTERN_2?check=OPTIONAL_FOOSTRUCT^#some() = x {}
+  }
+
+  buildStringTuple {
+    let x: FooStruct? = FooStruct()
+    guard case .#^GUARD_CASE_PATTERN_3?check=OPTIONAL_FOOSTRUCT^#some() = x {}
   }
 }
 
@@ -333,7 +364,98 @@ func testSwitchInResultBuilder() {
       }
     }
   }
-// SWITCH_IN_RESULT_BUILDER: Begin completions, 2 items
 // SWITCH_IN_RESULT_BUILDER-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: alertDismissed[#Action#];
-// SWITCH_IN_RESULT_BUILDER-DAG: Decl[InstanceMethod]/CurrNominal/TypeRelation[Invalid]: hash({#(self): Action#})[#(into: inout Hasher) -> Void#];
+}
+
+func testCompleteIfLetInResultBuilder() {
+  func takeClosure(_ x: () -> Void) -> Int {
+    return 0
+  }
+
+  @resultBuilder struct MyResultBuilder {
+    static func buildBlock() -> Int { return 0 }
+    static func buildBlock(_ content: Int) -> Int { content }
+  }
+
+  @MyResultBuilder func test(integer: Int?) -> Int {
+    takeClosure {
+      if let #^IF_LET_IN_RESULT_BUILDER^#integer = integer {
+      }
+    }
+    // IF_LET_IN_RESULT_BUILDER: Begin completions, 1 items
+    // IF_LET_IN_RESULT_BUILDER: Decl[LocalVar]/Local:               integer[#Int?#]; name=integer
+    // IF_LET_IN_RESULT_BUILDER: End completions
+  }
+}
+
+func testOverloadedCallArgs() {
+  func overloaded(single: Int) -> Int {}
+  func overloaded(_ first: Int, second: Int) -> Int {}
+
+  @resultBuilder struct ViewBuilder {
+    static func buildBlock(_ content: Int) -> Int { content }
+  }
+
+  struct Test {
+    @ViewBuilder var body: Int {
+      overloaded(#^OVERLOADED_CALL_ARG^#, second: 1)
+      // OVERLOADED_CALL_ARG: Begin completions
+      // OVERLOADED_CALL_ARG-DAG: Pattern/Local/Flair[ArgLabels]: {#single: Int#}[#Int#]; name=single:
+      // OVERLOADED_CALL_ARG-DAG: Literal[Integer]/None/TypeRelation[Convertible]: 0[#Int#];
+      // OVERLOADED_CALL_ARG: End completions
+    }
+  }
+
+}
+
+// https://github.com/swiftlang/swift/issues/77283
+func testInForLoop(_ x: [Int]) {
+  @resultBuilder
+  struct Builder {
+    static func buildBlock<T>(_ components: T...) -> T {
+      components.first!
+    }
+    static func buildArray<T>(_ components: [T]) -> T {
+      components.first!
+    }
+  }
+  struct S {
+    init() {}
+    func baz() -> Int { 0 }
+  }
+  struct R {
+    init<T>(@Builder _ x: () -> T) {}
+  }
+  _ = R {
+    for _ in x {
+      S().#^IN_FOR_LOOP^#
+      // IN_FOR_LOOP: Decl[InstanceMethod]/CurrNominal:   baz()[#Int#]; name=baz()
+    }
+  }
+  _ = R {
+    for _ in S().#^IN_FOR_LOOP_SEQ^# {
+      // IN_FOR_LOOP_SEQ: Decl[InstanceMethod]/CurrNominal:   baz()[#Int#]; name=baz()
+    }
+  }
+}
+
+func testUnsupportedForLoop() {
+  @resultBuilder
+  struct Builder {
+    static func buildBlock<T>(_ components: T...) -> T {
+      components.first!
+    }
+  }
+
+  func foo(@Builder fn: () -> Int) {}
+
+  foo {
+    for i in [0].#^COMPLETE_IN_UNSUPPORTED_FOR^# {}
+  }
+  // COMPLETE_IN_UNSUPPORTED_FOR: Decl[InstanceVar]/Super/IsSystem: first[#Int?#]; name=first
+
+  foo {
+    for i in [0].#^COMPLETE_IN_UNSUPPORTED_FOR_2?check=COMPLETE_IN_UNSUPPORTED_FOR^# {}
+    return 0
+  }
 }

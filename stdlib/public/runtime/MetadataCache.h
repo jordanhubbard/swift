@@ -22,8 +22,10 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/STLExtras.h"
 
+#include <atomic>
 #include <condition_variable>
-#include <thread>
+#include <optional>
+#include <tuple>
 
 #ifndef SWIFT_DEBUG_RUNTIME
 #define SWIFT_DEBUG_RUNTIME 0
@@ -44,6 +46,11 @@ public:
   MetadataAllocator() = delete;
 
   void Reset() {}
+
+  /// Get the location of the allocator's initial statically allocated pool.
+  /// The return values are start and size. If there is no statically allocated
+  /// pool, the return values are NULL, 0.
+  static std::tuple<const void *, size_t> InitialPoolLocation();
 
   SWIFT_RETURNS_NONNULL SWIFT_NODISCARD
   void *Allocate(size_t size, size_t alignment);
@@ -66,6 +73,9 @@ public:
 class MetadataAllocator {
 public:
   MetadataAllocator(uint16_t tag) {}
+  static std::tuple<const void *, size_t> InitialPoolLocation() {
+    return {nullptr, 0};
+  }
   SWIFT_RETURNS_NONNULL SWIFT_NODISCARD
   void *Allocate(size_t size, size_t alignment) {
     if (alignment < sizeof(void*)) alignment = sizeof(void*);
@@ -174,7 +184,8 @@ class LockingConcurrentMapStorage {
   // TargetGenericMetadataInstantiationCache::PrivateData. On 32-bit archs, that
   // space is not large enough to accommodate a Mutex along with everything
   // else. There, use a SmallMutex to squeeze into the available space.
-  using MutexTy = std::conditional_t<sizeof(void *) == 8, Mutex, SmallMutex>;
+  using MutexTy = std::conditional_t<sizeof(void *) == 8 && sizeof(Mutex) <= 56,
+                                     Mutex, SmallMutex>;
   StableAddressConcurrentReadableHashMap<EntryType,
                                          TaggedMetadataAllocator<Tag>, MutexTy>
       Map;
@@ -296,9 +307,10 @@ public:
 
   /// If an entry already exists, await it; otherwise report failure.
   template <class KeyType, class... ArgTys>
-  llvm::Optional<Status> tryAwaitExisting(KeyType key, ArgTys &&... args) {
+  std::optional<Status> tryAwaitExisting(KeyType key, ArgTys &&...args) {
     EntryType *entry = Storage.find(key);
-    if (!entry) return None;
+    if (!entry)
+      return std::nullopt;
     return entry->await(Storage.getConcurrency(),
                         std::forward<ArgTys>(args)...);
   }
@@ -380,8 +392,8 @@ public:
   }
 
   template <class... ArgTys>
-  llvm::Optional<Status> beginAllocation(WaitQueue::Worker &worker,
-                                         ArgTys &&... args) {
+  std::optional<Status> beginAllocation(WaitQueue::Worker &worker,
+                                        ArgTys &&...args) {
 
     // Delegate to the implementation class.
     ValueType origValue =
@@ -462,7 +474,9 @@ struct GenericSignatureLayout {
       }
     }
 
+#ifndef NDEBUG
     assert(packIdx == NumPacks);
+#endif
   }
 
   size_t sizeInWords() const {
@@ -601,12 +615,28 @@ public:
     // Compare the hashes.
     if (hash() != rhs.hash()) return false;
 
+    // Fast path the case where they're bytewise identical. That's nearly always
+    // the case if the hashes are the same, and we can skip the slower deep
+    // comparison.
+    auto *adata = begin();
+    auto *bdata = rhs.begin();
+
+    auto asize = (uintptr_t)end() - (uintptr_t)adata;
+    auto bsize = (uintptr_t)rhs.end() - (uintptr_t)bdata;
+
+    // If sizes don't match, they can never be equal.
+    if (asize != bsize)
+      return false;
+
+    // If sizes match, see if the bytes match. If they do, then the contents
+    // must necessarily match. Otherwise do a deep comparison.
+    if (memcmp(adata, bdata, asize) == 0)
+      return true;
+
     // Compare the layouts.
     if (Layout != rhs.Layout) return false;
 
     // Compare the content.
-    auto *adata = begin();
-    auto *bdata = rhs.begin();
     const uintptr_t *packCounts = reinterpret_cast<const uintptr_t *>(adata);
 
     unsigned argIdx = 0;
@@ -1123,9 +1153,9 @@ public:
 
   /// Perform the allocation operation.
   template <class... Args>
-  llvm::Optional<Status> beginAllocation(MetadataWaitQueue::Worker &worker,
-                                         MetadataRequest request,
-                                         Args &&... args) {
+  std::optional<Status> beginAllocation(MetadataWaitQueue::Worker &worker,
+                                        MetadataRequest request,
+                                        Args &&...args) {
     // Returning a non-None value here will preempt initialization, so we
     // should only do it if we're reached PrivateMetadataState::Complete.
 
@@ -1147,7 +1177,7 @@ public:
 
       // Otherwise, go directly to the initialization phase.
       assert(worker.isWorkerThread());
-      return None;
+      return std::nullopt;
     }
 
     assert(worker.isWorkerThread());
@@ -1191,7 +1221,7 @@ public:
       verifyMangledNameRoundtrip(value);
 #endif
 
-    return None;
+    return std::nullopt;
   }
 
   template <class... Args>
@@ -1206,7 +1236,8 @@ public:
                              MetadataRequest request, Args &&...args) {
     // Note that we ignore the extra arguments; those are just for the
     // constructor and allocation.
-    return doInitialization(worker, request);
+    auto result = doInitialization(worker, request);
+    return result;
   }
 
 private:

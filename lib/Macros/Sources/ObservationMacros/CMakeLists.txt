@@ -11,11 +11,12 @@
 #===----------------------------------------------------------------------===#
 
 add_swift_macro_library(ObservationMacros
+  Availability.swift
+  Extensions.swift
   ObservableMacro.swift
   SWIFT_DEPENDENCIES
-    SwiftSyntax::SwiftDiagnostics
-    SwiftSyntax::SwiftOperators
-    SwiftSyntax::SwiftSyntaxBuilder
-    SwiftSyntax::SwiftSyntax
-    SwiftSyntax::SwiftSyntaxMacros
+    SwiftDiagnostics
+    SwiftSyntaxBuilder
+    SwiftSyntax
+    SwiftSyntaxMacros
 )

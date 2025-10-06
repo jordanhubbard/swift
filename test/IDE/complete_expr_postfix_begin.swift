@@ -1,4 +1,4 @@
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 //
 // Test code completion at the beginning of expr-postfix.
@@ -27,23 +27,23 @@ protocol FooProtocol {
 typealias FooTypealias = Int
 
 // Function parameter
-// COMMON-DAG: Decl[LocalVar]/Local: fooParam[#FooStruct#]{{; name=.+$}}
+// COMMON-DAG: Decl[LocalVar]/Local{{(/TypeRelation\[Convertible\])?}}: fooParam[#FooStruct#]; name=fooParam
 // Global completions
-// COMMON-DAG: Decl[Struct]/CurrModule:     FooStruct[#FooStruct#]{{; name=.+$}}
-// COMMON-DAG: Decl[Enum]/CurrModule:       FooEnum[#FooEnum#]{{; name=.+$}}
-// COMMON-DAG: Decl[Class]/CurrModule:      FooClass[#FooClass#]{{; name=.+$}}
-// COMMON-DAG: Decl[Protocol]/CurrModule/Flair[RareType]: FooProtocol[#FooProtocol#]{{; name=.+$}}
+// COMMON-DAG: Decl[Struct]/CurrModule{{(/TypeRelation\[Convertible\])?}}:     FooStruct[#FooStruct#]{{; name=.+$}}
+// COMMON-DAG: Decl[Enum]/CurrModule{{(/TypeRelation\[Convertible\])?}}:       FooEnum[#FooEnum#]{{; name=.+$}}
+// COMMON-DAG: Decl[Class]/CurrModule{{(/TypeRelation\[Convertible\])?}}:      FooClass[#FooClass#]{{; name=.+$}}
+// COMMON-DAG: Decl[Protocol]/CurrModule/Flair[RareType]{{(/TypeRelation\[Convertible\])?}}: FooProtocol[#FooProtocol#]{{; name=.+$}}
 // COMMON-DAG: Decl[TypeAlias]/CurrModule{{(/TypeRelation\[Convertible\])?}}:  FooTypealias[#Int#]{{; name=.+$}}
-// COMMON-DAG: Decl[GlobalVar]/CurrModule:  fooObject[#FooStruct#]{{; name=.+$}}
+// COMMON-DAG: Decl[GlobalVar]/CurrModule{{(/TypeRelation\[Convertible\])?}}:  fooObject[#FooStruct#]{{; name=.+$}}
 // COMMON-DAG: Keyword[try]/None: try{{; name=.+$}}
-// COMMON-DAG: Literal[Boolean]/None: true[#Bool#]{{; name=.+$}}
-// COMMON-DAG: Literal[Boolean]/None: false[#Bool#]{{; name=.+$}}
-// COMMON-DAG: Literal[Nil]/None: nil{{; name=.+$}}
-// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem:    Int8[#Int8#]{{; name=.+$}}
-// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem:    Int16[#Int16#]{{; name=.+$}}
-// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem:    Int32[#Int32#]{{; name=.+$}}
-// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem:    Int64[#Int64#]{{; name=.+$}}
-// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem:    Bool[#Bool#]{{; name=.+$}}
+// COMMON-DAG: Literal[Boolean]/None{{(/TypeRelation\[Convertible\])?}}: true[#Bool#]{{; name=.+$}}
+// COMMON-DAG: Literal[Boolean]/None{{(/TypeRelation\[Convertible\])?}}: false[#Bool#]{{; name=.+$}}
+// COMMON-DAG: Literal[Nil]/None{{(/TypeRelation\[Convertible\])?}}: nil{{.*; name=.+$}}
+// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem{{(/TypeRelation\[Convertible\])?}}:    Int8[#Int8#]{{; name=.+$}}
+// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem{{(/TypeRelation\[Convertible\])?}}:    Int16[#Int16#]{{; name=.+$}}
+// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem{{(/TypeRelation\[Convertible\])?}}:    Int32[#Int32#]{{; name=.+$}}
+// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem{{(/TypeRelation\[Convertible\])?}}:    Int64[#Int64#]{{; name=.+$}}
+// COMMON-DAG: Decl[Struct]/OtherModule[Swift]/IsSystem{{(/TypeRelation\[Convertible\])?}}:    Bool[#Bool#]{{; name=.+$}}
 
 // NO_SELF-NOT: {{[[:<:]][Ss]elf[[:>:]]}}
 
@@ -63,7 +63,7 @@ func testExprPostfixBegin3(fooParam: FooStruct) {
 }
 
 func testExprPostfixBegin4(fooParam: FooStruct) {
-  "\(#^EXPR_POSTFIX_BEGIN_4?xfail=FIXME-64812321;check=COMMON^#)"
+  "\(#^EXPR_POSTFIX_BEGIN_4?check=COMMON^#)"
 }
 
 func testExprPostfixBegin5(fooParam: FooStruct) {

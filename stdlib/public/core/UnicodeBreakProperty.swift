@@ -13,7 +13,7 @@
 import SwiftShims
 
 extension Unicode {
-  internal enum _GraphemeBreakProperty {
+  internal enum _GraphemeBreakProperty: Sendable {
     case any
     case control
     case extend
@@ -28,6 +28,7 @@ extension Unicode {
     case v
     case zwj
 
+    @inline(__always)
     init(from scalar: Unicode.Scalar) {
       switch scalar.value {
       // Some fast paths for ascii characters...
@@ -85,7 +86,7 @@ extension Unicode {
 }
 
 extension Unicode {
-  internal enum _WordBreakProperty {
+  internal enum _WordBreakProperty: UInt8, Sendable {
     case aLetter
     case any
     case doubleQuote
@@ -104,8 +105,8 @@ extension Unicode {
     case singleQuote
     case wSegSpace
     case zwj
-    
-    init(from scalar: Unicode.Scalar) {
+
+    internal init(from scalar: Unicode.Scalar) {
       switch scalar.value {
       case 0xA ... 0xD,
            0x85,
@@ -121,7 +122,7 @@ extension Unicode {
         self = .regionalIndicator
       default:
         let rawValue = _swift_stdlib_getWordBreakProperty(scalar.value)
-        
+
         switch rawValue {
         case 0:
           self = .extend

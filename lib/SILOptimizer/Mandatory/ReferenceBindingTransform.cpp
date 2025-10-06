@@ -13,6 +13,7 @@
 #define DEBUG_TYPE "sil-reference-binding-transform"
 
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/FieldSensitivePrunedLiveness.h"
@@ -57,6 +58,30 @@ static void diagnose(SILInstruction *inst, Diag<T...> diag, U &&...args) {
 }
 
 //===----------------------------------------------------------------------===//
+//                              MARK: Utilities
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+struct RAIILLVMDebug {
+  StringRef str;
+
+  RAIILLVMDebug(StringRef str) : str(str) {
+    LLVM_DEBUG(llvm::dbgs() << "===>>> Starting " << str << '\n');
+  }
+
+  RAIILLVMDebug(StringRef str, SILInstruction *u) : str(str) {
+    LLVM_DEBUG(llvm::dbgs() << "===>>> Starting " << str << ":" << *u);
+  }
+
+  ~RAIILLVMDebug() {
+    LLVM_DEBUG(llvm::dbgs() << "===<<< Completed " << str << '\n');
+  }
+};
+
+} // namespace
+
+//===----------------------------------------------------------------------===//
 //                         MARK: Gather Address Uses
 //===----------------------------------------------------------------------===//
 
@@ -86,7 +111,8 @@ struct ValidateAllUsesWithinLiveness : public AccessUseVisitor {
     if (isa<EndAccessInst>(user))
       return true;
 
-    if (liveness.isWithinBoundary(user)) {
+    if (liveness.isWithinBoundary(user, /*deadEndBlocks=*/nullptr)) {
+      LLVM_DEBUG(llvm::dbgs() << "User in boundary: " << *user);
       diagnose(op->getUser(),
                diag::sil_referencebinding_src_used_within_inout_scope);
       diagnose(markInst, diag::sil_referencebinding_inout_binding_here);
@@ -103,9 +129,186 @@ struct ValidateAllUsesWithinLiveness : public AccessUseVisitor {
 //                              MARK: Transform
 //===----------------------------------------------------------------------===//
 
+namespace {
+
+struct DiagnosticEmitter {
+  unsigned numDiagnostics = 0;
+
+  void diagnoseUnknownPattern(MarkUnresolvedReferenceBindingInst *mark) {
+    diagnose(mark, diag::sil_referencebinding_unknown_pattern);
+    ++numDiagnostics;
+  }
+};
+
+} // namespace
+
+namespace {
+
+class ReferenceBindingProcessor {
+  MarkUnresolvedReferenceBindingInst *mark;
+  DiagnosticEmitter &diagnosticEmitter;
+
+public:
+  ReferenceBindingProcessor(MarkUnresolvedReferenceBindingInst *mark,
+                            DiagnosticEmitter &diagnosticEmitter)
+      : mark(mark), diagnosticEmitter(diagnosticEmitter) {}
+
+  bool process() &&;
+
+private:
+  CopyAddrInst *findInit();
+};
+
+} // namespace
+
+CopyAddrInst *ReferenceBindingProcessor::findInit() {
+  RAIILLVMDebug llvmDebug("Find initialization");
+
+  // We rely on the following semantics to find our initialization:
+  //
+  // 1. SILGen always initializes values completely.
+  // 2. Boxes always have operations guarded /except/ for their
+  //    initialization.
+  // 3. We force inout to always be initialized once.
+  //
+  // Thus to find our initialization, we need to find a project_box use of our
+  // target that directly initializes the value.
+  CopyAddrInst *initInst = nullptr;
+  InstructionWorklist worklist(mark->getFunction());
+  for (auto *user : mark->getUsers()) {
+    worklist.push(user);
+  }
+  while (auto *user = worklist.pop()) {
+    LLVM_DEBUG(llvm::dbgs() << "Visiting use: " << *user);
+
+    auto *bbi = dyn_cast<BeginBorrowInst>(user);
+    if (bbi && bbi->isFromVarDecl()) {
+      for (auto *user : bbi->getUsers()) {
+        worklist.push(user);
+      }
+      continue;
+    }
+    auto *pbi = dyn_cast<ProjectBoxInst>(user);
+    if (!pbi)
+      continue;
+    LLVM_DEBUG(llvm::dbgs() << "    Found project_box! Visiting pbi uses!\n");
+
+    for (auto *pbiUse : pbi->getUses()) {
+      LLVM_DEBUG(llvm::dbgs() << "    Pbi Use: " << *pbiUse->getUser());
+      auto *cai = dyn_cast<CopyAddrInst>(pbiUse->getUser());
+      if (!cai || cai->getDest() != pbi) {
+        LLVM_DEBUG(llvm::dbgs() << "    Either not a copy_addr or dest is "
+                                   "not the project_box! Skipping!\n");
+        continue;
+      }
+
+      if (initInst || !cai->isInitializationOfDest() || cai->isTakeOfSrc()) {
+        LLVM_DEBUG(
+            llvm::dbgs()
+            << "    Either already found an init inst or is an assign of a "
+               "dest or a take of src... emitting unknown pattern!\n");
+        diagnosticEmitter.diagnoseUnknownPattern(mark);
+        return nullptr;
+      }
+      assert(!initInst && "Init twice?!");
+      assert(!cai->isTakeOfSrc());
+      initInst = cai;
+      LLVM_DEBUG(llvm::dbgs()
+                 << "    Found our init! Checking for other inits!\n");
+    }
+  }
+  LLVM_DEBUG(llvm::dbgs() << "Final Init: " << *initInst);
+  return initInst;
+}
+
+bool ReferenceBindingProcessor::process() && {
+  // Find a single initialization of our inout parameter. See helper function
+  // for the information about the invariants we rely upon.
+  auto *initInst = findInit();
+  if (!initInst)
+    return false;
+
+  // Ok, we have our initialization. Now gather our destroys of our value and
+  // initialize an SSAPrunedLiveness, using our initInst as our def.
+  auto *fn = mark->getFunction();
+
+  SmallVector<SILBasicBlock *, 8> discoveredBlocks;
+  SSAPrunedLiveness liveness(fn, &discoveredBlocks);
+  StackList<DestroyValueInst *> destroyValueInst(fn);
+  {
+    RAIILLVMDebug llvmDebug("Initializing liveness!");
+
+    liveness.initializeDef(mark);
+    for (auto *consume : mark->getConsumingUses()) {
+      // Make sure that the destroy_value is not within the boundary.
+      auto *dai = dyn_cast<DestroyValueInst>(consume->getUser());
+      if (!dai) {
+        LLVM_DEBUG(llvm::dbgs() << "    Found non destroy value consuming use! "
+                                   "Emitting unknown pattern: "
+                                << *dai);
+        diagnosticEmitter.diagnoseUnknownPattern(mark);
+        return false;
+      }
+
+      LLVM_DEBUG(llvm::dbgs() << "    Found destroy_value use: " << *dai);
+      liveness.updateForUse(dai, true /*is lifetime ending*/);
+      destroyValueInst.push_back(dai);
+    }
+  }
+
+  // Now make sure that our source address doesn't have any uses within the
+  // lifetime of our box. Or emit an error. Since sema always ensures that we
+  // have an lvalue, we should always find an access scope.
+  BeginAccessInst *bai = nullptr;
+  StackList<SILInstruction *> endAccesses(fn);
+  {
+    auto accessPathWithBase =
+        AccessPathWithBase::computeInScope(initInst->getSrc());
+    assert(accessPathWithBase.base);
+
+    // Then search up for a single begin_access from src to find our
+    // begin_access we need to fix. We know that it will always be directly on
+    // the type since we only allow for inout today to be on decl_ref expr. This
+    // will change in the future. Once we find that begin_access, we need to
+    // convert it to a modify and expand it.
+    bai = cast<BeginAccessInst>(accessPathWithBase.base);
+    assert(bai->getAccessKind() == SILAccessKind::Read);
+    for (auto *eai : bai->getEndAccesses())
+      endAccesses.push_back(eai);
+
+    {
+      ValidateAllUsesWithinLiveness initGatherer(liveness, mark, initInst);
+      if (!visitAccessPathBaseUses(initGatherer, accessPathWithBase, fn)) {
+        diagnosticEmitter.diagnoseUnknownPattern(mark);
+        return false;
+      }
+    }
+  }
+
+  initInst->setIsTakeOfSrc(IsTake);
+  bai->setAccessKind(SILAccessKind::Modify);
+
+  while (!endAccesses.empty())
+    endAccesses.pop_back_val()->eraseFromParent();
+
+  while (!destroyValueInst.empty()) {
+    auto *consume = destroyValueInst.pop_back_val();
+    SILBuilderWithScope builder(consume);
+    auto *pbi = builder.createProjectBox(consume->getLoc(), mark, 0);
+    builder.createCopyAddr(consume->getLoc(), pbi, initInst->getSrc(), IsTake,
+                           IsInitialization);
+    builder.createEndAccess(consume->getLoc(), bai, false /*aborted*/);
+    builder.createDeallocBox(consume->getLoc(), mark);
+    consume->eraseFromParent();
+  }
+
+  return true;
+}
+
 static bool runTransform(SILFunction *fn) {
   bool madeChange = false;
 
+  // First go through and find all of our mark_unresolved_reference_binding.
   StackList<MarkUnresolvedReferenceBindingInst *> targets(fn);
   for (auto &block : *fn) {
     for (auto &ii : block) {
@@ -114,120 +317,17 @@ static bool runTransform(SILFunction *fn) {
     }
   }
 
-  bool emittedError = false;
+  DiagnosticEmitter emitter;
   while (!targets.empty()) {
     auto *mark = targets.pop_back_val();
-    SWIFT_DEFER {
-      mark->replaceAllUsesWith(mark->getOperand());
-      mark->eraseFromParent();
-      madeChange = true;
-    };
 
-    // We rely on the following semantics to find our initialization:
-    //
-    // 1. SILGen always initializes values completely.
-    // 2. Boxes always have operations guarded /except/ for their
-    //    initialization.
-    // 3. We force inout to always be initialized once.
-    //
-    // Thus to find our initialization, we need to find a project_box use of our
-    // target that directly initializes the value.
-    CopyAddrInst *initInst = nullptr;
-    for (auto *use : mark->getUses()) {
-      if (auto *pbi = dyn_cast<ProjectBoxInst>(use->getUser())) {
-        for (auto *use : pbi->getUses()) {
-          if (auto *cai = dyn_cast<CopyAddrInst>(use->getUser())) {
-            if (cai->getDest() == pbi) {
-              if (initInst || !cai->isInitializationOfDest() ||
-                  cai->isTakeOfSrc()) {
-                emittedError = true;
-                diagnose(mark, diag::sil_referencebinding_unknown_pattern);
-                break;
-              }
-              assert(!initInst && "Init twice?!");
-              assert(!cai->isTakeOfSrc());
-              initInst = cai;
-              continue;
-            }
-          }
-        }
+    LLVM_DEBUG(llvm::dbgs() << "===> Visiting mark: " << *mark);
+    ReferenceBindingProcessor processor{mark, emitter};
+    madeChange |= std::move(processor).process();
 
-        if (emittedError)
-          break;
-      }
-    }
-
-    if (emittedError)
-      continue;
-    assert(initInst && "Failed to find single initialization");
-
-    // Ok, we have our initialization. Now gather our destroys of our value and
-    // initialize an SSAPrunedLiveness, using our initInst as our def.
-    SmallVector<SILBasicBlock *, 8> discoveredBlocks;
-    SSAPrunedLiveness liveness(fn, &discoveredBlocks);
-    StackList<DestroyValueInst *> destroyValueInst(fn);
-    liveness.initializeDef(mark);
-    for (auto *consume : mark->getConsumingUses()) {
-      // Make sure that the destroy_value is not within the boundary.
-      auto *dai = dyn_cast<DestroyValueInst>(consume->getUser());
-      if (!dai) {
-        emittedError = true;
-        diagnose(mark, diag::sil_referencebinding_unknown_pattern);
-        break;
-      }
-
-      liveness.updateForUse(dai, true /*is lifetime ending*/);
-      destroyValueInst.push_back(dai);
-    }
-    if (emittedError)
-      continue;
-
-    // Now make sure that our source address doesn't have any uses within the
-    // lifetime of our box. Or emit an error.
-    auto accessPathWithBase = AccessPathWithBase::compute(initInst->getSrc());
-    assert(accessPathWithBase.base);
-
-    // Then search up for a single begin_access from src to find our
-    // begin_access we need to fix. We know that it will always be directly on
-    // the type since we only allow for inout today to be on decl_ref expr. This
-    // will change in the future. Once we find that begin_access, we need to
-    // convert it to a modify and expand it.
-    auto *bai = cast<BeginAccessInst>(initInst->getSrc());
-    assert(bai->getAccessKind() == SILAccessKind::Read);
-    StackList<SILInstruction *> endAccesses(fn);
-    for (auto *eai : bai->getEndAccesses())
-      endAccesses.push_back(eai);
-
-    {
-      ValidateAllUsesWithinLiveness initGatherer(liveness, mark, initInst);
-      if (!visitAccessPathBaseUses(initGatherer, accessPathWithBase, fn)) {
-        emittedError = true;
-        diagnose(mark, diag::sil_referencebinding_unknown_pattern);
-      }
-      emittedError |= initGatherer.emittedDiagnostic;
-    }
-    if (emittedError)
-      continue;
-
-    initInst->setIsTakeOfSrc(IsTake);
-    bai->setAccessKind(SILAccessKind::Modify);
+    mark->replaceAllUsesWith(mark->getOperand());
+    mark->eraseFromParent();
     madeChange = true;
-
-    while (!endAccesses.empty())
-      endAccesses.pop_back_val()->eraseFromParent();
-
-    {
-      while (!destroyValueInst.empty()) {
-        auto *consume = destroyValueInst.pop_back_val();
-        SILBuilderWithScope builder(consume);
-        auto *pbi = builder.createProjectBox(consume->getLoc(), mark, 0);
-        builder.createCopyAddr(consume->getLoc(), pbi, initInst->getSrc(),
-                               IsTake, IsInitialization);
-        builder.createEndAccess(consume->getLoc(), bai, false /*aborted*/);
-        builder.createDeallocBox(consume->getLoc(), mark);
-        consume->eraseFromParent();
-      }
-    }
   }
 
   return madeChange;
@@ -247,6 +347,8 @@ struct ReferenceBindingTransformPass : SILFunctionTransform {
     if (!fn->getASTContext().LangOpts.hasFeature(Feature::ReferenceBindings))
       return;
 
+    LLVM_DEBUG(llvm::dbgs()
+               << "!!! === RefBindingTransform: " << fn->getName() << '\n');
     if (runTransform(fn)) {
       invalidateAnalysis(SILAnalysis::Instructions);
     }

@@ -10,9 +10,8 @@
 #define LLVM_ADT_ARRAYREF_H
 
 #include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/None.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/Compiler.h"
 #include <algorithm>
 #include <array>
@@ -21,6 +20,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <type_traits>
 #include <vector>
 
@@ -69,8 +69,8 @@ namespace llvm {
     /// Construct an empty ArrayRef.
     /*implicit*/ ArrayRef() = default;
 
-    /// Construct an empty ArrayRef from None.
-    /*implicit*/ ArrayRef(NoneType) {}
+    /// Construct an empty ArrayRef from std::nullopt.
+    /*implicit*/ ArrayRef(std::nullopt_t) {}
 
     /// Construct an ArrayRef from a single element.
     /*implicit*/ ArrayRef(const T &OneElt)
@@ -322,8 +322,8 @@ namespace llvm {
     /// Construct an empty MutableArrayRef.
     /*implicit*/ MutableArrayRef() = default;
 
-    /// Construct an empty MutableArrayRef from None.
-    /*implicit*/ MutableArrayRef(NoneType) : ArrayRef<T>() {}
+    /// Construct an empty MutableArrayRef from std::nullopt.
+    /*implicit*/ MutableArrayRef(std::nullopt_t) : ArrayRef<T>() {}
 
     /// Construct a MutableArrayRef from a single element.
     /*implicit*/ MutableArrayRef(T &OneElt) : ArrayRef<T>(OneElt) {}
@@ -468,6 +468,28 @@ namespace llvm {
 
     ~OwningArrayRef() { delete[] this->data(); }
   };
+
+  /// C++17 ArrayRef deduction guides
+  template <typename T>
+  ArrayRef(const T &) -> ArrayRef<T>;
+  template <typename T>
+  ArrayRef(const T *, size_t) -> ArrayRef<T>;
+  template <typename T>
+  ArrayRef(const T *, const T *) -> ArrayRef<T>;
+  template <typename T>
+  ArrayRef(const SmallVectorImpl<T> &Vec) -> ArrayRef<T>;
+  template <typename T, unsigned N>
+  ArrayRef(const SmallVector<T, N> &Vec) -> ArrayRef<T>;
+  template <typename T, typename A>
+  ArrayRef(const std::vector<T, A> &) -> ArrayRef<T>;
+  template <typename T, std::size_t N>
+  ArrayRef(const std::array<T, N> &Vec) -> ArrayRef<T>;
+  template <typename T>
+  ArrayRef(const ArrayRef<T> &Vec) -> ArrayRef<T>;
+  template <typename T>
+  ArrayRef(ArrayRef<T> &Vec) -> ArrayRef<T>;
+  template <typename T, size_t N>
+  ArrayRef(const T (&Arr)[N]) -> ArrayRef<T>;
 
   /// @name ArrayRef Convenience constructors
   /// @{

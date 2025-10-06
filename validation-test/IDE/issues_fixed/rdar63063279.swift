@@ -1,5 +1,4 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 enum A {
     case one, two
@@ -62,4 +61,4 @@ D().b(b: .#^B_5?check=B^#)
 // B: Begin completions, 3 items
 // B-DAG: Decl[Constructor]/CurrNominal/TypeRelation[Convertible]: init({#(value): T#})[#B<T>#]; name=init(:)
 // B-DAG: Decl[StaticMethod]/CurrNominal/TypeRelation[Convertible]: void()[#B<Void>#]; name=void()
-// B-DAG: Decl[StaticMethod]/CurrNominal:     data({#(data): <<error type>>#})[#<<error type>>#]; name=data(:)
+// B-DAG: Decl[StaticMethod]/CurrNominal:     data({#(data): _#})[#_#]; name=data(:)

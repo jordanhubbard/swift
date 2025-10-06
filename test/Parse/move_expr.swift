@@ -2,7 +2,7 @@
 
 var global: Int = 5
 func testGlobal() {
-    let _ = consume global
+    let _ = consume global // expected-warning {{'consume' applied to bitwise-copyable type 'Int' has no effect}}
 }
 
 func testLet() {
@@ -76,8 +76,27 @@ struct Foo {
 
     func consumePropertyWrapper() {
         // should still parse, even if it doesn't semantically work out
-        _ = consume wrapperTest // expected-error{{can only be applied to lvalues}}
-        _ = consume _wrapperTest // expected-error{{can only be applied to lvalues}}
-        _ = consume $wrapperTest // expected-error{{can only be applied to lvalues}}
+        _ = consume wrapperTest // expected-error{{'consume' can only be used to partially consume storage of a noncopyable type}}
+        _ = consume _wrapperTest // expected-error{{'consume' can only be used to partially consume storage of a noncopyable type}}
+        _ = consume $wrapperTest // expected-error{{'consume' can only be used to partially consume storage of a noncopyable type}}
     }
+}
+
+func testParseConsumeWithDollarIdentifier() {
+  class Klass {}
+  let f: (Klass) -> () = {
+    let _ = consume $0
+  }
+  _ = f
+}
+
+class ParentKlass {}
+class ChildKlass : ParentKlass {}
+
+func testAsBindingVariableInSwitch(_ x: ChildKlass) {
+  switch x {
+  case let consume as ParentKlass:
+    _ = consume
+    break
+  }
 }

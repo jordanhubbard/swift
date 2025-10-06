@@ -1,4 +1,5 @@
 import Swift
+import CTypes
 
 public class SimpleClass {
     public let x: Int
@@ -39,6 +40,34 @@ public struct Simple {
     }
 }
 
+public struct CTypeAligned {
+    let x = BigAlignment()
+    let y: SimpleClass
+
+    public init(_ y: SimpleClass) {
+        self.y = y
+    }
+}
+
+public struct CTypeUnderAligned {
+    let w: Int32 = 0
+    let x: UnderAligned? = UnderAligned()
+    let y: SimpleClass
+
+    public init(_ y: SimpleClass) {
+        self.y = y
+    }
+}
+
+public struct GenericStruct<T> {
+    let x: Int = 0
+    let y: T
+
+    public init(_ y: T) {
+        self.y = y
+    }
+}
+
 public class GenericClass<T> {
     let x: T
 
@@ -48,17 +77,17 @@ public class GenericClass<T> {
 }
 
 public struct GenericBig<T> {
-    let x: T   
-    let x1: T  
-    let x2: T  
-    let x3: T  
-    let x4: T  
-    let x5: T  
-    let x6: T  
-    let x7: T  
-    let x8: T  
-    let x9: T  
-    let x10: T 
+    let x: T
+    let x1: T
+    let x2: T
+    let x3: T
+    let x4: T
+    let x5: T
+    let x6: T
+    let x7: T
+    let x8: T
+    let x9: T
+    let x10: T
 
     public init(x: T) {
         self.x = x
@@ -123,6 +152,11 @@ public struct ExistentialWrapper {
     public init(x: any SomeProtocol) {
         self.x = x
     }
+}
+
+@inline(never)
+public func createExistentialWrapper(_ x: any SomeProtocol) -> ExistentialWrapper {
+    return ExistentialWrapper(x: x)
 }
 
 public protocol SomeClassProtocol: AnyObject {}
@@ -218,6 +252,32 @@ public struct Recursive<T> {
     }
 }
 
+public protocol A {}
+public protocol B {}
+public protocol C {}
+
+public struct MultiProtocolExistentialWrapper {
+    let x: Int = 0
+    let y: any (A&B&C)
+    let z: AnyObject
+
+    public init(y: any (A&B&C), z: AnyObject) {
+        self.y = y
+        self.z = z
+    }
+}
+
+public struct AnyWrapper {
+    let x: Int = 0
+    let y: Any
+    let z: AnyObject
+
+    public init(y: Any, z: AnyObject) {
+        self.y = y
+        self.z = z
+    }
+}
+
 #if os(macOS)
 import Foundation
 
@@ -271,14 +331,52 @@ public struct Wrapper<T> {
     }
 }
 
-struct InternalGeneric<T> {
-    let x: T
+public struct NestedWrapper<T> {
+    public let x: Wrapper<T>
+    public let y: Wrapper<T>
+
+    public init(x: Wrapper<T>, y: Wrapper<T>) {
+        self.x = x
+        self.y = y
+    }
+}
+
+struct InternalGeneric<T: ~Copyable>: ~Copyable {
     let y: Int
+    let x: T
+}
+
+extension InternalGeneric: Copyable where T: Copyable {}
+
+public enum SinglePayloadSimpleClassEnum {
+    case empty0
+    case empty1
+    case empty2
+    case empty3
+    case empty4
+    case empty5
+    case empty6
+    case nonEmpty(SimpleClass)
+}
+
+public struct ContainsSinglePayloadSimpleClassEnum {
+    public let x: SinglePayloadSimpleClassEnum
+    public let y: AnyObject
+
+    public init(x: SinglePayloadSimpleClassEnum, y: AnyObject) {
+        self.x = x
+        self.y = y
+    }
+}
+
+public enum TestOptional<T> {
+    case empty
+    case nonEmpty(T)
 }
 
 public enum SinglePayloadEnum<T> {
     case empty
-    case nonEmpty(T?)
+    case nonEmpty(Int, T?)
 }
 
 public struct SinglePayloadEnumWrapper<T> {
@@ -296,6 +394,7 @@ public enum MultiPayloadEnum {
     case b(Int, String)
     case c(Bool)
     case d
+    case e(SimpleClass)
 }
 
 public struct MultiPayloadEnumWrapper {
@@ -308,6 +407,62 @@ public struct MultiPayloadEnumWrapper {
     }
 }
 
+public enum MultiPayloadEnumMultiLarge {
+    case empty
+    case nonEmpty(Int, SimpleClass, Int, SimpleClass, Int, Bool, SimpleClass, Bool, SimpleClass, Bool)
+    case nonEmpty2(SimpleClass, Int, Int, SimpleClass, Int, Bool, SimpleClass, Bool, SimpleClass, Bool)
+}
+
+public struct MixedEnumWrapper {
+    let x: SinglePayloadSimpleClassEnum
+    let y: MultiPayloadEnum
+
+    public init(x: SinglePayloadSimpleClassEnum, y: MultiPayloadEnum) {
+        self.x = x
+        self.y = y
+    }
+}
+
+public struct MixedEnumWrapperWrapperGeneric<T> {
+    let x: MixedEnumWrapper
+    let y: T
+
+    public init(x: MixedEnumWrapper, y: T) {
+        self.x = x
+        self.y = y
+    }
+}
+
+public struct SinglePayloadEnumExtraTagBytesWrapper {
+    let x: SinglePayloadEnumExtraTagBytes
+    let y: SimpleClass
+
+    public init(x: SinglePayloadEnumExtraTagBytes, y: SimpleClass) {
+        self.x = x
+        self.y = y
+    }
+}
+
+public struct NotBitwiseTakableBridge<T> {
+    let x: Int = 0
+    let y: [T]
+    weak var z: AnyObject? = nil
+
+    public init(_ y: [T]) {
+        self.y = y
+    }
+}
+
+public enum SinglePayloadEnumExtraTagBytes {
+    case empty0
+    case empty1
+    case empty2
+    case empty3
+    case empty4
+    case empty5
+    case empty6
+    case nonEmpty(WeakNativeWrapper)
+}
 
 public struct ComplexNesting<A, B, C, D> {
     let pre: Filler = Filler()
@@ -365,44 +520,265 @@ public struct ComplexNesting<A, B, C, D> {
     }
 }
 
+public enum SinglePayloadAnyHashableEnum {
+    case empty0
+    case empty1
+    case empty2
+    case empty3
+    case nonEmpty(AnyHashable)
+}
+
+internal enum InternalEnum {
+  case a(Int, AnyObject)
+  case b(Int)
+  case c(String)
+}
+
+public struct InternalEnumWrapper {
+  internal let x: InternalEnum
+  internal let y: Int = 32
+
+  public init(x: AnyObject) {
+    self.x = .a(23, x)
+  }
+}
+
+public enum SingletonEnum<T> {
+    case only(T, Int)
+}
+
+public enum SinglePayloadEnumManyXI {
+    case empty0
+    case empty1
+    case empty2
+    case empty3
+    case empty4
+    case empty5
+    case empty6
+    case nonEmpty(Builtin.Int63, SimpleClass)
+}
+
+public struct PrespecializedStruct<T> {
+    let y: Int = 0
+    let x: T
+    let z: T
+
+    public init(x: T) {
+        self.x = x
+        self.z = x
+    }
+}
+
+public enum PrespecializedSingletonEnum<T> {
+    case only(Int, T)
+}
+
+public enum PrespecializedSinglePayloadEnum<T> {
+    case empty0
+    case empty1
+    case nonEmpty(Int, T)
+}
+
+public enum PrespecializedMultiPayloadEnum<T> {
+    case empty0
+    case empty1
+    case nonEmpty0(Int, T)
+    case nonEmpty1(T, Int)
+}
+
+public enum SinglePayloadEnumExistential {
+    case a(SomeProtocol, AnyObject)
+    case b
+    case c
+}
+
+public struct TupleLargeAlignment<T> {
+    let x: AnyObject? = nil
+    let x1: AnyObject? = nil
+    let x2: AnyObject? = nil
+    let x3: (T, SIMD4<Int64>)
+
+    public init(_ t: T) {
+        self.x3 = (t, .init(Int64(Int32.max) + 32, Int64(Int32.max) + 32, Int64(Int32.max) + 32, Int64(Int32.max) + 32))
+    }
+}
+
+public enum NestedMultiPayloadInner {
+    case a(UInt)
+    case b(AnyObject)
+    case c(AnyObject)
+}
+
+public enum NestedMultiPayloadOuter {
+    case a(NestedMultiPayloadInner)
+    case b(NestedMultiPayloadInner)
+    case c(NestedMultiPayloadInner)
+}
+
+public enum MultiPayloadError {
+    case empty
+    case error1(Int, Error)
+    case error2(Int, Error)
+    case error3(Int, Error)
+}
+
+public enum TwoPayloadInner {
+    case x(Int)
+    case y(AnyObject)
+}
+
+public enum TwoPayloadOuter {
+    case x(Int)
+    case y(TwoPayloadInner)
+}
+
+public enum OneExtraTagValue {
+    public enum E0 {
+        case a(Bool)
+        case b(Bool)
+    }
+
+    public enum E1 {
+        case a(E0)
+        case b(Bool)
+    }
+    public enum E2 {
+        case a(E1)
+        case b(Bool)
+    }
+    public enum E3 {
+        case a(E2)
+        case b(Bool)
+    }
+
+    public enum E4 {
+        case a(E3)
+        case b(Bool)
+    }
+
+    case x0(E4, Int8, Int16, Int32)
+    case x1(E4, Int8, Int16, Int32)
+    case x2(E4, Int8, Int16, Int32)
+    case x3(E4, Int8, Int16, Int32)
+    case y(SimpleClass)
+    case z
+}
+
+public enum ErrorWrapper {
+    case x(Error)
+    case y(Error)
+}
+
+public enum MultiPayloadAnyObject {
+    case x(AnyObject)
+    case y(AnyObject)
+    case z(AnyObject)
+}
+
+public struct NonCopyableGenericStruct<T>: ~Copyable {
+    let x: Int
+    let y: T
+
+    public init(x: Int, y: T) {
+        self.x = x
+        self.y = y
+    }
+}
+
+public enum NonCopyableGenericEnum<T>: ~Copyable {
+    case x(Int, T?)
+    case y(Int)
+}
 
 @inline(never)
-public func testAssign<T>(_ ptr: UnsafeMutablePointer<T>, from x: T) {
+public func consume<T>(_ x: T.Type) {
+    withExtendedLifetime(x) {}
+}
+public func preSpec() {
+    consume(PrespecializedStruct<AnyObject>.self)
+    consume(PrespecializedStruct<SimpleClass>.self)
+    consume(PrespecializedStruct<Int>.self)
+
+    consume(PrespecializedSingletonEnum<AnyObject>.self)
+    consume(PrespecializedSingletonEnum<SimpleClass>.self)
+    consume(PrespecializedSingletonEnum<Int>.self)
+
+    consume(PrespecializedSinglePayloadEnum<AnyObject>.self)
+    consume(PrespecializedSinglePayloadEnum<SimpleClass>.self)
+    consume(PrespecializedSinglePayloadEnum<Int>.self)
+
+    consume(PrespecializedMultiPayloadEnum<AnyObject>.self)
+    consume(PrespecializedMultiPayloadEnum<SimpleClass>.self)
+    consume(PrespecializedMultiPayloadEnum<Int>.self)
+}
+
+@inline(never)
+public func testAssign<T: ~Copyable>(_ ptr: UnsafeMutablePointer<T>, from x: consuming T) {
     ptr.pointee = x
 }
 
 @inline(never)
-public func testInit<T>(_ ptr: UnsafeMutablePointer<T>, to x: T) {
+public func testAssignCopy<T>(_ ptr: UnsafeMutablePointer<T>, from x: inout T) {
+    ptr.update(from: &x, count: 1)
+}
+
+@inline(never)
+public func testInit<T: ~Copyable>(_ ptr: UnsafeMutablePointer<T>, to x: consuming T) {
     ptr.initialize(to: x)
 }
 
 @inline(never)
-public func testDestroy<T>(_ ptr: UnsafeMutablePointer<T>) {
-    ptr.deinitialize(count: 1)
+public func testInitTake<T>(_ ptr: UnsafeMutablePointer<T>, to x: consuming T) {
+    ptr.initialize(to: consume x)
 }
 
 @inline(never)
-public func allocateInternalGenericPtr<T>(of tpe: T.Type) -> UnsafeMutableRawPointer {
+public func testDestroy<T: ~Copyable>(_ ptr: UnsafeMutablePointer<T>) {
+    _ = ptr.move()
+}
+
+@inline(never)
+public func allocateInternalGenericPtr<T: ~Copyable>(of tpe: T.Type) -> UnsafeMutableRawPointer {
     return UnsafeMutableRawPointer(
         UnsafeMutablePointer<InternalGeneric<T>>.allocate(capacity: 1))
 }
 
 @inline(never)
-public func testGenericAssign<T>(_ ptr: __owned UnsafeMutableRawPointer, from x: T) {
+public func testGenericAssign<T: ~Copyable>(_ ptr: __owned UnsafeMutableRawPointer, from x: consuming T) {
     let ptr = ptr.assumingMemoryBound(to: InternalGeneric<T>.self)
-    let x = InternalGeneric(x: x, y: 23)
+    let x = InternalGeneric(y: 23, x: x)
     testAssign(ptr, from: x)
 }
 
 @inline(never)
-public func testGenericInit<T>(_ ptr: __owned UnsafeMutableRawPointer, to x: T) {
+public func testGenericInit<T: ~Copyable>(_ ptr: __owned UnsafeMutableRawPointer, to x: consuming T) {
     let ptr = ptr.assumingMemoryBound(to: InternalGeneric<T>.self)
-    let x = InternalGeneric(x: x, y: 23)
+    let x = InternalGeneric(y: 23, x: x)
     testInit(ptr, to: x)
 }
 
 @inline(never)
-public func testGenericDestroy<T>(_ ptr: __owned UnsafeMutableRawPointer, of tpe: T.Type) {
-    let ptr = ptr.assumingMemoryBound(to: tpe)
+public func testGenericDestroy<T: ~Copyable>(_ ptr: __owned UnsafeMutableRawPointer, of tpe: T.Type) {
+    let ptr = ptr.assumingMemoryBound(to: InternalGeneric<T>.self)
     testDestroy(ptr)
+}
+
+@inline(never)
+public func testGenericArrayDestroy<T>(_ buffer: UnsafeMutableBufferPointer<T>) {
+    buffer.deinitialize()
+}
+
+@inline(never)
+public func testGenericArrayDestroy<T: ~Copyable>(_ buffer: UnsafeMutableBufferPointer<T>) {
+    buffer.deinitialize()
+}
+
+@inline(never)
+public func testGenericArrayInitWithCopy<T>(dest: UnsafeMutableBufferPointer<T>, src: UnsafeMutableBufferPointer<T>) {
+    _ = dest.initialize(fromContentsOf: src)
+}
+
+@inline(never)
+public func testGenericArrayAssignWithCopy<T>(dest: UnsafeMutableBufferPointer<T>, src: UnsafeMutableBufferPointer<T>) {
+    _ = dest.update(fromContentsOf: src)
 }

@@ -1,7 +1,6 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
-// EMTPY: Token
+// EMPTY: Token
 // EMPTY-NOT: Begin completions
 
 //===--- Helper types that are used in this test
@@ -316,7 +315,7 @@ class C {
     do {
     } catch {
       error.#^ERROR_IN_CLOSURE_IN_INITIALIZER^#
-// ERROR_IN_CLOSURE_IN_INITIALIZER-DAG: Keyword[self]/CurrNominal:          self[#Error#]; name=self
+// ERROR_IN_CLOSURE_IN_INITIALIZER-DAG: Keyword[self]/CurrNominal:          self[#any Error#]; name=self
 // ERROR_IN_CLOSURE_IN_INITIALIZER-DAG: Decl[InstanceVar]/CurrNominal:      myErrorNumber[#Int#]; name=myErrorNumber
     }
     return ""
@@ -336,22 +335,22 @@ var foo = {
 func testWithMemoryRebound(_ bar: UnsafePointer<UInt64>) {
     _ = bar.withMemoryRebound(to: Int64.self, capacity: 3) { ptr in
         return ptr #^SINGLE_EXPR_CLOSURE_CONTEXT^#
-        // SINGLE_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: .deallocate()[#Void#]; name=deallocate()
-        // SINGLE_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem:    .pointee[#Int64#]; name=pointee
+        // SINGLE_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem/TypeRelation[Convertible]: .deallocate[#() -> ()#]; name=deallocate
+        // SINGLE_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem/TypeRelation[Convertible]: .pointee[#Int64#]; name=pointee
     }
 }
 
 func testInsideTernaryClosureReturn(test: Bool) -> [String] {
     return "hello".map { thing in
         test ? String(thing #^SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT^#).uppercased() : String(thing).lowercased()
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem: .utf8[#Character.UTF8View#]; name=utf8
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem: .description[#String#]; name=description
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem: .isWhitespace[#Bool#]; name=isWhitespace
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem: .uppercased()[#String#]; name=uppercased()
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem: [' ']... {#String.Element#}[#ClosedRange<String.Element>#]; name=...
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem: [' ']< {#Character#}[#Bool#]; name=<
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem: [' ']>= {#String.Element#}[#Bool#]; name=>=
-        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem: [' ']== {#Character#}[#Bool#]; name===
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem/TypeRelation[Convertible]: .utf8[#Character.UTF8View#]; name=utf8
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem/TypeRelation[Convertible]: .description[#String#]; name=description
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceVar]/CurrNominal/IsSystem/TypeRelation[Convertible]: .isWhitespace[#Bool#]; name=isWhitespace
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InstanceMethod]/CurrNominal/IsSystem/TypeRelation[Convertible]: .uppercased()[#String#]; name=uppercased()
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem/TypeRelation[Convertible]: [' ']... {#String.Element#}[#ClosedRange<String.Element>#]; name=...
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem/TypeRelation[Convertible]: [' ']< {#Character#}[#Bool#]; name=<
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem/TypeRelation[Convertible]: [' ']>= {#String.Element#}[#Bool#]; name=>=
+        // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem/TypeRelation[Convertible]: [' ']== {#Character#}[#Bool#]; name===
         // SINGLE_TERNARY_EXPR_CLOSURE_CONTEXT-DAG: Keyword[self]/CurrNominal:          .self[#String.Element#]; name=self
     }
 }
@@ -386,11 +385,11 @@ func testClosureInPatternBindingInit() {
     case dragging(translation: Int, predictedLocation: Int)
   }
 
-  func pnChanged(_ action: () -> Void) {}
+  func onChanged(_ action: () -> Void) {}
 
   func foo() {
     var gestureViewState: DragState = .dragging(translation: 0, predictedLocation: 0)
-    let longPressDrag = pnChanged {
+    let longPressDrag = onChanged {
       _ = 1
       gestureViewState = .dragging(translation: 0, #^CLOSURE_IN_PATTERN_BINDING^#predictedLocation: 0)
     }
@@ -470,7 +469,7 @@ func testCompleteInMatchOfAssociatedValueInSwitchCase() {
     }
   })
 
-// IN_ASSOC_OF_CASE_IN_CLOSURE-DAG: Decl[LocalVar]/Local:               str[#String#]; name=str
+// IN_ASSOC_OF_CASE_IN_CLOSURE-DAG: Decl[LocalVar]/Local/TypeRelation[Convertible]:               str[#String#]; name=str
 }
 
 }
@@ -485,3 +484,78 @@ func testReferenceToVariableDefinedInClosure() {
   // VARIABLE_DEFINED_IN_CLOSURE: Decl[LocalVar]/Local:               item[#String#]; name=item
 }
 
+func testBinaryOperatorWithEnum() {
+  func closureWithEnum(completionHandler: (SomeEnum) -> Void) {}
+
+  closureWithEnum { foo in
+    if foo != .#^BINARY_OPERATOR_WITH_ENUM^# {
+    }
+  }
+// BINARY_OPERATOR_WITH_ENUM: Begin completions
+// BINARY_OPERATOR_WITH_ENUM-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: north[#SomeEnum#]
+// BINARY_OPERATOR_WITH_ENUM-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: south[#SomeEnum#]
+// BINARY_OPERATOR_WITH_ENUM: End completions
+
+}
+
+func testPreviousSyntacticElementHasError() {
+  struct MyStruct {}
+
+  class MyClass {
+    var myMember: Int = 1
+    var myString: String = "1"
+  }
+
+  @resultBuilder struct ViewBuilder {
+    static func buildBlock<Content>(_ content: Content) -> Content { content }
+  }
+
+  func buildView<Content>(@ViewBuilder content: () -> Content) -> Int { 0 }
+
+  func takeClosure(_ action: () -> Void) {}
+
+  func test(x: MyClass) {
+    // Not that the previous syntactic element (let a) has an error because we
+    // skip MyStruct inside the result builder for performance reasons.
+    takeClosure {
+      let a = buildView {
+        MyStruct()
+      }
+      x.#^PREVIOUS_SYNTACTIC_ELEMENT_HAS_ERROR^#myMember = 1234
+    }
+  }
+// PREVIOUS_SYNTACTIC_ELEMENT_HAS_ERROR: Begin completions
+// PREVIOUS_SYNTACTIC_ELEMENT_HAS_ERROR-DAG: Keyword[self]/CurrNominal:          self[#MyClass#]; name=self
+// PREVIOUS_SYNTACTIC_ELEMENT_HAS_ERROR-DAG: Decl[InstanceVar]/CurrNominal/TypeRelation[Convertible]: myMember[#Int#]; name=myMember
+// PREVIOUS_SYNTACTIC_ELEMENT_HAS_ERROR-DAG: Decl[InstanceVar]/CurrNominal:      myString[#String#]; name=myString
+// PREVIOUS_SYNTACTIC_ELEMENT_HAS_ERROR: End completions
+}
+
+func testCompleteAfterClosureWithIfExprThatContainErrors() {
+  _ = {
+    if true {
+      invalid(1)
+    } else if true {
+      invalid(2)
+    } else {
+      invalid(3)
+    }
+  }#^AFTER_CLOSURE_WITH_IF_EXPR_THAT_CONTAIN_ERRORS^#
+
+  // AFTER_CLOSURE_WITH_IF_EXPR_THAT_CONTAIN_ERRORS: Begin completions, 2 items
+  // AFTER_CLOSURE_WITH_IF_EXPR_THAT_CONTAIN_ERRORS-DAG: Keyword[self]/CurrNominal:          .self[#() -> _#]; name=self
+  // AFTER_CLOSURE_WITH_IF_EXPR_THAT_CONTAIN_ERRORS-DAG: Pattern/CurrModule/Flair[ArgLabels]: ()[#_#]; name=()
+  // AFTER_CLOSURE_WITH_IF_EXPR_THAT_CONTAIN_ERRORS: End completions
+}
+
+func testVariableInClosureHasArchetype<K>(_ key: K) {
+  func takeClosure(_ x: () -> Void) {}
+
+  takeClosure {
+    var varWithArchetype = key
+    #^VAR_WITH_ARCHETYPE^#
+    // VAR_WITH_ARCHETYPE: Begin completions
+    // VAR_WITH_ARCHETYPE: Decl[LocalVar]/Local:               varWithArchetype[#K#];
+    // VAR_WITH_ARCHETYPE: End completions
+  }
+}

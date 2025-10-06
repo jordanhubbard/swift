@@ -28,19 +28,6 @@ class SILPhiArgument;
 class SILUndef;
 class TermInst;
 
-// Map an argument index onto a SILArgumentConvention.
-inline SILArgumentConvention
-SILFunctionConventions::getSILArgumentConvention(unsigned index) const {
-  assert(index <= getNumSILArguments());
-  if (index < getNumIndirectSILResults()) {
-    assert(silConv.loweredAddresses);
-    return SILArgumentConvention::Indirect_Out;
-  } else {
-    auto param = funcTy->getParameters()[index - getNumIndirectSILResults()];
-    return SILArgumentConvention(param.getConvention());
-  }
-}
-
 struct SILArgumentKind {
   enum innerty : std::underlying_type<ValueKind>::type {
 #define ARGUMENT(ID, PARENT) ID = unsigned(SILNodeKind::ID),
@@ -53,14 +40,14 @@ struct SILArgumentKind {
   SILArgumentKind(innerty value) : value(value) {}
   operator innerty() const { return value; }
 
-  static Optional<SILArgumentKind> fromValueKind(ValueKind kind) {
+  static std::optional<SILArgumentKind> fromValueKind(ValueKind kind) {
     switch (kind) {
 #define ARGUMENT(ID, PARENT)                                                   \
   case ValueKind::ID:                                                          \
     return SILArgumentKind(ID);
 #include "swift/SIL/SILNodes.def"
     default:
-      return None;
+      return std::nullopt;
     }
   }
 };
@@ -69,22 +56,27 @@ class SILArgument : public ValueBase {
   friend class SILBasicBlock;
 
   SILBasicBlock *parentBlock;
-  const ValueDecl *decl;
+  ValueDecl *decl;
   USE_SHARED_UINT8;
 
 protected:
   SILArgument(ValueKind subClassKind, SILBasicBlock *inputParentBlock,
               SILType type, ValueOwnershipKind ownershipKind,
-              const ValueDecl *inputDecl = nullptr);
+              ValueDecl *inputDecl = nullptr, bool reborrow = false,
+              bool pointerEscape = false);
 
   // A special constructor, only intended for use in
   // SILBasicBlock::replacePHIArg and replaceFunctionArg.
   explicit SILArgument(ValueKind subClassKind, SILType type,
                        ValueOwnershipKind ownershipKind,
-                       const ValueDecl *inputDecl = nullptr)
-      : ValueBase(subClassKind, type),
-        parentBlock(nullptr), decl(inputDecl) {
+                       ValueDecl *inputDecl = nullptr,
+                       bool reborrow = false, bool pointerEscape = false)
+      : ValueBase(subClassKind, type), parentBlock(nullptr), decl(inputDecl) {
     sharedUInt8().SILArgument.valueOwnershipKind = uint8_t(ownershipKind);
+    // When the optimizer creates reborrows, reborrow flag needs to be set by
+    // calling setReborrow.
+    sharedUInt8().SILArgument.reborrow = false;
+    sharedUInt8().SILArgument.pointerEscape = false;
   }
 
 public:
@@ -95,8 +87,39 @@ public:
     return ValueOwnershipKind(sharedUInt8().SILArgument.valueOwnershipKind);
   }
 
+  bool isScoped() const {
+    auto ownershipKind = getOwnershipKind();
+    if (ownershipKind == OwnershipKind::Owned) {
+      return true;
+    }
+    if (ownershipKind != OwnershipKind::Guaranteed) {
+      return false;
+    }
+    return isReborrow();
+  }
+
+  bool isReborrow() const {
+    return ValueOwnershipKind(sharedUInt8().SILArgument.reborrow);
+  }
+
+  bool isGuaranteedForwarding() const {
+    return getOwnershipKind() == OwnershipKind::Guaranteed && !isReborrow();
+  }
+
+  bool hasPointerEscape() const {
+    return ValueOwnershipKind(sharedUInt8().SILArgument.pointerEscape);
+  }
+
   void setOwnershipKind(ValueOwnershipKind newKind) {
     sharedUInt8().SILArgument.valueOwnershipKind = uint8_t(newKind);
+  }
+
+  void setReborrow(bool isReborrow) {
+    sharedUInt8().SILArgument.reborrow = isReborrow;
+  }
+
+  void setHasPointerEscape(bool hasPointerEscape) {
+    sharedUInt8().SILArgument.pointerEscape = hasPointerEscape;
   }
 
   SILBasicBlock *getParent() const { return parentBlock; }
@@ -114,7 +137,7 @@ public:
 
   SILModule &getModule() const;
 
-  const ValueDecl *getDecl() const { return decl; }
+  ValueDecl *getDecl() const { return decl; }
 
   static bool classof(const SILInstruction *) = delete;
   static bool classof(const SILUndef *) = delete;
@@ -223,14 +246,19 @@ class SILPhiArgument : public SILArgument {
 
   SILPhiArgument(SILBasicBlock *parentBlock, SILType type,
                  ValueOwnershipKind ownershipKind,
-                 const ValueDecl *decl = nullptr)
+                 ValueDecl *decl = nullptr, bool isReborrow = false,
+                 bool hasPointerEscape = false)
       : SILArgument(ValueKind::SILPhiArgument, parentBlock, type, ownershipKind,
-                    decl) {}
+                    decl, isReborrow, hasPointerEscape) {}
+
   // A special constructor, only intended for use in
   // SILBasicBlock::replacePHIArg.
   explicit SILPhiArgument(SILType type, ValueOwnershipKind ownershipKind,
-                          const ValueDecl *decl = nullptr)
-      : SILArgument(ValueKind::SILPhiArgument, type, ownershipKind, decl) {}
+                          ValueDecl *decl = nullptr,
+                          bool isReborrow = false,
+                          bool hasPointerEscape = false)
+      : SILArgument(ValueKind::SILPhiArgument, type, ownershipKind, decl,
+                    isReborrow, hasPointerEscape) {}
 
 public:
   /// Return true if this is block argument is a phi, as opposed to a terminator
@@ -335,11 +363,10 @@ class SILFunctionArgument : public SILArgument {
 
   SILFunctionArgument(
       SILBasicBlock *parentBlock, SILType type,
-      ValueOwnershipKind ownershipKind, const ValueDecl *decl = nullptr,
+      ValueOwnershipKind ownershipKind, ValueDecl *decl = nullptr,
       bool isNoImplicitCopy = false,
       LifetimeAnnotation lifetimeAnnotation = LifetimeAnnotation::None,
-      bool isCapture = false,
-      bool isParameterPack = false)
+      bool isCapture = false, bool isParameterPack = false)
       : SILArgument(ValueKind::SILFunctionArgument, parentBlock, type,
                     ownershipKind, decl) {
     sharedUInt32().SILFunctionArgument.noImplicitCopy = isNoImplicitCopy;
@@ -351,7 +378,7 @@ class SILFunctionArgument : public SILArgument {
   // A special constructor, only intended for use in
   // SILBasicBlock::replaceFunctionArg.
   explicit SILFunctionArgument(SILType type, ValueOwnershipKind ownershipKind,
-                               const ValueDecl *decl = nullptr)
+                               ValueDecl *decl = nullptr)
       : SILArgument(ValueKind::SILFunctionArgument, type, ownershipKind, decl) {
   }
 
@@ -397,6 +424,8 @@ public:
     sharedUInt32().SILFunctionArgument.lifetimeAnnotation = newValue;
   }
 
+  bool isSending() const;
+
   Lifetime getLifetime() const {
     return getType()
         .getLifetime(*getFunction())
@@ -404,6 +433,8 @@ public:
   }
 
   bool isIndirectResult() const;
+
+  bool isIndirectErrorResult() const;
 
   SILArgumentConvention getArgumentConvention() const;
 

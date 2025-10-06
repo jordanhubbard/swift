@@ -1,6 +1,4 @@
-// RUN: %target-typecheck-verify-swift -enable-experimental-feature VariadicGenerics
-
-// REQUIRES: asserts
+// RUN: %target-typecheck-verify-swift
 
 // Test instantiation of constraint solver constraints from generic requirements
 // involving type pack parameters
@@ -9,7 +7,7 @@
 
 protocol P {}
 
-func takesP<each T: P>(_: repeat each T) {}  // expected-note {{where 'T' = 'DoesNotConformToP'}}
+func takesP<each T: P>(_: repeat each T) {}  // expected-note {{where 'each T' = 'DoesNotConformToP'}}
 
 struct ConformsToP: P {}
 struct DoesNotConformToP {}
@@ -26,7 +24,7 @@ class C {}
 class SubclassOfC: C {}
 class NotSubclassOfC {}
 
-func takesC<each T: C>(_: repeat each T) {}  // expected-note {{where 'T' = 'NotSubclassOfC'}}
+func takesC<each T: C>(_: repeat each T) {}  // expected-note {{where 'each T' = 'NotSubclassOfC'}}
 
 takesC()  // ok
 takesC(SubclassOfC(), SubclassOfC(), SubclassOfC())  // ok
@@ -43,13 +41,15 @@ takesAnyObject()
 takesAnyObject(C(), C(), C())
 
 // FIXME: Bad diagnostic
-takesAnyObject(C(), S(), C())  // expected-error {{type of expression is ambiguous without more context}}
+takesAnyObject(C(), S(), C())  // expected-error {{failed to produce diagnostic for expression}}
 
 // Same-type requirements
 
-func takesParallelSequences<each T, each U>(t: repeat each T, u: repeat each U) where each T: Sequence, each U: Sequence, each T.Element == each U.Element {}
-// expected-note@-1 {{where 'T.Element' = 'String', 'U.Element' = 'Int'}}
-
+// expected-note@+1 {{where '(each T).Element' = 'String', '(each U).Element' = 'Int'}}
+func takesParallelSequences<each T, each U>(t: repeat each T, u: repeat each U)
+    where repeat each T: Sequence,
+          repeat each U: Sequence,
+          repeat (each T).Element == (each U).Element {}
 takesParallelSequences()  // ok
 takesParallelSequences(t: Array<Int>(), u: Set<Int>())  // ok
 takesParallelSequences(t: Array<String>(), Set<Int>(), u: Set<String>(), Array<Int>())  // ok
@@ -58,14 +58,14 @@ takesParallelSequences(t: Array<String>(), Set<Int>(), u: Array<Int>(), Set<Stri
 // Same-shape requirements
 
 func zip<each T, each U>(t: repeat each T, u: repeat each U) -> (repeat (each T, each U)) {}
+// expected-note@-1 {{'zip(t:u:)' declared here}}
 
 let _ = zip()  // ok
 let _ = zip(t: 1, u: "hi")  // ok
 let _ = zip(t: 1, 2, u: "hi", "hello")  // ok
 let _ = zip(t: 1, 2, 3, u: "hi", "hello", "greetings")  // ok
-
-// FIXME: Bad diagnostic
-let _ = zip(t: 1, u: "hi", "hello", "greetings")  // expected-error {{type of expression is ambiguous without more context}}
+let _ = zip(t: 1, u: "hi", "hello", "greetings")  // expected-error {{extra arguments at positions #3, #4 in call}}
+// expected-error@-1 {{global function 'zip(t:u:)' requires the type packs 'Int' and 'String, String, String' have the same shape}}
 
 func goodCallToZip<each T, each U>(t: repeat each T, u: repeat each U) where (repeat (each T, each U)): Any {
   _ = zip(t: repeat each t, u: repeat each u)
@@ -73,5 +73,32 @@ func goodCallToZip<each T, each U>(t: repeat each T, u: repeat each U) where (re
 
 func badCallToZip<each T, each U>(t: repeat each T, u: repeat each U) {
   _ = zip(t: repeat each t, u: repeat each u)
-  // expected-error@-1 {{global function 'zip(t:u:)' requires the type packs 'U' and 'T' have the same shape}}
+  // expected-error@-1 {{global function 'zip(t:u:)' requires the type packs 'each T' and 'each U' have the same shape}}
+  // expected-error@-2 {{pack expansion requires that 'each U' and 'each T' have the same shape}}
+}
+
+func variadicGenericsInOptionalContext(v: Int?) {
+  func test1<A, B, each C>(
+    _: A,
+    _: B,
+    _: repeat each C
+  ) throws -> (A, B, repeat each C) {
+    fatalError()
+  }
+
+  func test2<A, B, each C>(
+    _: A,
+    _: B,
+    _: (repeat each C)
+  ) throws -> (A, B, repeat each C) {
+    fatalError()
+  }
+
+  func test() {
+    guard let _ = try? test1(1, 2, 3) else { return } // Ok
+    guard let _ = try? test1(1, 2, v) else { return } // Ok
+
+    guard let _ = try? test2(1, 2, 3) else { return } // Ok
+    guard let _ = try? test2(1, 2, v) else { return } // Ok
+  }
 }

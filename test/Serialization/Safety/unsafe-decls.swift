@@ -35,7 +35,7 @@ public protocol PublicProto {}
 // SAFETY-PRIVATE: Serialization safety, safe: 'PublicProto'
 internal protocol InternalProto {}
 // SAFETY-INTERNAL: Serialization safety, unsafe: 'InternalProto'
-// NO-SAFETY-INTERNAL: Serialization safety, safe: 'InternalProto'
+// NO-SAFETY-INTERNAL: Serialization safety, unsafe: 'InternalProto'
 private protocol PrivateProto {}
 // SAFETY-PRIVATE: Serialization safety, unsafe: 'PrivateProto'
 fileprivate protocol FileprivateProto {}
@@ -70,11 +70,20 @@ public struct PublicStruct {
 // SAFETY-PRIVATE: Serialization safety, unsafe: 'init(fileprivateInit:)'
 
     @inlinable public func inlinableFunc() {
-        typealias localTypealias = Int
-    }
 // SAFETY-PRIVATE: Serialization safety, safe: 'inlinableFunc()'
-    public func publicFunc() {}
+        typealias localTypealias = Int
+
+        func inlinableFunc_nested() {}
+// SAFETY-PRIVATE-NOT: inlinableFunc_nested()
+        inlinableFunc_nested()
+    }
+
+    public func publicFunc() {
 // SAFETY-PRIVATE: Serialization safety, safe: 'publicFunc()'
+        func publicFunc_nested() {}
+// SAFETY-PRIVATE-NOT: publicFunc_nested()
+        publicFunc_nested()
+    }
 
     @available(SwiftStdlib 5.1, *) // for the `some` keyword.
     public func opaqueTypeFunc() -> some PublicProto {

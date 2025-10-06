@@ -31,14 +31,14 @@ func badMembers2(_ a: BadMembers2) {
 // BAD_MEMBERS_2: Begin completions, 3 items
 // BAD_MEMBERS_2-DAG: Decl[InstanceVar]/CurrNominal: .prop[#Int#]{{; name=.+$}}
 // BAD_MEMBERS_2-DAG: Decl[Subscript]/CurrNominal:   [{#(i): Int#}][#Double#]{{; name=.+$}}
-// BAD_MEMBERS_2-DAG: Keyword[self]/CurrNominal:     .self[#BadMembers2#]; name=self
+// BAD_MEMBERS_2-DAG: Keyword[self]/CurrNominal:     .self[#any BadMembers2#]; name=self
 
 func globalFunc() {}
 
 func globalFuncInt() -> Int { return 0 }
 
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=LET_COMPUTED | %FileCheck %s -check-prefix=WITH_GLOBAL
-class C {
+class C1 {
   let x : Int { #^LET_COMPUTED^# }
 }
 
@@ -85,7 +85,7 @@ private protocol RoundRobin : Sendable, Receivable {
 
 // rdar://problem/21435993
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=RDAR_21435993
-class C<T> {
+class C2<T> {
   func test() {
     do {} catch { #^RDAR_21435993^# }
   }
@@ -156,7 +156,7 @@ func rdar22834017() {
   Foo(#^RDAR_22834017^#)
 }
 // RDAR_22834017: Begin completions, 1 items
-// RDAR_22834017: Decl[Constructor]/CurrNominal/Flair[ArgLabels]:      ['(']{#a: <<error type>>#}, {#b: <<error type>>#}, {#c: <<error type>>#}[')'][#Foo#];
+// RDAR_22834017: Decl[Constructor]/CurrNominal/Flair[ArgLabels]:      ['(']{#a: _#}, {#b: _#}, {#c: _#}[')'][#Foo#];
 
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=RDAR_23173692 | %FileCheck %s -check-prefix=RDAR_23173692
 func rdar23173692() {
@@ -213,8 +213,6 @@ func foo_38149042(bar: Bar_38149042) {
 }
 // RDAR_38149042-DAG: Decl[InstanceVar]/CurrNominal:                  .x[#Int#]; name=x
 // RDAR_38149042-DAG: Keyword[self]/CurrNominal: .self[#Baz_38149042#]; name=self
-// RDAR_38149042-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem: [' ']=== {#AnyObject?#}[#Bool#]; name====
-// RDAR_38149042-DAG: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem: [' ']!== {#AnyObject?#}[#Bool#]; name=!==
 
 // rdar://problem/38272904
 // RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=RDAR_38272904 | %FileCheck %s -check-prefix=RDAR_38272904
@@ -239,7 +237,7 @@ func foo_38272904(a: A_38272904) {
 
 // rdar://problem/41159258
 // RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=RDAR41159258_1 | %FileCheck %s -check-prefix=RDAR_41159258
-// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=RDAR41159258_2 | %FileCheck %s -check-prefix=RDAR_41159258
+// RUN: %target-swift-ide-test -code-completion -source-filename=%s -code-completion-token=RDAR41159258_2
 public func ==(lhs: RDAR41159258_MyResult1, rhs: RDAR41159258_MyResult1) -> Bool {
   fatalError()
 }
@@ -278,15 +276,15 @@ public final class IntStore {
       _ = true ? 1 : provider.nextInt() #^RDAR41232519_2^#
   }
 }
-// RDAR_41232519: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem: [' ']+ {#Int#}[#Int#]; name=+
+// RDAR_41232519: Decl[InfixOperatorFunction]/OtherModule[Swift]/IsSystem/TypeRelation[Convertible]: [' ']+ {#Int#}[#Int#]; name=+
 
 // rdar://problem/28188259
 // RUN: %target-swift-ide-test -code-completion -code-completion-token=RDAR_28188259 -source-filename=%s | %FileCheck %s -check-prefix=RDAR_28188259
 func test_28188259(x: ((Int) -> Void) -> Void) {
   x({_ in }#^RDAR_28188259^#)
 }
-// RDAR_28188259-DAG: Pattern/CurrModule/Flair[ArgLabels]: ({#Int#})[#Void#]; name=()
-// RDAR_28188259-DAG: Keyword[self]/CurrNominal:          .self[#(Int) -> ()#]; name=self
+// RDAR_28188259-DAG: Pattern/CurrModule/Flair[ArgLabels]/TypeRelation[Invalid]: ({#_#})[#Void#]; name=()
+// RDAR_28188259-DAG: Keyword[self]/CurrNominal:          .self[#(_) -> ()#]; name=self
 
 // rdar://problem/40956846
 // RUN: %target-swift-ide-test -code-completion -code-completion-token=RDAR_40956846 -source-filename=%s | %FileCheck %s -check-prefix=RDAR_40956846
@@ -341,14 +339,13 @@ extension Foo {
 // RDAR_41234606-DAG: Decl[AssociatedType]/CurrNominal/IsSystem: .Iterator; name=Iterator
 
 // rdar://problem/41071587
-// RUN: %target-swift-ide-test -code-completion -code-completion-token=RDAR_41071587 -source-filename=%s | %FileCheck %s -check-prefix=RDAR_41071587
+// RUN: %target-swift-ide-test -code-completion -code-completion-token=RDAR_41071587 -source-filename=%s
 func test_41071587(x: Any) {
   switch x {
     case (let (_, _)) #^RDAR_41071587^#:
       ()
   }
 }
-// RDAR_41071587: Begin completions
 
 // rdar://problem/54215016
 // RUN: %target-swift-ide-test -code-completion -code-completion-token=RDAR_54215016 -source-filename=%s | %FileCheck %s -check-prefix=RDAR_54215016
@@ -384,6 +381,6 @@ extension P_80635105 {
 func test_80635105() {
   let fn = { x in
     S_80635105.#^RDAR_80635105^#
-    // RDAR_80635105: Decl[InstanceMethod]/Super: foo({#(self): S_80635105<_>#})[#(P_80635105.T) -> Void#]; name=foo
+    // RDAR_80635105: Decl[InstanceMethod]/Super: foo({#(self): S_80635105<T>#})[#(P_80635105.T) -> Void#]; name=foo
   }
 }

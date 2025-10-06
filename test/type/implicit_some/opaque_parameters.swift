@@ -1,6 +1,6 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking -warn-redundant-requirements  -enable-experimental-feature ImplicitSome
+// RUN: %target-typecheck-verify-swift -disable-availability-checking -enable-experimental-feature ImplicitSome
 
-// REQUIRES: asserts
+// REQUIRES: swift_feature_ImplicitSome
 
 protocol P { }
 
@@ -86,5 +86,5 @@ func testPrimaries(
   takePrimaryCollections(setOfStrings, setOfInts)
   takePrimaryCollections(setOfStrings, arrayOfInts)
   _ = takeMatchedPrimaryCollections(arrayOfInts, setOfInts)
-  _ = takeMatchedPrimaryCollections(arrayOfInts, setOfStrings) // expected-error{{type of expression is ambiguous without more context}}
+  _ = takeMatchedPrimaryCollections(arrayOfInts, setOfStrings) // expected-error{{failed to produce diagnostic for expression}}
 }

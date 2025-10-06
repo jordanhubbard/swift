@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SILOptimizer/Analysis/Reachability.h"
 
 using namespace swift;
@@ -69,6 +70,10 @@ private:
 
   void visitBarrierBlock(SILBasicBlock *block) {
     barriers.edges.push_back(block);
+  }
+
+  void visitInitialBlock(SILBasicBlock *block) {
+    barriers.initialBlocks.push_back(block);
   }
 };
 

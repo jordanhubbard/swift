@@ -1,78 +1,45 @@
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=GLOBAL_FUNC | %FileCheck %s -check-prefix=BEGINNING_WITH_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=GLOBAL_VAR | %FileCheck %s -check-prefix=BEGINNING_WITHOUT_SOME
-
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=PROTOCOL_ASSOCIATEDTYPE | %FileCheck %s -check-prefix=BEGINNING_WITHOUT_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=PROTOCOL_METHOD_REQUIREMENT | %FileCheck %s -check-prefix=BEGINNING_WITHOUT_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=PROTOCOL_VAR_REQUIREMENT | %FileCheck %s -check-prefix=BEGINNING_WITHOUT_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=PROTOCOL_SUBSCRIPT_REQUIREMENT | %FileCheck %s -check-prefix=BEGINNING_WITHOUT_SOME
-
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=PROTOCOL_METHOD_EXTENSION | %FileCheck %s -check-prefix=BEGINNING_WITH_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=PROTOCOL_VAR_EXTENSION | %FileCheck %s -check-prefix=BEGINNING_WITH_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=PROTOCOL_SUBSCRIPT_EXTENSION | %FileCheck %s -check-prefix=BEGINNING_WITH_SOME
-
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=STRUCT_METHOD | %FileCheck %s -check-prefix=BEGINNING_WITH_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=STRUCT_VAR | %FileCheck %s -check-prefix=BEGINNING_WITH_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=STRUCT_SUBSCRIPT | %FileCheck %s -check-prefix=BEGINNING_WITH_SOME
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=STRUCT_TYPEALIAS_RHS | %FileCheck %s -check-prefix=BEGINNING_WITHOUT_SOME
-
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=OVERRIDE_TestClass | %FileCheck %s -check-prefix=OVERRIDE
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=OVERRIDE_TestStruct | %FileCheck %s -check-prefix=OVERRIDE
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=OVERRIDE_HasTypealias | %FileCheck %s -check-prefix=OVERRIDE_HasTypealias
-
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=POSTFIX_TestProtocol_DOT | %FileCheck %s -check-prefix=POSTFIX_TestProtocol_DOT
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=POSTFIX_TestProtocol_NODOT | %FileCheck %s -check-prefix=POSTFIX_TestProtocol_NODOT
-
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=OVERRIDE_TestProtocol2 | %FileCheck %s -check-prefix=OVERRIDE_TestProtocol2
-// RUN: %target-swift-ide-test -code-completion -source-filename %s -code-completion-token=POSTFIX_ConcreteTestProtocol2 | %FileCheck %s -check-prefix=POSTFIX_ConcreteTestProtocol2
+// RUN: %batch-code-completion
 
 protocol MyProtocol {
-  associatedtype Mistery
+  associatedtype Mystery
 }
 struct MyStruct {}
 enum MyEnum {}
 class MyClass {}
 struct ConcreteMyProtocol : MyProtocol {
-  typealias Mistery = MyStruct
+  typealias Mystery = MyStruct
 }
 
 // MARK: 'some' keyword.
 
-// BEGINNING_WITH_SOME-DAG: Keyword/None:                       some[#some#]; name=some
+// BEGINNING_WITH_SOME-DAG: Keyword/None:                       some; name=some
 // BEGINNING_WITH_SOME-DAG: Keyword/None:                       Any[#Any#]; name=Any
 // BEGINNING_WITH_SOME-DAG: Decl[Enum]/CurrModule:              MyEnum[#MyEnum#]; name=MyEnum
 // BEGINNING_WITH_SOME-DAG: Decl[Class]/CurrModule:             MyClass[#MyClass#]; name=MyClass
 // BEGINNING_WITH_SOME-DAG: Decl[Protocol]/CurrModule:          MyProtocol[#MyProtocol#]; name=MyProtocol
 // BEGINNING_WITH_SOME-DAG: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
 
-// BEGINNING_WITHOUT_SOME-NOT: Keyword/None: some
-// BEGINNING_WITHOUT_SOME-DAG: Keyword/None:                       Any[#Any#]; name=Any
-// BEGINNING_WITHOUT_SOME-DAG: Decl[Enum]/CurrModule:              MyEnum[#MyEnum#]; name=MyEnum
-// BEGINNING_WITHOUT_SOME-DAG: Decl[Class]/CurrModule:             MyClass[#MyClass#]; name=MyClass
-// BEGINNING_WITHOUT_SOME-DAG: Decl[Protocol]/CurrModule:          MyProtocol[#MyProtocol#]; name=MyProtocol
-// BEGINNING_WITHOUT_SOME-DAG: Decl[Struct]/CurrModule:            MyStruct[#MyStruct#]; name=MyStruct
-// BEGINNING_WITHOUT_SOME-NOT: Keyword/None: some
-
-func gloabalFunc() -> #^GLOBAL_FUNC^#
-var globalVar: #^GLOBAL_VAR^#
+func globalFunc() -> #^GLOBAL_FUNC?check=BEGINNING_WITH_SOME^#
+var globalVar: #^GLOBAL_VAR?check=BEGINNING_WITH_SOME^#
 
 protocol SomeProto {
-  associatedtype protoAssocTy: #^PROTOCOL_ASSOCIATEDTYPE^#
-  func protoMethodReq() -> #^PROTOCOL_METHOD_REQUIREMENT^#
-  var protoVarReq: #^PROTOCOL_VAR_REQUIREMENT^#
-  subscript(req: Int) -> #^PROTOCOL_SUBSCRIPT_REQUIREMENT^#
+  associatedtype protoAssocTy: #^PROTOCOL_ASSOCIATEDTYPE?check=BEGINNING_WITH_SOME^#
+  func protoMethodReq() -> #^PROTOCOL_METHOD_REQUIREMENT?check=BEGINNING_WITH_SOME^#
+  var protoVarReq: #^PROTOCOL_VAR_REQUIREMENT?check=BEGINNING_WITH_SOME^#
+  subscript(req: Int) -> #^PROTOCOL_SUBSCRIPT_REQUIREMENT?check=BEGINNING_WITH_SOME^#
 }
 
 extension SomeProto {
-  func protoMethodExt() -> #^PROTOCOL_METHOD_EXTENSION^#
-  var protoVarExt: #^PROTOCOL_VAR_EXTENSION^#
-  subscript(ext: Int) -> #^PROTOCOL_SUBSCRIPT_EXTENSION^#
+  func protoMethodExt() -> #^PROTOCOL_METHOD_EXTENSION?check=BEGINNING_WITH_SOME^#
+  var protoVarExt: #^PROTOCOL_VAR_EXTENSION?check=BEGINNING_WITH_SOME^#
+  subscript(ext: Int) -> #^PROTOCOL_SUBSCRIPT_EXTENSION?check=BEGINNING_WITH_SOME^#
 }
 
 struct SomeStruct {
-  typealias TyAlias = #^STRUCT_TYPEALIAS_RHS^#
-  func structMethodExt() -> #^STRUCT_METHOD^#
-  var structVarExt: #^STRUCT_VAR^#
-  subscript(struct: Int) -> #^STRUCT_SUBSCRIPT^#
+  typealias TyAlias = #^STRUCT_TYPEALIAS_RHS?check=BEGINNING_WITH_SOME^#
+  func structMethodExt() -> #^STRUCT_METHOD?check=BEGINNING_WITH_SOME^#
+  var structVarExt: #^STRUCT_VAR?check=BEGINNING_WITH_SOME^#
+  subscript(struct: Int) -> #^STRUCT_SUBSCRIPT?check=BEGINNING_WITH_SOME^#
 }
 
 // MARK: Conformance.
@@ -129,7 +96,7 @@ class TestClass :
     HasAssocWithConstraintOnProto,
     HasAssocWithSameTypeConstraint,
     HasAssocWithConformanceConstraintGeneric {
-  #^OVERRIDE_TestClass^#
+  #^OVERRIDE_TestClass?check=OVERRIDE^#
 // OVERRIDE-DAG: Decl[InstanceMethod]/Super:         func returnAssocPlain() -> AssocPlain {|};
 // OVERRIDE-DAG: Decl[InstanceMethod]/Super:         func returnAssocWithConformanceConstraint(fn: (Int) -> Int) -> some MyProtocol {|};
 // OVERRIDE-DAG: Decl[InstanceVar]/Super:            var valAssocWithSuperClassConstraint: some MyClass;
@@ -153,7 +120,7 @@ struct TestStruct :
     HasAssocWithConstraintOnProto,
     HasAssocWithSameTypeConstraint,
     HasAssocWithConformanceConstraintGeneric {
-  #^OVERRIDE_TestStruct^#
+  #^OVERRIDE_TestStruct?check=OVERRIDE^#
 }
 
 class HasTypealias : HasAssocWithConformanceConstraint {
@@ -162,7 +129,7 @@ class HasTypealias : HasAssocWithConformanceConstraint {
 // OVERRIDE_HasTypealias-DAG: Decl[InstanceMethod]/Super:         func returnAssocWithConformanceConstraint(fn: (Int) -> Int) -> ConcreteMyProtocol {|};
 }
 
-// MARK: Postfix expession for opaque result types.
+// MARK: Postfix expression for opaque result types.
 
 protocol TestProtocol {
   associatedtype Assoc1
@@ -191,7 +158,7 @@ func postfixExpr() {
 // POSTFIX_TestProtocol_NODOT-DAG: Decl[InstanceMethod]/CurrNominal:   .foo({#arg1: TestProtocol.Assoc1#}, {#arg2: (Comparable) -> TestProtocol.Assoc1##(Comparable) -> TestProtocol.Assoc1#})[#Comparable#]; name={{.*$}}
 // POSTFIX_TestProtocol_NODOT-DAG: Decl[Subscript]/CurrNominal:        [{#(idx): TestProtocol.Assoc1#}, {#(idx2): Comparable#}][#TestProtocol#]; name={{.*$}}
 // POSTFIX_TestProtocol_NODOT-DAG: Decl[InstanceVar]/CurrNominal:      .value[#(TestProtocol.Assoc1, Comparable)#]; name={{.*$}}
-// POSTFIX_TestProtocol_NODOT-DAG: BuiltinOperator/None:                = {#TestProtocol#}[#Void#]; name={{.*$}}
+// POSTFIX_TestProtocol_NODOT-DAG: BuiltinOperator/None:                = {#TestProtocol#}; name={{.*$}}
 // POSTFIX_TestProtocol_NODOT-DAG: Keyword[self]/CurrNominal:          .self[#TestProtocol#]; name={{.*$}}
 
 protocol TestProtocol2 {
@@ -221,4 +188,17 @@ func testUseTestProtocol2(value: ConcreteTestProtocol2) {
 // POSTFIX_ConcreteTestProtocol2-DAG: Decl[InstanceMethod]/Super:         bar()[#ConcreteTestProtocol2.Assoc#];
 // POSTFIX_ConcreteTestProtocol2-DAG: Decl[InstanceMethod]/Super:         baz({#x: ConcreteTestProtocol2.Assoc#})[#(ConcreteTestProtocol2.Assoc) -> ConcreteTestProtocol2.Assoc#];
 // POSTFIX_ConcreteTestProtocol2-DAG: Decl[InstanceMethod]/Super:         inExt()[#ConcreteTestProtocol2.Assoc#];
+}
+
+struct Generic<T> {
+  func returnMyProto() -> some MyProtocol { ConcreteMyProtocol() }
+}
+func overloaded() -> Generic<Int> { fatalError() }
+func overloaded() -> Generic<Float> { fatalError() }
+// Tests that ambiguous doesn't result duplicated 'returnMyProto()'.
+func testDupGenericReturningOpaque() {
+  overloaded().#^DupGenericReturningOpaque^#
+// DupGenericReturningOpaque-NOT: returnMyProto()
+// DupGenericReturningOpaque: Decl[InstanceMethod]/CurrNominal: returnMyProto()[#MyProtocol#]; name=returnMyProto()
+// DupGenericReturningOpaque-NOT: returnMyProto()
 }

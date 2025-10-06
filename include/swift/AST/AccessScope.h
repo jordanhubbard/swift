@@ -17,6 +17,7 @@
 #include "swift/AST/DeclContext.h"
 #include "swift/Basic/Debug.h"
 #include "llvm/ADT/PointerIntPair.h"
+#include <optional>
 
 namespace swift {
 
@@ -73,6 +74,7 @@ public:
   bool isFileScope() const;
   bool isInternal() const;
   bool isPackage() const;
+  bool isPublicOrPackage() const { return isPublic() || isPackage(); }
 
   /// Checks if the DeclContext of this (use site) access scope is more
   /// restrictive than that of the argument (decl site) based on the DeclContext
@@ -132,7 +134,8 @@ public:
 
   /// Returns the narrowest access scope if this and the specified access scope
   /// have common intersection, or None if scopes don't intersect.
-  const Optional<AccessScope> intersectWith(AccessScope accessScope) const {
+  const std::optional<AccessScope>
+  intersectWith(AccessScope accessScope) const {
     if (hasEqualDeclContextWith(accessScope)) {
       if (isPrivate())
         return *this;
@@ -143,7 +146,7 @@ public:
     if (accessScope.isChildOf(*this))
       return accessScope;
 
-    return None;
+    return std::nullopt;
   }
 
   SWIFT_DEBUG_DUMP;

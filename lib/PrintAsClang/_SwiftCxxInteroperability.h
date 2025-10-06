@@ -28,18 +28,21 @@
 # define SWIFT_CALL __attribute__((swiftcall))
 #endif
 
-#if __has_attribute(always_inline) && __has_attribute(nodebug)
+#if __has_attribute(transparent_stepping)
 #define SWIFT_INLINE_THUNK_ATTRIBUTES                                          \
-  __attribute__((always_inline)) __attribute__((nodebug))
+  __attribute__((transparent_stepping))
+#elif __has_attribute(always_inline) && __has_attribute(nodebug)
+ #define SWIFT_INLINE_THUNK_ATTRIBUTES                                          \
+   __attribute__((always_inline)) __attribute__((nodebug))
+#else
+#define SWIFT_INLINE_THUNK_ATTRIBUTES
+#endif
+
 #if defined(DEBUG) && __has_attribute(used)
 // Additional 'used' attribute is used in debug mode to make inline thunks
 // accessible to LLDB.
 #define SWIFT_INLINE_THUNK_USED_ATTRIBUTE __attribute__((used))
 #else
-#define SWIFT_INLINE_THUNK_USED_ATTRIBUTE
-#endif
-#else
-#define SWIFT_INLINE_THUNK_ATTRIBUTES
 #define SWIFT_INLINE_THUNK_USED_ATTRIBUTE
 #endif
 
@@ -90,8 +93,29 @@ extern "C" void *_Nonnull swift_retain(void *_Nonnull) noexcept;
 
 extern "C" void swift_release(void *_Nonnull) noexcept;
 
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wreserved-identifier"
+
+extern "C" void _swift_stdlib_reportFatalError(const char *_Nonnull prefix,
+                                               int prefixLength,
+                                               const char *_Nonnull message,
+                                               int messageLength,
+                                               uint32_t flags) noexcept;
+
+// A dummy symbol that forces a linker error when
+// C++ tries to invoke a move of a Swift value type.
+extern "C" void _fatalError_Cxx_move_of_Swift_value_type_not_supported_yet();
+
+#pragma clang diagnostic pop
+
 SWIFT_INLINE_THUNK void *_Nonnull opaqueAlloc(size_t size,
                                               size_t align) noexcept {
+#if defined(SWIFT_CXX_INTEROPERABILITY_OVERRIDE_OPAQUE_STORAGE_alloc) &&       \
+    defined(SWIFT_CXX_INTEROPERABILITY_OVERRIDE_OPAQUE_STORAGE_free)
+  // Allow the user to provide custom allocator for heap-allocated Swift
+  // value types.
+  return SWIFT_CXX_INTEROPERABILITY_OVERRIDE_OPAQUE_STORAGE_alloc(size, align);
+#else
 #if defined(_WIN32)
   void *r = _aligned_malloc(size, align);
 #else
@@ -102,13 +126,21 @@ SWIFT_INLINE_THUNK void *_Nonnull opaqueAlloc(size_t size,
   (void)res;
 #endif
   return r;
+#endif
 }
 
 SWIFT_INLINE_THUNK void opaqueFree(void *_Nonnull p) noexcept {
+#if defined(SWIFT_CXX_INTEROPERABILITY_OVERRIDE_OPAQUE_STORAGE_alloc) &&       \
+    defined(SWIFT_CXX_INTEROPERABILITY_OVERRIDE_OPAQUE_STORAGE_free)
+  // Allow the user to provide custom allocator for heap-allocated Swift
+  // value types.
+  SWIFT_CXX_INTEROPERABILITY_OVERRIDE_OPAQUE_STORAGE_free(p);
+#else
 #if defined(_WIN32)
   _aligned_free(p);
 #else
   free(p);
+#endif
 #endif
 }
 
@@ -156,6 +188,14 @@ public:
       : _opaquePointer(other._opaquePointer) {
     swift_retain(_opaquePointer);
   }
+  SWIFT_INLINE_THUNK RefCountedClass(RefCountedClass &&other) noexcept
+      : _opaquePointer(other._opaquePointer) {
+    // Moving a Swift class reference is a copy
+    // in C++. This allows C++ to avoid liveness
+    // checks to see if the pointer is `null` or not,
+    // as C++'s move is not consuming, unlike Swift's.
+    swift_retain(_opaquePointer);
+  }
   SWIFT_INLINE_THUNK RefCountedClass &
   operator=(const RefCountedClass &other) noexcept {
     swift_retain(other._opaquePointer);
@@ -163,11 +203,13 @@ public:
     _opaquePointer = other._opaquePointer;
     return *this;
   }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wmissing-noreturn"
-  // FIXME: implement 'move'?
-  SWIFT_INLINE_THUNK RefCountedClass(RefCountedClass &&) noexcept { abort(); }
-#pragma clang diagnostic pop
+  SWIFT_INLINE_THUNK RefCountedClass &
+  operator=(RefCountedClass &&other) noexcept {
+    swift_retain(other._opaquePointer);
+    swift_release(_opaquePointer);
+    _opaquePointer = other._opaquePointer;
+    return *this;
+  }
 
 protected:
   SWIFT_INLINE_THUNK RefCountedClass(void *_Nonnull ptr) noexcept
@@ -250,6 +292,22 @@ SWIFT_INLINE_THUNK void *_Nonnull getOpaquePointer(T &value) {
     return reinterpret_cast<OpaqueStorage &>(value).getOpaquePointer();
   return reinterpret_cast<void *>(&value);
 }
+
+/// Helper struct that destroys any additional storage allocated (e.g. for
+/// resilient value types) for a Swift value owned by C++ code after the Swift
+/// value was consumed and thus the original C++ destructor is not ran.
+template <class T> class ConsumedValueStorageDestroyer {
+public:
+  SWIFT_INLINE_THUNK ConsumedValueStorageDestroyer(T &val) noexcept
+      : value(val) {}
+  SWIFT_INLINE_THUNK ~ConsumedValueStorageDestroyer() noexcept {
+    if constexpr (isOpaqueLayout<T>)
+      reinterpret_cast<OpaqueStorage &>(value).~OpaqueStorage();
+  }
+
+private:
+  T &value;
+};
 
 } // namespace _impl
 

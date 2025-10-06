@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Core -clang-header-expose-decls=all-public -emit-clang-header-path %t/core.h
+// RUN: %target-swift-frontend %s -module-name Core -clang-header-expose-decls=all-public -typecheck -verify -emit-clang-header-path %t/core.h
 // RUN: %FileCheck %s < %t/core.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/core.h)
@@ -93,8 +93,7 @@
 // CHECK-NEXT: SWIFT_IMPORT_STDLIB_SYMBOL extern size_t $sSdN;
 // CHECK-NEXT: // type metadata address for OpaquePointer.
 // CHECK-NEXT: SWIFT_IMPORT_STDLIB_SYMBOL extern size_t $ss13OpaquePointerVN;
-// CHECK-EMPTY:
-// CHECK-NEXT: #ifdef __cplusplus
+// CHECK: #ifdef __cplusplus
 // CHECK-NEXT: }
 // CHECK-NEXT: #endif
 // CHECK-EMPTY:
@@ -105,7 +104,7 @@
 // CHECK-NEXT: #pragma clang diagnostic push
 // CHECK-NEXT: #pragma clang diagnostic ignored "-Wc++17-extensions"
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<bool> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<bool> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<bool> {
@@ -115,7 +114,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int8_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<int8_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int8_t> {
@@ -125,7 +124,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint8_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<uint8_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint8_t> {
@@ -135,7 +134,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int16_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<int16_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int16_t> {
@@ -145,7 +144,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint16_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<uint16_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint16_t> {
@@ -155,7 +154,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int32_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<int32_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int32_t> {
@@ -165,7 +164,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint32_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<uint32_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint32_t> {
@@ -175,7 +174,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<int64_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<int64_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<int64_t> {
@@ -185,7 +184,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<uint64_t> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<uint64_t> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<uint64_t> {
@@ -195,7 +194,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<float> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<float> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<float> {
@@ -205,7 +204,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<double> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<double> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<double> {
@@ -215,7 +214,7 @@
 // CHECK-NEXT: };
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<void *> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<void *> = true;
 // CHECK-EMPTY:
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<void *> {
@@ -224,7 +223,7 @@
 // CHECK-NEXT:   }
 // CHECK-NEXT: };
 // CHECK-EMPTY:
-// CHECK-NEXT: #pragma clang diagnostic pop
+// CHECK: #pragma clang diagnostic pop
 // CHECK-EMPTY:
 // CHECK-NEXT: } // namespace swift
 // CHECK-EMPTY:

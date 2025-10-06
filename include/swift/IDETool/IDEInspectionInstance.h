@@ -21,6 +21,7 @@
 #include "swift/IDE/ConformingMethodList.h"
 #include "swift/IDE/CursorInfo.h"
 #include "swift/IDE/ImportDepth.h"
+#include "swift/IDE/SignatureHelp.h"
 #include "swift/IDE/SwiftCompletionInfo.h"
 #include "swift/IDE/TypeContextInfo.h"
 #include "llvm/ADT/Hashing.h"
@@ -35,6 +36,7 @@ namespace swift {
 class CompilerInstance;
 class CompilerInvocation;
 class DiagnosticConsumer;
+class PluginRegistry;
 
 namespace ide {
 
@@ -79,6 +81,14 @@ struct ConformingMethodListResults {
   bool DidReuseAST;
 };
 
+/// The results returned from \c IDEInspectionInstance::signatures.
+struct SignatureHelpResults {
+  /// The actual results. If \c nullptr, no results were found.
+  const SignatureHelpResult *Result;
+  /// Whether an AST was reused to produce the results.
+  bool DidReuseAST;
+};
+
 /// The results returned from \c IDEInspectionInstance::cursorInfo.
 struct CursorInfoResults {
   /// The actual results.
@@ -95,6 +105,8 @@ class IDEInspectionInstance {
   } Opts;
 
   std::mutex mtx;
+
+  std::shared_ptr<PluginRegistry> Plugins;
 
   std::shared_ptr<CompilerInstance> CachedCI;
   llvm::hash_code CachedArgHash;
@@ -130,7 +142,7 @@ class IDEInspectionInstance {
   /// the first pass.
   /// Returns \c false if it fails to setup the \c CompilerInstance.
   void performNewOperation(
-      llvm::Optional<llvm::hash_code> ArgsHash,
+      std::optional<llvm::hash_code> ArgsHash,
       swift::CompilerInvocation &Invocation,
       llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
       llvm::MemoryBuffer *ideInspectionTargetBuffer, unsigned int Offset,
@@ -167,7 +179,8 @@ class IDEInspectionInstance {
           Callback);
 
 public:
-  IDEInspectionInstance() : CachedCIShouldBeInvalidated(false) {}
+  IDEInspectionInstance(std::shared_ptr<PluginRegistry> Plugins = nullptr)
+      : Plugins(Plugins), CachedCIShouldBeInvalidated(false) {}
 
   // Mark the cached compiler instance "should be invalidated". In the next
   // completion, new compiler instance will be used. (Thread safe.)
@@ -200,6 +213,15 @@ public:
       DiagnosticConsumer *DiagC, ArrayRef<const char *> ExpectedTypeNames,
       std::shared_ptr<std::atomic<bool>> CancellationFlag,
       llvm::function_ref<void(CancellableResult<ConformingMethodListResults>)>
+          Callback);
+
+  void signatureHelp(
+      swift::CompilerInvocation &Invocation, llvm::ArrayRef<const char *> Args,
+      llvm::IntrusiveRefCntPtr<llvm::vfs::FileSystem> FileSystem,
+      llvm::MemoryBuffer *ideInspectionTargetBuffer, unsigned int Offset,
+      DiagnosticConsumer *DiagC,
+      std::shared_ptr<std::atomic<bool>> CancellationFlag,
+      llvm::function_ref<void(CancellableResult<SignatureHelpResults>)>
           Callback);
 
   void cursorInfo(

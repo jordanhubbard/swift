@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-access-summary-analysis"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SILOptimizer/Analysis/AccessSummaryAnalysis.h"
@@ -89,9 +90,9 @@ void AccessSummaryAnalysis::processArgument(FunctionInfo *info,
     }
 
     switch (user->getKind()) {
-    case SILInstructionKind::MarkMustCheckInst: {
+    case SILInstructionKind::MarkUnresolvedNonCopyableValueInst: {
       // Pass through to the address being checked.
-      auto inst = cast<MarkMustCheckInst>(user);
+      auto inst = cast<MarkUnresolvedNonCopyableValueInst>(user);
       worklist.append(inst->use_begin(), inst->use_end());
       break;
     }
@@ -148,7 +149,7 @@ void AccessSummaryAnalysis::processArgument(FunctionInfo *info,
 }
 
 #ifndef NDEBUG
-/// Sanity check to make sure that a noescape partial apply is only ultimately
+/// Soundness check to make sure that a noescape partial apply is only ultimately
 /// used by directly calling it or passing it as argument, but not using it as a
 /// partial_apply callee.
 ///
@@ -215,7 +216,11 @@ static bool hasExpectedUsesOfNoEscapePartialApply(Operand *partialApplyUse) {
     return llvm::all_of(cast<CopyValueInst>(user)->getUses(),
                         hasExpectedUsesOfNoEscapePartialApply);
 
-  case SILInstructionKind::IsEscapingClosureInst:
+  case SILInstructionKind::MoveValueInst:
+    return llvm::all_of(cast<MoveValueInst>(user)->getUses(),
+                        hasExpectedUsesOfNoEscapePartialApply);
+
+  case SILInstructionKind::DestroyNotEscapedClosureInst:
   case SILInstructionKind::StoreInst:
   case SILInstructionKind::DestroyValueInst:
     // @block_storage is passed by storing it to the stack. We know this is
@@ -238,8 +243,15 @@ static bool hasExpectedUsesOfNoEscapePartialApply(Operand *partialApplyUse) {
     // destroy_value %storage : $@callee_owned () -> ()
     return true;
   default:
-    return false;
+    break;
   }
+  if (auto *startAsyncLet = dyn_cast<BuiltinInst>(user)) {
+    if (startAsyncLet->getBuiltinKind() ==
+        BuiltinValueKind::StartAsyncLetWithLocalBuffer) {
+      return true;
+    }
+  }
+  return false;
 }
 #endif
 
@@ -545,6 +557,37 @@ AccessSummaryAnalysis::findSubPathAccessed(BeginAccessInst *BAI) {
   }
 
   return SubPath;
+}
+
+SILType AccessSummaryAnalysis::getSubPathType(SILType baseType,
+                                              const IndexTrieNode *subPath,
+                                              SILModule &mod,
+                                              TypeExpansionContext context) {
+  // Walk the trie to the root to collect the sequence (in reverse order).
+  llvm::SmallVector<unsigned, 4> reversedIndices;
+  const IndexTrieNode *indexTrieNode = subPath;
+  while (!indexTrieNode->isRoot()) {
+    reversedIndices.push_back(indexTrieNode->getIndex());
+    indexTrieNode = indexTrieNode->getParent();
+  }
+
+  SILType iterType = baseType;
+  for (unsigned index : llvm::reverse(reversedIndices)) {
+    if (StructDecl *decl = iterType.getStructOrBoundGenericStruct()) {
+      VarDecl *var = decl->getStoredProperties()[index];
+      iterType = iterType.getFieldType(var, mod, context);
+      continue;
+    }
+
+    if (auto tupleTy = iterType.getAs<TupleType>()) {
+      iterType = iterType.getTupleElementType(index);
+      continue;
+    }
+
+    llvm_unreachable("unexpected type in projection subpath!");
+  }
+
+  return iterType;
 }
 
 /// Returns a string representation of the SubPath

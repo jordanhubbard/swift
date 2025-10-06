@@ -1,4 +1,6 @@
 // RUN: %target-run-simple-swift( -Xfrontend -disable-availability-checking %import-libdispatch -parse-as-library) | %FileCheck %s --dump-input=always
+// RUN: %target-run-simple-swift( -Xfrontend -disable-availability-checking %import-libdispatch -parse-as-library -swift-version 5 -strict-concurrency=complete -enable-upcoming-feature NonisolatedNonsendingByDefault)  | %FileCheck %s --dump-input=always
+// REQUIRES: swift_feature_NonisolatedNonsendingByDefault
 
 // REQUIRES: concurrency
 // REQUIRES: executable_test
@@ -6,14 +8,11 @@
 // rdar://106849189 move-only types should be supported in freestanding mode
 // UNSUPPORTED: freestanding
 
-// FIXME: rdar://107112715 test failing on iOS simulator, investigating
-// UNSUPPORTED: OS=ios
-
 // UNSUPPORTED: back_deployment_runtime
 // REQUIRES: concurrency_runtime
 
 final class InlineExecutor: SerialExecutor {
-  public func enqueue(_ job: __owned Job) {
+  public func enqueue(_ job: consuming ExecutorJob) {
     print("\(self): enqueue (priority: \(TaskPriority(job.priority)!))")
     job.runSynchronously(on: self.asUnownedSerialExecutor())
   }

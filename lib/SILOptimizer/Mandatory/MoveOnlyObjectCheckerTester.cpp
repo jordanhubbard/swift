@@ -14,6 +14,7 @@
 
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/FrozenMultiMap.h"
 #include "swift/Basic/STLExtras.h"
@@ -41,8 +42,8 @@
 #include "swift/SILOptimizer/Analysis/PostOrderAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/CFGOptUtils.h"
-#include "swift/SILOptimizer/Utils/CanonicalizeOSSALifetime.h"
 #include "swift/SILOptimizer/Utils/InstructionDeleter.h"
+#include "swift/SILOptimizer/Utils/OSSACanonicalizeOwned.h"
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
 #include "clang/AST/DeclTemplate.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -75,10 +76,6 @@ class MoveOnlyObjectCheckerTesterPass : public SILFunctionTransform {
   void run() override {
     auto *fn = getFunction();
 
-    // Only run this pass if the move only language feature is enabled.
-    if (!fn->getASTContext().supportsMoveOnlyTypes())
-      return;
-
     // Don't rerun diagnostics on deserialized functions.
     if (getFunction()->wasDeserializedCanonical())
       return;
@@ -92,14 +89,17 @@ class MoveOnlyObjectCheckerTesterPass : public SILFunctionTransform {
     auto *dominanceAnalysis = getAnalysis<DominanceAnalysis>();
     DominanceInfo *domTree = dominanceAnalysis->get(fn);
     auto *poa = getAnalysis<PostOrderAnalysis>();
+    auto *deba = getAnalysis<DeadEndBlocksAnalysis>();
 
     DiagnosticEmitter diagnosticEmitter(fn);
     borrowtodestructure::IntervalMapAllocator allocator;
 
     unsigned diagCount = diagnosticEmitter.getDiagnosticCount();
-    SmallSetVector<MarkMustCheckInst *, 32> moveIntroducersToProcess;
-    bool madeChange = searchForCandidateObjectMarkMustChecks(
-        fn, moveIntroducersToProcess, diagnosticEmitter);
+    llvm::SmallSetVector<MarkUnresolvedNonCopyableValueInst *, 32>
+        moveIntroducersToProcess;
+    bool madeChange =
+        searchForCandidateObjectMarkUnresolvedNonCopyableValueInsts(
+            fn, moveIntroducersToProcess, diagnosticEmitter);
 
     LLVM_DEBUG(llvm::dbgs()
                << "Emitting diagnostic when checking for mark must check inst: "
@@ -112,7 +112,8 @@ class MoveOnlyObjectCheckerTesterPass : public SILFunctionTransform {
                  << "No move introducers found?! Returning early?!\n");
     } else {
       diagCount = diagnosticEmitter.getDiagnosticCount();
-      MoveOnlyObjectChecker checker{diagnosticEmitter, domTree, poa, allocator};
+      MoveOnlyObjectChecker checker{diagnosticEmitter, domTree, deba, poa,
+                                    allocator};
       madeChange |= checker.check(moveIntroducersToProcess);
     }
 

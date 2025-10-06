@@ -2,7 +2,7 @@
 //
 // This source file is part of the Swift.org open source project
 //
-// Copyright (c) 2014 - 2021 Apple Inc. and the Swift project authors
+// Copyright (c) 2014 - 2025 Apple Inc. and the Swift project authors
 // Licensed under Apache License v2.0 with Runtime Library Exception
 //
 // See https://swift.org/LICENSE.txt for license information
@@ -16,11 +16,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/AccessNotes.h"
+#include "swift/AST/ASTContext.h"
 #include "swift/AST/Attr.h"
 #include "swift/AST/Decl.h"
-#include "swift/AST/Module.h"     // DeclContext::isModuleScopeContext()
 #include "swift/AST/DiagnosticsFrontend.h"
-#include "swift/Parse/Parser.h"
+#include "swift/AST/Module.h" // DeclContext::isModuleScopeContext()
+#include "swift/Basic/Assertions.h"
+#include "swift/Parse/ParseDeclName.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/YAMLTraits.h"
@@ -28,7 +30,7 @@
 namespace swift {
 
 AccessNoteDeclName::AccessNoteDeclName()
-  : parentNames(), name(), accessorKind(None) { }
+    : parentNames(), name(), accessorKind(std::nullopt) {}
 
 AccessNoteDeclName::AccessNoteDeclName(ASTContext &ctx, StringRef str) {
   auto parsedName = parseDeclName(str);
@@ -44,7 +46,7 @@ AccessNoteDeclName::AccessNoteDeclName(ASTContext &ctx, StringRef str) {
   else if (parsedName.IsSetter)
     accessorKind = AccessorKind::Set;
   else
-    accessorKind = None;
+    accessorKind = std::nullopt;
 
   name = parsedName.formDeclName(ctx, /*isSubscript=*/true);
 }
@@ -180,7 +182,7 @@ static void
 convertToErrorAndJoin(const llvm::SMDiagnostic &diag, void *ctxPtr) {
   ASTContext &ctx = *(ASTContext*)ctxPtr;
 
-  SourceLoc loc{diag.getLoc()};
+  auto loc = SourceLoc::getFromPointer(diag.getLoc().getPointer());
   assert(ctx.SourceMgr.isOwning(loc));
 
   switch (diag.getKind()) {
@@ -196,7 +198,7 @@ convertToErrorAndJoin(const llvm::SMDiagnostic &diag, void *ctxPtr) {
   }
 }
 
-llvm::Optional<AccessNotesFile>
+std::optional<AccessNotesFile>
 AccessNotesFile::load(ASTContext &ctx, const llvm::MemoryBuffer *buffer) {
   llvm::yaml::Input yamlIn(llvm::MemoryBufferRef(*buffer), (void *)&ctx,
                            convertToErrorAndJoin, &ctx);
@@ -206,7 +208,7 @@ AccessNotesFile::load(ASTContext &ctx, const llvm::MemoryBuffer *buffer) {
   yamlIn >> notes;
 
   if (yamlIn.error())
-    return None;
+    return std::nullopt;
 
   return notes;
 }

@@ -1,4 +1,4 @@
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 //===--- Helper types that are used in this test
 
@@ -281,7 +281,7 @@ protocol AssocType1 {
 //===--- Test that we can complete types in inheritance clause of associated type declarations.
 //===---
 
-protocol AssocType1 {
+protocol AssocType2 {
   associatedtype AssocType : #^TYPE_IN_ASSOC_TYPE_INHERITANCE_1?check=WITH_GLOBAL_TYPES;check=GLOBAL_NEGATIVE^#
 }
 
@@ -313,7 +313,7 @@ struct TypeInStructInheritance2 : , #^TYPE_IN_STRUCT_INHERITANCE_2?check=WITH_GL
 
 struct TypeInStructInheritance3 : FooProtocol, #^TYPE_IN_STRUCT_INHERITANCE_3?check=WITH_GLOBAL_TYPES;check=GLOBAL_NEGATIVE^#
 
-// FIXME: 'check' shold be 'WITH_GLOBAL_TYPES'
+// FIXME: 'check' should be 'WITH_GLOBAL_TYPES'
 struct TypeInStructInheritance4 : FooProtocol., #^TYPE_IN_STRUCT_INHERITANCE_4?check=WITH_GLOBAL_TYPES_EXPR^#
 
 struct TypeInStructInheritance5 : #^TYPE_IN_STRUCT_INHERITANCE_5?check=WITH_GLOBAL_TYPES;check=GLOBAL_NEGATIVE^# {
@@ -325,7 +325,7 @@ struct TypeInStructInheritance6 : , #^TYPE_IN_STRUCT_INHERITANCE_6?check=WITH_GL
 struct TypeInStructInheritance7 : FooProtocol, #^TYPE_IN_STRUCT_INHERITANCE_7?check=WITH_GLOBAL_TYPES;check=GLOBAL_NEGATIVE^# {
 }
 
-// FIXME: 'check' shold be 'WITH_GLOBAL_TYPES'
+// FIXME: 'check' should be 'WITH_GLOBAL_TYPES'
 struct TypeInStructInheritance8 : FooProtocol., #^TYPE_IN_STRUCT_INHERITANCE_8?check=WITH_GLOBAL_TYPES_EXPR^# {
 }
 
@@ -622,7 +622,7 @@ func testTypeIdentifierGeneric1<
 
 // TYPE_IDENTIFIER_GENERIC_1: Begin completions, 2 items
 // TYPE_IDENTIFIER_GENERIC_1-DAG: Decl[AssociatedType]/CurrNominal: FooTypeAlias1{{; name=.+$}}
-// TYPE_IDENTIFIER_GENERIC_1-DAG: Keyword/None:          Type[#GenericFoo.Type#]
+// TYPE_IDENTIFIER_GENERIC_1-DAG: Keyword/None:          Type[#FooProtocol.Type#]
 
 func testTypeIdentifierGeneric2<
     GenericFoo : FooProtocol & BarProtocol
@@ -631,7 +631,7 @@ func testTypeIdentifierGeneric2<
 // TYPE_IDENTIFIER_GENERIC_2: Begin completions, 3 items
 // TYPE_IDENTIFIER_GENERIC_2-DAG: Decl[AssociatedType]/CurrNominal: BarTypeAlias1{{; name=.+$}}
 // TYPE_IDENTIFIER_GENERIC_2-DAG: Decl[AssociatedType]/CurrNominal: FooTypeAlias1{{; name=.+$}}
-// TYPE_IDENTIFIER_GENERIC_2-DAG: Keyword/None:          Type[#GenericFoo.Type#]
+// TYPE_IDENTIFIER_GENERIC_2-DAG: Keyword/None:          Type[#(BarProtocol & FooProtocol).Type#]
 
 func testTypeIdentifierGeneric3<
     GenericFoo>(a: GenericFoo.#^TYPE_IDENTIFIER_GENERIC_3^#
@@ -689,8 +689,8 @@ func testProtocol() {
   let _: FooProtocol.#^PROTOCOL_DOT_1^#
 // PROTOCOL_DOT_1: Begin completions, 3 items
 // PROTOCOL_DOT_1-DAG: Decl[AssociatedType]/CurrNominal:   FooTypeAlias1; name=FooTypeAlias1
-// PROTOCOL_DOT_1-DAG: Keyword/None:                       Protocol[#FooProtocol.Protocol#]; name=Protocol
-// PROTOCOL_DOT_1-DAG: Keyword/None:                       Type[#FooProtocol.Type#]; name=Type
+// PROTOCOL_DOT_1-DAG: Keyword/None:                       Protocol[#(any FooProtocol).Type#]; name=Protocol
+// PROTOCOL_DOT_1-DAG: Keyword/None:                       Type[#any FooProtocol.Type#]; name=Type
 }
 
 //===---
@@ -755,3 +755,14 @@ var _: HaveNested.#^IN_POSTFIX_BASE_MEMBER_5?check=POSTFIX_BASE_MEMBER^#.Type
 // POSTFIX_BASE_MEMBER: Begin completions, 2 items
 // POSTFIX_BASE_MEMBER-DAG: Decl[Struct]/CurrNominal:           Nested[#HaveNested.Nested#];
 // POSTFIX_BASE_MEMBER-DAG: Keyword/None:                       Type[#HaveNested.Type#];
+
+func testGenericResultCompletion1<T>() -> #^GENERIC_RESULT1?check=GENERIC_RESULT^# {}
+func testGenericResultCompletion2<T>() -> [#^GENERIC_RESULT2?check=GENERIC_RESULT^#] {}
+func testGenericResultCompletion3<T>() -> (#^GENERIC_RESULT3?check=GENERIC_RESULT^#) {}
+func testGenericResultCompletion4<T>() -> (Int, #^GENERIC_RESULT4?check=GENERIC_RESULT^#) {}
+func testGenericResultCompletion5<T>() -> FooProtocol & #^GENERIC_RESULT5?check=GENERIC_RESULT^# {}
+func testGenericResultCompletion6<T>() -> [[#^GENERIC_RESULT6?check=GENERIC_RESULT^#]] {}
+func testGenericResultCompletion7<T>() -> Array< #^GENERIC_RESULT7?check=GENERIC_RESULT^#> {}
+func testGenericResultCompletion8<T>() -> Array<(Int, #^GENERIC_RESULT8?check=GENERIC_RESULT^#)> {}
+
+// GENERIC_RESULT-DAG: Decl[GenericTypeParam]/Local: T[#T#]; name=T

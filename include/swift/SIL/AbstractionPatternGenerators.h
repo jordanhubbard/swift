@@ -67,7 +67,7 @@ class FunctionParamGenerator {
   /// pattern type.
   AbstractionPattern origParamType = AbstractionPattern::getInvalid();
 
-  /// Load the informaton for the current orig parameter into the
+  /// Load the information for the current orig parameter into the
   /// fields above for it.
   void loadParameter() {
     origParamType = origFunctionType.getFunctionParamType(origParamIndex);
@@ -107,7 +107,13 @@ public:
   /// to the current orig parameter.
   unsigned getSubstIndex() const {
     assert(!isFinished());
-    return origParamIndex;
+    return substParamIndex;
+  }
+
+  IntRange<unsigned> getSubstIndexRange() const {
+    assert(!isFinished());
+    return IntRange<unsigned>(substParamIndex,
+                              substParamIndex + numSubstParamsForOrigParam);
   }
 
   /// Return the parameter flags for the current orig parameter.
@@ -128,6 +134,18 @@ public:
   bool isOrigPackExpansion() const {
     assert(!isFinished());
     return origParamIsExpansion;
+  }
+
+  /// Return whether the current substituted parameter is a pack
+  /// expansion but the orig function type is opaque.  This is
+  /// unimplementable in our ABI because the calling convention for
+  /// function types in the most-general abstraction pattern still
+  /// assumes a fixed arity.
+  bool isUnimplementablePackExpansion() const {
+    assert(!isFinished());
+    return (origFunctionTypeIsOpaque &&
+            isa<PackExpansionType>(
+              allSubstParams[substParamIndex].getParameterType()));
   }
 
   /// Return the substituted parameters corresponding to the current
@@ -157,8 +175,9 @@ class TupleElementGenerator {
   /// during construction.
   AbstractionPattern origTupleType;
 
-  /// The substitute tuple type.  Set once during construction.
-  CanTupleType substTupleType;
+  /// The substituted type.  A tuple type unless this is a vanishing
+  /// tuple.  Set once during construction.
+  CanType substType;
 
   /// The number of orig elements to traverse.  Set once during
   /// construction.
@@ -176,6 +195,10 @@ class TupleElementGenerator {
   /// orig element.
   unsigned numSubstEltsForOrigElt;
 
+  /// Whether the orig tuple type is a vanishing tuple, i.e. substitution
+  /// turns it into a singleton element.
+  bool origTupleVanishes;
+
   /// Whether the orig tuple type is opaque, i.e. does not permit us to
   /// call getNumTupleElements() and similar accessors.  Set once during
   /// construction.
@@ -189,7 +212,10 @@ class TupleElementGenerator {
   /// pattern type.
   AbstractionPattern origEltType = AbstractionPattern::getInvalid();
 
-  /// Load the informaton for the current orig element into the
+  /// A scratch element that is used for vanishing tuple types.
+  mutable TupleTypeElt scratchSubstElt;
+
+  /// Load the information for the current orig element into the
   /// fields above for it.
   void loadElement() {
     origEltType = origTupleType.getTupleElementType(origEltIndex);
@@ -202,7 +228,163 @@ class TupleElementGenerator {
 
 public:
   TupleElementGenerator(AbstractionPattern origTupleType,
-                        CanTupleType substTupleType);
+                        CanType substType);
+
+  /// Is the traversal finished?  If so, none of the getters below
+  /// are allowed to be called.
+  bool isFinished() const {
+    return origEltIndex == numOrigElts;
+  }
+
+  /// Does the entire original tuple vanish?
+  bool doesOrigTupleVanish() const {
+    return origTupleVanishes;
+  }
+
+  /// Advance to the next orig element.
+  void advance() {
+    assert(!isFinished());
+    origEltIndex++;
+    substEltIndex += numSubstEltsForOrigElt;
+    if (!isFinished()) loadElement();
+  }
+
+  /// Return the index of the current orig element.
+  unsigned getOrigIndex() const {
+    assert(!isFinished());
+    return origEltIndex;
+  }
+
+  /// Return the index of the (first) subst element corresponding
+  /// to the current orig element.
+  unsigned getSubstIndex() const {
+    assert(!isFinished());
+    return substEltIndex;
+  }
+
+  IntRange<unsigned> getSubstIndexRange() const {
+    assert(!isFinished());
+    return IntRange<unsigned>(substEltIndex,
+                              substEltIndex + numSubstEltsForOrigElt);
+  }
+
+  /// Return a tuple element for the current orig element.
+  TupleTypeElt getOrigElement() const {
+    assert(!isFinished());
+    // If the orig tuple is opaque, it can't have vanished, so this
+    // cast of substType is okay.
+    return (origTupleTypeIsOpaque
+              ? cast<TupleType>(substType)->getElement(substEltIndex)
+              : cast<TupleType>(origTupleType.getType())
+                  ->getElement(origEltIndex));
+  }
+
+  /// Return the type of the current orig element.
+  const AbstractionPattern &getOrigType() const {
+    assert(!isFinished());
+    return origEltType;
+  }
+
+  /// Return whether the current orig element type is a pack expansion.
+  bool isOrigPackExpansion() const {
+    assert(!isFinished());
+    return origEltIsExpansion;
+  }
+
+  /// Return the substituted elements corresponding to the current
+  /// orig element type.  If the current orig element is not a
+  /// pack expansion, this will have exactly one element.
+  CanTupleEltTypeArrayRef getSubstTypes() const {
+    assert(!isFinished());
+    if (!origTupleVanishes) {
+      return cast<TupleType>(substType)
+               .getElementTypes().slice(substEltIndex,
+                                        numSubstEltsForOrigElt);
+    } else if (numSubstEltsForOrigElt == 0) {
+      return CanTupleEltTypeArrayRef();
+    } else {
+      scratchSubstElt = TupleTypeElt(substType);
+      return CanTupleEltTypeArrayRef(scratchSubstElt);
+    }
+  }
+
+  /// Like `getSubstTypes`, but uses a different and possibly
+  /// non-canonical tuple type.
+  TupleEltTypeArrayRef getSubstTypes(Type ncSubstType) const {
+    assert(!isFinished());
+    if (!origTupleVanishes) {
+      return ncSubstType->castTo<TupleType>()
+               ->getElementTypes().slice(substEltIndex,
+                                         numSubstEltsForOrigElt);
+    } else if (numSubstEltsForOrigElt == 0) {
+      return TupleEltTypeArrayRef();
+    } else {
+      scratchSubstElt = TupleTypeElt(ncSubstType);
+      return TupleEltTypeArrayRef(scratchSubstElt);
+    }
+  }
+
+  /// Call this to finalize the traversal and assert that it was done
+  /// properly.
+  void finish() {
+    assert(isFinished() && "didn't finish the traversal");
+    assert(substEltIndex == (origTupleVanishes ? 1 :
+               cast<TupleType>(substType)->getNumElements()) &&
+           "didn't exhaust subst elements; possible missing subs on "
+           "orig tuple type");
+  }
+};
+
+/// A generator for traversing the formal elements of a pack type
+/// while properly respecting variadic generics.
+class PackElementGenerator {
+  // The steady state of the generator.
+
+  /// The abstraction pattern of the entire pack type.  Set once
+  /// during construction.
+  AbstractionPattern origPackType;
+
+  /// The substituted pack type.  Set once during construction.
+  CanPackType substPackType;
+
+  /// The number of orig elements to traverse.  Set once during
+  /// construction.
+  unsigned numOrigElts;
+
+  /// The index of the current orig element.
+  /// Incremented during advance().
+  unsigned origEltIndex = 0;
+
+  /// The (start) index of the current subst elements.
+  /// Incremented during advance().
+  unsigned substEltIndex = 0;
+
+  /// The number of subst elements corresponding to the current
+  /// orig element.
+  unsigned numSubstEltsForOrigElt;
+
+  /// Whether the current orig element is a pack expansion.
+  bool origEltIsExpansion;
+
+  /// The abstraction pattern of the current orig element.
+  /// If it is a pack expansion, this is the expansion type, not the
+  /// pattern type.
+  AbstractionPattern origEltType = AbstractionPattern::getInvalid();
+
+  /// Load the information for the current orig element into the
+  /// fields above for it.
+  void loadElement() {
+    origEltType = origPackType.getPackElementType(origEltIndex);
+    origEltIsExpansion = origEltType.isPackExpansion();
+    numSubstEltsForOrigElt =
+      (origEltIsExpansion
+         ? origEltType.getNumPackExpandedComponents()
+         : 1);
+  }
+
+public:
+  PackElementGenerator(AbstractionPattern origTupleType,
+                       CanPackType substPackType);
 
   /// Is the traversal finished?  If so, none of the getters below
   /// are allowed to be called.
@@ -228,16 +410,13 @@ public:
   /// to the current orig element.
   unsigned getSubstIndex() const {
     assert(!isFinished());
-    return origEltIndex;
+    return substEltIndex;
   }
 
-  /// Return a tuple element for the current orig element.
-  TupleTypeElt getOrigElement() const {
+  IntRange<unsigned> getSubstIndexRange() const {
     assert(!isFinished());
-    return (origTupleTypeIsOpaque
-              ? substTupleType->getElement(substEltIndex)
-              : cast<TupleType>(origTupleType.getType())
-                  ->getElement(origEltIndex));
+    return IntRange<unsigned>(substEltIndex,
+                              substEltIndex + numSubstEltsForOrigElt);
   }
 
   /// Return the type of the current orig element.
@@ -255,19 +434,20 @@ public:
   /// Return the substituted elements corresponding to the current
   /// orig element type.  If the current orig element is not a
   /// pack expansion, this will have exactly one element.
-  CanTupleEltTypeArrayRef getSubstTypes() const {
+  CanTypeArrayRef getSubstTypes() const {
     assert(!isFinished());
-    return substTupleType.getElementTypes().slice(substEltIndex,
-                                                  numSubstEltsForOrigElt);
+    return substPackType
+             .getElementTypes().slice(substEltIndex,
+                                      numSubstEltsForOrigElt);
   }
 
   /// Call this to finalize the traversal and assert that it was done
   /// properly.
   void finish() {
     assert(isFinished() && "didn't finish the traversal");
-    assert(substEltIndex == substTupleType->getNumElements() &&
+    assert(substEltIndex == substPackType->getNumElements() &&
            "didn't exhaust subst elements; possible missing subs on "
-           "orig tuple type");
+           "orig pack type");
   }
 };
 

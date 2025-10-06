@@ -43,6 +43,17 @@
 #endif
 
 #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+#if __has_include(<sys/codesign.h>)
+#include <sys/codesign.h>
+#else
+// SPI
+#define CS_OPS_STATUS 0
+#define CS_GET_TASK_ALLOW  0x00000004
+#define CS_RUNTIME         0x00010000
+#define CS_PLATFORM_BINARY 0x04000000
+#define CS_PLATFORM_PATH   0x08000000
+extern "C" int csops(int, unsigned int, void *, size_t);
+#endif
 #include <spawn.h>
 #endif
 #include <unistd.h>
@@ -51,6 +62,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+
+#ifdef _WIN32
+// We'll probably want dbghelp.h here
+#else
+#include <cxxabi.h>
+#endif
+
+#include "BacktracePrivate.h"
 
 #define DEBUG_BACKTRACING_SETTINGS 0
 
@@ -68,19 +87,13 @@ SWIFT_RUNTIME_STDLIB_INTERNAL BacktraceSettings _swift_backtraceSettings = {
   UnwindAlgorithm::Auto,
 
   // enabled
-#if TARGET_OS_OSX
-  OnOffTty::TTY,
-#elif 0 // defined(__linux__) || defined(_WIN32)
-  OnOffTty::On,
-#else
-  OnOffTty::Off,
-#endif
+  OnOffTty::Default,
 
   // demangle
   true,
 
   // interactive
-#if TARGET_OS_OSX // || defined(__linux__) || defined(_WIN32)
+#if TARGET_OS_OSX || defined(__linux__) // || defined(_WIN32)
   OnOffTty::TTY,
 #else
   OnOffTty::Off,
@@ -107,7 +120,7 @@ SWIFT_RUNTIME_STDLIB_INTERNAL BacktraceSettings _swift_backtraceSettings = {
   // top
   16,
 
-  // sanitize,
+  // sanitize
   SanitizePaths::Preset,
 
   // preset
@@ -116,10 +129,22 @@ SWIFT_RUNTIME_STDLIB_INTERNAL BacktraceSettings _swift_backtraceSettings = {
   // cache
   true,
 
-  // outputTo,
-  OutputTo::Stdout,
+  // outputTo
+  OutputTo::Auto,
+
+  // symbolicate
+  Symbolication::Full,
+
+  // suppressWarnings
+  false,
+
+  // format
+  OutputFormat::Text,
 
   // swiftBacktracePath
+  NULL,
+
+  // outputPath
   NULL,
 };
 
@@ -140,11 +165,6 @@ BacktraceInitializer backtraceInitializer;
 
 SWIFT_ALLOWED_RUNTIME_GLOBAL_CTOR_END
 
-#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
-posix_spawnattr_t backtraceSpawnAttrs;
-posix_spawn_file_actions_t backtraceFileActions;
-#endif
-
 #if SWIFT_BACKTRACE_ON_CRASH_SUPPORTED
 
 // We need swiftBacktracePath to be aligned on a page boundary, and it also
@@ -164,14 +184,40 @@ static_assert((SWIFT_BACKTRACE_ENVIRONMENT_SIZE % SWIFT_PAGE_SIZE) == 0,
               "page size.  If it isn't, you'll get weird crashes in other "
               "code because we'll protect more than just the buffer.");
 
+// And the output path
+#define SWIFT_BACKTRACE_OUTPUT_PATH_SIZE 16384
+
+static_assert((SWIFT_BACKTRACE_OUTPUT_PATH_SIZE % SWIFT_PAGE_SIZE) == 0,
+              "The output path buffer must be a multiple of the system "
+              "page size.  If it isn't, you'll get weird crashes in other "
+              "code because we'll protect more than just the buffer.");
+
 #if _WIN32
 #pragma section(SWIFT_BACKTRACE_SECTION, read, write)
+
+#if defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
+const WCHAR swiftBacktracePath[] = L"" SWIFT_RUNTIME_FIXED_BACKTRACER_PATH;
+#else
 __declspec(allocate(SWIFT_BACKTRACE_SECTION)) WCHAR swiftBacktracePath[SWIFT_BACKTRACE_BUFFER_SIZE];
+#endif // !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
+
 __declspec(allocate(SWIFT_BACKTRACE_SECTION)) CHAR swiftBacktraceEnv[SWIFT_BACKTRACE_ENVIRONMENT_SIZE];
+
+__declspec(allocate(SWIFT_BACKTRACE_SECTION)) CHAR swiftBacktraceOutputPath[SWIFT_BACKTRACE_OUTPUT_PATH_SIZE];
+
 #elif defined(__linux__) || TARGET_OS_OSX
+
+#if defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
+const char swiftBacktracePath[] = SWIFT_RUNTIME_FIXED_BACKTRACER_PATH;
+#else
 char swiftBacktracePath[SWIFT_BACKTRACE_BUFFER_SIZE] __attribute__((section(SWIFT_BACKTRACE_SECTION), aligned(SWIFT_PAGE_SIZE)));
+#endif // !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH
+
 char swiftBacktraceEnv[SWIFT_BACKTRACE_ENVIRONMENT_SIZE] __attribute__((section(SWIFT_BACKTRACE_SECTION), aligned(SWIFT_PAGE_SIZE)));
-#endif
+
+char swiftBacktraceOutputPath[SWIFT_BACKTRACE_OUTPUT_PATH_SIZE] __attribute__((section(SWIFT_BACKTRACE_SECTION), aligned(SWIFT_PAGE_SIZE)));
+
+#endif // defined(__linux__) || TARGET_OS_OSX
 
 void _swift_backtraceSetupEnvironment();
 
@@ -211,6 +257,7 @@ const char *algorithmToString(UnwindAlgorithm algorithm) {
 
 const char *onOffTtyToString(OnOffTty oot) {
   switch (oot) {
+  case OnOffTty::Default: return "Default";
   case OnOffTty::On: return "On";
   case OnOffTty::Off: return "Off";
   case OnOffTty::TTY: return "TTY";
@@ -235,6 +282,23 @@ const char *presetToString(Preset preset) {
 bool isPrivileged() {
   return getauxval(AT_SECURE);
 }
+#elif TARGET_OS_OSX || TARGET_OS_MACCATALYST
+bool isPrivileged() {
+  if (issetugid())
+    return true;
+
+  uint32_t flags = 0;
+  if (csops(getpid(),
+            CS_OPS_STATUS,
+            &flags,
+            sizeof(flags)) != 0)
+    return true;
+
+  if (flags & (CS_PLATFORM_BINARY | CS_PLATFORM_PATH | CS_RUNTIME))
+    return true;
+
+  return !(flags & CS_GET_TASK_ALLOW);
+}
 #elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 bool isPrivileged() {
   return issetugid();
@@ -243,6 +307,18 @@ bool isPrivileged() {
 bool isPrivileged() {
   return false;
 }
+#endif
+
+#if SWIFT_BACKTRACE_ON_CRASH_SUPPORTED
+#if _WIN32
+bool writeProtectMemory(void *ptr, size_t size) {
+  return !!VirtualProtect(ptr, size, PAGE_READONLY, NULL);
+}
+#else
+bool writeProtectMemory(void *ptr, size_t size) {
+  return mprotect(ptr, size, PROT_READ) == 0;
+}
+#endif
 #endif
 
 } // namespace
@@ -258,22 +334,41 @@ BacktraceInitializer::BacktraceInitializer() {
   if (backtracing)
     _swift_parseBacktracingSettings(backtracing);
 
-#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
-  // Make sure that all fds are closed except for stdin/stdout/stderr.
-  posix_spawnattr_init(&backtraceSpawnAttrs);
-  posix_spawnattr_setflags(&backtraceSpawnAttrs, POSIX_SPAWN_CLOEXEC_DEFAULT);
+#if !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
+  if (!_swift_backtraceSettings.swiftBacktracePath) {
+    _swift_backtraceSettings.swiftBacktracePath
+      = swift_copyAuxiliaryExecutablePath("swift-backtrace");
 
-  posix_spawn_file_actions_init(&backtraceFileActions);
-  posix_spawn_file_actions_addinherit_np(&backtraceFileActions, STDIN_FILENO);
-  posix_spawn_file_actions_addinherit_np(&backtraceFileActions, STDOUT_FILENO);
-  posix_spawn_file_actions_addinherit_np(&backtraceFileActions, STDERR_FILENO);
+    if (!_swift_backtraceSettings.swiftBacktracePath) {
+      if (_swift_backtraceSettings.enabled == OnOffTty::On) {
+        if (!_swift_backtraceSettings.suppressWarnings) {
+          swift::warning(0,
+                         "swift runtime: unable to locate swift-backtrace; "
+                         "disabling backtracing.\n");
+        }
+      }
+      _swift_backtraceSettings.enabled = OnOffTty::Off;
+    }
+  }
 #endif
+
+  if (_swift_backtraceSettings.enabled == OnOffTty::Default) {
+#if TARGET_OS_OSX
+    _swift_backtraceSettings.enabled = OnOffTty::TTY;
+#elif defined(__linux__) // || defined(_WIN32)
+    _swift_backtraceSettings.enabled = OnOffTty::On;
+#else
+    _swift_backtraceSettings.enabled = OnOffTty::Off;
+#endif
+  }
 
 #if !SWIFT_BACKTRACE_ON_CRASH_SUPPORTED
   if (_swift_backtraceSettings.enabled != OnOffTty::Off) {
-    swift::warning(0,
-                   "swift runtime: backtrace-on-crash is not supported on "
-                   "this platform.\n");
+    if (!_swift_backtraceSettings.suppressWarnings) {
+      swift::warning(0,
+                     "swift runtime: backtrace-on-crash is not supported on "
+                     "this platform.\n");
+    }
     _swift_backtraceSettings.enabled = OnOffTty::Off;
   }
 #else
@@ -288,10 +383,24 @@ BacktraceInitializer::BacktraceInitializer() {
     //    /path/to/some/setuid/binary
     //
     // i.e. when you're trying to force matters.
-    swift::warning(0,
-                   "swift runtime: backtrace-on-crash is not supported for "
-                   "privileged executables.\n");
+    if (!_swift_backtraceSettings.suppressWarnings) {
+      swift::warning(0,
+                     "swift runtime: backtrace-on-crash is not supported for "
+                     "privileged executables.\n");
+    }
     _swift_backtraceSettings.enabled = OnOffTty::Off;
+  }
+
+  // If we're outputting to a file, then the defaults are different
+  if (_swift_backtraceSettings.outputTo == OutputTo::File) {
+    if (_swift_backtraceSettings.interactive == OnOffTty::TTY)
+      _swift_backtraceSettings.interactive = OnOffTty::Off;
+    if (_swift_backtraceSettings.color == OnOffTty::TTY)
+      _swift_backtraceSettings.color = OnOffTty::Off;
+
+    // Unlike the other settings, this defaults to on if you specified a file
+    if (_swift_backtraceSettings.enabled == OnOffTty::TTY)
+      _swift_backtraceSettings.enabled = OnOffTty::On;
   }
 
   if (_swift_backtraceSettings.enabled == OnOffTty::TTY)
@@ -314,18 +423,35 @@ BacktraceInitializer::BacktraceInitializer() {
       _swift_backtraceSettings.preset = Preset::Full;
   }
 
-  if (_swift_backtraceSettings.enabled == OnOffTty::On
-      && !_swift_backtraceSettings.swiftBacktracePath) {
-    _swift_backtraceSettings.swiftBacktracePath
-      = swift_copyAuxiliaryExecutablePath("swift-backtrace");
+  if (_swift_backtraceSettings.outputTo == OutputTo::File) {
+    size_t len = strlen(_swift_backtraceSettings.outputPath);
+    if (len > SWIFT_BACKTRACE_OUTPUT_PATH_SIZE - 1) {
+      swift::warning(0,
+                     "swift runtime: backtracer output path too long; output "
+                     "path setting will be ignored.\n");
+      _swift_backtraceSettings.outputTo = OutputTo::Auto;
+    } else {
+      memcpy(swiftBacktraceOutputPath,
+             _swift_backtraceSettings.outputPath,
+             len + 1);
 
-    if (!_swift_backtraceSettings.swiftBacktracePath) {
-      // Disabled warning for now - rdar://106813646
-      /* swift::warning(0,
-                     "swift runtime: unable to locate swift-backtrace; "
-                     "disabling backtracing.\n"); */
-      _swift_backtraceSettings.enabled = OnOffTty::Off;
+#if PROTECT_BACKTRACE_SETTINGS
+      if (!writeProtectMemory(swiftBacktraceOutputPath,
+                              sizeof(swiftBacktraceOutputPath))) {
+        swift::warning(0,
+                       "swift runtime: unable to protect backtracer output "
+                       "path; path setting will be ignored.\n");
+        _swift_backtraceSettings.outputTo = OutputTo::Auto;
+      }
+#endif
     }
+  }
+
+  if (_swift_backtraceSettings.outputTo == OutputTo::Auto) {
+    if (_swift_backtraceSettings.interactive == OnOffTty::On)
+      _swift_backtraceSettings.outputTo = OutputTo::Stdout;
+    else
+      _swift_backtraceSettings.outputTo = OutputTo::Stderr;
   }
 
   if (_swift_backtraceSettings.enabled == OnOffTty::On) {
@@ -335,96 +461,84 @@ BacktraceInitializer::BacktraceInitializer() {
     // attacker to overwrite the path and then cause a crash to get us to
     // execute an arbitrary file.
 
-#if _WIN32
     if (_swift_backtraceSettings.algorithm == UnwindAlgorithm::Auto)
       _swift_backtraceSettings.algorithm = UnwindAlgorithm::Precise;
 
+#if _WIN32
+#if !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
     int len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
                                     _swift_backtraceSettings.swiftBacktracePath, -1,
                                     swiftBacktracePath,
                                     SWIFT_BACKTRACE_BUFFER_SIZE);
     if (!len) {
-      swift::warning(0,
-                     "swift runtime: unable to convert path to "
-                     "swift-backtrace: %08lx; disabling backtracing.\n",
-                     ::GetLastError());
-      _swift_backtraceSettings.enabled = OnOffTty::Off;
-    } else if (!VirtualProtect(swiftBacktracePath,
-                               sizeof(swiftBacktracePath),
-                               PAGE_READONLY,
-                               NULL)) {
-      swift::warning(0,
-                     "swift runtime: unable to protect path to "
-                     "swift-backtrace: %08lx; disabling backtracing.\n",
-                     ::GetLastError());
+      if (!_swift_backtraceSettings.suppressWarnings) {
+        swift::warning(0,
+                       "swift runtime: unable to convert path to "
+                       "swift-backtrace: %08lx; disabling backtracing.\n",
+                       ::GetLastError());
+      }
       _swift_backtraceSettings.enabled = OnOffTty::Off;
     }
+#endif // !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
 
-    _swift_backtraceSetupEnvironment();
+#else // !_WIN32
 
-    if (!VirtualProtect(swiftBacktraceEnv,
-                        sizeof(swiftBacktraceEnv),
-                        PAGE_READONLY,
-                        NULL)) {
-      swift::warning(0,
-                     "swift runtime: unable to protect environment "
-                     "for swift-backtrace: %08lx; disabling backtracing.\n",
-                     ::GetLastError());
-      _swift_backtraceSettings.enabled = OnOffTty::Off;
-    }
-#else
-    if (_swift_backtraceSettings.algorithm == UnwindAlgorithm::Auto)
-      _swift_backtraceSettings.algorithm = UnwindAlgorithm::Precise;
-
+#if !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
     size_t len = strlen(_swift_backtraceSettings.swiftBacktracePath);
     if (len > SWIFT_BACKTRACE_BUFFER_SIZE - 1) {
-      swift::warning(0,
-                     "swift runtime: path to swift-backtrace is too long; "
-                     "disabling backtracing.\n");
+      if (!_swift_backtraceSettings.suppressWarnings) {
+        swift::warning(0,
+                       "swift runtime: path to swift-backtrace is too long; "
+                       "disabling backtracing.\n");
+      }
       _swift_backtraceSettings.enabled = OnOffTty::Off;
     } else {
       memcpy(swiftBacktracePath,
              _swift_backtraceSettings.swiftBacktracePath,
              len + 1);
-
-#if PROTECT_BACKTRACE_SETTINGS
-      if (mprotect(swiftBacktracePath,
-                   sizeof(swiftBacktracePath),
-                   PROT_READ) < 0) {
-        swift::warning(0,
-                       "swift runtime: unable to protect path to "
-                       "swift-backtrace at %p: %d; disabling backtracing.\n",
-                       swiftBacktracePath,
-                       errno);
-        _swift_backtraceSettings.enabled = OnOffTty::Off;
-      }
-#endif // PROTECT_BACKTRACE_SETTINGS
     }
+#endif // !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
+
+#endif // !_WIN32
 
     _swift_backtraceSetupEnvironment();
 
 #if PROTECT_BACKTRACE_SETTINGS
-    if (mprotect(swiftBacktraceEnv,
-                 sizeof(swiftBacktraceEnv),
-                 PROT_READ) < 0) {
+#if !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
+    if (!writeProtectMemory(swiftBacktracePath,
+                            sizeof(swiftBacktracePath))) {
+      if (!_swift_backtraceSettings.suppressWarnings) {
         swift::warning(0,
-                       "swift runtime: unable to protect environment for "
-                       "swift-backtrace at %p: %d; disabling backtracing.\n",
-                       swiftBacktraceEnv,
-                       errno);
-        _swift_backtraceSettings.enabled = OnOffTty::Off;
+                       "swift runtime: unable to protect path to "
+                       "swift-backtrace at %p; disabling backtracing.\n",
+                       swiftBacktracePath);
+      }
+      _swift_backtraceSettings.enabled = OnOffTty::Off;
     }
-#endif // PROTECT_BACKTRACE_SETTINGS
+#endif
+    if (!writeProtectMemory(swiftBacktraceEnv,
+                            sizeof(swiftBacktraceEnv))) {
+      if (!_swift_backtraceSettings.suppressWarnings) {
+        swift::warning(0,
+                       "swift runtime: unable to protect environment "
+                       "for swift-backtrace at %p; disabling backtracing.\n",
+                       swiftBacktraceEnv);
+      }
+      _swift_backtraceSettings.enabled = OnOffTty::Off;
+    }
+#endif
 
-#endif // !_WIN32
+
   }
 
   if (_swift_backtraceSettings.enabled == OnOffTty::On) {
     ErrorCode err = _swift_installCrashHandler();
     if (err != 0) {
-      swift::warning(0,
-                     "swift runtime: crash handler installation failed; "
-                     "disabling backtracing.\n");
+      if (!_swift_backtraceSettings.suppressWarnings) {
+        swift::warning(0,
+                       "swift runtime: crash handler installation failed; "
+                       "disabling backtracing.\n");
+      }
     }
   }
 #endif
@@ -490,6 +604,22 @@ parseBoolean(llvm::StringRef value)
           || value.equals_insensitive("1"));
 }
 
+Symbolication
+parseSymbolication(llvm::StringRef value)
+{
+  if (value.equals_insensitive("on")
+      || value.equals_insensitive("true")
+      || value.equals_insensitive("yes")
+      || value.equals_insensitive("y")
+      || value.equals_insensitive("t")
+      || value.equals_insensitive("1")
+      || value.equals_insensitive("full"))
+    return Symbolication::Full;
+  if (value.equals_insensitive("fast"))
+    return Symbolication::Fast;
+  return Symbolication::Off;
+}
+
 void
 _swift_processBacktracingSetting(llvm::StringRef key,
                                  llvm::StringRef value)
@@ -525,12 +655,14 @@ _swift_processBacktracingSetting(llvm::StringRef key,
         _swift_backtraceSettings.timeout = count * 3600;
 
       if (_swift_backtraceSettings.timeout < 0) {
-        swift::warning(0,
-                       "swift runtime: bad backtracing timeout %ds\n",
-                       _swift_backtraceSettings.timeout);
+        if (!_swift_backtraceSettings.suppressWarnings) {
+          swift::warning(0,
+                         "swift runtime: bad backtracing timeout %ds\n",
+                         _swift_backtraceSettings.timeout);
+        }
         _swift_backtraceSettings.timeout = 0;
       }
-    } else {
+    } else if (!_swift_backtraceSettings.suppressWarnings) {
       swift::warning(0,
                      "swift runtime: bad backtracing timeout '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -542,7 +674,7 @@ _swift_processBacktracingSetting(llvm::StringRef key,
       _swift_backtraceSettings.algorithm = UnwindAlgorithm::Fast;
     else if (value.equals_insensitive("precise"))
       _swift_backtraceSettings.algorithm = UnwindAlgorithm::Precise;
-    else {
+    else if (!_swift_backtraceSettings.suppressWarnings) {
       swift::warning(0,
                      "swift runtime: unknown unwind algorithm '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -559,7 +691,7 @@ _swift_processBacktracingSetting(llvm::StringRef key,
       _swift_backtraceSettings.preset = Preset::Medium;
     else if (value.equals_insensitive("full"))
       _swift_backtraceSettings.preset = Preset::Full;
-    else {
+    else if (!_swift_backtraceSettings.suppressWarnings) {
       swift::warning(0,
                      "swift runtime: unknown backtracing preset '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -569,7 +701,7 @@ _swift_processBacktracingSetting(llvm::StringRef key,
       _swift_backtraceSettings.threads = ThreadsToShow::All;
     else if (value.equals_insensitive("crashed"))
       _swift_backtraceSettings.threads = ThreadsToShow::Crashed;
-    else {
+    else if (!_swift_backtraceSettings.suppressWarnings) {
       swift::warning(0,
                      "swift runtime: unknown threads setting '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -581,7 +713,7 @@ _swift_processBacktracingSetting(llvm::StringRef key,
       _swift_backtraceSettings.registers = RegistersToShow::All;
     else if (value.equals_insensitive("crashed"))
       _swift_backtraceSettings.registers = RegistersToShow::Crashed;
-    else {
+    else if (!_swift_backtraceSettings.suppressWarnings) {
       swift::warning(0,
                      "swift runtime: unknown registers setting '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -593,7 +725,7 @@ _swift_processBacktracingSetting(llvm::StringRef key,
       _swift_backtraceSettings.images = ImagesToShow::All;
     else if (value.equals_insensitive("mentioned"))
       _swift_backtraceSettings.images = ImagesToShow::Mentioned;
-    else {
+    else if (!_swift_backtraceSettings.suppressWarnings) {
       swift::warning(0,
                      "swift runtime: unknown registers setting '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -605,7 +737,7 @@ _swift_processBacktracingSetting(llvm::StringRef key,
       _swift_backtraceSettings.limit = -1;
     else if (!value.getAsInteger(0, limit) && limit > 0)
       _swift_backtraceSettings.limit = limit;
-    else {
+    else if (!_swift_backtraceSettings.suppressWarnings) {
       swift::warning(0,
                      "swift runtime: bad backtrace limit '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -615,7 +747,7 @@ _swift_processBacktracingSetting(llvm::StringRef key,
     // (If you think the next line is wrong, see above.)
     if (!value.getAsInteger(0, top) && top >= 0)
       _swift_backtraceSettings.top = top;
-    else {
+    else if (!_swift_backtraceSettings.suppressWarnings) {
        swift::warning(0,
                      "swift runtime: bad backtrace top count '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
@@ -623,15 +755,36 @@ _swift_processBacktracingSetting(llvm::StringRef key,
   } else if (key.equals_insensitive("cache")) {
     _swift_backtraceSettings.cache = parseBoolean(value);
   } else if (key.equals_insensitive("output-to")) {
-    if (value.equals_insensitive("stdout"))
+    if (value.equals_insensitive("auto"))
+      _swift_backtraceSettings.outputTo = OutputTo::Auto;
+    else if (value.equals_insensitive("stdout"))
       _swift_backtraceSettings.outputTo = OutputTo::Stdout;
     else if (value.equals_insensitive("stderr"))
       _swift_backtraceSettings.outputTo = OutputTo::Stderr;
     else {
+      size_t len = value.size();
+      char *path = (char *)std::malloc(len + 1);
+      std::copy(value.begin(), value.end(), path);
+      path[len] = 0;
+
+      std::free(const_cast<char *>(_swift_backtraceSettings.outputPath));
+
+      _swift_backtraceSettings.outputTo = OutputTo::File;
+      _swift_backtraceSettings.outputPath = path;
+    }
+  } else if (key.equals_insensitive("symbolicate")) {
+    _swift_backtraceSettings.symbolicate = parseSymbolication(value);
+  } else if (key.equals_insensitive("format")) {
+    if (value.equals_insensitive("text")) {
+      _swift_backtraceSettings.format = OutputFormat::Text;
+    } else if (value.equals_insensitive("json")) {
+      _swift_backtraceSettings.format = OutputFormat::JSON;
+    } else {
       swift::warning(0,
-                     "swift runtime: unknown output-to setting '%.*s'\n",
+                     "swift runtime: unknown backtrace format '%.*s'\n",
                      static_cast<int>(value.size()), value.data());
     }
+#if !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
   } else if (key.equals_insensitive("swift-backtrace")) {
     size_t len = value.size();
     char *path = (char *)std::malloc(len + 1);
@@ -640,7 +793,21 @@ _swift_processBacktracingSetting(llvm::StringRef key,
 
     std::free(const_cast<char *>(_swift_backtraceSettings.swiftBacktracePath));
     _swift_backtraceSettings.swiftBacktracePath = path;
-  } else {
+#endif // !defined(SWIFT_RUNTIME_FIXED_BACKTRACER_PATH)
+  } else if (key.equals_insensitive("warnings")) {
+    if (value.equals_insensitive("suppressed")
+        || value.equals_insensitive("disabled")
+        || value.equals_insensitive("off"))
+      _swift_backtraceSettings.suppressWarnings = true;
+    else if (value.equals_insensitive("enabled")
+             || value.equals_insensitive("on"))
+      _swift_backtraceSettings.suppressWarnings = false;
+    else if (!_swift_backtraceSettings.suppressWarnings) {
+      swift::warning(0,
+                     "swift runtime: unknown warnings setting '%.*s'\n",
+                     static_cast<int>(value.size()), value.data());
+    }
+  } else if (!_swift_backtraceSettings.suppressWarnings) {
     swift::warning(0,
                    "swift runtime: unknown backtracing setting '%.*s'\n",
                    static_cast<int>(key.size()), key.data());
@@ -735,7 +902,11 @@ _swift_backtraceSetupEnvironment()
 
     size_t nameLen = std::strlen(name);
     size_t valueLen = std::strlen(value);
-    size_t totalLen = nameLen + 1 + valueLen + 1;
+    size_t totalLen;
+
+    if (__builtin_add_overflow(nameLen + 1, valueLen + 1, &totalLen)) {
+      break;
+    }
 
     if (remaining > totalLen) {
       std::memcpy(penv, name, nameLen);
@@ -751,6 +922,54 @@ _swift_backtraceSetupEnvironment()
 
   *penv = 0;
 }
+
+#ifdef __linux__
+struct spawn_info {
+  const char *path;
+  char * const *argv;
+  char * const *envp;
+  int memserver;
+};
+
+uint8_t spawn_stack[4096] __attribute__((aligned(SWIFT_PAGE_SIZE)));
+
+int
+do_spawn(void *ptr) {
+  struct spawn_info *pinfo = (struct spawn_info *)ptr;
+
+  /* Ensure that the memory server is always on fd 4 */
+  if (pinfo->memserver != 4) {
+    dup2(pinfo->memserver, 4);
+    close(pinfo->memserver);
+  }
+
+  /* Clear the signal mask */
+  sigset_t mask;
+  sigfillset(&mask);
+  sigprocmask(SIG_UNBLOCK, &mask, NULL);
+
+  return execvpe(pinfo->path, pinfo->argv, pinfo->envp);
+}
+
+int
+safe_spawn(pid_t *ppid, const char *path, int memserver,
+           char * const argv[], char * const envp[])
+{
+  struct spawn_info info = { path, argv, envp, memserver };
+
+  /* The CLONE_VFORK is *required* because info is on the stack; we don't
+     want to return until *after* the subprocess has called execvpe(). */
+  int ret = clone(do_spawn, spawn_stack + sizeof(spawn_stack),
+                  CLONE_VFORK|CLONE_VM, &info);
+  if (ret < 0)
+    return ret;
+
+  close(memserver);
+
+  *ppid = ret;
+  return 0;
+}
+#endif // defined(__linux__)
 
 #endif // SWIFT_BACKTRACE_ON_CRASH_SUPPORTED
 
@@ -768,24 +987,290 @@ namespace backtrace {
 /// @param mangledName is the symbol name to be tested.
 ///
 /// @returns `true` if `mangledName` represents a thunk function.
-SWIFT_RUNTIME_STDLIB_SPI SWIFT_CC(swift) bool
-_swift_isThunkFunction(const char *mangledName) {
+SWIFT_RUNTIME_STDLIB_SPI bool
+_swift_backtrace_isThunkFunction(const char *mangledName) {
   swift::Demangle::Context ctx;
 
   return ctx.isThunkSymbol(mangledName);
 }
 
+// Try to demangle a symbol.
+SWIFT_RUNTIME_STDLIB_SPI char *
+_swift_backtrace_demangle(const char *mangledName,
+                          size_t mangledNameLength,
+                          char *outputBuffer,
+                          size_t *outputBufferSize) {
+  llvm::StringRef name = llvm::StringRef(mangledName, mangledNameLength);
+
+  // You must provide buffer size if you're providing your own output buffer
+  if (outputBuffer && !outputBufferSize) {
+    return nullptr;
+  }
+
+  if (Demangle::isSwiftSymbol(name)) {
+    // This is a Swift mangling
+    auto options = DemangleOptions::SimplifiedUIDemangleOptions();
+    auto result = Demangle::demangleSymbolAsString(name, options);
+    size_t bufferSize;
+
+    if (outputBufferSize) {
+      bufferSize = *outputBufferSize;
+      *outputBufferSize = result.length() + 1;
+    }
+
+    if (outputBuffer == nullptr) {
+      outputBuffer = (char *)::malloc(result.length() + 1);
+      bufferSize = result.length() + 1;
+    }
+
+    size_t toCopy = std::min(bufferSize - 1, result.length());
+    ::memcpy(outputBuffer, result.data(), toCopy);
+    outputBuffer[toCopy] = '\0';
+
+    return outputBuffer;
+#ifndef _WIN32
+  } else if (name.starts_with("_Z")) {
+    // Try C++; note that we don't want to force callers to use malloc() to
+    // allocate their buffer, which is a requirement for __cxa_demangle
+    // because it may call realloc() on the incoming pointer.  As a result,
+    // we never pass the caller's buffer to __cxa_demangle.
+    size_t resultLen;
+    int status = 0;
+    char *result = abi::__cxa_demangle(mangledName, nullptr, &resultLen, &status);
+
+    if (result) {
+      size_t bufferSize;
+
+      if (outputBufferSize) {
+        bufferSize = *outputBufferSize;
+        *outputBufferSize = resultLen;
+      }
+
+      if (outputBuffer == nullptr) {
+        return result;
+      }
+
+      size_t toCopy = std::min(bufferSize - 1, resultLen - 1);
+      ::memcpy(outputBuffer, result, toCopy);
+      outputBuffer[toCopy] = '\0';
+
+      free(result);
+
+      return outputBuffer;
+    }
+#else
+    // On Windows, the mangling is different.
+    // ###TODO: Call __unDName()
+#endif
+  }
+
+  return nullptr;
+}
+
+#if SWIFT_BACKTRACE_ON_CRASH_SUPPORTED
+namespace {
+
+char addr_buf[18];
+char timeout_buf[22];
+char limit_buf[22];
+char top_buf[22];
+const char *backtracer_argv[] = {
+  "swift-backtrace",            // 0
+  "--unwind",                   // 1
+  "precise",                    // 2
+  "--demangle",                 // 3
+  "true",                       // 4
+  "--interactive",              // 5
+  "true",                       // 6
+  "--color",                    // 7
+  "true",                       // 8
+  "--timeout",                  // 9
+  timeout_buf,                  // 10
+  "--preset",                   // 11
+  "friendly",                   // 12
+  "--crashinfo",                // 13
+  addr_buf,                     // 14
+  "--threads",                  // 15
+  "preset",                     // 16
+  "--registers",                // 17
+  "preset",                     // 18
+  "--images",                   // 19
+  "preset",                     // 20
+  "--limit",                    // 21
+  limit_buf,                    // 22
+  "--top",                      // 23
+  top_buf,                      // 24
+  "--sanitize",                 // 25
+  "preset",                     // 26
+  "--cache",                    // 27
+  "true",                       // 28
+  "--output-to",                // 29
+  "stdout",                     // 30
+  "--symbolicate",              // 31
+  "full",                       // 32
+  "--format",                   // 33
+  "text",                       // 34
+  NULL
+};
+
+const char *
+trueOrFalse(bool b) {
+  return b ? "true" : "false";
+}
+
+const char *
+trueOrFalse(OnOffTty oot) {
+  return trueOrFalse(oot == OnOffTty::On);
+}
+
+} // namespace
+#endif
+
 // N.B. THIS FUNCTION MUST BE SAFE TO USE FROM A CRASH HANDLER.  On Linux
 // and macOS, that means it must be async-signal-safe.  On Windows, there
 // isn't an equivalent notion but a similar restriction applies.
 SWIFT_RUNTIME_STDLIB_INTERNAL bool
-_swift_spawnBacktracer(const ArgChar * const *argv)
+#ifdef __linux__
+_swift_spawnBacktracer(CrashInfo *crashInfo, int memserver_fd)
+#else
+_swift_spawnBacktracer(CrashInfo *crashInfo)
+#endif
 {
-#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+#if !SWIFT_BACKTRACE_ON_CRASH_SUPPORTED
+  return false;
+#elif TARGET_OS_OSX || TARGET_OS_MACCATALYST || defined(__linux__)
+  // Set-up the backtracer's command line arguments
+  switch (_swift_backtraceSettings.algorithm) {
+  case UnwindAlgorithm::Fast:
+    backtracer_argv[2] = "fast";
+    break;
+  default:
+    backtracer_argv[2] = "precise";
+    break;
+  }
+
+  // (The TTY option has already been handled at this point, so these are
+  //  all either "On" or "Off".)
+  backtracer_argv[4] = trueOrFalse(_swift_backtraceSettings.demangle);
+  backtracer_argv[6] = trueOrFalse(_swift_backtraceSettings.interactive);
+  backtracer_argv[8] = trueOrFalse(_swift_backtraceSettings.color);
+
+  switch (_swift_backtraceSettings.threads) {
+  case ThreadsToShow::Preset:
+    backtracer_argv[16] = "preset";
+    break;
+  case ThreadsToShow::All:
+    backtracer_argv[16] = "all";
+    break;
+  case ThreadsToShow::Crashed:
+    backtracer_argv[16] = "crashed";
+    break;
+  }
+
+  switch (_swift_backtraceSettings.registers) {
+  case RegistersToShow::Preset:
+    backtracer_argv[18] = "preset";
+    break;
+  case RegistersToShow::None:
+    backtracer_argv[18] = "none";
+    break;
+  case RegistersToShow::All:
+    backtracer_argv[18] = "all";
+    break;
+  case RegistersToShow::Crashed:
+    backtracer_argv[18] = "crashed";
+    break;
+  }
+
+  switch (_swift_backtraceSettings.images) {
+  case ImagesToShow::Preset:
+    backtracer_argv[20] = "preset";
+    break;
+  case ImagesToShow::None:
+    backtracer_argv[20] = "none";
+    break;
+  case ImagesToShow::All:
+    backtracer_argv[20] = "all";
+    break;
+  case ImagesToShow::Mentioned:
+    backtracer_argv[20] = "mentioned";
+    break;
+  }
+
+  switch (_swift_backtraceSettings.preset) {
+  case Preset::Friendly:
+    backtracer_argv[12] = "friendly";
+    break;
+  case Preset::Medium:
+    backtracer_argv[12] = "medium";
+    break;
+  default:
+    backtracer_argv[12] = "full";
+    break;
+  }
+
+  switch (_swift_backtraceSettings.sanitize) {
+  case SanitizePaths::Preset:
+    backtracer_argv[26] = "preset";
+    break;
+  case SanitizePaths::Off:
+    backtracer_argv[26] = "false";
+    break;
+  case SanitizePaths::On:
+    backtracer_argv[26] = "true";
+    break;
+  }
+
+  switch (_swift_backtraceSettings.outputTo) {
+  case OutputTo::Stdout:
+    backtracer_argv[30] = "stdout";
+    break;
+  case OutputTo::Auto: // Shouldn't happen, but if it does pick stderr
+  case OutputTo::Stderr:
+    backtracer_argv[30] = "stderr";
+    break;
+  case OutputTo::File:
+    backtracer_argv[30] = swiftBacktraceOutputPath;
+    break;
+  }
+
+  backtracer_argv[28] = trueOrFalse(_swift_backtraceSettings.cache);
+
+  switch (_swift_backtraceSettings.symbolicate) {
+  case Symbolication::Off:
+    backtracer_argv[32] = "off";
+    break;
+  case Symbolication::Fast:
+    backtracer_argv[32] = "fast";
+    break;
+  case Symbolication::Full:
+    backtracer_argv[32] = "full";
+    break;
+  }
+
+  switch (_swift_backtraceSettings.format) {
+  case OutputFormat::Text:
+    backtracer_argv[34] = "text";
+    break;
+  case OutputFormat::JSON:
+    backtracer_argv[34] = "json";
+    break;
+  }
+
+  _swift_formatUnsigned(_swift_backtraceSettings.timeout, timeout_buf);
+
+  if (_swift_backtraceSettings.limit < 0)
+    std::strcpy(limit_buf, "none");
+  else
+    _swift_formatUnsigned(_swift_backtraceSettings.limit, limit_buf);
+
+  _swift_formatUnsigned(_swift_backtraceSettings.top, top_buf);
+  _swift_formatAddress(crashInfo, addr_buf);
+
+  // Set-up the environment array
   pid_t child;
   const char *env[BACKTRACE_MAX_ENV_VARS + 1];
 
-  // Set-up the environment array
   const char *ptr = swiftBacktraceEnv;
   unsigned nEnv = 0;
   while (*ptr && nEnv < lengthof(env) - 1) {
@@ -796,10 +1281,16 @@ _swift_spawnBacktracer(const ArgChar * const *argv)
 
   // SUSv3 says argv and envp are "completely constant" and that the reason
   // posix_spawn() et al use char * const * is for compatibility.
+#ifdef __linux__
+  int ret = safe_spawn(&child, swiftBacktracePath, memserver_fd,
+                       const_cast<char * const *>(backtracer_argv),
+                       const_cast<char * const *>(env));
+#else
   int ret = posix_spawn(&child, swiftBacktracePath,
-                        &backtraceFileActions, &backtraceSpawnAttrs,
-                        const_cast<char * const *>(argv),
+                        nullptr, nullptr,
+                        const_cast<char * const *>(backtracer_argv),
                         const_cast<char * const *>(env));
+#endif
   if (ret < 0)
     return false;
 
@@ -814,10 +1305,58 @@ _swift_spawnBacktracer(const ArgChar * const *argv)
 
   return false;
 
-  // ###TODO: Linux
   // ###TODO: Windows
+#endif
+}
+
+// N.B. THIS FUNCTION MUST BE SAFE TO USE FROM A CRASH HANDLER.  On Linux
+// and macOS, that means it must be async-signal-safe.  On Windows, there
+// isn't an equivalent notion but a similar restriction applies.
+SWIFT_RUNTIME_STDLIB_INTERNAL void
+_swift_displayCrashMessage(int signum, const void *pc)
+{
+#if !SWIFT_BACKTRACE_ON_CRASH_SUPPORTED
+  return;
 #else
-  return false;
+  int fd = STDERR_FILENO;
+
+  if (_swift_backtraceSettings.outputTo == OutputTo::Stdout)
+    fd = STDOUT_FILENO;
+
+  const char *intro;
+  if (_swift_backtraceSettings.color == OnOffTty::On) {
+    intro = "\n💣 \033[91mProgram crashed: ";
+  } else {
+    intro = "\n*** ";
+  }
+  write(fd, intro, strlen(intro));
+
+  char sigbuf[30];
+  strcpy(sigbuf, "Signal ");
+  _swift_formatUnsigned((unsigned)signum, sigbuf + 7);
+  write(fd, sigbuf, strlen(sigbuf));
+
+  const char *message;
+  if (!pc) {
+    message = ": Backtracing";
+  } else {
+    message = ": Backtracing from 0x";
+  }
+  write(fd, message, strlen(message));
+
+  if (pc) {
+    char pcbuf[18];
+    _swift_formatAddress(pc, pcbuf);
+    write(fd, pcbuf, strlen(pcbuf));
+  }
+
+  const char *outro;
+  if (_swift_backtraceSettings.color == OnOffTty::On) {
+    outro = "...\033[0m";
+  } else {
+    outro = "...";
+  }
+  write(fd, outro, strlen(outro));
 #endif
 }
 

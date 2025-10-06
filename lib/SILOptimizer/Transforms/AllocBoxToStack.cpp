@@ -14,15 +14,19 @@
 
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/SemanticAttrs.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/BlotMapVector.h"
 #include "swift/Basic/GraphNodeWorklist.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/BasicBlockDatastructures.h"
 #include "swift/SIL/Dominance.h"
 #include "swift/SIL/MemAccessUtils.h"
+#include "swift/SIL/NodeDatastructures.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILBuilder.h"
 #include "swift/SIL/SILCloner.h"
+#include "swift/SILOptimizer/Analysis/DeadEndBlocksAnalysis.h"
+#include "swift/SILOptimizer/Analysis/LoopAnalysis.h"
 #include "swift/SILOptimizer/PassManager/Passes.h"
 #include "swift/SILOptimizer/PassManager/Transforms.h"
 #include "swift/SILOptimizer/Utils/InstOptUtils.h"
@@ -254,10 +258,11 @@ static bool partialApplyEscapes(SILValue V, bool examineApply) {
 
     auto *User = Op->getUser();
 
-    // If we have a copy_value, the copy value does not cause an escape, but its
-    // uses might do so... so add the copy_value's uses to the worklist and
-    // continue.
-    if (isa<CopyValueInst>(User) || isa<BeginBorrowInst>(User)) {
+    // If we have a copy_value, begin_borrow, or move_value, that instruction
+    // does not cause an escape, but its uses might do so... so add the
+    // its uses to the worklist and continue.
+    if (isa<CopyValueInst>(User) || isa<BeginBorrowInst>(User) ||
+        isa<MoveValueInst>(User)) {
       llvm::copy(cast<SingleValueInstruction>(User)->getUses(),
                  std::back_inserter(Worklist));
       continue;
@@ -352,7 +357,8 @@ static bool isOptimizableApplySite(ApplySite Apply) {
     return false;
 
   // Do not optimize always_inlinable functions.
-  if (callee->getInlineStrategy() == Inline_t::AlwaysInline)
+  if (callee->getInlineStrategy() == Inline_t::HeuristicAlwaysInline ||
+      callee->getInlineStrategy() == Inline_t::AlwaysInline)
     return false;
 
   if (callee->getLinkage() != SILLinkage::Private)
@@ -525,29 +531,48 @@ static void replaceProjectBoxUsers(SILValue heapBox, SILValue stackBox) {
   }
 }
 
-static void hoistMarkMustCheckInsts(SILValue stackBox,
-                                    MarkMustCheckInst::CheckKind checkKind) {
+static void replaceAllNonDebugUsesWith(SILValue value,
+                                       SILValue with) {
+  auto useI = value->use_begin();
+  while (useI != value->use_end()) {
+    Operand *op = *useI;
+    ++useI;
+    // Leave debug instructions on the original value.
+    if (op->getUser()->isDebugInstruction()) {
+      continue;
+    }
+    
+    // Rewrite all other uses.
+    op->set(with);
+  }
+}
+
+static void hoistMarkUnresolvedNonCopyableValueInsts(
+    SILValue stackBox,
+    MarkUnresolvedNonCopyableValueInst::CheckKind checkKind) {
   StackList<Operand *> worklist(stackBox->getFunction());
 
   for (auto *use : stackBox->getUses()) {
     worklist.push_back(use);
   }
 
-  StackList<MarkMustCheckInst *> targets(stackBox->getFunction());
+  StackList<MarkUnresolvedNonCopyableValueInst *> targets(
+      stackBox->getFunction());
   while (!worklist.empty()) {
     auto *nextUse = worklist.pop_back_val();
     auto *nextUser = nextUse->getUser();
 
     if (isa<BeginBorrowInst>(nextUser) || isa<BeginAccessInst>(nextUser) ||
         isa<CopyValueInst>(nextUser) || isa<MarkUninitializedInst>(nextUser) ||
-        isa<MarkMustCheckInst>(nextUser)) {
+        isa<MarkUnresolvedNonCopyableValueInst>(nextUser)) {
       for (auto result : nextUser->getResults()) {
         for (auto *use : result->getUses())
           worklist.push_back(use);
       }
     }
 
-    if (auto *mmci = dyn_cast<MarkMustCheckInst>(nextUser)) {
+    if (auto *mmci = dyn_cast<MarkUnresolvedNonCopyableValueInst>(nextUser);
+        mmci && !mmci->isStrict()) {
       targets.push_back(mmci);
     }
   }
@@ -567,20 +592,25 @@ static void hoistMarkMustCheckInsts(SILValue stackBox,
     loc = RegularLocation::getDiagnosticsOnlyLocation(loc, next->getModule());
   SILBuilderWithScope builder(next);
 
-  auto *undef = SILUndef::get(stackBox->getType(), *stackBox->getModule());
+  auto *undef = SILUndef::get(stackBox);
 
-  auto *mmci = builder.createMarkMustCheckInst(loc, undef, checkKind);
-  stackBox->replaceAllUsesWith(mmci);
+  auto *mmci =
+      builder.createMarkUnresolvedNonCopyableValueInst(loc, undef, checkKind);
+  // Leave debug uses on the to-be-promoted box, but hoist all other uses to the
+  // new mark_unresolved_non_copyable_value.
+  replaceAllNonDebugUsesWith(stackBox, mmci);
   mmci->setOperand(stackBox);
 }
 
 /// rewriteAllocBoxAsAllocStack - Replace uses of the alloc_box with a
 /// new alloc_stack, but do not delete the alloc_box yet.
-static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI) {
+static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI,
+                                        DeadEndBlocksAnalysis &deba,
+                                        SILLoopAnalysis &la) {
   LLVM_DEBUG(llvm::dbgs() << "*** Promoting alloc_box to stack: " << *ABI);
 
   SILValue HeapBox = ABI;
-  Optional<MarkUninitializedInst::Kind> Kind;
+  std::optional<MarkUninitializedInst::Kind> Kind;
   if (HeapBox->hasOneUse()) {
     auto *User = HeapBox->getSingleUse()->getUser();
     if (auto *MUI = dyn_cast<MarkUninitializedInst>(User)) {
@@ -600,12 +630,16 @@ static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI) {
          && "rewriting multi-field box not implemented");
   auto ty = getSILBoxFieldType(TypeExpansionContext(*ABI->getFunction()),
                                ABI->getBoxType(), ABI->getModule().Types, 0);
-  auto isLexical = [&]() -> bool {
+  struct Flags {
+    IsLexical_t isLexical;
+    IsFromVarDecl_t isVarDecl;
+  };
+  auto getFlags = [&]() -> Flags {
     auto &mod = ABI->getFunction()->getModule();
     bool lexicalLifetimesEnabled =
         mod.getASTContext().SILOpts.supportsLexicalLifetimes(mod);
-    if (!lexicalLifetimesEnabled)
-      return false;
+    bool sawLexical = false;
+    bool sawVarDecl = false;
     // Look for lexical borrows of the alloc_box.
     GraphNodeWorklist<Operand *, 4> worklist;
     worklist.initializeRange(ABI->getUses());
@@ -618,15 +652,25 @@ static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI) {
           worklist.insert(use);
       } else if (auto *bbi = dyn_cast<BeginBorrowInst>(use->getUser())) {
         if (bbi->isLexical())
-          return true;
+          sawLexical = true;
+        if (bbi->isFromVarDecl())
+          sawVarDecl = true;
         for (auto *use : bbi->getUses())
           worklist.insert(use);
       }
     }
-    return false;
+    return Flags{IsLexical_t(lexicalLifetimesEnabled && sawLexical),
+                 IsFromVarDecl_t(sawVarDecl)};
   };
-  auto *ASI = Builder.createAllocStack(ABI->getLoc(), ty, ABI->getVarInfo(),
-                                       ABI->hasDynamicLifetime(), isLexical());
+  auto flags = getFlags();
+  auto *ASI = Builder.createAllocStack(
+      ABI->getLoc(), ty, ABI->getVarInfo(), ABI->hasDynamicLifetime(),
+      flags.isLexical, flags.isVarDecl, DoesNotUseMoveableValueDebugInfo
+#ifndef NDEBUG
+      ,
+      true
+#endif
+  );
 
   // Transfer a mark_uninitialized if we have one.
   SingleValueInstruction *StackBox = ASI;
@@ -639,12 +683,13 @@ static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI) {
   // the address of the stack location.
   replaceProjectBoxUsers(HeapBox, StackBox);
 
-  // Then hoist any mark_must_check [assignable_but_not_consumable] to the
-  // alloc_stack and convert them to [consumable_but_not_assignable]. This is
-  // because we are semantically converting from escaping semantics to
-  // non-escaping semantics.
-  hoistMarkMustCheckInsts(
-      StackBox, MarkMustCheckInst::CheckKind::ConsumableAndAssignable);
+  // Then hoist any mark_unresolved_non_copyable_value
+  // [assignable_but_not_consumable] to the alloc_stack and convert them to
+  // [consumable_but_not_assignable]. This is because we are semantically
+  // converting from escaping semantics to non-escaping semantics.
+  hoistMarkUnresolvedNonCopyableValueInsts(
+      StackBox,
+      MarkUnresolvedNonCopyableValueInst::CheckKind::ConsumableAndAssignable);
 
   assert(ABI->getBoxType()->getLayout()->getFields().size() == 1
          && "promoting multi-field box not implemented");
@@ -653,19 +698,47 @@ static bool rewriteAllocBoxAsAllocStack(AllocBoxInst *ABI) {
                          ABI->getBoxType(), ABI->getModule().Types, 0));
   auto Loc = CleanupLocation(ABI->getLoc());
 
+  auto *deb = deba.get(ABI->getFunction());
   for (auto LastRelease : FinalReleases) {
+    auto *dbi = dyn_cast<DeallocBoxInst>(LastRelease);
+    if (!dbi && deb->isDeadEnd(LastRelease->getParent()) &&
+        !la.get(ABI->getFunction())->getLoopFor(LastRelease->getParent())) {
+      // "Last" releases in dead-end regions may not actually destroy the box
+      // and consequently may not actually release the stored value.  That's
+      // because values (including boxes) may be leaked along paths into
+      // dead-end regions.  Thus it is invalid to lower such final releases of
+      // the box to destroy_addr's/dealloc_box's of the stack-promoted storage.
+      //
+      // There is one exception: if the alloc_box is in a dead-end loop.  In
+      // that case SIL invariants require that the final releases actually
+      // destroy the box; otherwise, a box would leak once per loop.  To check
+      // for this, it is sufficient check that the LastRelease is in a dead-end
+      // loop: if the alloc_box is not in that loop, then the entire loop is in
+      // the live range, so no release within the loop would be a "final
+      // release".
+      //
+      // None of this applies to dealloc_box instructions which always destroy
+      // the box.
+      continue;
+    }
     SILBuilderWithScope Builder(LastRelease);
-    if (!isa<DeallocBoxInst>(LastRelease)&& !Lowering.isTrivial()) {
-      // If we have a mark_must_check use of our stack box, we want to destroy
-      // that.
+    if (!dbi && !Lowering.isTrivial()) {
+      // If we have a mark_unresolved_non_copyable_value use of our stack box,
+      // we want to destroy that.
       SILValue valueToDestroy = StackBox;
-      if (auto *mmci = StackBox->getSingleUserOfType<MarkMustCheckInst>()) {
+      if (auto *mmci =
+              StackBox
+                  ->getSingleUserOfType<MarkUnresolvedNonCopyableValueInst>()) {
         valueToDestroy = mmci;
       }
 
       // For non-trivial types, insert destroys for each final release-like
       // instruction we found that isn't an explicit dealloc_box.
       Builder.emitDestroyAddrAndFold(Loc, valueToDestroy);
+    }
+    if (dbi && dbi->isDeadEnd()) {
+      // Don't bother to create dealloc_stack instructions in dead-ends.
+      continue;
     }
     Builder.createDeallocStack(Loc, ASI);
   }
@@ -720,7 +793,7 @@ class PromotedParamCloner : public SILClonerWithScopes<PromotedParamCloner> {
 
 public:
   PromotedParamCloner(SILOptFunctionBuilder &FuncBuilder, SILFunction *Orig,
-                      IsSerialized_t Serialized,
+                      SerializedKind_t Serialized,
                       ArgIndexList &PromotedArgIndices, StringRef ClonedName);
 
   void populateCloned();
@@ -729,7 +802,7 @@ public:
 
 private:
   static SILFunction *initCloned(SILOptFunctionBuilder &FuncBuilder,
-                                 SILFunction *Orig, IsSerialized_t Serialized,
+                                 SILFunction *Orig, SerializedKind_t Serialized,
                                  ArgIndexList &PromotedArgIndices,
                                  StringRef ClonedName);
 
@@ -748,7 +821,7 @@ private:
 
 PromotedParamCloner::PromotedParamCloner(SILOptFunctionBuilder &FuncBuilder,
                                          SILFunction *Orig,
-                                         IsSerialized_t Serialized,
+                                         SerializedKind_t Serialized,
                                          ArgIndexList &PromotedArgIndices,
                                          StringRef ClonedName)
     : SILClonerWithScopes<PromotedParamCloner>(*initCloned(
@@ -759,10 +832,10 @@ PromotedParamCloner::PromotedParamCloner(SILOptFunctionBuilder &FuncBuilder,
          getCloned()->getDebugScope()->getParentFunction());
 }
 
-static std::string getClonedName(SILFunction *F, IsSerialized_t Serialized,
+static std::string getClonedName(SILFunction *F, SerializedKind_t Serialized,
                                  ArgIndexList &PromotedArgIndices) {
   auto P = Demangle::SpecializationPass::AllocBoxToStack;
-  Mangle::FunctionSignatureSpecializationMangler Mangler(P, Serialized, F);
+  Mangle::FunctionSignatureSpecializationMangler Mangler(F->getASTContext(), P, Serialized, F);
   for (unsigned i : PromotedArgIndices) {
     Mangler.setArgumentBoxToStack(i);
   }
@@ -774,7 +847,7 @@ static std::string getClonedName(SILFunction *F, IsSerialized_t Serialized,
 /// parameters (which are specified by PromotedArgIndices).
 SILFunction *PromotedParamCloner::initCloned(SILOptFunctionBuilder &FuncBuilder,
                                              SILFunction *Orig,
-                                             IsSerialized_t Serialized,
+                                             SerializedKind_t Serialized,
                                              ArgIndexList &PromotedArgIndices,
                                              StringRef ClonedName) {
   SILModule &M = Orig->getModule();
@@ -1000,43 +1073,42 @@ specializeApplySite(SILOptFunctionBuilder &FuncBuilder, ApplySite Apply,
   auto *F = FRI->getReferencedFunction();
   assert(F && "Expected a referenced function!");
 
-  IsSerialized_t Serialized = IsNotSerialized;
-  if (Apply.getFunction()->isSerialized())
-    Serialized = IsSerialized;
-
+  SerializedKind_t serializedKind = Apply.getFunction()->getSerializedKind();
   std::string ClonedName =
-    getClonedName(F, Serialized, PromotedCalleeArgIndices);
+    getClonedName(F, serializedKind, PromotedCalleeArgIndices);
 
   auto &M = Apply.getModule();
 
   SILFunction *ClonedFn;
   if (auto *PrevFn = M.lookUpFunction(ClonedName)) {
-    assert(PrevFn->isSerialized() == Serialized);
+    assert(PrevFn->getSerializedKind() == serializedKind);
     ClonedFn = PrevFn;
   } else {
     // Clone the function the existing ApplySite references.
-    PromotedParamCloner Cloner(FuncBuilder, F, Serialized,
+    PromotedParamCloner Cloner(FuncBuilder, F, serializedKind,
                                PromotedCalleeArgIndices,
                                ClonedName);
     Cloner.populateCloned();
     ClonedFn = Cloner.getCloned();
     pass.T->addFunctionToPassManagerWorklist(ClonedFn, F);
 
-    // Set the moveonly ignore flag so we do not emit an error on the original
-    // function even though it is still around.
-    F->addSemanticsAttr(semantics::NO_MOVEONLY_DIAGNOSTICS);
+    // Set the moveonly delete-if-unused flag so we do not emit an error on the
+    // original once we promote all its current uses.
+    F->addSemanticsAttr(semantics::DELETE_IF_UNUSED);
 
     // If any of our promoted callee arg indices were originally noncopyable let
     // boxes, convert them from having escaping to having non-escaping
     // semantics.
     for (unsigned index : PromotedCalleeArgIndices) {
-      if (F->getArgument(index)->getType().isBoxedNonCopyableType(*F)) {
+      if (F->getArgument(index)->getType().isBoxedNonCopyableType(F)) {
         auto boxType = F->getArgument(index)->getType().castTo<SILBoxType>();
         bool isMutable = boxType->getLayout()->getFields()[0].isMutable();
-        auto checkKind =
-            isMutable ? MarkMustCheckInst::CheckKind::AssignableButNotConsumable
-                      : MarkMustCheckInst::CheckKind::NoConsumeOrAssign;
-        hoistMarkMustCheckInsts(ClonedFn->getArgument(index), checkKind);
+        auto checkKind = isMutable ? MarkUnresolvedNonCopyableValueInst::
+                                         CheckKind::ConsumableAndAssignable
+                                   : MarkUnresolvedNonCopyableValueInst::
+                                         CheckKind::NoConsumeOrAssign;
+        hoistMarkUnresolvedNonCopyableValueInsts(ClonedFn->getArgument(index),
+                                                 checkKind);
       }
     }
   }
@@ -1076,7 +1148,31 @@ specializeApplySite(SILOptFunctionBuilder &FuncBuilder, ApplySite Apply,
       // borrows its captures, and we don't need to adjust capture lifetimes.
       if (!PAI->isOnStack()) {
         if (PAFrontier.empty()) {
-          ValueLifetimeAnalysis VLA(PAI, PAI->getUses());
+          SmallVector<SILInstruction *, 8> users;
+          InstructionWorklist worklist(PAI->getFunction());
+          worklist.push(PAI);
+          while (auto *inst = worklist.pop()) {
+            auto *svi = cast<SingleValueInstruction>(inst);
+            for (auto *use : svi->getUses()) {
+              auto *user = use->getUser();
+              SingleValueInstruction *svi;
+              // A copy_value produces a value with a new lifetime on which the
+              // captured alloc_box's lifetime depends.  If the transformation
+              // were only to create a destroy_value of the alloc_box (and to
+              // rewrite the closure not to consume it), the alloc_box would be
+              // kept alive by the copy_value.  The transformation does more,
+              // however: it rewrites the alloc_box as an alloc_stack, creating
+              // the alloc_stack/dealloc_stack instructions where the alloc_box/
+              // destroy_value instructions are respectively.  The copy_value
+              // can't keep the alloc_stack alive.
+              if ((svi = dyn_cast<CopyValueInst>(user)) ||
+                  (svi = dyn_cast<MoveValueInst>(user))) {
+                worklist.push(svi);
+              }
+              users.push_back(user);
+            }
+          }
+          ValueLifetimeAnalysis VLA(PAI, users);
           pass.CFGChanged |= !VLA.computeFrontier(
               PAFrontier, ValueLifetimeAnalysis::AllowToModifyCFG);
           assert(!PAFrontier.empty() &&
@@ -1104,8 +1200,7 @@ specializeApplySite(SILOptFunctionBuilder &FuncBuilder, ApplySite Apply,
     auto *PAI = cast<PartialApplyInst>(ApplyInst);
     return Builder.createPartialApply(
         Apply.getLoc(), FunctionRef, Apply.getSubstitutionMap(), Args,
-        PAI->getType().getAs<SILFunctionType>()->getCalleeConvention(),
-        PAI->isOnStack(),
+        PAI->getCalleeConvention(), PAI->getResultIsolation(), PAI->isOnStack(),
         GenericSpecializationInformation::create(ApplyInst, Builder));
   }
   case ApplySiteKind::ApplyInst:
@@ -1196,7 +1291,9 @@ static void rewriteApplySites(AllocBoxToStackState &pass) {
 
 /// Clone closure bodies and rewrite partial applies. Returns the number of
 /// alloc_box allocations promoted.
-static unsigned rewritePromotedBoxes(AllocBoxToStackState &pass) {
+static unsigned rewritePromotedBoxes(AllocBoxToStackState &pass,
+                                     DeadEndBlocksAnalysis &deba,
+                                     SILLoopAnalysis &la) {
   // First we'll rewrite any ApplySite that we can to remove
   // the box container pointer from the operands.
   rewriteApplySites(pass);
@@ -1205,7 +1302,7 @@ static unsigned rewritePromotedBoxes(AllocBoxToStackState &pass) {
   auto rend = pass.Promotable.rend();
   for (auto I = pass.Promotable.rbegin(); I != rend; ++I) {
     auto *ABI = *I;
-    if (rewriteAllocBoxAsAllocStack(ABI)) {
+    if (rewriteAllocBoxAsAllocStack(ABI, deba, la)) {
       ++Count;
       ABI->eraseFromParent();
     }
@@ -1230,7 +1327,9 @@ class AllocBoxToStack : public SILFunctionTransform {
     }
 
     if (!pass.Promotable.empty()) {
-      auto Count = rewritePromotedBoxes(pass);
+      auto *deba = getAnalysis<DeadEndBlocksAnalysis>();
+      auto *la = getAnalysis<SILLoopAnalysis>();
+      auto Count = rewritePromotedBoxes(pass, *deba, *la);
       NumStackPromoted += Count;
       if (Count) {
         if (StackNesting::fixNesting(getFunction()) == StackNesting::Changes::CFG)
@@ -1246,6 +1345,6 @@ class AllocBoxToStack : public SILFunctionTransform {
 };
 } // end anonymous namespace
 
-SILTransform *swift::createAllocBoxToStack() {
+SILTransform *swift::createLegacyAllocBoxToStack() {
   return new AllocBoxToStack();
 }

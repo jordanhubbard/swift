@@ -46,6 +46,12 @@ enum class DisallowedOriginKind : uint8_t {
   SPILocal,
   SPIOnly,
   MissingImport,
+  FragileCxxAPI,
+
+  /// An import that is internal via the internally-imported bridging header.
+  InternalBridgingHeaderImport,
+
+  NonPublicImport,
   None
 };
 

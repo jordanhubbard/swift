@@ -12,6 +12,7 @@
 
 #define DEBUG_TYPE "sil-loop-region-analysis"
 #include "swift/SILOptimizer/Analysis/LoopRegionAnalysis.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "llvm/Support/DOTGraphTraits.h"
 #include "llvm/Support/CommandLine.h"
@@ -34,15 +35,13 @@ LoopRegion::~LoopRegion() {
 }
 
 LoopRegion::BlockTy *LoopRegion::getBlock() const {
-  return Ptr.get<BlockTy *>();
+  return cast<BlockTy *>(Ptr);
 }
 
-LoopRegion::LoopTy *LoopRegion::getLoop() const {
-  return Ptr.get<LoopTy *>();
-}
+LoopRegion::LoopTy *LoopRegion::getLoop() const { return cast<LoopTy *>(Ptr); }
 
 LoopRegion::FunctionTy *LoopRegion::getFunction() const {
-  return Ptr.get<FunctionTy *>();
+  return cast<FunctionTy *>(Ptr);
 }
 
 void LoopRegion::dump(bool isVerbose) const {
@@ -1029,7 +1028,7 @@ struct alledge_iterator {
     return copy;
   }
 
-  bool operator==(alledge_iterator rhs) {
+  bool operator==(alledge_iterator rhs) const {
     if (Wrapper->Region != rhs.Wrapper->Region)
       return false;
     if (SubregionIter != rhs.SubregionIter)
@@ -1041,7 +1040,7 @@ struct alledge_iterator {
     return BackedgeIter == rhs.BackedgeIter;
   }
 
-  bool operator!=(alledge_iterator rhs) { return !(*this == rhs); }
+  bool operator!=(alledge_iterator rhs) const { return !(*this == rhs); }
 };
 
 } // end anonymous namespace

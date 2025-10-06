@@ -4,7 +4,7 @@
 
 struct SomeValue {}
 
-@_moveOnly class NoncopyableClass {} // expected-error {{'moveOnly' only applies to structs or enums}}
+class NoncopyableClass: ~Copyable {} // expected-error {{classes cannot be '~Copyable'}}
 
 func checkOldConsumeName() {
   let x = SomeValue()

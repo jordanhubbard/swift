@@ -1,5 +1,4 @@
-// RUN: %target-swift-emit-silgen -enable-experimental-feature VariadicGenerics %s | %FileCheck %s
-// REQUIRES: asserts
+// RUN: %target-swift-emit-silgen -Xllvm -sil-print-types %s | %FileCheck %s
 
 func takesVariadicFunction<each T>(function: (repeat each T) -> Int) {}
 func takesVariadicOwnedFunction<each T>(function: (repeat __owned each T) -> Int) {}
@@ -19,24 +18,24 @@ func forwardAndReabstractFunctionPack<each T>(functions: repeat (each T) -> Bool
 // CHECK-NEXT:     cond_br [[IDX_EQ_LEN]], bb3, bb2
 // CHECK:       bb2:
 // CHECK-NEXT:    [[INDEX:%.*]] = dynamic_pack_index [[IDX]] of $Pack{repeat (each T) -> Bool}
-// CHECK-NEXT:    open_pack_element [[INDEX]] of <each T> at <Pack{repeat each T}>, shape $T, uuid [[UUID:".*"]]
+// CHECK-NEXT:    open_pack_element [[INDEX]] of <each T> at <Pack{repeat each T}>, shape $each T, uuid [[UUID:".*"]]
 // CHECK-NEXT:    [[ARG_TUPLE_ELT_ADDR:%.*]] = tuple_pack_element_addr [[INDEX]] of [[ARG_TUPLE]] :
 //   Load the parameter function from the parameter pack.
-// CHECK-NEXT:    [[PARAM_ELT_ADDR:%.*]] = pack_element_get [[INDEX]] of %0 : $*Pack{repeat @noescape @callee_guaranteed @substituted <τ_0_0> (@in_guaranteed τ_0_0) -> Bool for <each T>} as $*@noescape @callee_guaranteed @substituted <τ_0_0> (@in_guaranteed τ_0_0) -> Bool for <@pack_element([[UUID]]) T>
+// CHECK-NEXT:    [[PARAM_ELT_ADDR:%.*]] = pack_element_get [[INDEX]] of %0 : $*Pack{repeat @noescape @callee_guaranteed @substituted <τ_0_0> (@in_guaranteed τ_0_0) -> Bool for <each T>} as $*@noescape @callee_guaranteed @substituted <τ_0_0> (@in_guaranteed τ_0_0) -> Bool for <@pack_element([[UUID]]) each T>
 // CHECK-NEXT:    [[COPY:%.*]] = load [copy] [[PARAM_ELT_ADDR]] :
 //   Convert that to an unsubstituted type
-// CHECK-NEXT:    [[COPY_CONVERT:%.*]] = convert_function [[COPY]] : $@noescape @callee_guaranteed @substituted <τ_0_0> (@in_guaranteed τ_0_0) -> Bool for <@pack_element([[UUID]]) T> to $@noescape @callee_guaranteed (@in_guaranteed @pack_element([[UUID]]) T) -> Bool
+// CHECK-NEXT:    [[COPY_CONVERT:%.*]] = convert_function [[COPY]] : $@noescape @callee_guaranteed @substituted <τ_0_0> (@in_guaranteed τ_0_0) -> Bool for <@pack_element([[UUID]]) each T> to $@noescape @callee_guaranteed (@in_guaranteed @pack_element([[UUID]]) each T) -> Bool
 //   Wrap in the conversion thunk.
 // CHECK-NEXT:    // function_ref
-// CHECK-NEXT:    [[THUNK:%.*]] = function_ref @$sxSbIgnd_xSbIegnr_lTR : $@convention(thin) <τ_0_0> (@in_guaranteed τ_0_0, @guaranteed @noescape @callee_guaranteed (@in_guaranteed τ_0_0) -> Bool) -> @out Bool
-// CHECK-NEXT:    [[THUNKED:%.*]] = partial_apply [callee_guaranteed] [[THUNK]]<@pack_element([[UUID]]) T>([[COPY_CONVERT]])
+// CHECK-NEXT:    [[THUNK:%.*]] = function_ref @$sqd__SbIgnd_qd__SbIegnr_Rvzr__lTR : $@convention(thin) <each τ_0_0><τ_1_0> (@in_guaranteed τ_1_0, @guaranteed @noescape @callee_guaranteed (@in_guaranteed τ_1_0) -> Bool) -> @out Bool
+// CHECK-NEXT:    [[THUNKED:%.*]] = partial_apply [callee_guaranteed] [[THUNK]]<Pack{repeat each T}, @pack_element([[UUID]]) each T>([[COPY_CONVERT]])
 //   Convert to a substituted type.
-// CHECK-NEXT:    [[THUNKED_CONVERT:%.*]] = convert_function [[THUNKED]] : $@callee_guaranteed (@in_guaranteed @pack_element([[UUID]]) T) -> @out Bool to $@callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) T, Bool>
+// CHECK-NEXT:    [[THUNKED_CONVERT:%.*]] = convert_function [[THUNKED]] : $@callee_guaranteed (@in_guaranteed @pack_element([[UUID]]) each T) -> @out Bool to $@callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) each T, Bool>
 //   Convert to noescape.
-// CHECK-NEXT:    [[NOESCAPE:%.*]] = convert_escape_to_noescape [not_guaranteed] [[THUNKED_CONVERT]] : $@callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) T, Bool> to $@noescape @callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) T, Bool>
+// CHECK-NEXT:    [[NOESCAPE:%.*]] = convert_escape_to_noescape [not_guaranteed] [[THUNKED_CONVERT]] : $@callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) each T, Bool> to $@noescape @callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) each T, Bool>
 //   Store into the tuple and put the tuple address into the argument pack.
 // CHECK-NEXT:    store [[NOESCAPE]] to [init] [[ARG_TUPLE_ELT_ADDR]] :
-// CHECK-NEXT:    pack_element_set [[ARG_TUPLE_ELT_ADDR]] : $*@noescape @callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) T, Bool> into %11 of [[ARG_PACK]] : $*Pack{repeat @noescape @callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <each T, Bool>}
+// CHECK-NEXT:    pack_element_set [[ARG_TUPLE_ELT_ADDR]] : $*@noescape @callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <@pack_element([[UUID]]) each T, Bool> into %11 of [[ARG_PACK]] : $*Pack{repeat @noescape @callee_guaranteed @substituted <τ_0_0, τ_0_1> (@in_guaranteed τ_0_0) -> @out τ_0_1 for <each T, Bool>}
 //   Destroy the thunked escaping function
 //   FIXME: does this leave the noescape function dangling??
 // CHECK-NEXT:    destroy_value [[THUNKED_CONVERT]] :
@@ -54,13 +53,13 @@ func forwardAndReabstractFunctionPack<each T>(functions: repeat (each T) -> Bool
 
 // CHECK-LABEL: sil{{.*}} @$s4main22passConcreteToVariadic2fnyS2i_SStXE_tF :
 // CHECK:         [[COPY:%.*]] = copy_value %0 : $@noescape @callee_guaranteed (Int, @guaranteed String) -> Int
-// CHECK:         [[THUNK:%.*]] = function_ref @$sSiSSSiIgygd_Si_SSQSiSiIeggd_TR
+// CHECK:         [[THUNK:%.*]] = function_ref @$sSiSSSiIgygd_Si_SSQSiSiIegpd_TR
 // CHECK:         partial_apply [callee_guaranteed] [[THUNK]]([[COPY]])
 func passConcreteToVariadic(fn: (Int, String) -> Int) {
   takesVariadicFunction(function: fn)
 }
 
-// CHECK-LABEL: sil{{.*}} @$sSiSSSiIgygd_Si_SSQSiSiIeggd_TR :
+// CHECK-LABEL: sil{{.*}} @$sSiSSSiIgygd_Si_SSQSiSiIegpd_TR :
 // CHECK:       bb0(%0 : $*Pack{Int, String}, %1 : @guaranteed $@noescape @callee_guaranteed (Int, @guaranteed String) -> Int):
 // CHECK-NEXT:    [[INT_INDEX:%.*]] = scalar_pack_index 0 of $Pack{Int, String}
 // CHECK-NEXT:    [[INT_ADDR:%.*]] = pack_element_get [[INT_INDEX]] of %0 : $*Pack{Int, String}
@@ -75,7 +74,7 @@ func passConcreteToVariadic(fn: (Int, String) -> Int) {
 //   FIXME: we aren't preserving that the argument is owned
 // CHECK-LABEL: sil{{.*}} @$s4main27passConcreteToOwnedVariadic2fnyS2i_SStXE_tF :
 // CHECK:         [[COPY:%.*]] = copy_value %0 : $@noescape @callee_guaranteed (Int, @guaranteed String) -> Int
-// CHECK:         [[THUNK:%.*]] = function_ref @$sSiSSSiIgygd_Si_SSQSiSiIeggd_TR
+// CHECK:         [[THUNK:%.*]] = function_ref @$sSiSSSiIgygd_Si_SSQSiSiIegpd_TR
 // CHECK:         partial_apply [callee_guaranteed] [[THUNK]]([[COPY]])
 func passConcreteToOwnedVariadic(fn: (Int, String) -> Int) {
   takesVariadicOwnedFunction(function: fn)
@@ -109,3 +108,52 @@ func passConcreteClosureToVariadic2(fn: (Int, String) -> Int, x: Int) {
   takesVariadicFunction {y in fn(x, y)}
 }
  */
+
+// rdar://109843932
+//   Test that the path where we emit closures naturally at a
+//   particular abstraction level correctly handles variadic
+//   expansion in the result type.
+func takeClosureWithVariadicResult<each Argument, each Result>(_: (repeat each Argument) -> (repeat each Result)) {}
+
+// CHECK-LABEL: sil {{.*}}@$s4main30testResultReabstractedEmissionyyFSb_SitSi_SbtXEfU_ :
+// CHECK-SAME: $@convention(thin) @substituted <each τ_0_0, each τ_0_1> (@pack_guaranteed Pack{repeat each τ_0_0}) -> @pack_out Pack{repeat each τ_0_1} for <Pack{Int, Bool}, Pack{Bool, Int}>
+// CHECK:       bb0(%0 : $*Pack{Bool, Int}, %1 : $*Pack{Int, Bool}):
+// CHECK-NEXT:    [[ARG_INDEX_0:%.*]] = scalar_pack_index 0 of $Pack{Int, Bool}
+// CHECK-NEXT:    [[ARG_ADDR_0:%.*]] = pack_element_get [[ARG_INDEX_0]] of %1 : $*Pack{Int, Bool} as $*Int
+// CHECK-NEXT:    [[ARG_0:%.*]] = load [trivial] [[ARG_ADDR_0]] : $*Int
+// CHECK-NEXT:    debug_value [[ARG_0]] :
+// CHECK-NEXT:    [[ARG_INDEX_1:%.*]] = scalar_pack_index 1 of $Pack{Int, Bool}
+// CHECK-NEXT:    [[ARG_ADDR_1:%.*]] = pack_element_get [[ARG_INDEX_1]] of %1 : $*Pack{Int, Bool} as $*Bool
+// CHECK-NEXT:    [[ARG_1:%.*]] = load [trivial] [[ARG_ADDR_1]] : $*Bool
+// CHECK-NEXT:    debug_value [[ARG_1]] :
+// CHECK-NEXT:    [[RET_INDEX_0:%.*]] = scalar_pack_index 0 of $Pack{Bool, Int}
+// CHECK-NEXT:    [[RET_ADDR_0:%.*]] = pack_element_get [[RET_INDEX_0]] of %0 : $*Pack{Bool, Int} as $*Bool
+// CHECK-NEXT:    [[RET_INDEX_1:%.*]] = scalar_pack_index 1 of $Pack{Bool, Int}
+// CHECK-NEXT:    [[RET_ADDR_1:%.*]] = pack_element_get [[RET_INDEX_1]] of %0 : $*Pack{Bool, Int} as $*Int
+// CHECK-NEXT:    store [[ARG_1]] to [trivial] [[RET_ADDR_0]] : $*Bool
+// CHECK-NEXT:    store [[ARG_0]] to [trivial] [[RET_ADDR_1]] : $*Int
+func testResultReabstractedEmission() {
+  takeClosureWithVariadicResult {
+    (a: Int, b: Bool) -> (Bool, Int) in (b, a)
+  }
+}
+
+// CHECK-LABEL: sil {{.*}}@$s4main40testResultReabstractedEmission_vanishingyyFSbSi_SbtXEfU_ :
+// CHECK-SAME: $@convention(thin) @substituted <each τ_0_0, each τ_0_1> (@pack_guaranteed Pack{repeat each τ_0_0}) -> @pack_out Pack{repeat each τ_0_1} for <Pack{Int, Bool}, Pack{Bool}>
+// CHECK:       bb0(%0 : $*Pack{Bool}, %1 : $*Pack{Int, Bool}):
+// CHECK-NEXT:    [[ARG_INDEX_0:%.*]] = scalar_pack_index 0 of $Pack{Int, Bool}
+// CHECK-NEXT:    [[ARG_ADDR_0:%.*]] = pack_element_get [[ARG_INDEX_0]] of %1 : $*Pack{Int, Bool} as $*Int
+// CHECK-NEXT:    [[ARG_0:%.*]] = load [trivial] [[ARG_ADDR_0]] : $*Int
+// CHECK-NEXT:    debug_value [[ARG_0]] :
+// CHECK-NEXT:    [[ARG_INDEX_1:%.*]] = scalar_pack_index 1 of $Pack{Int, Bool}
+// CHECK-NEXT:    [[ARG_ADDR_1:%.*]] = pack_element_get [[ARG_INDEX_1]] of %1 : $*Pack{Int, Bool} as $*Bool
+// CHECK-NEXT:    [[ARG_1:%.*]] = load [trivial] [[ARG_ADDR_1]] : $*Bool
+// CHECK-NEXT:    debug_value [[ARG_1]] :
+// CHECK-NEXT:    [[RET_INDEX_0:%.*]] = scalar_pack_index 0 of $Pack{Bool}
+// CHECK-NEXT:    [[RET_ADDR_0:%.*]] = pack_element_get [[RET_INDEX_0]] of %0 : $*Pack{Bool} as $*Bool
+// CHECK-NEXT:    store [[ARG_1]] to [trivial] [[RET_ADDR_0]] : $*Bool
+func testResultReabstractedEmission_vanishing() {
+  takeClosureWithVariadicResult {
+    (a: Int, b: Bool) -> Bool in b
+  }
+}

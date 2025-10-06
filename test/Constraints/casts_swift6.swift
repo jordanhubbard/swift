@@ -1,8 +1,5 @@
 // RUN: %target-typecheck-verify-swift -enable-objc-interop -swift-version 6
 
-// -swift-version 6 is currently asserts-only
-// REQUIRES: asserts
-
 func id<T>(_ x: T) -> T { x }
 func ohno<T>(_ x: T) -> T? { nil }
 
@@ -28,9 +25,9 @@ func test_compatibility_coercions(_ arr: [Int], _ optArr: [Int]?, _ dict: [Strin
 
   // Make sure we error on the following in Swift 6 mode.
   _ = id(arr) as [String] // expected-error {{conflicting arguments to generic parameter 'T' ('[Int]' vs. '[String]')}}
-  _ = (arr ?? []) as [String] // expected-error {{conflicting arguments to generic parameter 'T' ('[String]' vs. '[Int]')}}
-  _ = (arr ?? [] ?? []) as [String] // expected-error {{conflicting arguments to generic parameter 'T' ('[String]' vs. '[Int]')}}
-  // expected-error@-1{{conflicting arguments to generic parameter 'T' ('[String]' vs. '[Int]')}}
+  _ = (arr ?? []) as [String] // expected-error {{conflicting arguments to generic parameter 'T' ('[Int]' vs. '[String]')}}
+  _ = (arr ?? [] ?? []) as [String] // expected-error {{conflicting arguments to generic parameter 'T' ('[Int]' vs. '[String]')}}
+  // expected-error@-1{{conflicting arguments to generic parameter 'T' ('[Int]' vs. '[String]')}}
   _ = (optArr ?? []) as [String] // expected-error {{conflicting arguments to generic parameter 'T' ('[Int]' vs. '[String]'}}
 
   _ = (arr ?? []) as [String]? // expected-error {{'[Int]' is not convertible to '[String]?'}}
@@ -57,7 +54,6 @@ func test_compatibility_coercions(_ arr: [Int], _ optArr: [Int]?, _ dict: [Strin
 
   // The array can also be inferred to be [Any].
   _ = ([] ?? []) as Array // expected-warning {{left side of nil coalescing operator '??' has non-optional type '[Any]', so the right side is never used}}
-  // expected-warning@-1 {{empty collection literal requires an explicit type}}
 
   // Cases from rdar://88334481
   typealias Magic<T> = T

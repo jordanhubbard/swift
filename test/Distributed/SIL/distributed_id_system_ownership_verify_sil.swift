@@ -1,9 +1,10 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend-emit-module -emit-module-path %t/FakeDistributedActorSystems.swiftmodule -module-name FakeDistributedActorSystems -disable-availability-checking %S/../Inputs/FakeDistributedActorSystems.swift
-// RUN: %target-swift-frontend -verify -emit-sil -module-name main -disable-availability-checking -parse-as-library -I %t %s %S/../Inputs/FakeDistributedActorSystems.swift | %FileCheck %s
+// RUN: %target-swift-frontend-emit-module -emit-module-path %t/FakeDistributedActorSystems.swiftmodule -module-name FakeDistributedActorSystems -target %target-swift-5.7-abi-triple %S/../Inputs/FakeDistributedActorSystems.swift
+// RUN: %target-swift-frontend -verify -Xllvm -sil-print-types -emit-sil -module-name main -target %target-swift-5.7-abi-triple -parse-as-library -I %t %s %S/../Inputs/FakeDistributedActorSystems.swift | %FileCheck %s
 
 // REQUIRES: concurrency
 // REQUIRES: distributed
+// REQUIRES: swift_in_compiler
 
 // rdar://76038845
 // UNSUPPORTED: use_os_stdlib
@@ -39,7 +40,7 @@ distributed actor Greeter {
 // CHECK: [[TYPE:%[0-9]+]] = metatype $@thick Greeter.Type
 
 // CHECK: [[INSTANCE:%[0-9]+]] = builtin "initializeDistributedRemoteActor"([[TYPE]] : $@thick Greeter.Type) : $Greeter
-// CHECK: [[ID_PROPERTY:%[0-9]+]] = ref_element_addr [[INSTANCE]] : $Greeter, #Greeter.id
+// CHECK: [[ID_PROPERTY:%[0-9]+]] = ref_element_addr [immutable] [[INSTANCE]] : $Greeter, #Greeter.id
 // Note specifically that we don't [take] in the below copy_addr:
 // CHECK: copy_addr [[ADDRESS_ARG]] to [init] [[ID_PROPERTY]] : $*NotLoadableActorAddress
 

@@ -132,7 +132,10 @@
 #ifndef SWIFT_BASIC_RELATIVEPOINTER_H
 #define SWIFT_BASIC_RELATIVEPOINTER_H
 
+#include <cassert>
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 
 namespace swift {
 
@@ -590,8 +593,12 @@ public:
   using ValueTy = PointeeTy;
   using PointerTy = PointeeTy*;
 
+  Offset getOffset() const & {
+    return RelativeOffsetPlusInt & ~getMask();
+  }
+
   PointerTy getPointer() const & {
-    Offset offset = (RelativeOffsetPlusInt & ~getMask());
+    Offset offset = getOffset();
 
     // Check for null.
     if (Nullable && offset == 0)
@@ -624,6 +631,7 @@ class RelativeDirectPointerIntPair<PointeeTy, IntTy, Nullable, Offset,
 {
   using super = RelativeDirectPointerIntPairImpl<PointeeTy, IntTy, Nullable, Offset>;
 public:
+  using super::getOffset;
   using super::getPointer;
   using super::getInt;
   using super::getOpaqueValue;

@@ -11,9 +11,13 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/DeclContext.h"
-#include "swift/AST/AccessScope.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTWalker.h"
+#include "swift/AST/AccessScope.h"
+#include "swift/AST/AvailabilityConstraint.h"
+#include "swift/AST/AvailabilityContext.h"
+#include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Expr.h"
 #include "swift/AST/FileUnit.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -22,15 +26,18 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/ParseRequests.h"
 #include "swift/AST/SourceFile.h"
-#include "swift/AST/Types.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/AST/TypeRepr.h"
+#include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
+#include "swift/ClangImporter/ClangImporter.h"
+#include "clang/AST/ASTContext.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/Statistic.h"
-#include "llvm/Support/raw_ostream.h"
 #include "llvm/Support/SaveAndRestore.h"
-#include "clang/AST/ASTContext.h"
+#include "llvm/Support/raw_ostream.h"
 using namespace swift;
 
 #define DEBUG_TYPE "Name lookup"
@@ -95,24 +102,6 @@ VarDecl *DeclContext::getNonLocalVarDecl() const {
   return nullptr;
 }
 
-GenericTypeParamType *DeclContext::getProtocolSelfType() const {
-  assert(getSelfProtocolDecl() && "not a protocol");
-
-  GenericParamList *genericParams;
-  if (auto proto = dyn_cast<ProtocolDecl>(this)) {
-    genericParams = proto->getGenericParams();
-  } else {
-    genericParams = cast<ExtensionDecl>(this)->getGenericParams();
-  }
-
-  if (genericParams == nullptr)
-    return nullptr;
-
-  return genericParams->getParams().front()
-      ->getDeclaredInterfaceType()
-      ->castTo<GenericTypeParamType>();
-}
-
 Type DeclContext::getDeclaredTypeInContext() const {
   if (auto declaredType = getDeclaredInterfaceType())
     return mapTypeIntoContext(declaredType);
@@ -150,6 +139,10 @@ void DeclContext::forEachGenericContext(
       if (auto genericCtx = decl->getAsGenericContext())
         if (auto *gpList = genericCtx->getGenericParams())
           fn(gpList);
+
+      // Protocols do not capture outer generic parameters.
+      if (isa<ProtocolDecl>(decl))
+        return;
     }
   } while ((dc = dc->getParentForLookup()));
 }
@@ -211,6 +204,26 @@ AbstractFunctionDecl *DeclContext::getInnermostMethodContext() {
   return nullptr;
 }
 
+AccessorDecl *DeclContext::getInnermostPropertyAccessorContext() {
+  auto dc = this;
+  do {
+    if (auto decl = dc->getAsDecl()) {
+      auto accessor = dyn_cast<AccessorDecl>(decl);
+      // If we found a non-accessor decl, we're done.
+      if (accessor == nullptr)
+        return nullptr;
+
+      auto *storage = accessor->getStorage();
+      if ((isa<VarDecl>(storage) || isa<SubscriptDecl>(storage)) &&
+          storage->getDeclContext()->isTypeContext()) {
+        return accessor;
+      }
+    }
+  } while ((dc = dc->getParent()));
+
+  return nullptr;
+}
+
 bool DeclContext::isTypeContext() const {
   if (auto decl = getAsDecl())
     return isa<NominalTypeDecl>(decl) || isa<ExtensionDecl>(decl);
@@ -247,6 +260,22 @@ Decl *DeclContext::getTopmostDeclarationDeclContext() {
   return topmost;
 }
 
+DeclContext *DeclContext::getOutermostFunctionContext() {
+  AbstractFunctionDecl *result = nullptr;
+  auto dc = this;
+  do {
+    if (auto afd = dyn_cast<AbstractFunctionDecl>(dc))
+      result = afd;
+
+    // If we've found a non-local context, we don't have to keep walking up
+    // the hierarchy.
+    if (!dc->isLocalContext())
+      break;
+  } while ((dc = dc->getParent()));
+
+  return result;
+}
+
 DeclContext *DeclContext::getInnermostSkippedFunctionContext() {
   auto dc = this;
   do {
@@ -258,11 +287,36 @@ DeclContext *DeclContext::getInnermostSkippedFunctionContext() {
   return nullptr;
 }
 
+ClosureExpr *DeclContext::getInnermostClosureForCaptures() {
+  auto *DC = this;
+  do {
+    if (auto *CE = dyn_cast<ClosureExpr>(DC))
+      return CE;
+
+    // Autoclosures and AbstractFunctionDecls can propagate captures.
+    switch (DC->getContextKind()) {
+    case DeclContextKind::AbstractClosureExpr:
+    case DeclContextKind::AbstractFunctionDecl:
+      continue;
+    default:
+      return nullptr;
+    }
+  } while ((DC = DC->getParent()));
+
+  return nullptr;
+}
+
 DeclContext *DeclContext::getParentForLookup() const {
-  if (isa<ProtocolDecl>(this) || isa<ExtensionDecl>(this)) {
-    // If we are inside a protocol or an extension, skip directly
+  if (isa<ExtensionDecl>(this)) {
+    // If we are inside an extension, skip directly
     // to the module scope context, without looking at any (invalid)
     // outer types.
+    return getModuleScopeContext();
+  }
+  if (isUnsupportedNestedProtocol()) {
+    // Protocols in generic contexts must not look in to their parents,
+    // as the parents may contain types with inferred implicit
+    // generic parameters not present in the protocol's generic signature.
     return getModuleScopeContext();
   }
   if (isa<NominalTypeDecl>(this)) {
@@ -331,7 +385,8 @@ SourceFile *DeclContext::getParentSourceFile() const {
       case DeclContextKind::FileUnit:
       case DeclContextKind::Module:
       case DeclContextKind::Package:
-      case DeclContextKind::SerializedLocal:
+      case DeclContextKind::SerializedAbstractClosure:
+      case DeclContextKind::SerializedTopLevelCodeDecl:
         break;
       }
     }
@@ -363,6 +418,11 @@ SourceFile *DeclContext::getOutermostParentSourceFile() const {
   return sf;
 }
 
+bool DeclContext::isInSwiftinterface() const {
+  auto sf = getParentSourceFile();
+  return sf && sf->Kind == SourceFileKind::Interface;
+}
+
 DeclContext *DeclContext::getModuleScopeContext() const {
   // If the current context is PackageUnit, return the module
   // decl context pointing to the current context. This check
@@ -389,7 +449,7 @@ DeclContext *DeclContext::getModuleScopeContext() const {
 
 void DeclContext::getSeparatelyImportedOverlays(
     ModuleDecl *declaring, SmallVectorImpl<ModuleDecl *> &overlays) const {
-  if (auto SF = getParentSourceFile())
+  if (auto SF = getOutermostParentSourceFile())
     SF->getSeparatelyImportedOverlays(declaring, overlays);
 }
 
@@ -427,9 +487,10 @@ ResilienceExpansion DeclContext::getResilienceExpansion() const {
 
 FragileFunctionKind DeclContext::getFragileFunctionKind() const {
   auto &context = getASTContext();
-  return evaluateOrDefault(context.evaluator,
-                           FragileFunctionKindRequest { const_cast<DeclContext *>(this) },
-                           {FragileFunctionKind::None, false});
+  return evaluateOrDefault(
+      context.evaluator,
+      FragileFunctionKindRequest{const_cast<DeclContext *>(this)},
+      {FragileFunctionKind::None});
 }
 
 FragileFunctionKind
@@ -443,28 +504,22 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
       dc = dc->getParent();
 
       auto *VD = cast<ValueDecl>(dc->getAsDecl());
-      assert(VD->hasParameterList());
+      ASSERT(VD->hasParameterList());
 
       if (VD->getDeclContext()->isLocalContext()) {
         auto kind = VD->getDeclContext()->getFragileFunctionKind();
         if (kind.kind != FragileFunctionKind::None)
-          return {FragileFunctionKind::DefaultArgument,
-                  kind.allowUsableFromInline};
+          return {FragileFunctionKind::DefaultArgument};
       }
 
       auto effectiveAccess =
-        VD->getFormalAccessScope(/*useDC=*/nullptr,
-                                 /*treatUsableFromInlineAsPublic=*/true);
-      auto formalAccess =
-        VD->getFormalAccessScope(/*useDC=*/nullptr,
-                                 /*treatUsableFromInlineAsPublic=*/false);
+          VD->getFormalAccessScope(/*useDC=*/nullptr,
+                                   /*treatUsableFromInlineAsPublic=*/true);
       if (effectiveAccess.isPublic()) {
-        return {FragileFunctionKind::DefaultArgument,
-                !formalAccess.isPublic()};
+        return {FragileFunctionKind::DefaultArgument};
       }
 
-      return {FragileFunctionKind::None,
-              /*allowUsableFromInline=*/false};
+      return {FragileFunctionKind::None};
     }
 
     // Stored property initializer contexts use minimal resilience expansion
@@ -473,13 +528,11 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
       auto bindingIndex = init->getBindingIndex();
       if (auto *varDecl = init->getBinding()->getAnchoringVarDecl(bindingIndex)) {
         if (varDecl->isInitExposedToClients()) {
-          return {FragileFunctionKind::PropertyInitializer,
-                  /*allowUsableFromInline=*/true};
+          return {FragileFunctionKind::PropertyInitializer};
         }
       }
 
-      return {FragileFunctionKind::None,
-              /*allowUsableFromInline=*/false};
+      return {FragileFunctionKind::None};
     }
 
     if (auto *AFD = dyn_cast<AbstractFunctionDecl>(dc)) {
@@ -495,53 +548,44 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
       // If the function is not externally visible, we will not be serializing
       // its body.
       if (!funcAccess.isPublic()) {
-        return {FragileFunctionKind::None,
-                /*allowUsableFromInline=*/false};
+        return {FragileFunctionKind::None};
       }
 
       // If the function is public, @_transparent implies @inlinable.
       if (AFD->isTransparent()) {
-        return {FragileFunctionKind::Transparent,
-                /*allowUsableFromInline=*/true};
+        return {FragileFunctionKind::Transparent};
       }
 
-      if (AFD->getAttrs().hasAttribute<InlinableAttr>()) {
-        return {FragileFunctionKind::Inlinable,
-                /*allowUsableFromInline=*/true};
+      if (AFD->hasAttributeWithInlinableSemantics()) {
+        return {FragileFunctionKind::Inlinable};
       }
 
       if (AFD->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>()) {
-        return {FragileFunctionKind::AlwaysEmitIntoClient,
-                /*allowUsableFromInline=*/true};
+        return {FragileFunctionKind::AlwaysEmitIntoClient};
       }
 
-      if (AFD->isBackDeployed(context->getASTContext())) {
-        return {FragileFunctionKind::BackDeploy,
-                /*allowUsableFromInline=*/true};
+      if (AFD->isBackDeployed()) {
+        return {FragileFunctionKind::BackDeploy};
       }
 
       // Property and subscript accessors inherit @_alwaysEmitIntoClient,
       // @backDeployed, and @inlinable from their storage declarations.
       if (auto accessor = dyn_cast<AccessorDecl>(AFD)) {
         auto *storage = accessor->getStorage();
-        if (storage->getAttrs().getAttribute<InlinableAttr>()) {
-          return {FragileFunctionKind::Inlinable,
-                  /*allowUsableFromInline=*/true};
+        if (storage->hasAttributeWithInlinableSemantics()) {
+          return {FragileFunctionKind::Inlinable};
         }
         if (storage->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>()) {
-          return {FragileFunctionKind::AlwaysEmitIntoClient,
-                  /*allowUsableFromInline=*/true};
+          return {FragileFunctionKind::AlwaysEmitIntoClient};
         }
-        if (storage->isBackDeployed(context->getASTContext())) {
-          return {FragileFunctionKind::BackDeploy,
-                  /*allowUsableFromInline=*/true};
+        if (storage->isBackDeployed()) {
+          return {FragileFunctionKind::BackDeploy};
         }
       }
     }
   }
 
-  return {FragileFunctionKind::None,
-          /*allowUsableFromInline=*/false};
+  return {FragileFunctionKind::None};
 }
 
 /// Determine whether the innermost context is generic.
@@ -618,7 +662,8 @@ bool DeclContext::walkContext(ASTWalker &Walker) {
     return cast<EnumElementDecl>(this)->walk(Walker);
   case DeclContextKind::MacroDecl:
     return cast<MacroDecl>(this)->walk(Walker);
-  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::SerializedAbstractClosure:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
     llvm_unreachable("walk is unimplemented for deserialized contexts");
   case DeclContextKind::Initializer:
     // Is there any point in trying to walk the expression?
@@ -694,9 +739,11 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
   case DeclContextKind::Package:          Kind = "Package"; break;
   case DeclContextKind::Module:           Kind = "Module"; break;
   case DeclContextKind::FileUnit:         Kind = "FileUnit"; break;
-  case DeclContextKind::SerializedLocal:  Kind = "Serialized Local"; break;
   case DeclContextKind::AbstractClosureExpr:
     Kind = "AbstractClosureExpr";
+    break;
+  case DeclContextKind::SerializedAbstractClosure:
+    Kind = "SerializedAbstractClosure";
     break;
   case DeclContextKind::GenericTypeDecl:
     switch (cast<GenericTypeDecl>(this)->getKind()) {
@@ -707,6 +754,9 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
     break;
   case DeclContextKind::ExtensionDecl:    Kind = "ExtensionDecl"; break;
   case DeclContextKind::TopLevelCodeDecl: Kind = "TopLevelCodeDecl"; break;
+  case DeclContextKind::SerializedTopLevelCodeDecl:
+    Kind = "SerializedTopLevelCodeDecl"; 
+    break;
   case DeclContextKind::Initializer:      Kind = "Initializer"; break;
   case DeclContextKind::AbstractFunctionDecl:
     Kind = "AbstractFunctionDecl";
@@ -715,7 +765,8 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
   case DeclContextKind::EnumElementDecl:  Kind = "EnumElementDecl"; break;
   case DeclContextKind::MacroDecl:    Kind = "MacroDecl"; break;
   }
-  OS.indent(Depth*2 + indent) << (void*)this << " " << Kind;
+  OS.indent(Depth * 2 + indent)
+      << static_cast<const void *>(this) << " " << Kind;
 
   switch (getContextKind()) {
   case DeclContextKind::Package:
@@ -746,19 +797,44 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
     OS << " line=" << getLineNumber(cast<AbstractClosureExpr>(this));
     OS << " : " << cast<AbstractClosureExpr>(this)->getType();
     break;
+
+  case DeclContextKind::SerializedAbstractClosure: {
+    OS << " : " << cast<SerializedAbstractClosureExpr>(this)->getType();
+    break;
+  }
+
   case DeclContextKind::GenericTypeDecl:
     OS << " name=" << cast<GenericTypeDecl>(this)->getName();
     break;
-  case DeclContextKind::ExtensionDecl:
-    OS << " line=" << getLineNumber(cast<ExtensionDecl>(this));
-    OS << " base=" << cast<ExtensionDecl>(this)->getExtendedType();
+
+  case DeclContextKind::ExtensionDecl: {
+    auto *ED = cast<ExtensionDecl>(this);
+    OS << " line=" << getLineNumber(ED);
+    OS << " base=";
+    if (ED->hasBeenBound()) {
+      OS << ED->getExtendedType();
+    } else {
+      ED->getExtendedTypeRepr()->print(OS);
+    }
     break;
+  }
+
   case DeclContextKind::TopLevelCodeDecl:
     OS << " line=" << getLineNumber(cast<TopLevelCodeDecl>(this));
     break;
+
+  case DeclContextKind::SerializedTopLevelCodeDecl:
+    // Already printed the kind, nothing else to do.
+    break;
+
   case DeclContextKind::AbstractFunctionDecl: {
     auto *AFD = cast<AbstractFunctionDecl>(this);
-    OS << " name=" << AFD->getName();
+    OS << " name=";
+    if (auto *AD = dyn_cast<AccessorDecl>(AFD)) {
+      OS << accessorKindName(AD->getAccessorKind());
+    } else {
+      OS << AFD->getName();
+    }
     if (AFD->hasInterfaceType())
       OS << " : " << AFD->getInterfaceType();
     else
@@ -818,42 +894,11 @@ unsigned DeclContext::printContext(raw_ostream &OS, const unsigned indent,
       }
       break;
     }
-
-    case InitializerKind::RuntimeAttribute: {
-      auto init = cast<RuntimeAttributeInitializer>(this);
-      auto *decl = init->getAttachedToDecl();
-
-      OS << "RuntimeAttribute attachedTo="
-         << init->getAttachedToDecl()->getName() << ", attribute=";
-      init->getAttr()->print(OS, decl);
-    }
+    case InitializerKind::CustomAttribute:
+      OS << " CustomAttribute";
+      break;
     }
     break;
-
-  case DeclContextKind::SerializedLocal: {
-    auto local = cast<SerializedLocalDeclContext>(this);
-    switch (local->getLocalDeclContextKind()) {
-    case LocalDeclContextKind::AbstractClosure: {
-      auto serializedClosure = cast<SerializedAbstractClosureExpr>(local);
-      OS << " closure : " << serializedClosure->getType();
-      break;
-    }
-    case LocalDeclContextKind::DefaultArgumentInitializer: {
-      auto init = cast<SerializedDefaultArgumentInitializer>(local);
-      OS << "DefaultArgument index=" << init->getIndex();
-      break;
-    }
-    case LocalDeclContextKind::PatternBindingInitializer: {
-      auto init = cast<SerializedPatternBindingInitializer>(local);
-      OS << " PatternBinding 0x" << (void*) init->getBinding()
-         << " #" << init->getBindingIndex();
-      break;
-    }
-    case LocalDeclContextKind::TopLevelCodeDecl:
-      OS << " TopLevelCode";
-      break;
-    }
-  }
   }
 
   if (auto decl = getAsDecl())
@@ -897,11 +942,27 @@ ASTContext &IterableDeclContext::getASTContext() const {
   return getDecl()->getASTContext();
 }
 
+SourceRange IterableDeclContext::getBraces() const {
+  switch (getIterableContextKind()) {
+  case IterableDeclContextKind::NominalTypeDecl:
+    return cast<NominalTypeDecl>(this)->getBraces();
+    break;
+
+  case IterableDeclContextKind::ExtensionDecl:
+    return cast<ExtensionDecl>(this)->getBraces();
+    break;
+  }
+}
+
 DeclRange IterableDeclContext::getCurrentMembersWithoutLoading() const {
   return DeclRange(FirstDeclAndLazyMembers.getPointer(), nullptr);
 }
 
 DeclRange IterableDeclContext::getMembers() const {
+  return getCurrentMembers();
+}
+
+DeclRange IterableDeclContext::getCurrentMembers() const {
   loadAllMembers();
 
   return getCurrentMembersWithoutLoading();
@@ -947,13 +1008,6 @@ void IterableDeclContext::addMemberPreservingSourceOrder(Decl *member) {
     // the parent enum. We ignore the EnumCaseDecl since its
     // source range overlaps with that of the EnumElementDecls.
     if (isa<EnumCaseDecl>(existingMember))
-      continue;
-
-    // The elements of the active clause of an IfConfigDecl
-    // are added to the parent type. We ignore the IfConfigDecl
-    // since its source range overlaps with the source ranges
-    // of the active elements.
-    if (isa<IfConfigDecl>(existingMember))
       continue;
 
     if (!SM.isBeforeInBuffer(existingMember->getEndLoc(), start))
@@ -1004,14 +1058,11 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
       return;
 
     auto shouldSkip = [](Decl *d) {
-      // PatternBindingDecl source ranges overlap with VarDecls,
-      // EnumCaseDecl source ranges overlap with EnumElementDecls,
-      // and IfConfigDecl source ranges overlap with the elements
-      // of the active clause. Skip them all here to avoid
-      // spurious assertions.
+      // PatternBindingDecl source ranges overlap with VarDecls and
+      // EnumCaseDecl source ranges overlap with EnumElementDecls.
+      // Skip them all here to avoid spurious assertions.
       if (isa<PatternBindingDecl>(d) ||
-          isa<EnumCaseDecl>(d) ||
-          isa<IfConfigDecl>(d))
+          isa<EnumCaseDecl>(d))
         return true;
 
       // Ignore source location information of implicit declarations.
@@ -1036,13 +1087,7 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
     assert(nextStart.isValid() &&
            "Only implicit decls can have invalid source location");
 
-    if (getASTContext().SourceMgr.isBeforeInBuffer(prevEnd, nextStart))
-      return;
-
-    // Synthesized member macros can add new members in a macro expansion buffer.
-    auto *memberSourceFile = member->getInnermostDeclContext()->getParentSourceFile();
-    if (memberSourceFile->getFulfilledMacroRole() == MacroRole::Member ||
-        memberSourceFile->getFulfilledMacroRole() == MacroRole::Peer)
+    if (getASTContext().SourceMgr.isAtOrBefore(prevEnd, nextStart))
       return;
 
     llvm::errs() << "Source ranges out of order in addMember():\n";
@@ -1165,6 +1210,152 @@ void IterableDeclContext::loadAllMembers() const {
     --s->getFrontendCounters().NumUnloadedLazyIterableDeclContexts;
 }
 
+// Checks whether members of this decl and their respective member decls
+// (recursively) were deserialized into another module correctly, and
+// emits a diagnostic if deserialization failed. Requires the other module
+// module and this decl's module are in the same package, and this
+// decl's module has package optimization enabled.
+void IterableDeclContext::checkDeserializeMemberErrorInPackage(ModuleDecl *accessingModule) {
+  // For decls in the same module, we can skip deserialization error checks.
+  if (getDecl()->getModuleContext() == accessingModule)
+    return;
+  // Only check if accessing module is in the same package as this
+  // decl's module, which has package optimization enabled.
+  if (!getDecl()->getModuleContext()->inSamePackage(accessingModule) ||
+      !getDecl()->getModuleContext()->isResilient() ||
+      !getDecl()->getModuleContext()->serializePackageEnabled())
+    return;
+  // Bail if already checked for an error.
+  if (checkedForDeserializeMemberError())
+    return;
+  // If members were not deserialized, force load here.
+  if (!didDeserializeMembers()) {
+    // This needs to be set to force load all members if not done already.
+    setHasLazyMembers(true);
+    // Calling getMembers actually loads the members.
+    (void)getMembers();
+    assert(!hasLazyMembers());
+    assert(didDeserializeMembers());
+  }
+  // Members could have been deserialized from other flows. Check
+  // for an error here. First mark this decl 'checked' to prevent
+  // infinite recursion in case of self-referencing members.
+  setCheckedForDeserializeMemberError(true);
+
+  // If members are already loaded above or by other flows,
+  // calling getMembers here should be inexpensive.
+  auto memberList = getMembers();
+
+  // This decl contains a member deserialization error; emit a diag.
+  if (hasDeserializeMemberError()) {
+    auto containerID = Identifier();
+    if (auto container = dyn_cast<NominalTypeDecl>(getDecl())) {
+      containerID = container->getBaseIdentifier();
+    }
+
+    auto diagID = diag::cannot_bypass_resilience_due_to_missing_member_warn;
+    if (getASTContext().LangOpts.AbortOnDeserializationFailForPackageCMO)
+      diagID = diag::cannot_bypass_resilience_due_to_missing_member;
+
+    auto foundMissing = false;
+    for (auto member: memberList) {
+      // Only storage vars can affect memory layout so
+      // look up pattern binding decl or var decl.
+      if (auto *PBD = dyn_cast<PatternBindingDecl>(member)) {
+        // If this pattern binding decl is empty, we have
+        // a missing member.
+        if (PBD->getNumPatternEntries() == 0)
+          foundMissing = true;
+      }
+      // Check if a member can be cast to MissingMemberDecl.
+      if (auto missingMember = dyn_cast<MissingMemberDecl>(member)) {
+        if (!missingMember->getName().getBaseName().isSpecial() &&
+            foundMissing) {
+          foundMissing = false;
+          auto missingMemberID = missingMember->getName().getBaseIdentifier();
+          getASTContext().Diags.diagnose(member->getLoc(),
+                                         diagID,
+                                         missingMemberID,
+                                         missingMemberID.empty(),
+                                         containerID,
+                                         getDecl()->getModuleContext()->getBaseIdentifier(),
+                                         accessingModule->getBaseIdentifier());
+          continue;
+        }
+      }
+      // If not handled above, emit a diag here.
+      if (foundMissing) {
+        getASTContext().Diags.diagnose(getDecl()->getLoc(),
+                                       diagID,
+                                       Identifier(),
+                                       true,
+                                       containerID,
+                                       getDecl()->getModuleContext()->getBaseIdentifier(),
+                                       accessingModule->getBaseIdentifier());
+      }
+    }
+  } else {
+    // This decl does not contain a member deserialization error.
+    // Check for members of this decl's members recursively to
+    // see if a member deserialization failed.
+    for (auto member: memberList) {
+      // Only storage vars can affect memory layout so
+      // look up pattern binding decl or var decl.
+      if (auto *PBD = dyn_cast<PatternBindingDecl>(member)) {
+        for (auto i : range(PBD->getNumPatternEntries())) {
+          auto pattern = PBD->getPattern(i);
+          pattern->forEachVariable([&](const VarDecl *VD) {
+            // Bail if the var is static or has no storage
+            if (VD->isStatic() ||
+               !VD->hasStorageOrWrapsStorage())
+              return;
+            // Unwrap in case this var is optional.
+            auto varType = VD->getInterfaceType()->getCanonicalType();
+            if (auto unwrapped = varType->getCanonicalType()->getOptionalObjectType()) {
+              varType = unwrapped->getCanonicalType();
+            }
+            // Handle BoundGenericType, e.g. [Foo: Bar], Dictionary<Foo, Bar>.
+            // Check for its arguments types, i.e. Foo, Bar.
+            if (auto boundGeneric = varType->getAs<BoundGenericType>()) {
+                for (auto arg : boundGeneric->getGenericArgs()) {
+                  if (auto argNominal = arg->getNominalOrBoundGenericNominal()) {
+                    if (auto argIDC = dyn_cast<IterableDeclContext>(argNominal)) {
+                      argIDC->checkDeserializeMemberErrorInPackage(getDecl()->getModuleContext());
+                      if (argIDC->hasDeserializeMemberError()) {
+                         setHasDeserializeMemberError(true);
+                        break;
+                      }
+                    }
+                  }
+                }
+            } else if (auto tupleType = varType->getAs<TupleType>()) {
+              // Handle TupleType, e.g. (Foo, Var).
+              for (auto element : tupleType->getElements()) {
+                if (auto elementNominal = element.getType()->getNominalOrBoundGenericNominal()) {
+                    if (auto elementIDC = dyn_cast<IterableDeclContext>(elementNominal)) {
+                      elementIDC->checkDeserializeMemberErrorInPackage(getDecl()->getModuleContext());
+                      if (elementIDC->hasDeserializeMemberError()) {
+                         setHasDeserializeMemberError(true);
+                        break;
+                      }
+                    }
+                  }
+                }
+            } else if (auto varNominal = varType->getNominalOrBoundGenericNominal()) {
+              if (auto varIDC = dyn_cast<IterableDeclContext>(varNominal)) {
+                varIDC->checkDeserializeMemberErrorInPackage(getDecl()->getModuleContext());
+                if (varIDC->hasDeserializeMemberError()) {
+                   setHasDeserializeMemberError(true);
+                }
+              }
+            }
+          });
+        }
+      }
+    }
+  }
+}
+
 bool IterableDeclContext::wasDeserialized() const {
   const DeclContext *DC = getAsGenericContext();
   if (auto F = dyn_cast<FileUnit>(DC->getModuleScopeContext())) {
@@ -1196,10 +1387,10 @@ IterableDeclContext::castDeclToIterableDeclContext(const Decl *D) {
   }
 }
 
-Optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
+std::optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
   auto fileUnit = dyn_cast<FileUnit>(getAsGenericContext()->getModuleScopeContext());
   if (!fileUnit)
-    return None;
+    return std::nullopt;
 
   if (isa<SourceFile>(fileUnit)) {
     auto mutableThis = const_cast<IterableDeclContext *>(this);
@@ -1210,7 +1401,7 @@ Optional<Fingerprint> IterableDeclContext::getBodyFingerprint() const {
   }
 
   if (getDecl()->isImplicit())
-    return None;
+    return std::nullopt;
 
   return fileUnit->loadFingerprint(this);
 }
@@ -1228,13 +1419,13 @@ getPrivateDeclContext(const DeclContext *DC, const SourceFile *useSF) {
 
   // use the type declaration as the private scope if it is in the same
   // file as useSF. This occurs for both extensions and declarations.
-  if (NTD->getParentSourceFile() == useSF)
+  if (NTD->getOutermostParentSourceFile() == useSF)
     return NTD;
 
   // Otherwise use the last extension declaration in the same file.
   const DeclContext *lastExtension = nullptr;
   for (ExtensionDecl *ED : NTD->getExtensions())
-    if (ED->getParentSourceFile() == useSF)
+    if (ED->getOutermostParentSourceFile() == useSF)
       lastExtension = ED;
 
   // If there's no last extension, return the supplied context.
@@ -1244,7 +1435,7 @@ getPrivateDeclContext(const DeclContext *DC, const SourceFile *useSF) {
 AccessScope::AccessScope(const DeclContext *DC, bool isPrivate)
     : Value(DC, isPrivate) {
   if (isPrivate) {
-    DC = getPrivateDeclContext(DC, DC->getParentSourceFile());
+    DC = getPrivateDeclContext(DC, DC->getOutermostParentSourceFile());
     Value.setPointer(DC);
   }
   if (!DC || isa<ModuleDecl>(DC) || isa<PackageUnit>(DC))
@@ -1293,15 +1484,67 @@ bool AccessScope::allowsPrivateAccess(const DeclContext *useDC, const DeclContex
       return usePkg->isSamePackageAs(srcPkg);
     }
   }
-  // Do not allow access if the sourceDC is in a different file
-  auto useSF = useDC->getParentSourceFile();
-  if (useSF != sourceDC->getParentSourceFile())
-    return false;
 
   // Do not allow access if the sourceDC does not represent a type.
   auto sourceNTD = sourceDC->getSelfNominalTypeDecl();
   if (!sourceNTD)
     return false;
+
+  // Do not allow access if the sourceDC is in a different file
+  auto *useSF = useDC->getOutermostParentSourceFile();
+  if (useSF != sourceDC->getOutermostParentSourceFile()) {
+    // sourceDC might be a C++ record with a SWIFT_PRIVATE_FILEID attribute,
+    // which asks us to treat it as if it were defined in the file
+    // with the specified FileID.
+    auto clangDecl = sourceNTD->getDecl()->getClangDecl();
+
+    if (isa_and_nonnull<clang::EnumDecl>(clangDecl)) {
+      // C/C++ enums are an odd case for access checking because they can only
+      // contain variants as members, and those variants cannot be assigned
+      // access specifiers. Instead, those variants should simply inherit the
+      // access of their parent enum, if any. For instance:
+      //
+      //   class Base { protected: enum class E { M }; };
+      //   class Derived : public Base {};
+      //
+      // In C++, E::M should be accessible within Base and Derived; we should
+      // follow suit in Swift.
+      //
+      // When we check the access of something like E.M, clangDecl will point to
+      // enum class E (the DeclContext of M), and if we've gotten this far, we
+      // can infer that E was accessible in useDC, so its members should be too.
+      //
+      // This is technically unsound (i.e., encapsulation-breaking), because it
+      // is possible to extend imported Clang enums private in Swift extensions.
+      // With this hack, those private members would be accessible everywhere
+      // even though they shouldn't. But right here, when we're checking the E
+      // of E.M, there's no way to tell whether the M is something we imported
+      // from Clang (which we should allow) versus something we defined in Swift
+      // (which we should disallow), without over-complicating the access check.
+      // To limit the encapsulate the breakage, we do an additional check to
+      // ensure we're checking an imported enum that is *nested* in a Clang
+      // record (which is the only way this enum can be imported as private).
+      return isa_and_nonnull<clang::CXXRecordDecl>(clangDecl->getDeclContext());
+    }
+
+    if (!isa_and_nonnull<clang::CXXRecordDecl>(clangDecl))
+      return false;
+
+    auto recordDecl = cast<clang::CXXRecordDecl>(clangDecl);
+
+    // Diagnostics should enforce that there is at most SWIFT_PRIVATE_FILEID,
+    // but this handles the case where there is more than anyway (whether that
+    // is a feature or a bug). Allow access check to proceed if useSF is blessed
+    // by any of the SWIFT_PRIVATE_FILEID annotations (i.e., disallow private
+    // access if none of them bless useSF).
+    if (!llvm::any_of(
+            importer::getPrivateFileIDAttrs(recordDecl), [&](auto &blessed) {
+              auto blessedFileID = SourceFile::FileIDStr::parse(blessed.first);
+              return blessedFileID && blessedFileID->matches(useSF);
+            })) {
+      return false;
+    }
+  }
 
   // Compare the private scopes and iterate over the parent types.
   sourceDC = getPrivateDeclContext(sourceDC, useSF);
@@ -1335,8 +1578,10 @@ DeclContextKind DeclContext::getContextKind() const {
     return DeclContextKind::AbstractClosureExpr;
   case ASTHierarchy::Initializer:
     return DeclContextKind::Initializer;
-  case ASTHierarchy::SerializedLocal:
-    return DeclContextKind::SerializedLocal;
+  case ASTHierarchy::SerializedAbstractClosure:
+    return DeclContextKind::SerializedAbstractClosure;
+  case ASTHierarchy::SerializedTopLevelCodeDecl:
+    return DeclContextKind::SerializedTopLevelCodeDecl;
   case ASTHierarchy::FileUnit:
     return DeclContextKind::FileUnit;
   case ASTHierarchy::Package:
@@ -1389,7 +1634,8 @@ bool DeclContext::isAsyncContext() const {
   case DeclContextKind::Initializer:
   case DeclContextKind::EnumElementDecl:
   case DeclContextKind::ExtensionDecl:
-  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::SerializedAbstractClosure:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
   case DeclContextKind::Package:
   case DeclContextKind::Module:
   case DeclContextKind::GenericTypeDecl:
@@ -1403,20 +1649,17 @@ bool DeclContext::isAsyncContext() const {
     return getParent()->isAsyncContext();
   case DeclContextKind::AbstractClosureExpr:
     return cast<AbstractClosureExpr>(this)->isBodyAsync();
-  case DeclContextKind::AbstractFunctionDecl: {
-    const AbstractFunctionDecl *function = cast<AbstractFunctionDecl>(this);
-    return function->hasAsync();
-  }
-  case DeclContextKind::SubscriptDecl: {
-    AccessorDecl *getter =
-        cast<SubscriptDecl>(this)->getAccessor(AccessorKind::Get);
-    return getter != nullptr && getter->hasAsync();
-  }
+  case DeclContextKind::AbstractFunctionDecl:
+    return cast<AbstractFunctionDecl>(this)->hasAsync();
+  case DeclContextKind::SubscriptDecl:
+    return cast<SubscriptDecl>(this)->isAsync();
   }
   llvm_unreachable("Unhandled DeclContextKind switch");
 }
 
 SourceLoc swift::extractNearestSourceLoc(const DeclContext *dc) {
+  assert(dc && "Expected non-null DeclContext!");
+
   switch (dc->getContextKind()) {
   case DeclContextKind::Package:
   case DeclContextKind::Module:
@@ -1441,7 +1684,8 @@ SourceLoc swift::extractNearestSourceLoc(const DeclContext *dc) {
     return SourceLoc();
 
   case DeclContextKind::Initializer:
-  case DeclContextKind::SerializedLocal:
+  case DeclContextKind::SerializedAbstractClosure:
+  case DeclContextKind::SerializedTopLevelCodeDecl:
     return extractNearestSourceLoc(dc->getParent());
   }
   llvm_unreachable("Unhandled DeclContextKindIn switch");
@@ -1518,21 +1762,19 @@ bool DeclContext::isInSpecializeExtensionContext() const {
    return isSpecializeExtensionContext(this);
 }
 
+bool DeclContext::isUnsupportedNestedProtocol() const {
+  return isa<ProtocolDecl>(this) && getParent()->isGenericContext();
+}
+
 bool DeclContext::isAlwaysAvailableConformanceContext() const {
   auto *ext = dyn_cast<ExtensionDecl>(this);
   if (ext == nullptr)
     return true;
 
-  if (AvailableAttr::isUnavailable(ext))
-    return false;
-
+  // Check whether the extension is always available relative to the deployment
+  // target.
   auto &ctx = getASTContext();
-
-  AvailabilityContext conformanceAvailability{
-      AvailabilityInference::availableRange(ext, ctx)};
-
-  auto deploymentTarget =
-      AvailabilityContext::forDeploymentTarget(ctx);
-
-  return deploymentTarget.isContainedIn(conformanceAvailability);
+  auto deploymentTarget = AvailabilityContext::forDeploymentTarget(ctx);
+  auto constraints = getAvailabilityConstraintsForDecl(ext, deploymentTarget);
+  return !constraints.getPrimaryConstraint();
 }

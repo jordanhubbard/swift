@@ -9,10 +9,12 @@
 swift_compiler_sources(Optimizer
   FunctionUsesDumper.swift
   AccessDumper.swift
+  AliasInfoDumper.swift
   DeadEndBlockDumper.swift
   EscapeInfoDumper.swift
+  MemBehaviorDumper.swift
   SILPrinter.swift
   RangeDumper.swift
-  RunUnitTests.swift
+  UpdateBorrowedFrom.swift
   TestInstructionIteration.swift
 )

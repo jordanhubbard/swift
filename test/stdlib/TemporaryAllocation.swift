@@ -70,6 +70,7 @@ TemporaryAllocationTestSuite.test("untypedEmptyAllocationIsStackAllocated") {
   }
 }
 
+#if !os(WASI)
 TemporaryAllocationTestSuite.test("crashOnNegativeByteCount") {
   expectCrash {
     let byteCount = Int.random(in: -2 ..< -1)
@@ -83,6 +84,7 @@ TemporaryAllocationTestSuite.test("crashOnNegativeAlignment") {
     withUnsafeTemporaryAllocation(byteCount: 16, alignment: alignment) { _ in }
   }
 }
+#endif
 
 TemporaryAllocationTestSuite.test("untypedAllocationIsAligned") {
   withUnsafeTemporaryAllocation(byteCount: 1, alignment: 8) { buffer in
@@ -136,18 +138,37 @@ TemporaryAllocationTestSuite.test("voidAllocationIsStackAllocated") {
   }
 }
 
+#if !os(WASI)
 TemporaryAllocationTestSuite.test("crashOnNegativeValueCount") {
   expectCrash {
     let capacity = Int.random(in: -2 ..< -1)
     withUnsafeTemporaryAllocation(of: Int.self, capacity: capacity) { _ in }
   }
 }
+#endif
 
 TemporaryAllocationTestSuite.test("typedAllocationIsAligned") {
   withUnsafeTemporaryAllocation(of: Int.self, capacity: 1) { buffer in
     let pointerBits = Int(bitPattern: buffer.baseAddress!)
     let alignmentMask = MemoryLayout<Int>.alignment - 1
     expectEqual(pointerBits & alignmentMask, 0)
+  }
+}
+
+// MARK: Typed throws
+enum HomeworkError: Error, Equatable {
+case dogAteIt
+case forgot
+}
+
+TemporaryAllocationTestSuite.test("typedAllocationWithThrow") {
+  do throws(HomeworkError) {
+    try withUnsafeTemporaryAllocation(of: Int.self, capacity: 1) { (buffer) throws(HomeworkError) -> Void in
+      throw HomeworkError.forgot
+    }
+    fatalError("did not throw!?!")
+  } catch {
+    expectEqual(error, .forgot)
   }
 }
 

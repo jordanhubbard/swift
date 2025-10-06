@@ -60,7 +60,7 @@ enum class LayoutKind {
 class NonFixedOffsetsImpl;
 
 /// The type to pass around for non-fixed offsets.
-using NonFixedOffsets = Optional<NonFixedOffsetsImpl *>;
+using NonFixedOffsets = std::optional<NonFixedOffsetsImpl *>;
 
 /// An abstract class for determining non-fixed offsets.
 class NonFixedOffsetsImpl {
@@ -283,8 +283,9 @@ private:
   SmallVector<SpareBitVector, 8> CurSpareBits;
   unsigned NextNonFixedOffsetIndex = 0;
   bool IsFixedLayout = true;
+  bool IsLoadable = true;
   IsTriviallyDestroyable_t IsKnownTriviallyDestroyable = IsTriviallyDestroyable;
-  IsBitwiseTakable_t IsKnownBitwiseTakable = IsBitwiseTakable;
+  IsBitwiseTakable_t IsKnownBitwiseTakable = IsBitwiseTakableAndBorrowable;
   IsCopyable_t IsKnownCopyable = IsCopyable;
   IsFixedSize_t IsKnownAlwaysFixedSize = IsFixedSize;
 public:
@@ -326,6 +327,9 @@ public:
 
   /// Return whether the structure has a fixed-size layout.
   bool isFixedLayout() const { return IsFixedLayout; }
+
+  /// Return whether the structure has a loadable layout.
+  bool isLoadable() const { return IsLoadable; }
 
   /// Return whether the structure is known to be POD in the local
   /// resilience scope.
@@ -402,6 +406,9 @@ class StructLayout {
   /// alignment are exact.
   bool IsFixedLayout;
 
+  /// Whether this layout 
+  bool IsLoadable;
+
   IsTriviallyDestroyable_t IsKnownTriviallyDestroyable;
   IsBitwiseTakable_t IsKnownBitwiseTakable;
   IsCopyable_t IsKnownCopyable;
@@ -419,9 +426,8 @@ public:
   ///   layout must include the reference-counting header
   /// \param typeToFill - if present, must be an opaque type whose body
   ///   will be filled with this layout
-  StructLayout(IRGenModule &IGM, NominalTypeDecl *decl,
-               LayoutKind kind, LayoutStrategy strategy,
-               ArrayRef<const TypeInfo *> fields,
+  StructLayout(IRGenModule &IGM, std::optional<CanType> type, LayoutKind kind,
+               LayoutStrategy strategy, ArrayRef<const TypeInfo *> fields,
                llvm::StructType *typeToFill = 0);
 
   /// Create a structure layout from a builder.
@@ -434,6 +440,7 @@ public:
       headerSize(builder.getHeaderSize()),
       SpareBits(builder.getSpareBits()),
       IsFixedLayout(builder.isFixedLayout()),
+      IsLoadable(builder.isLoadable()),
       IsKnownTriviallyDestroyable(builder.isTriviallyDestroyable()),
       IsKnownBitwiseTakable(builder.isBitwiseTakable()),
       IsKnownCopyable(builder.isCopyable()),
@@ -467,6 +474,7 @@ public:
   }
 
   bool isFixedLayout() const { return IsFixedLayout; }
+  bool isLoadable() const { return IsLoadable; }
   llvm::Constant *emitSize(IRGenModule &IGM) const;
   llvm::Constant *emitAlignMask(IRGenModule &IGM) const;
 

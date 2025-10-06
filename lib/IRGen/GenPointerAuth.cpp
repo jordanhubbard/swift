@@ -22,9 +22,11 @@
 #include "IRGenMangler.h"
 #include "IRGenModule.h"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/TypeLowering.h"
 #include "clang/CodeGen/CodeGenABITypes.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/Support/SipHash.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace swift;
@@ -127,11 +129,14 @@ llvm::Value *irgen::emitPointerAuthSign(IRGenFunction &IGF, llvm::Value *fnPtr,
   if (auto constantFnPtr = dyn_cast<llvm::Constant>(fnPtr)) {
     if (auto constantDiscriminator =
           dyn_cast<llvm::Constant>(newAuthInfo.getDiscriminator())) {
-      llvm::Constant *other = nullptr, *address = nullptr;
-      if (constantDiscriminator->getType()->isPointerTy())
+      llvm::Constant *address = nullptr;
+      llvm::ConstantInt *other = nullptr;
+      if (constantDiscriminator->getType()->isPointerTy()) {
         address = constantDiscriminator;
-      else
-        other = constantDiscriminator;
+      } else if (auto otherDiscriminator =
+                     dyn_cast<llvm::ConstantInt>(constantDiscriminator)) {
+        other = otherDiscriminator;
+      }
       return IGF.IGM.getConstantSignedPointer(constantFnPtr,
                                               newAuthInfo.getKey(),
                                               address, other);
@@ -156,7 +161,7 @@ struct IRGenModule::PointerAuthCachesType {
   llvm::DenseMap<SILDeclRef, llvm::ConstantInt*> Decls;
   llvm::DenseMap<CanType, llvm::ConstantInt*> Types;
   llvm::DenseMap<CanType, llvm::ConstantInt*> YieldTypes;
-  llvm::DenseMap<AssociatedType, llvm::ConstantInt*> AssociatedTypes;
+  llvm::DenseMap<AssociatedTypeDecl *, llvm::ConstantInt*> AssociatedTypes;
   llvm::DenseMap<AssociatedConformance, llvm::ConstantInt*> AssociatedConformances;
 };
 
@@ -183,8 +188,14 @@ static const PointerAuthSchema &getFunctionPointerSchema(IRGenModule &IGM,
   case SILFunctionTypeRepresentation::Method:
   case SILFunctionTypeRepresentation::WitnessMethod:
   case SILFunctionTypeRepresentation::Closure:
+  case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+  case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+  case SILFunctionTypeRepresentation::KeyPathAccessorHash:
     if (fnType->isAsync()) {
       return options.AsyncSwiftFunctionPointers;
+    } else if (fnType->isCalleeAllocatedCoroutine()) {
+      return options.CoroSwiftFunctionPointers;
     }
 
     return options.SwiftFunctionPointers;
@@ -314,25 +325,19 @@ PointerAuthInfo::getOtherDiscriminator(IRGenModule &IGM,
   llvm_unreachable("bad kind");
 }
 
-static llvm::ConstantInt *getDiscriminatorForHash(IRGenModule &IGM,
-                                                  uint64_t rawHash) {
-  uint16_t reducedHash = (rawHash % 0xFFFF) + 1;
-  return llvm::ConstantInt::get(IGM.Int64Ty, reducedHash);
-}
-
 static llvm::ConstantInt *getDiscriminatorForString(IRGenModule &IGM,
                                                     StringRef string) {
-  uint64_t rawHash = clang::CodeGen::computeStableStringHash(string);
-  return getDiscriminatorForHash(IGM, rawHash);
+  return llvm::ConstantInt::get(IGM.Int64Ty,
+                                llvm::getPointerAuthStableSipHash(string));
 }
 
-static std::string mangle(AssociatedType association) {
-  return IRGenMangler()
-    .mangleAssociatedTypeAccessFunctionDiscriminator(association);
+static std::string mangle(AssociatedTypeDecl *assocType) {
+  return IRGenMangler(assocType->getASTContext())
+    .mangleAssociatedTypeAccessFunctionDiscriminator(assocType);
 }
 
 static std::string mangle(const AssociatedConformance &association) {
-  return IRGenMangler()
+  return IRGenMangler(association.getAssociatedRequirement()->getASTContext())
     .mangleAssociatedTypeWitnessTableAccessFunctionDiscriminator(association);
 }
 
@@ -355,6 +360,12 @@ PointerAuthEntity::getDeclDiscriminator(IRGenModule &IGM) const {
       case Special::ProtocolConformanceDescriptor:
       case Special::ProtocolConformanceDescriptorAsArgument:
         return SpecialPointerAuthDiscriminators::ProtocolConformanceDescriptor;
+      case Special::ProtocolDescriptorAsArgument:
+        return SpecialPointerAuthDiscriminators::ProtocolDescriptor;
+      case Special::OpaqueTypeDescriptorAsArgument:
+        return SpecialPointerAuthDiscriminators::OpaqueTypeDescriptor;
+      case Special::ContextDescriptorAsArgument:
+        return SpecialPointerAuthDiscriminators::ContextDescriptor;
       case Special::PartialApplyCapture:
         return PointerAuthDiscriminator_PartialApplyCapture;
       case Special::KeyPathDestroy:
@@ -414,7 +425,7 @@ PointerAuthEntity::getDeclDiscriminator(IRGenModule &IGM) const {
   }
 
   case Kind::AssociatedType: {
-    auto association = Storage.get<AssociatedType>(StoredKind);
+    auto association = Storage.get<AssociatedTypeDecl *>(StoredKind);
     llvm::ConstantInt *&cache =
       IGM.getPointerAuthCaches().AssociatedTypes[association];
     if (cache) return cache;
@@ -492,7 +503,7 @@ static void hashStringForType(IRGenModule &IGM, CanType Ty, raw_ostream &Out,
     // For generic and non-generic value types, use the mangled declaration
     // name, and ignore all generic arguments.
     NominalTypeDecl *nominal = cast<NominalTypeDecl>(GTy->getDecl());
-    Out << Mangle::ASTMangler().mangleNominalType(nominal);
+    Out << Mangle::ASTMangler(IGM.Context).mangleNominalType(nominal);
   } else if (auto FTy = dyn_cast<SILFunctionType>(Ty)) {
     Out << "(";
     hashStringForFunctionType(IGM, FTy, Out, genericEnv);
@@ -554,11 +565,15 @@ static void hashStringForFunctionType(IRGenModule &IGM, CanSILFunctionType type,
   }
 }
 
-static uint64_t getTypeHash(IRGenModule &IGM, CanSILFunctionType type) {
+static llvm::ConstantInt *getTypeDiscriminator(IRGenModule &IGM,
+                                               CanSILFunctionType type) {
   // The hash we need to do here ignores:
   //   - thickness, so that we can promote thin-to-thick without rehashing;
   //   - error results, so that we can promote nonthrowing-to-throwing
   //     without rehashing;
+  //   - isolation, so that global actor annotations can change in the SDK
+  //     without breaking compatibility and so that we can erase it to
+  //     nonisolated without rehashing;
   //   - types of indirect arguments/retvals, so they can be substituted freely;
   //   - types of class arguments/retvals
   //   - types of metatype arguments/retvals
@@ -571,10 +586,11 @@ static uint64_t getTypeHash(IRGenModule &IGM, CanSILFunctionType type) {
   hashStringForFunctionType(
       IGM, type, Out,
       genericSig.getCanonicalSignature().getGenericEnvironment());
-  return clang::CodeGen::computeStableStringHash(Out.str());
+  return getDiscriminatorForString(IGM, Out.str());
 }
 
-static uint64_t getYieldTypesHash(IRGenModule &IGM, CanSILFunctionType type) {
+static llvm::ConstantInt *
+getCoroutineYieldTypesDiscriminator(IRGenModule &IGM, CanSILFunctionType type) {
   SmallString<32> buffer;
   llvm::raw_svector_ostream out(buffer);
   auto genericSig = type->getInvocationGenericSignature();
@@ -584,6 +600,8 @@ static uint64_t getYieldTypesHash(IRGenModule &IGM, CanSILFunctionType type) {
     switch (type->getCoroutineKind()) {
     case SILCoroutineKind::YieldMany: return "yield_many:";
     case SILCoroutineKind::YieldOnce: return "yield_once:";
+    case SILCoroutineKind::YieldOnce2:
+      return "yield_once_2:";
     case SILCoroutineKind::None: llvm_unreachable("not a coroutine");
     }
     llvm_unreachable("bad coroutine kind");
@@ -608,7 +626,7 @@ static uint64_t getYieldTypesHash(IRGenModule &IGM, CanSILFunctionType type) {
     out << ":";
   }
 
-  return clang::CodeGen::computeStableStringHash(out.str());  
+  return getDiscriminatorForString(IGM, out.str());
 }
 
 llvm::ConstantInt *
@@ -620,12 +638,15 @@ PointerAuthEntity::getTypeDiscriminator(IRGenModule &IGM) const {
     case SILFunctionTypeRepresentation::Thin:
     case SILFunctionTypeRepresentation::Method:
     case SILFunctionTypeRepresentation::WitnessMethod:
-    case SILFunctionTypeRepresentation::Closure: {
+    case SILFunctionTypeRepresentation::Closure:
+    case SILFunctionTypeRepresentation::KeyPathAccessorGetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorSetter:
+    case SILFunctionTypeRepresentation::KeyPathAccessorEquals:
+    case SILFunctionTypeRepresentation::KeyPathAccessorHash: {
       llvm::ConstantInt *&cache = IGM.getPointerAuthCaches().Types[fnType];
       if (cache) return cache;
 
-      auto hash = getTypeHash(IGM, fnType);
-      cache = getDiscriminatorForHash(IGM, hash);
+      cache = ::getTypeDiscriminator(IGM, fnType);
       return cache;
     }
     
@@ -642,15 +663,6 @@ PointerAuthEntity::getTypeDiscriminator(IRGenModule &IGM) const {
     llvm_unreachable("invalid representation");
   };
 
-  auto getCoroutineYieldTypesDiscriminator = [&](CanSILFunctionType fnType) {
-    llvm::ConstantInt *&cache = IGM.getPointerAuthCaches().Types[fnType];
-    if (cache) return cache;
-
-    auto hash = getYieldTypesHash(IGM, fnType);
-    cache = getDiscriminatorForHash(IGM, hash);
-    return cache;
-  };
-
   switch (StoredKind) {
   case Kind::None:
   case Kind::Special:
@@ -662,7 +674,13 @@ PointerAuthEntity::getTypeDiscriminator(IRGenModule &IGM) const {
 
   case Kind::CoroutineYieldTypes: {
     auto fnType = Storage.get<CanSILFunctionType>(StoredKind);
-    return getCoroutineYieldTypesDiscriminator(fnType);
+
+    llvm::ConstantInt *&cache = IGM.getPointerAuthCaches().Types[fnType];
+    if (cache)
+      return cache;
+
+    cache = getCoroutineYieldTypesDiscriminator(IGM, fnType);
+    return cache;
   }
 
   case Kind::CanSILFunctionType: {
@@ -698,10 +716,10 @@ IRGenModule::getConstantSignedCFunctionPointer(llvm::Constant *fn) {
   return fn;
 }
 
-llvm::Constant *IRGenModule::getConstantSignedPointer(llvm::Constant *pointer,
-                                                      unsigned key,
-                                          llvm::Constant *storageAddress,
-                                          llvm::Constant *otherDiscriminator) {
+llvm::Constant *
+IRGenModule::getConstantSignedPointer(llvm::Constant *pointer, unsigned key,
+                                      llvm::Constant *storageAddress,
+                                      llvm::ConstantInt *otherDiscriminator) {
   return clang::CodeGen::getConstantSignedPointer(getClangCGM(), pointer, key,
                                                   storageAddress,
                                                   otherDiscriminator);
@@ -743,4 +761,8 @@ void ConstantAggregateBuilderBase::addSignedPointer(llvm::Constant *pointer,
 
   addSignedPointer(pointer, schema.getKey(), schema.isAddressDiscriminated(),
                    llvm::ConstantInt::get(IGM().Int64Ty, otherDiscriminator));
+}
+
+llvm::ConstantInt* IRGenFunction::getMallocTypeId() {
+  return getDiscriminatorForString(IGM, CurFn->getName());
 }

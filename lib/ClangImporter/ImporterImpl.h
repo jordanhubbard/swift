@@ -23,23 +23,28 @@
 #include "ImportName.h"
 #include "SwiftLookupTable.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/ForeignErrorConvention.h"
+#include "swift/AST/Identifier.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/RequirementSignature.h"
 #include "swift/AST/Type.h"
 #include "swift/Basic/FileTypes.h"
+#include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
-#include "clang/Lex/MacroInfo.h"
-#include "clang/Lex/Preprocessor.h"
 #include "clang/AST/DeclVisitor.h"
 #include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/Basic/IdentifierTable.h"
+#include "clang/Basic/Specifiers.h"
+#include "clang/Basic/TargetInfo.h"
 #include "clang/Frontend/CompilerInstance.h"
+#include "clang/Lex/MacroInfo.h"
+#include "clang/Lex/Preprocessor.h"
 #include "clang/Serialization/ModuleFileExtension.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
@@ -52,8 +57,8 @@
 #include "llvm/Support/Path.h"
 #include <functional>
 #include <set>
-#include <unordered_set>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace llvm {
@@ -149,24 +154,15 @@ enum class ImportTypeKind {
   /// Parameters are always considered CF-audited.
   Parameter,
 
+  /// Import the type of a special "completion handler" function parameter.
+  CompletionHandlerParameter,
+
   /// Import the type of a parameter to a completion handler that can indicate
   /// a thrown error.
   ///
   /// Special handling:
   /// * _Nullable_result is treated as _Nonnull rather than _Nullable_result.
   CompletionHandlerResultParameter,
-
-  /// Import the type of a parameter declared with
-  /// \c CF_RETURNS_RETAINED.
-  ///
-  /// This ensures that the parameter is not marked as Unmanaged.
-  CFRetainedOutParameter,
-
-  /// Import the type of a parameter declared with
-  /// \c CF_RETURNS_NON_RETAINED.
-  ///
-  /// This ensures that the parameter is not marked as Unmanaged.
-  CFUnretainedOutParameter,
 
   /// Import the type of an ObjC property.
   ///
@@ -207,10 +203,31 @@ enum class ImportTypeAttr : uint8_t {
   Sendable = 1 << 2,
 
   /// Type is in a declaration where it would be imported as Sendable by
-  /// default. This comes directly from the parameters to
-  /// \c getImportTypeAttrs() and merely affects diagnostics.
-  DefaultsToSendable = 1 << 3
+  /// default. Currently used for completion handlers.
+  DefaultsToSendable = 1 << 3,
+
+  /// Import the type of a parameter declared with
+  /// \c CF_RETURNS_RETAINED.
+  ///
+  /// This ensures that the parameter is not marked as Unmanaged.
+  CFRetainedOutParameter = 1 << 4,
+
+  /// Import the type of a parameter declared with
+  /// \c CF_RETURNS_NON_RETAINED.
+  ///
+  /// This ensures that the parameter is not marked as Unmanaged.
+  CFUnretainedOutParameter = 1 << 5,
+
+  /// Type should be imported as though declaration was marked with
+  /// \c __attribute__((swift_attr("sending"))) .
+  Sending = 1 << 6,
 };
+
+/// Find and iterate over swift attributes embedded in the type
+/// without looking through typealiases.
+void findSwiftAttributes(
+    clang::QualType type,
+    llvm::function_ref<void(const clang::SwiftAttrAttr *)> callback);
 
 /// Attributes which were set on the declaration and affect how its type is
 /// imported.
@@ -223,11 +240,16 @@ using ImportTypeAttrs = OptionSet<ImportTypeAttr>;
 /// \param D The declaration to extract attributes from.
 /// \param isParam Is the declaration a function parameter? If so, additional
 ///        attributes will be imported.
-/// \param sendableByDefault If the sendability of the declaration is not
-///        specified, should the \c \@Sendable attribute be added implicitly?
-///        Used for e.g. completion handlers.
-ImportTypeAttrs getImportTypeAttrs(const clang::Decl *D, bool isParam = false,
-                                   bool sendableByDefault = false);
+ImportTypeAttrs getImportTypeAttrs(const clang::Decl *D, bool isParam = false);
+
+/// Extract concurrency related attributes from a type.
+///
+/// \param SwiftContext The context.
+/// \param importKind The kind of import being performed.
+/// \param attrs The list to add the new attributes to.
+/// \param type The type to extract attributes from.
+void getConcurrencyAttrs(ASTContext &SwiftContext, ImportTypeKind importKind,
+                         ImportTypeAttrs &attrs, clang::QualType type);
 
 struct ImportDiagnostic {
   ImportDiagnosticTarget target;
@@ -415,7 +437,7 @@ class LLVM_LIBRARY_VISIBILITY ClangImporter::Implementation
   using Version = importer::ImportNameVersion;
 
 public:
-  Implementation(ASTContext &ctx,
+  Implementation(ASTContext &ctx, DependencyTracker *dependencyTracker,
                  DWARFImporterDelegate *dwarfImporterDelegate);
   ~Implementation();
 
@@ -447,12 +469,21 @@ public:
   std::unordered_set<ImportDiagnostic, ImportDiagnosticHasher>
       CollectedDiagnostics;
 
+  // Keeps track of `clang::RecordDecl`s where diagnostics have already been
+  // emitted due to failed SWIFT_SHARED_REFERENCE inference.
+  std::unordered_set<const clang::RecordDecl *> DiagnosedCxxRefDecls;
+
+  // Tracks which function templates have already had a diagnostic emitted,
+  // to avoid duplicate diagnostics across instantiations.
+  llvm::DenseSet<std::pair<const clang::FunctionDecl *, DiagID>>
+      DiagnosedTemplateDiagnostics;
+
   const bool ImportForwardDeclarations;
   const bool DisableSwiftBridgeAttr;
   const bool BridgingHeaderExplicitlyRequested;
+  const bool BridgingHeaderIsInternal;
   const bool DisableOverlayModules;
   const bool EnableClangSPI;
-  bool importSymbolicCXXDecls;
 
   bool IsReadingBridgingPCH;
   llvm::SmallVector<clang::serialization::SubmoduleID, 2> PCHImportedSubmodules;
@@ -520,14 +551,11 @@ private:
   /// Clang arguments used to create the Clang invocation.
   std::vector<std::string> ClangArgs;
 
-  /// Mapping from Clang swift_attr attribute text to the Swift source buffer
-  /// IDs that contain that attribute text. These are re-used when parsing the
-  /// Swift attributes on import.
-  llvm::StringMap<unsigned> ClangSwiftAttrSourceBuffers;
-
-  /// Mapping from modules in which a Clang swift_attr attribute occurs, to be
-  /// used when parsing the attribute text.
-  llvm::SmallDenseMap<ModuleDecl *, SourceFile *> ClangSwiftAttrSourceFiles;
+  /// Mapping from Clang swift_attr attribute text to the Swift source file(s)
+  /// that contain that attribute text.
+  ///
+  /// These are re-used when parsing the Swift attributes on import.
+  llvm::StringMap<llvm::TinyPtrVector<SourceFile *>> ClangSwiftAttrSourceFiles;
 
 public:
   /// The Swift lookup table for the bridging header.
@@ -584,9 +612,51 @@ public:
   // Mapping from imported types to their raw value types.
   llvm::DenseMap<const NominalTypeDecl *, Type> RawTypes;
 
+  // Caches used by ObjCInterfaceAndImplementationRequest.
+  llvm::DenseMap<Decl *, Decl *> ImplementationsByInterface;
+  llvm::DenseMap<Decl *, llvm::TinyPtrVector<Decl*>> InterfacesByImplementation;
+
   clang::CompilerInstance *getClangInstance() {
     return Instance.get();
   }
+
+  /// Writes the mangled name of \p clangDecl to \p os.
+  void getMangledName(clang::MangleContext *mangler,
+                      const clang::NamedDecl *clangDecl, raw_ostream &os);
+
+  /// Whether the C++ interoperability compatibility version is at least
+  /// 'major'.
+  ///
+  /// Use the
+  /// `isCxxInteropCompatVersionAtLeast(version::getUpcomingCxxInteropCompatVersion())`
+  /// check when making a source breaking C++ interop change.
+  bool isCxxInteropCompatVersionAtLeast(unsigned major,
+                                        unsigned minor = 0) const {
+    return SwiftContext.LangOpts.isCxxInteropCompatVersionAtLeast(major, minor);
+  }
+
+private:
+  /// The Importer may be configured to load modules of a different OS Version
+  /// than the underlying Swift compilation. This is the `TargetOptions`
+  /// corresponding to the instantiating Swift compilation's triple. These are
+  /// to be used by all IRGen/CodeGen clients of `ClangImporter`.
+  std::unique_ptr<clang::TargetInfo> CodeGenTargetInfo;
+  /// - Important: Do not access directly. This field exists only to make sure
+  ///   we own the target options stored in `CodeGenTargetInfo` because
+  ///   `clang::TargetOptions` no longer co-owns them:
+  ///   https://github.com/llvm/llvm-project/pull/106271.
+  std::unique_ptr<clang::TargetOptions> TargetOpts;
+  std::unique_ptr<clang::CodeGenOptions> CodeGenOpts;
+
+  /// Sets the target & code generation options for use by IRGen/CodeGen
+  /// clients of `ClangImporter`. If `CI` is null, the data is drawn from the
+  /// importer's invocation.
+  void configureOptionsForCodeGen(clang::DiagnosticsEngine &Diags,
+                                  clang::CompilerInvocation *CI = nullptr);
+
+  clang::TargetInfo &getCodeGenTargetInfo() const { return *CodeGenTargetInfo; }
+
+  clang::CodeGenOptions &getCodeGenOptions() const;
 
 private:
   /// Generation number that is used for crude versioning.
@@ -603,7 +673,10 @@ public:
   /// Keep track of subscript declarations based on getter/setter
   /// pairs.
   llvm::DenseMap<std::pair<FuncDecl *, FuncDecl *>, SubscriptDecl *> Subscripts;
-  llvm::DenseMap<llvm::StringRef, std::pair<FuncDecl *, FuncDecl *>>
+
+  llvm::DenseMap<
+      NominalTypeDecl *,
+      llvm::DenseMap<llvm::StringRef, std::pair<FuncDecl *, FuncDecl *>>>
       GetterSetterMap;
 
   /// Keep track of getter/setter pairs for functions imported from C++
@@ -612,25 +685,59 @@ public:
   ///
   /// `.first` corresponds to a getter
   /// `.second` corresponds to a setter
-  llvm::MapVector<std::pair<NominalTypeDecl *, Type>,
-                  std::pair<FuncDecl *, FuncDecl *>> cxxSubscripts;
+  llvm::DenseMap<NominalTypeDecl *,
+                 llvm::MapVector<SmallVector<TypeBase *>,
+                                 std::pair<FuncDecl *, FuncDecl *>,
+                                 std::map<SmallVector<TypeBase *>, unsigned>>>
+      cxxSubscripts;
 
+  llvm::MapVector<NominalTypeDecl *, std::pair<FuncDecl *, FuncDecl *>>
+      cxxDereferenceOperators;
+
+  llvm::SmallPtrSet<const clang::Decl *, 1> synthesizedAndAlwaysVisibleDecls;
+
+private:
   // Keep track of the decls that were already cloned for this specific class.
   llvm::DenseMap<std::pair<ValueDecl *, DeclContext *>, ValueDecl *>
       clonedBaseMembers;
+
+  // Map all cloned methods back to the original member
+  llvm::DenseMap<ValueDecl *, ValueDecl *> clonedMembers;
+
+  // Keep track of methods that are unavailale in each class.
+  // We need this set because these methods will be imported lazily. We don't
+  // have the corresponding Swift method when the availability check is
+  // performed, so instead we store the information in this set and then, when
+  // the method is finally generated, we check if it's present here
+  llvm::DenseSet<std::pair<const clang::CXXRecordDecl *, DeclName>>
+      unavailableMethods;
+
+public:
+  llvm::DenseMap<const clang::ParmVarDecl*, FuncDecl*> defaultArgGenerators;
+
+  bool isDefaultArgSafeToImport(const clang::ParmVarDecl *param);
+
+  ValueDecl *importBaseMemberDecl(ValueDecl *decl, DeclContext *newContext,
+                                  ClangInheritanceInfo inheritance);
+
+  ValueDecl *getOriginalForClonedMember(const ValueDecl *decl);
+
+  static size_t getImportedBaseMemberDeclArity(const ValueDecl *valueDecl);
 
   // Cache for already-specialized function templates and any thunks they may
   // have.
   llvm::DenseMap<clang::FunctionDecl *, ValueDecl *>
       specializedFunctionTemplates;
 
-  /// Stores qualified names of C++ template specializations that were too deep
-  /// to import into Swift.
-  llvm::StringSet<> tooDeepTemplateSpecializations;
-
   /// Keeps track of the Clang functions that have been turned into
   /// properties.
   llvm::DenseMap<const clang::FunctionDecl *, VarDecl *> FunctionsAsProperties;
+
+  /// Calling AbstractFunctionDecl::getLifetimeDependencies before we added
+  /// the conformances we want to all the imported types is problematic because
+  /// it will populate the conformance too early. To avoid the need for that we
+  /// store functions with interesting lifetimes.
+  llvm::DenseSet<const AbstractFunctionDecl *> returnsSelfDependentValue;
 
   importer::EnumInfo getEnumInfo(const clang::EnumDecl *decl) {
     return getNameImporter().getEnumInfo(decl);
@@ -638,6 +745,18 @@ public:
   importer::EnumKind getEnumKind(const clang::EnumDecl *decl) {
     return getNameImporter().getEnumKind(decl);
   }
+
+  bool findUnavailableMethod(const clang::CXXRecordDecl *classDecl,
+                             DeclName name) {
+    return unavailableMethods.contains({classDecl, name});
+  }
+
+  void insertUnavailableMethod(const clang::CXXRecordDecl *classDecl,
+                               DeclName name) {
+    unavailableMethods.insert({classDecl, name});
+  }
+
+  void handleAmbiguousSwiftName(ValueDecl *decl);
 
 private:
   /// A mapping from imported declarations to their "alternate" declarations,
@@ -730,14 +849,15 @@ private:
   llvm::DenseMap<const Decl *, ArrayRef<ProtocolDecl *>>
     ImportedProtocols;
 
-  /// The set of declaration context for which we've already ruled out the
-  /// presence of globals-as-members.
-  llvm::DenseSet<const IterableDeclContext *> checkedGlobalsAsMembers;
-
   void startedImportingEntity();
 
 public:
   importer::PlatformAvailability platformAvailability;
+
+  /// The synthesized predicate functions for imported `VarDecl`s that represent
+  /// availability domains.
+  llvm::DenseMap<const clang::VarDecl *, FuncDecl *>
+      availabilityDomainPredicates;
 
 private:
   /// For importing names. This is initialized by the ClangImporter::create()
@@ -746,8 +866,8 @@ private:
 
   /// If there is a single .PCH file imported into the __ObjC module, this
   /// is the filename of that PCH. When other files are imported, this should
-  /// be llvm::None.
-  Optional<std::string> SinglePCHImport = None;
+  /// be std::nullopt.
+  std::optional<std::string> SinglePCHImport = std::nullopt;
 
 public:
   importer::NameImporter &getNameImporter() {
@@ -773,6 +893,9 @@ private:
   /// DWARFImporter delegate.
   bool DisableSourceImport;
   
+  /// File dependency tracker, if installed.
+  DependencyTracker *SwiftDependencyTracker = nullptr;
+
   /// The DWARF importer delegate, if installed.
   DWARFImporterDelegate *DWARFImporter = nullptr;
 
@@ -792,6 +915,9 @@ private:
   /// demand, this doesn't really do any work.
   ModuleDecl *loadModuleDWARF(SourceLoc importLoc,
                               ImportPath::Module path);
+
+  /// Lookup a clang module.
+  clang::Module *lookupModule(StringRef moduleName);
 
 public:
   /// Load a module using either method.
@@ -832,7 +958,7 @@ public:
     return Instance->getPreprocessor();
   }
   
-  clang::CodeGenOptions &getClangCodeGenOpts() const {
+  clang::CodeGenOptions &getCodeGenOpts() const {
     return Instance->getCodeGenOpts();
   }
 
@@ -978,13 +1104,23 @@ public:
   /// Map a Clang identifier name to its imported Swift equivalent.
   StringRef getSwiftNameFromClangName(StringRef name);
 
-  /// Retrieve the Swift source buffer ID that corresponds to the given
-  /// swift_attr attribute text, creating one if necessary.
-  unsigned getClangSwiftAttrSourceBuffer(StringRef attributeText);
-
   /// Retrieve the placeholder source file for use in parsing Swift attributes
-  /// in the given module.
-  SourceFile &getClangSwiftAttrSourceFile(ModuleDecl &module);
+  /// of the given Decl.
+  SourceFile &getClangSwiftAttrSourceFile(Decl *MappedDecl,
+                                          StringRef attributeText, bool cached);
+
+  /// Create attribute with given text and attach it to decl, creating or
+  /// retrieving a chached source file as needed.
+  void importNontrivialAttribute(Decl *MappedDecl, StringRef attributeText);
+
+  /// Utility function to import Clang attributes from a source Swift decl to
+  /// synthesized Swift decl.
+  ///
+  /// \param SourceDecl The Swift decl to copy the atteribute from.
+  /// \param SynthesizedDecl The synthesized Swift decl to attach attributes to.
+  void
+  importAttributesFromClangDeclToSynthesizedSwiftDecl(Decl *SourceDecl,
+                                                      Decl *SynthesizedDecl);
 
   /// Import attributes from the given Clang declaration to its Swift
   /// equivalent.
@@ -1001,9 +1137,9 @@ public:
 
   /// If we already imported a given decl, return the corresponding Swift decl.
   /// Otherwise, return nullptr.
-  Optional<Decl *> importDeclCached(const clang::NamedDecl *ClangDecl,
-                                    Version version,
-                                    bool UseCanonicalDecl = true);
+  std::optional<Decl *> importDeclCached(const clang::NamedDecl *ClangDecl,
+                                         Version version,
+                                         bool UseCanonicalDecl = true);
 
   Decl *importDeclImpl(const clang::NamedDecl *ClangDecl, Version version,
                        bool &TypedefIsSuperfluous, bool &HadForwardDeclaration);
@@ -1052,7 +1188,8 @@ public:
                                    const ClassDecl *classDecl,
                                    SmallVectorImpl<Decl *> &newMembers);
   void importMirroredProtocolMembers(const clang::ObjCContainerDecl *decl,
-                                     DeclContext *dc, Optional<DeclBaseName> name,
+                                     DeclContext *dc,
+                                     std::optional<DeclBaseName> name,
                                      SmallVectorImpl<Decl *> &members);
 
   /// Utility function for building simple generic signatures.
@@ -1101,7 +1238,8 @@ public:
   /// \returns The imported declaration context, or null if it could not
   /// be converted.
   DeclContext *importDeclContextOf(const clang::Decl *D,
-                                   EffectiveClangContext context);
+                                   EffectiveClangContext context,
+                                   bool allowForwardDeclaration = false);
 
   /// Determine whether the given declaration is considered
   /// 'unavailable' in Swift.
@@ -1115,9 +1253,9 @@ public:
 
   /// Create a decl with error type and an "unavailable" attribute on it
   /// with the specified message.
-  ValueDecl *createUnavailableDecl(Identifier name, DeclContext *dc,
-                                   Type type, StringRef UnavailableMessage,
-                                   bool isStatic, ClangNode ClangN);
+  ValueDecl *createUnavailableDecl(Identifier name, DeclContext *dc, Type type,
+                                   StringRef UnavailableMessage, bool isStatic,
+                                   ClangNode ClangN, AccessLevel access);
 
   /// Add a synthesized typealias to the given nominal type.
   void addSynthesizedTypealias(NominalTypeDecl *nominal, Identifier name,
@@ -1140,6 +1278,8 @@ public:
   ///
   /// \returns The named module, or null if the module has not been imported.
   ModuleDecl *getNamedModule(StringRef name);
+
+  ImportPath::Builder getSwiftModulePath(const clang::Module *M);
 
   /// Returns the "Foundation" module, if it can be loaded.
   ///
@@ -1267,14 +1407,14 @@ public:
   ///          indicates if the Optional is implicitly unwrapped. If
   ///          the type cannot be represented in Swift, then the type
   ///          field will be null.
-  ImportedType
-  importType(clang::QualType type, ImportTypeKind kind,
-             llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn,
-             bool allowNSUIntegerAsInt, Bridgeability topLevelBridgeability,
-             ImportTypeAttrs attrs,
-             OptionalTypeKind optional = OTK_ImplicitlyUnwrappedOptional,
-             bool resugarNSErrorPointer = true,
-             Optional<unsigned> completionHandlerErrorParamIndex = None);
+  ImportedType importType(
+      clang::QualType type, ImportTypeKind kind,
+      llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn,
+      bool allowNSUIntegerAsInt, Bridgeability topLevelBridgeability,
+      ImportTypeAttrs attrs,
+      OptionalTypeKind optional = OTK_ImplicitlyUnwrappedOptional,
+      bool resugarNSErrorPointer = true,
+      std::optional<unsigned> completionHandlerErrorParamIndex = std::nullopt);
 
   /// Import the given Clang type into Swift.
   ///
@@ -1362,12 +1502,16 @@ public:
     swift::Type swiftTy;
     /// If the parameter is or not inout.
     bool isInOut;
+    /// If the parameter should be imported as consuming.
+    bool isConsuming;
     /// If the parameter is implicitly unwrapped or not.
     bool isParamTypeImplicitlyUnwrapped;
   };
 
   /// Import a parameter type
   ///
+  /// \param dc The declaration context in which this parameter appears.
+  /// \param parent The declaration with which this parameter is associated.
   /// \param param The underlaying parameter declaraction.
   /// \param optionalityOfParam The kind of optionality for the parameter
   ///        being imported.
@@ -1394,11 +1538,12 @@ public:
   ///        with \c ImportDiagnosticAdder .
   ///
   /// \returns The imported parameter result on success, or None on failure.
-  Optional<ImportParameterTypeResult> importParameterType(
+  std::optional<ImportParameterTypeResult> importParameterType(
+      DeclContext *dc, const clang::Decl *parent,
       const clang::ParmVarDecl *param, OptionalTypeKind optionalityOfParam,
       bool allowNSUIntegerAsInt, bool isNSDictionarySubscriptGetter,
       bool paramIsError, bool paramIsCompletionHandler,
-      Optional<unsigned> completionHandlerErrorParamIndex,
+      std::optional<unsigned> completionHandlerErrorParamIndex,
       ArrayRef<GenericTypeParamDecl *> genericParams,
       llvm::function_ref<void(Diagnostic &&)> addImportDiagnosticFn);
 
@@ -1443,17 +1588,13 @@ public:
   ///
   /// \returns the imported result type, or null if the type cannot be
   /// imported.
-  ImportedType
-  importMethodParamsAndReturnType(const DeclContext *dc,
-                                  const clang::ObjCMethodDecl *clangDecl,
-                                  ArrayRef<const clang::ParmVarDecl *> params,
-                                  bool isVariadic,
-                                  bool isFromSystemModule,
-                                  ParameterList **bodyParams,
-                                  importer::ImportedName importedName,
-                                  Optional<ForeignAsyncConvention> &asyncConv,
-                                  Optional<ForeignErrorConvention> &errorConv,
-                                  SpecialMethodKind kind);
+  ImportedType importMethodParamsAndReturnType(
+      const DeclContext *dc, const clang::ObjCMethodDecl *clangDecl,
+      ArrayRef<const clang::ParmVarDecl *> params, bool isVariadic,
+      bool isFromSystemModule, ParameterList **bodyParams,
+      importer::ImportedName importedName,
+      std::optional<ForeignAsyncConvention> &asyncConv,
+      std::optional<ForeignErrorConvention> &errorConv, SpecialMethodKind kind);
 
   /// Import the type of an Objective-C method that will be imported as an
   /// accessor for \p property.
@@ -1484,7 +1625,7 @@ public:
   /// Determine whether the given typedef-name is "special", meaning
   /// that it has performed some non-trivial mapping of its underlying type
   /// based on the name of the typedef.
-  Optional<MappedTypeNameKind>
+  std::optional<MappedTypeNameKind>
   getSpecialTypedefKind(clang::TypedefNameDecl *decl);
 
   /// Look up a name, accepting only typedef results.
@@ -1544,13 +1685,15 @@ private:
   loadAllMembersOfObjcContainer(Decl *D,
                                 const clang::ObjCContainerDecl *objcContainer);
   void loadAllMembersOfRecordDecl(NominalTypeDecl *swiftDecl,
-                                  const clang::RecordDecl *clangRecord);
+                                  const clang::RecordDecl *clangRecord,
+                                  ClangInheritanceInfo inheritance);
 
   void collectMembersToAdd(const clang::ObjCContainerDecl *objcContainer,
                            Decl *D, DeclContext *DC,
                            SmallVectorImpl<Decl *> &members);
   void insertMembersAndAlternates(const clang::NamedDecl *nd,
-                                  SmallVectorImpl<Decl *> &members);
+                                  SmallVectorImpl<Decl *> &members,
+                                  DeclContext *expectedDC = nullptr);
   void loadAllMembersIntoExtension(Decl *D, uint64_t extra);
 
   /// Imports \p decl under \p nameVersion with the name \p newName, and adds
@@ -1595,7 +1738,7 @@ public:
     llvm_unreachable("unimplemented for ClangImporter");
   }
 
-  ValueDecl *loadTargetFunctionDecl(const SpecializeAttr *attr,
+  ValueDecl *loadTargetFunctionDecl(const AbstractSpecializeAttr *attr,
                                     uint64_t contextData) override {
     llvm_unreachable("unimplemented for ClangImporter");
   }
@@ -1630,6 +1773,32 @@ public:
     if (auto ASD = dyn_cast<AbstractStorageDecl>(D))
       ASD->setSetterAccess(access);
 
+    if constexpr (std::is_base_of_v<NominalTypeDecl, DeclTy>) {
+      // Estimate brace locations.
+      clang::SourceLocation begin;
+      clang::SourceLocation end;
+      if (auto *td = dyn_cast_or_null<clang::TagDecl>(ClangN.getAsDecl())) {
+        begin = td->getBraceRange().getBegin();
+        end = td->getBraceRange().getEnd();
+      } else {
+        begin = ClangN.getAsDecl()->getBeginLoc();
+        end = ClangN.getAsDecl()->getEndLoc();
+      }
+      SourceRange range;
+      if (begin.isValid() && end.isValid() && D->getNameLoc().isValid())
+        range = SourceRange(importSourceLoc(begin), importSourceLoc(end));
+      else {
+        range = SourceRange(D->getNameLoc(), D->getNameLoc());
+      }
+      assert(range.isValid() == D->getNameLoc().isValid());
+      D->setBraces(range);
+#ifndef NDEBUG
+      auto declRange = D->getSourceRange();
+      CharSourceRange checkValidRange(SwiftContext.SourceMgr, declRange.Start,
+                                      declRange.End);
+#endif
+    }
+
     // SwiftAttrs on ParamDecls are interpreted by applyParamAttributes().
     if (!isa<ParamDecl>(D))
       importSwiftAttrAttributes(D);
@@ -1638,6 +1807,26 @@ public:
   }
 
   void importSwiftAttrAttributes(Decl *decl);
+
+  /// Add the explicit protocol conformance specified by the given swift_attr
+  /// attribute to the given nominal type.
+  void addExplicitProtocolConformance(
+      NominalTypeDecl *decl,
+      clang::SwiftAttrAttr *conformsToAttr,
+      llvm::SmallSet<ProtocolDecl *, 4> &alreadyAdded);
+
+  /// Add explicit protocol conformances from the bases of the given C++ class
+  /// declaration's swift_attr attributes to the given nominal type.
+  void addExplicitProtocolConformancesFromBases(
+      NominalTypeDecl *nominal,
+      const clang::CXXRecordDecl *cxxRecordDecl,
+      bool isBase);
+
+  /// Add implicit typealiases required when turning the given nominal type
+  /// into an option set.
+  void addOptionSetTypealiases(NominalTypeDecl *nominal);
+
+  void swiftify(AbstractFunctionDecl *MappedDecl);
 
   /// Find the lookup table that corresponds to the given Clang module.
   ///
@@ -1743,10 +1932,10 @@ public:
   /// Dump the Swift-specific name lookup tables we generate.
   void dumpSwiftLookupTables();
 
-  void setSinglePCHImport(Optional<std::string> PCHFilename) {
+  void setSinglePCHImport(std::optional<std::string> PCHFilename) {
     if (PCHFilename.has_value()) {
       assert(llvm::sys::path::extension(PCHFilename.value())
-                 .endswith(file_types::getExtension(file_types::TY_PCH)) &&
+                 .ends_with(file_types::getExtension(file_types::TY_PCH)) &&
              "Single PCH imported filename doesn't have .pch extension!");
     }
     SinglePCHImport = PCHFilename;
@@ -1780,6 +1969,11 @@ public:
 
 namespace importer {
 
+/// Returns true if the given C/C++ record should be imported as a reference
+/// type into Swift.
+bool recordHasReferenceSemantics(const clang::RecordDecl *decl,
+                                 ClangImporter::Implementation *importerImpl);
+
 /// Whether this is a forward declaration of a type. We ignore forward
 /// declarations in certain cases, and instead process the real declarations.
 bool isForwardDeclOfType(const clang::Decl *decl);
@@ -1791,6 +1985,12 @@ bool shouldSuppressDeclImport(const clang::Decl *decl);
 /// but are now renamed using the swift_name attribute.
 bool isSpecialUIKitStructZeroProperty(const clang::NamedDecl *decl);
 
+/// Identifies certain AppKit constants that have overlay equivalents but are
+/// also annotated with SwiftName API Notes attributes at the same time. Older
+/// Clang versions were silently dropping the API Notes attribute on those
+/// constants.
+bool isSpecialAppKitFunctionKeyProperty(const clang::NamedDecl *decl);
+
 /// \returns true if \p a has the same underlying type as \p b after removing
 /// any pointer/reference specifiers. Note that this does not currently look through
 /// nested types other than pointers or references.
@@ -1799,11 +1999,13 @@ bool hasSameUnderlyingType(const clang::Type *a,
 
 /// Add command-line arguments for a normal import of Clang code.
 void getNormalInvocationArguments(std::vector<std::string> &invocationArgStrs,
-                                  ASTContext &ctx);
+                                  ASTContext &ctx, bool ignoreClangTarget);
 
 /// Add command-line arguments common to all imports of Clang code.
 void addCommonInvocationArguments(std::vector<std::string> &invocationArgStrs,
-                                  ASTContext &ctx);
+                                  ASTContext &ctx,
+                                  bool requiresBuiltinHeadersInSystemModules,
+                                  bool ignoreClangTarget);
 
 /// Finds a particular kind of nominal by looking through typealiases.
 template <typename T>
@@ -1838,15 +2040,19 @@ class SwiftNameLookupExtension : public clang::ModuleFileExtension {
   ClangSourceBufferImporter &buffersForDiagnostics;
   const PlatformAvailability &availability;
 
+  ClangImporter::Implementation *importerImpl;
+
 public:
   SwiftNameLookupExtension(std::unique_ptr<SwiftLookupTable> &pchLookupTable,
                            LookupTableMap &tables, ASTContext &ctx,
                            ClangSourceBufferImporter &buffersForDiagnostics,
-                           const PlatformAvailability &avail)
+                           const PlatformAvailability &avail,
+                           ClangImporter::Implementation *importerImpl)
       : // Update in response to D97702 landing.
-        clang::ModuleFileExtension(),
-        pchLookupTable(pchLookupTable), lookupTables(tables), swiftCtx(ctx),
-        buffersForDiagnostics(buffersForDiagnostics), availability(avail) {}
+        clang::ModuleFileExtension(), pchLookupTable(pchLookupTable),
+        lookupTables(tables), swiftCtx(ctx),
+        buffersForDiagnostics(buffersForDiagnostics), availability(avail),
+        importerImpl(importerImpl) {}
 
   clang::ModuleFileExtensionMetadata getExtensionMetadata() const override;
   void hashExtension(ExtensionHashBuilder &HBuilder) const override;
@@ -1887,22 +2093,24 @@ static inline Type applyToFunctionType(
   return type;
 }
 
-inline Optional<const clang::EnumDecl *> findAnonymousEnumForTypedef(
-    const ASTContext &ctx,
-    const clang::TypedefType *typedefType) {
+inline std::optional<const clang::EnumDecl *>
+findAnonymousEnumForTypedef(const ASTContext &ctx,
+                            const clang::TypedefType *typedefType) {
   auto *typedefDecl = typedefType->getDecl();
   auto *lookupTable = ctx.getClangModuleLoader()->findLookupTable(typedefDecl->getOwningModule());
 
   auto foundDecls = lookupTable->lookup(
       SerializedSwiftName(typedefDecl->getName()), EffectiveClangContext());
 
-  auto found = llvm::find_if(foundDecls, [](SwiftLookupTable::SingleEntry decl) {
-    return decl.is<clang::NamedDecl *>() &&
-        isa<clang::EnumDecl>(decl.get<clang::NamedDecl *>());
-  });
+  auto found =
+      llvm::find_if(foundDecls, [](SwiftLookupTable::SingleEntry decl) {
+        return isa<clang::NamedDecl *>(decl) &&
+               isa<clang::EnumDecl>(cast<clang::NamedDecl *>(decl));
+      });
 
-  if (found != foundDecls.end())
-    return cast<clang::EnumDecl>(found->get<clang::NamedDecl *>());
+  if (found != foundDecls.end()) {
+    return cast<clang::EnumDecl>(cast<clang::NamedDecl *>(*found));
+  }
 
   // If a swift_private attribute has been attached to the enum, its name will
   // be prefixed with two underscores
@@ -1915,28 +2123,89 @@ inline Optional<const clang::EnumDecl *> findAnonymousEnumForTypedef(
 
   auto swiftPrivateFound =
       llvm::find_if(foundDecls, [](SwiftLookupTable::SingleEntry decl) {
-        return decl.is<clang::NamedDecl *>() &&
-               isa<clang::EnumDecl>(decl.get<clang::NamedDecl *>()) &&
-               decl.get<clang::NamedDecl *>()
+        return isa<clang::NamedDecl *>(decl) &&
+               isa<clang::EnumDecl>(cast<clang::NamedDecl *>(decl)) &&
+               cast<clang::NamedDecl *>(decl)
                    ->hasAttr<clang::SwiftPrivateAttr>();
       });
 
-  if (swiftPrivateFound != foundDecls.end())
-    return cast<clang::EnumDecl>(swiftPrivateFound->get<clang::NamedDecl *>());
+  if (swiftPrivateFound != foundDecls.end()) {
+    return cast<clang::EnumDecl>(cast<clang::NamedDecl *>(*swiftPrivateFound));
+  }
 
-  return None;
-}
-
-inline std::string getPrivateOperatorName(const std::string &OperatorToken) {
-#define OVERLOADED_OPERATOR(Name, Spelling, Token, Unary, Binary, MemberOnly)  \
-  if (OperatorToken == Spelling) {                                             \
-    return "__operator" #Name;                                                 \
-  };
-#include "clang/Basic/OperatorKinds.def"
-  return "None";
+  return std::nullopt;
 }
 
+/// Construct the imported Swift name for an imported Clang operator kind,
+/// e.g., \c "__operatorPlus" for Clang::OO_Plus.
+///
+/// Returns an empty identifier (internally, a nullptr) when \a op does not
+/// represent an actual operator, i.e., OO_None or NUM_OVERLOADED_OPERATORS.
+Identifier getOperatorName(ASTContext &ctx, clang::OverloadedOperatorKind op);
+
+/// Construct the imported Swift name corresponding to an operator identifier,
+/// e.g., \c "__operatorPlus" for \c "+".
+///
+/// Returns an empty identifier (internally, a nullptr) when \a op does not
+/// correspond to an overloaded C++ operator.
+Identifier getOperatorName(ASTContext &ctx, Identifier op);
+
+bool hasOwnedValueAttr(const clang::RecordDecl *decl);
+bool hasUnsafeAPIAttr(const clang::Decl *decl);
+bool hasIteratorAPIAttr(const clang::Decl *decl);
+
+bool hasNonEscapableAttr(const clang::RecordDecl *decl);
+bool hasNonCopyableAttr(const clang::RecordDecl *decl);
+bool hasEscapableAttr(const clang::RecordDecl *decl);
+
+bool isViewType(const clang::CXXRecordDecl *decl);
+
+inline const clang::Type *desugarIfElaborated(const clang::Type *type) {
+  if (auto elaborated = dyn_cast<clang::ElaboratedType>(type))
+    return elaborated->desugar().getTypePtr();
+  return type;
 }
+
+inline clang::QualType desugarIfElaborated(clang::QualType type) {
+  if (auto elaborated = dyn_cast<clang::ElaboratedType>(type))
+    return elaborated->desugar();
+  return type;
 }
+
+inline clang::QualType desugarIfBoundsAttributed(clang::QualType type) {
+  if (auto BAT = dyn_cast<clang::BoundsAttributedType>(type))
+    return BAT->desugar();
+  if (auto VT = dyn_cast<clang::ValueTerminatedType>(type))
+    return VT->desugar();
+  if (auto AT = dyn_cast<clang::AttributedType>(type))
+    switch (AT->getAttrKind()) {
+      case clang::attr::PtrUnsafeIndexable:
+      case clang::attr::PtrSingle:
+        return AT->desugar();
+      default:
+        break;
+    }
+  return type;
+}
+
+/// Option set enums are sometimes imported as typedefs which assign a name to
+/// the type, but are unavailable in Swift.
+///
+/// If given such a typedef, this helper function retrieves and imports the
+/// underlying enum type. Returns an empty ImportedType otherwise.
+///
+/// If \a type is an elaborated type, it should be desugared first.
+ImportedType findOptionSetEnum(clang::QualType type,
+                               ClangImporter::Implementation &Impl);
+
+/// Find value declarations in the same module as the given Clang declaration
+/// and with the given name.
+///
+/// The name we're looking for is the Swift name.
+llvm::SmallVector<ValueDecl *, 1>
+getValueDeclsForName(NominalTypeDecl* decl, StringRef name);
+
+} // end namespace importer
+} // end namespace swift
 
 #endif

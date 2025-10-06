@@ -1,8 +1,8 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Functions -clang-header-expose-decls=all-public -emit-clang-header-path %t/functions.h
+// RUN: %target-swift-frontend %s -module-name Functions -clang-header-expose-decls=all-public -typecheck -verify -emit-clang-header-path %t/functions.h
 // RUN: %FileCheck %s < %t/functions.h
 
-// RUN: %check-interop-cxx-header-in-clang(%t/functions.h)
+// RUN: %check-interop-cxx-header-in-clang(%t/functions.h -DSWIFT_CXX_INTEROP_HIDE_STL_OVERLAY)
 
 public func a() { }
 public func b(_ x: @escaping (Int) -> ()) { }
@@ -13,4 +13,4 @@ public func c() {}
 
 // CHECK: SWIFT_INLINE_THUNK void a() noexcept SWIFT_SYMBOL("s:9Functions1ayyF") {
 // CHECK: SWIFT_INLINE_THUNK void c() noexcept SWIFT_SYMBOL("s:9Functions1cyyF") {
-// CHECK-NOT: b(
+// CHECK: // Unavailable in C++: Swift global function 'b(_:)'.

@@ -1,12 +1,14 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-build-swift -Xfrontend -disable-availability-checking -parse-as-library %s -o %t/a.out
+// RUN: %target-build-swift -target %target-swift-5.1-abi-triple -parse-as-library %s -o %t/a.out
 // RUN: %target-codesign %t/a.out
-// RUN:  %target-run %t/a.out
+// RUN: env %env-SWIFT_IS_CURRENT_EXECUTOR_LEGACY_MODE_OVERRIDE=legacy %target-run %t/a.out
 
 // REQUIRES: executable_test
 // REQUIRES: concurrency
 // REQUIRES: concurrency_runtime
-// UNSUPPORTED: back_deployment_runtime
+
+// TODO: The actual reason is that we do these %env- tricks, which e.g. Windows is confused about
+// REQUIRES: libdispatch
 
 // UNSUPPORTED: back_deploy_concurrency
 // UNSUPPORTED: use_os_stdlib
@@ -15,8 +17,8 @@
 import StdlibUnittest
 
 func checkAssumeMainActor(echo: MainActorEcho) /* synchronous! */ {
-  // Echo.get("any") // error: main actor isolated, cannot perform async call here
-  assumeOnMainActorExecutor {
+  // Echo.get("any") // error: MainActor isolated, cannot perform async call here
+  MainActor.assumeIsolated {
     let input = "example"
     let got = echo.get(input)
     precondition(got == "example", "Expected echo to match \(input)")
@@ -38,16 +40,16 @@ actor MainFriend {
   }
 }
 
-func checkAssumeSomeone(someone: Someone) /* synchronous */ {
+func checkAssumeSomeone(someone: SomeoneOnDefaultExecutor) /* synchronous */ {
   // someone.something // can't access, would need a hop but we can't
-  assumeOnActorExecutor(someone) { someone in
+  someone.assumeIsolated { someone in
     let something = someone.something
     let expected = "isolated something"
     precondition(something == expected, "expected '\(expected)', got: \(something)")
   }
 }
 
-actor Someone {
+actor SomeoneOnDefaultExecutor {
   func callCheckMainActor(echo: MainActorEcho) {
     checkAssumeMainActor(echo: echo)
   }
@@ -62,12 +64,12 @@ actor Someone {
 }
 
 actor SomeonesFriend {
-  let someone: Someone
+  let someone: SomeoneOnDefaultExecutor
   nonisolated var unownedExecutor: UnownedSerialExecutor {
     self.someone.unownedExecutor
   }
 
-  init(someone: Someone) {
+  init(someone: SomeoneOnDefaultExecutor) {
     self.someone = someone
   }
 
@@ -77,8 +79,8 @@ actor SomeonesFriend {
 }
 
 actor CompleteStranger {
-  let someone: Someone
-  init(someone: Someone) {
+  let someone: SomeoneOnDefaultExecutor
+  init(someone: SomeoneOnDefaultExecutor) {
     self.someone = someone
   }
 
@@ -100,52 +102,57 @@ final class MainActorEcho {
 
     let echo = MainActorEcho()
 
-    if #available(SwiftStdlib 5.9, *) {
+    if #available(SwiftStdlib 5.1, *) {
       // === MainActor --------------------------------------------------------
 
-      tests.test("assumeOnMainActorExecutor: assume the main executor, from 'main() async'") {
+      tests.test("MainActor.assumeIsolated: assume the main executor, from 'main() async'") {
         await checkAssumeMainActor(echo: echo)
       }
 
-      tests.test("assumeOnMainActorExecutor: assume the main executor, from MainActor method") {
+      tests.test("MainActor.assumeIsolated: assume the main executor, from MainActor method") {
         await mainActorCallCheck(echo: echo)
       }
 
-      tests.test("assumeOnMainActorExecutor: assume the main executor, from actor on MainActor executor") {
+      tests.test("MainActor.assumeIsolated: assume the main executor, from actor on MainActor executor") {
         await MainFriend().callCheck(echo: echo)
       }
 
-      tests.test("assumeOnMainActorExecutor: wrongly assume the main executor, from actor on other executor") {
+      #if !os(WASI)
+      tests.test("MainActor.assumeIsolated: wrongly assume the main executor, from actor on other executor") {
         expectCrashLater(withMessage: "Incorrect actor executor assumption; Expected 'MainActor' executor.")
-        await Someone().callCheckMainActor(echo: echo)
+        await SomeoneOnDefaultExecutor().callCheckMainActor(echo: echo)
       }
+      #endif
 
       // === some Actor -------------------------------------------------------
 
-      let someone = Someone()
+      let someone = SomeoneOnDefaultExecutor()
+      #if !os(WASI)
       tests.test("assumeOnActorExecutor: wrongly assume someone's executor, from 'main() async'") {
-        expectCrashLater(withMessage: "Incorrect actor executor assumption; Expected same executor as a.Someone.")
+        expectCrashLater(withMessage: "Incorrect actor executor assumption; Expected same executor as a.SomeoneOnDefaultExecutor.")
         checkAssumeSomeone(someone: someone)
       }
 
       tests.test("assumeOnActorExecutor: wrongly assume someone's executor, from MainActor method") {
-        expectCrashLater(withMessage: "Incorrect actor executor assumption; Expected same executor as a.Someone.")
+        expectCrashLater(withMessage: "Incorrect actor executor assumption; Expected same executor as a.SomeoneOnDefaultExecutor.")
         checkAssumeSomeone(someone: someone)
       }
+      #endif
 
-      tests.test("assumeOnActorExecutor: assume someone's executor, from Someone") {
+      tests.test("assumeOnActorExecutor: assume someone's executor, from SomeoneOnDefaultExecutor") {
         await someone.callCheckSomeone()
       }
 
-      tests.test("assumeOnActorExecutor: assume someone's executor, from actor on the Someone.unownedExecutor") {
+      tests.test("assumeOnActorExecutor: assume someone's executor, from actor on the SomeoneOnDefaultExecutor.unownedExecutor") {
         await SomeonesFriend(someone: someone).callCheckSomeone()
       }
 
+      #if !os(WASI)
       tests.test("assumeOnActorExecutor: wrongly assume the main executor, from actor on other executor") {
-        expectCrashLater(withMessage: "Incorrect actor executor assumption; Expected same executor as a.Someone.")
+        expectCrashLater(withMessage: "Incorrect actor executor assumption; Expected same executor as a.SomeoneOnDefaultExecutor.")
         await CompleteStranger(someone: someone).callCheckSomeone()
       }
-
+      #endif
 
     }
 

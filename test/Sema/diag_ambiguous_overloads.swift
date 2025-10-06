@@ -16,14 +16,14 @@ fe(.nope, .nyet) // expected-error {{type 'Int' has no member 'nope'}}
 // expected-error@-1 {{reference to member 'nyet' cannot be resolved without a contextual type}}
 
 func fg<T>(_ f: (T) -> T) -> Void {}
-fg({x in x}) // expected-error {{unable to infer type of a closure parameter 'x' in the current context}}
+fg({x in x}) // expected-error {{cannot infer type of closure parameter 'x' without a type annotation}}
 
 
 struct S {
   func f<T>(_ i: (T) -> T, _ j: Int) -> Void {}
   func f(_ d: (Double) -> Double) -> Void {}
   func test() -> Void {
-    f({x in x}, 2) // expected-error {{unable to infer type of a closure parameter 'x' in the current context}}
+    f({x in x}, 2) // expected-error {{cannot infer type of closure parameter 'x' without a type annotation}}
   }
   
   func g<T>(_ a: T, _ b: Int) -> Void {}
@@ -162,4 +162,30 @@ do {
   func f2(_ param: (String)-> Void) {}
 
   f2(f1) // expected-error {{no 'f1' candidates produce the expected type '(String) -> Void' for parameter #0}}
+}
+
+// https://forums.swift.org/t/1-x-type-inference/69417/15
+protocol N { associatedtype D }
+
+infix operator ++ : AdditionPrecedence
+infix operator -- : AdditionPrecedence
+
+func ++ <T: N> (lhs: T, rhs: T) -> T.D { fatalError() } // expected-note {{found this candidate}}
+func ++ <T: N> (lhs: T, rhs: T) -> T { fatalError() } // expected-note {{found this candidate}}
+
+func -- <T: N> (lhs: T, rhs: T) -> T { fatalError() } // expected-note {{found this candidate}}
+func -- <T: N> (lhs: T, rhs: T) -> T.D { fatalError() } // expected-note {{found this candidate}}
+
+do {
+  struct MyInt16: N { typealias D = MyInt32 }
+  struct MyInt32: N { typealias D = MyInt64 }
+  struct MyInt64 {}
+
+  var i16 = MyInt16()
+
+  let _ = i16 ++ i16
+  // expected-error@-1 {{ambiguous use of operator '++'}}
+
+  let _ = i16 -- i16
+  // expected-error@-1 {{ambiguous use of operator '--'}}
 }

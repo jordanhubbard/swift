@@ -63,6 +63,9 @@ class MetadataPath {
       /// Type metadata at requirement index P of a generic nominal type.
       NominalTypeArgument,
 
+      /// Value at requirement index P of a generic nominal type.
+      NominalValueArgument,
+
       /// Conditional conformance at index P (i.e. the P'th element) of a
       /// conformance.
       ConditionalConformance,
@@ -73,7 +76,13 @@ class MetadataPath {
       /// The count type of a pack expansion at index P in a pack.
       PackExpansionCount,
 
-      LastWithPrimaryIndex = PackExpansionCount,
+      /// Materialize tuple as a pack.
+      TuplePack,
+
+      /// Materialize length of tuple as a pack shape expression.
+      TupleShape,
+
+      LastWithPrimaryIndex = TupleShape,
 
       // Everything past this point has no index.
 
@@ -116,9 +125,12 @@ class MetadataPath {
       case Kind::NominalTypeArgumentConformance:
       case Kind::NominalTypeArgumentShape:
       case Kind::NominalTypeArgument:
+      case Kind::NominalValueArgument:
       case Kind::ConditionalConformance:
+      case Kind::TupleShape:
         return OperationCost::Load;
 
+      case Kind::TuplePack:
       case Kind::AssociatedConformance:
         return OperationCost::Call;
 
@@ -182,6 +194,13 @@ public:
                              index));
   }
 
+  /// Add a step to this path which gets the value stored at requirement
+  /// index n in a generic type metadata.
+  void addNominalValueArgumentComponent(unsigned index) {
+    Path.push_back(Component(Component::Kind::NominalValueArgument,
+                             index));
+  }
+
   /// Add a step to this path which gets the inherited protocol at
   /// a particular witness index.
   void addInheritedProtocolComponent(WitnessIndex index) {
@@ -208,6 +227,14 @@ public:
 
   void addPackExpansionCountComponent(unsigned index) {
     Path.push_back(Component(Component::Kind::PackExpansionCount, index));
+  }
+
+  void addTuplePackComponent() {
+    Path.push_back(Component(Component::Kind::TuplePack, /*index=*/0));
+  }
+
+  void addTupleShapeComponent() {
+    Path.push_back(Component(Component::Kind::TupleShape, /*index=*/0));
   }
 
   /// Return an abstract measurement of the cost of this path.

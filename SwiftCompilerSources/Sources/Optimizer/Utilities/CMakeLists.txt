@@ -7,8 +7,14 @@
 # See http://swift.org/CONTRIBUTORS.txt for Swift project authors
 
 swift_compiler_sources(Optimizer
+  AddressUtils.swift
+  Devirtualization.swift
   EscapeUtils.swift
+  FunctionSignatureTransforms.swift
+  FunctionTest.swift
+  GenericSpecialization.swift
+  LifetimeDependenceUtils.swift
+  LocalVariableUtils.swift
   OptUtils.swift
-  WalkUtils.swift
-  AccessUtils.swift
+  OwnershipLiveness.swift
 )

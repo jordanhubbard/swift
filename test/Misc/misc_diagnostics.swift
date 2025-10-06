@@ -56,7 +56,7 @@ class A {
     var a: MyArray<Int>
     init() {
         a = MyArray<Int // expected-error {{generic parameter 'Element' could not be inferred}} expected-note {{explicitly specify the generic arguments to fix this issue}}
-       // expected-error@-1 {{binary operator '<' cannot be applied to operands of type 'MyArray<_>.Type' and 'Int.Type'}}
+       // expected-error@-1 {{binary operator '<' cannot be applied to operands of type 'MyArray<Element>.Type' and 'Int.Type'}}
        // expected-error@-2 {{cannot assign value of type 'Bool' to type 'MyArray<Int>'}}
     }
 }
@@ -144,9 +144,6 @@ func test17875634() {
 func test20770032() {
   if case let 1...10 = (1, 1) { // expected-warning{{'let' pattern has no effect; sub-pattern didn't bind any variables}} {{11-15=}}
     // expected-error@-1 {{expression pattern of type 'ClosedRange<Int>' cannot match values of type '(Int, Int)'}}
-    // expected-error@-2 {{type '(Int, Int)' cannot conform to 'Equatable'}}
-    // expected-note@-3 {{only concrete types such as structs, enums and classes can conform to protocols}}
-    // expected-note@-4 {{required by operator function '~=' where 'T' = '(Int, Int)'}}
   }
 }
 

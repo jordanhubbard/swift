@@ -23,53 +23,53 @@
 #define SWIFT_AST_INFLIGHTSUBSTITUTION_H
 
 #include "swift/AST/SubstitutionMap.h"
+#include "llvm/ADT/DenseMap.h"
 
 namespace swift {
 class SubstitutionMap;
 
 class InFlightSubstitution {
-  SubstOptions Options;
+  friend class SubstitutionMap;
+
   TypeSubstitutionFn BaselineSubstType;
   LookupConformanceFn BaselineLookupConformance;
+  SubstOptions Options;
+  RecursiveTypeProperties Props;
+  unsigned RemainingCount : 31;
+  unsigned InitLimit : 1;
+  unsigned RemainingDepth : 31;
+  unsigned LimitReached : 1;
 
   struct ActivePackExpansion {
     bool isSubstExpansion = false;
     unsigned expansionIndex = 0;
   };
-  SmallVector<ActivePackExpansion, 4> ActivePackExpansions;
+  llvm::SmallVector<ActivePackExpansion, 4> ActivePackExpansions;
+  llvm::SmallDenseMap<SubstitutionMap, SubstitutionMap, 2> SubMaps;
+
+  Type projectLaneFromPackType(
+      Type substType, unsigned level);
+  ProtocolConformanceRef projectLaneFromPackConformance(
+      PackConformance *substPackConf, unsigned level);
+
+  bool checkLimits(Type ty);
 
 public:
   InFlightSubstitution(TypeSubstitutionFn substType,
                        LookupConformanceFn lookupConformance,
-                       SubstOptions options)
-    : Options(options),
-      BaselineSubstType(substType),
-      BaselineLookupConformance(lookupConformance) {}
+                       SubstOptions options);
 
   InFlightSubstitution(const InFlightSubstitution &) = delete;
   InFlightSubstitution &operator=(const InFlightSubstitution &) = delete;
 
-  // TODO: when we add PackElementType, we should recognize it during
-  // substitution and either call different methods on this class or
-  // pass an extra argument for the pack-expansion depth D.  We should
-  // be able to rely on that to mark a pack-element reference instead
-  // of checking whether the original type was a pack.  Substitution
-  // should use the D'th entry from the end of ActivePackExpansions to
-  // guide the element substitution:
-  //   - project the given index of the pack substitution
-  //   - wrap it in a PackElementType if it's a subst expansion
-  //   - the depth of that PackElementType is the number of subst
-  //     expansions between the depth entry and the end of
-  //     ActivePackExpansions
-
   /// Perform primitive substitution on the given type.  Returns Type()
   /// if the type should not be substituted as a whole.
-  Type substType(SubstitutableType *origType);
+  Type substType(SubstitutableType *origType, unsigned level);
 
   /// Perform primitive conformance lookup on the given type.
-  ProtocolConformanceRef lookupConformance(CanType dependentType,
-                                           Type conformingReplacementType,
-                                           ProtocolDecl *conformedProtocol);
+  ProtocolConformanceRef lookupConformance(Type dependentType,
+                                           ProtocolDecl *conformedProtocol,
+                                           unsigned level);
 
   /// Given the shape type of a pack expansion, invoke the given callback
   /// for each expanded component of it.  If the substituted component
@@ -146,12 +146,24 @@ public:
     return Options;
   }
 
+  bool shouldSubstitutePrimaryArchetypes() const {
+    return Options.contains(SubstFlags::SubstitutePrimaryArchetypes);
+  }
+
   bool shouldSubstituteOpaqueArchetypes() const {
     return Options.contains(SubstFlags::SubstituteOpaqueArchetypes);
   }
 
+  bool shouldSubstituteLocalArchetypes() const {
+    return Options.contains(SubstFlags::SubstituteLocalArchetypes);
+  }
+
   /// Is the given type invariant to substitution?
   bool isInvariant(Type type) const;
+
+  bool wasLimitReached() const {
+    return LimitReached;
+  }
 };
 
 /// A helper classes that provides stable storage for the query

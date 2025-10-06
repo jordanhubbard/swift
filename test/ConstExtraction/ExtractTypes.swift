@@ -20,28 +20,28 @@ public struct Types : MyProto {
 }
 
 // CHECK:       "label": "types1",
-// CHECK-NEXT:  "type": "Swift.Array<ExtractTypes.ContainerType.Type>",
+// CHECK-NEXT:  "type": "Swift.Array<any ExtractTypes.ContainerType.Type>",
 // CHECK:       "valueKind": "Array",
 // CHECK-NEXT:  "value": [
 // CHECK-NEXT:    {
 // CHECK-NEXT:      "valueKind": "Type",
 // CHECK-NEXT:      "value": {
-// CHECK-NEXT:        "type": "ExtractTypes.TypeA.Type"
-// CHECK-NEXT:        "mangledName": "12ExtractTypes5TypeAVm"
+// CHECK-NEXT:        "type": "ExtractTypes.TypeA"
+// CHECK-NEXT:        "mangledName": "12ExtractTypes5TypeAV"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    },
 // CHECK-NEXT:    {
 // CHECK-NEXT:      "valueKind": "Type",
 // CHECK-NEXT:      "value": {
-// CHECK-NEXT:        "type": "ExtractTypes.TypeB.Type"
-// CHECK-NEXT:        "mangledName": "12ExtractTypes5TypeBOm"
+// CHECK-NEXT:        "type": "ExtractTypes.TypeB"
+// CHECK-NEXT:        "mangledName": "12ExtractTypes5TypeBO"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    },
 // CHECK-NEXT:    {
 // CHECK-NEXT:      "valueKind": "Type",
 // CHECK-NEXT:      "value": {
-// CHECK-NEXT:        "type": "ExtractTypes.TypeC.Type"
-// CHECK-NEXT:        "mangledName": "12ExtractTypes5TypeCCm"
+// CHECK-NEXT:        "type": "ExtractTypes.TypeC"
+// CHECK-NEXT:        "mangledName": "12ExtractTypes5TypeCC"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    }
 // CHECK-NEXT:  ]

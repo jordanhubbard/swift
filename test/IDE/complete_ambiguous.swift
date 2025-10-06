@@ -1,5 +1,4 @@
-// RUN: %empty-directory(%t)
-// RUN: %target-swift-ide-test -batch-code-completion -source-filename %s -filecheck %raw-FileCheck -completion-output-dir %t
+// RUN: %batch-code-completion
 
 struct A {
   func doAThings() -> A { return self }
@@ -35,7 +34,7 @@ arrayWrapper(overloadedReturn()).#^SKIP_DUPLICATES^#
 // SKIP_DUPLICATES-NOT: count[#Int#]
 // SKIP_DUPLICATES-NOT: formIndex({#(i): &Int#}, {#offsetBy: Int#})[#Void#]
 
-let x: (inout Int, Int) -> () = arrayWrapper(overloadedReturn()).#^SKIP_COMPOUND_DUPLICATES^#
+let x1: (inout Int, Int) -> () = arrayWrapper(overloadedReturn()).#^SKIP_COMPOUND_DUPLICATES^#
 
 // SKIP_COMPOUND_DUPLICATES: Decl[InstanceMethod]/Super/IsSystem/TypeRelation[Convertible]: formIndex(_:offsetBy:)[#(inout Int, Int) -> ()#]{{; name=.+$}}
 // SKIP_COMPOUND_DUPLICATES-NOT: formIndex(_:offsetBy:)[#(inout Int, Int) -> ()#]
@@ -51,8 +50,9 @@ func testCallAsFunctionDeduplication() {
   overloaded()#^SKIP_CALLASFUNCTION_DUPLICATES^#
 }
 
-// FIXME: Update this to check the callAsFunction pattern only appears once when PostfixExpr completion is migrated to the solver-based implementation (which handles ambiguity).
-// SKIP_CALLASFUNCTION_DUPLICATES-NOT: Begin completions
+// SKIP_CALLASFUNCTION_DUPLICATES: Begin completions
+// SKIP_CALLASFUNCTION_DUPLICATES-DAG: Decl[InstanceMethod]/CurrNominal: .callAsFunction({#x: Int#})[#Void#];
+// SKIP_CALLASFUNCTION_DUPLICATES: End completions
 
 givenErrorExpr(undefined).#^ERROR_IN_BASE?check=SIMPLE^#
 
@@ -62,8 +62,8 @@ givenErrorExpr(undefined).#^ERROR_IN_BASE?check=SIMPLE^#
 // SIMPLE-DAG: Keyword[self]/CurrNominal:          self[#B#]{{; name=.+$}}
 // SIMPLE-DAG: Decl[InstanceMethod]/CurrNominal:   doBThings()[#Void#]{{; name=.+$}}
 
-let x: A = overloadedReturn().#^RELATED^#
-let x: A = overloadedReturn(1).#^RELATED_EXTRAARG?check=RELATED^#
+let x2: A = overloadedReturn().#^RELATED^#
+let x3: A = overloadedReturn(1).#^RELATED_EXTRAARG?check=RELATED^#
 
 // RELATED: Begin completions, 4 items
 // RELATED-DAG: Keyword[self]/CurrNominal:          self[#A#]{{; name=.+$}}
@@ -394,8 +394,12 @@ CreateThings {
 CreateThings {
     Thing { point in
       print("hello")
-      point. // ErrorExpr
-      point.#^MULTICLOSURE_FUNCBUILDER_ERROR?check=POINT_MEMBER^#
+      do {
+        point. // ErrorExpr
+      }
+      do {
+        point.#^MULTICLOSURE_FUNCBUILDER_ERROR?check=POINT_MEMBER^#
+      }
     }
     Thing { point in 
       print("hello")
@@ -443,8 +447,8 @@ struct Struct123: Equatable {
 }
 func testBestSolutionFilter() {
   let a = Struct123();
-  let b = [Struct123]().first(where: { $0 == a && 1 + 90 * 5 / 8 == 45 * -10 })?.structMem != .#^BEST_SOLUTION_FILTER?xfail=rdar73282163^#
-  let c = min(10.3, 10 / 10.4) < 6 / 7 ? true : Optional(a)?.structMem != .#^BEST_SOLUTION_FILTER2?check=BEST_SOLUTION_FILTER;xfail=rdar73282163^#
+  let b = [Struct123]().first(where: { $0 == a && 1 + 90 * 5 / 8 == 45 * -10 })?.structMem != .#^BEST_SOLUTION_FILTER^#
+  let c = min(10.3, 10 / 10.4) < 6 / 7 ? true : Optional(a)?.structMem != .#^BEST_SOLUTION_FILTER2?check=BEST_SOLUTION_FILTER^#
 }
 
 // BEST_SOLUTION_FILTER-DAG: Decl[EnumElement]/CurrNominal/Flair[ExprSpecific]/TypeRelation[Convertible]: enumElem[#Enum123#]{{; name=.+$}}

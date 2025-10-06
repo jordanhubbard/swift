@@ -1,14 +1,16 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-build-swift %s -Xfrontend -enable-implicit-backtracing-module-import -parse-as-library -Onone -o %t/SimpleBacktrace
+// RUN: %target-build-swift %s -Xfrontend -parse-as-library -Onone -o %t/SimpleBacktrace
 // RUN: %target-codesign %t/SimpleBacktrace
 // RUN: %target-run %t/SimpleBacktrace | %FileCheck %s
 
 // REQUIRES: executable_test
 // REQUIRES: backtracing
-// REQUIRES: OS=macosx
+// REQUIRES: OS=macosx || OS=linux-gnu
 
 // UNSUPPORTED: use_os_stdlib
 // UNSUPPORTED: back_deployment_runtime
+
+import Runtime
 
 func level1() {
   level2()

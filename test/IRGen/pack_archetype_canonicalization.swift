@@ -1,7 +1,4 @@
-// RUN: %target-swift-frontend -emit-ir %s -enable-experimental-feature VariadicGenerics
-
-// Because of -enable-experimental-feature VariadicGenerics
-// REQUIRES: asserts
+// RUN: %target-swift-frontend -emit-ir %s -target %target-swift-5.9-abi-triple
 
 // This would crash.
 public struct G<T> {}

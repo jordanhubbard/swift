@@ -1,5 +1,5 @@
-// RUN: %target-typecheck-verify-swift -import-objc-header %S/Inputs/objc_implementation.h
-// RUN: %target-typecheck-verify-swift -DPRIVATE_MODULE -Xcc -fmodule-map-file=%S/Inputs/objc_implementation_private.modulemap
+// RUN: %target-typecheck-verify-swift -import-objc-header %S/Inputs/objc_implementation.h -target %target-stable-abi-triple
+// RUN: %target-typecheck-verify-swift -DPRIVATE_MODULE -Xcc -fmodule-map-file=%S/Inputs/objc_implementation_private.modulemap -target %target-stable-abi-triple
 
 // REQUIRES: objc_interop
 
@@ -11,7 +11,7 @@
 import objc_implementation_private
 #endif
 
-@_objcImplementation extension ObjCClass {
+@objc @implementation extension ObjCClass {
   @objc func method(fromHeader1: CInt) {
     // OK, provides an implementation for the header's method.
   }
@@ -25,6 +25,14 @@ import objc_implementation_private
   }
 
   func method(fromHeader4: CInt) {
+    // OK
+  }
+
+  func methodFromHeader5() -> CInt {
+    return 1 // OK
+  }
+
+  func method(fromHeader6: CInt) {
     // OK
   }
 
@@ -54,21 +62,25 @@ import objc_implementation_private
     set {}
   }
 
-  @objc let propertyFromHeader5: CInt
-  // FIXME: bad, needs to be settable
+  @objc var propertyFromHeader5: CInt
 
   @objc var propertyFromHeader6: CInt {
-    // FIXME: bad, needs a setter
     get { return 1 }
+    set {}
   }
 
   @objc var propertyFromHeader7: CInt {
     get { return 1 }
+    set {}
   }
 
   var propertyFromHeader8: CInt
 
   @objc var propertyFromHeader9: CInt
+
+  @objc var propertyFromHeader10: CInt
+
+  @objc var propertyFromHeader11: CInt
 
   @objc var readonlyPropertyFromHeader1: CInt
   // OK, provides an implementation with a stored property that's nonpublicly settable
@@ -95,6 +107,8 @@ import objc_implementation_private
     // OK, provides an implementation with a computed read-only property
     get { return 1 }
   }
+
+  @objc let readonlyPropertyFromHeader7: CInt
 
   @objc fileprivate var propertyNotFromHeader2: CInt
   // OK, provides a nonpublic but ObjC-compatible stored property
@@ -134,14 +148,40 @@ import objc_implementation_private
     super.init(fromSuperclass2: v)
   }
 
+  @objc(initFromProtocol1:)
+  required public init?(fromProtocol1 v: CInt) {
+    // OK
+    super.init(fromSuperclass: v)
+  }
+
+  @objc(initFromProtocol2:)
+  required public init?(fromProtocol2 v: CInt) {
+    // OK
+    super.init(fromSuperclass: v)
+  }
+
+  @objc(initNotFromProtocol:)
+  public init?(notFromProtocol v: CInt) {
+    // OK
+    super.init(fromSuperclass: v)
+  }
+
   class func classMethod1(_: CInt) {}
   class func classMethod2(_: CInt) {}
+  class func classMethod3(_: CInt) {}
 
   func instanceMethod1(_: CInt) {}
   func instanceMethod2(_: CInt) {}
+
+  @objc func extensionMethod(fromHeader1: CInt) {}
+  @objc func extensionMethod(fromHeader2: CInt) {}
+
+  @objc(copyWithZone:) func copy(with zone: NSZone?) -> Any { self }
+
+  let rdar122280735: (@escaping () -> ()) -> Void = { _ in }
 }
 
-@_objcImplementation(PresentAdditions) extension ObjCClass {
+@objc(PresentAdditions) @implementation extension ObjCClass {
   @objc func categoryMethod(fromHeader3: CInt) {
     // OK
   }
@@ -190,6 +230,17 @@ import objc_implementation_private
     // OK, provides an implementation with a computed property
     get { return 1 }
     set {}
+  }
+
+  @objc var categoryPropertyFromHeader5: CInt {
+    // OK, provides an implementation with a computed property
+    get { return 1 }
+    set {}
+  }
+
+  @objc var categoryReadonlyPropertyFromHeader1: CInt {
+    // OK, provides an implementation with a computed property
+    get { return 1 }
   }
 }
 

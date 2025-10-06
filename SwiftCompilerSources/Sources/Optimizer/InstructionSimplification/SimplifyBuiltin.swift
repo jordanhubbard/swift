@@ -12,7 +12,7 @@
 
 import SIL
 
-extension BuiltinInst : OnoneSimplifyable {
+extension BuiltinInst : OnoneSimplifiable, SILCombineSimplifiable {
   func simplify(_ context: SimplifyContext) {
     switch id {
       case .IsConcrete:
@@ -22,14 +22,48 @@ extension BuiltinInst : OnoneSimplifyable {
         optimizeIsConcrete(allowArchetypes: false, context)
       case .IsSameMetatype:
         optimizeIsSameMetatype(context)
+      case .Once:
+        optimizeBuiltinOnce(context)
+      case .CanBeObjCClass:
+        optimizeCanBeClass(context)
+      case .AssertConf:
+        optimizeAssertConfig(context)
+      case .Sizeof,
+           .Strideof,
+           .Alignof:
+        optimizeTargetTypeConst(context)
+      case .DestroyArray:
+        let elementType = substitutionMap.replacementType.loweredType(in: parentFunction, maximallyAbstracted: true)
+        if elementType.isTrivial(in: parentFunction) {
+          context.erase(instruction: self)
+          return
+        }
+        optimizeArgumentToThinMetatype(argument: 0, context)
+      case .CopyArray,
+           .TakeArrayNoAlias,
+           .TakeArrayFrontToBack,
+           .TakeArrayBackToFront,
+           .AssignCopyArrayNoAlias,
+           .AssignCopyArrayFrontToBack,
+           .AssignCopyArrayBackToFront,
+           .AssignTakeArray,
+           .IsPOD:
+        optimizeArgumentToThinMetatype(argument: 0, context)
+      case .ICMP_EQ:
+        constantFoldIntegerEquality(isEqual: true, context)
+      case .ICMP_NE:
+        constantFoldIntegerEquality(isEqual: false, context)
+      case .Xor:
+        simplifyNegation(context)
       default:
-        // TODO: handle other builtin types
-        break
+        if let literal = context.constantFold(builtin: self) {
+          uses.replaceAll(with: literal, context)
+        }
     }
   }
 }
 
-extension BuiltinInst : LateOnoneSimplifyable {
+extension BuiltinInst : LateOnoneSimplifiable {
   func simplifyLate(_ context: SimplifyContext) {
     if id == .IsConcrete {
       // At the end of the pipeline we can be sure that the isConcrete's type doesn't get "more" concrete.
@@ -47,7 +81,7 @@ private extension BuiltinInst {
       return
     }
     let builder = Builder(before: self, context)
-    let result = builder.createIntegerLiteral(hasArchetype ? 0 : 1, type: type)
+    let result = builder.createBoolLiteral(!hasArchetype)
     uses.replaceAll(with: result, context)
     context.erase(instruction: self)
   }
@@ -60,9 +94,248 @@ private extension BuiltinInst {
       return
     }
     let builder = Builder(before: self, context)
-    let result = builder.createIntegerLiteral(equal ? 1 : 0, type: type)
+    let result = builder.createBoolLiteral(equal)
 
     uses.replaceAll(with: result, context)
+  }
+
+  func optimizeBuiltinOnce(_ context: SimplifyContext) {
+    guard let callee = calleeOfOnce, callee.isDefinition else {
+      return
+    }
+    context.notifyDependency(onBodyOf: callee)
+
+    // If the callee is side effect-free we can remove the whole builtin "once".
+    // We don't use the callee's memory effects but instead look at all callee instructions
+    // because memory effects are not computed in the Onone pipeline, yet.
+    // This is no problem because the callee (usually a global init function )is mostly very small,
+    // or contains the side-effect instruction `alloc_global` right at the beginning.
+    if callee.instructions.contains(where: hasSideEffectForBuiltinOnce) {
+      return
+    }
+    for use in uses {
+      let ga = use.instruction as! GlobalAddrInst
+      ga.clearToken(context)
+    }
+    context.erase(instruction: self)
+  }
+
+  var calleeOfOnce: Function? {
+    let callee = operands[1].value
+    if let fri = callee as? FunctionRefInst {
+      return fri.referencedFunction
+    }
+    return nil
+  }
+
+  func optimizeCanBeClass(_ context: SimplifyContext) {
+    let literal: IntegerLiteralInst
+    switch substitutionMap.replacementType.canonical.canBeClass {
+    case .isNot:
+      let builder = Builder(before: self, context)
+      literal = builder.createIntegerLiteral(0,  type: type)
+    case .is:
+      let builder = Builder(before: self, context)
+      literal = builder.createIntegerLiteral(1,  type: type)
+    case .canBe:
+      return
+    }
+    self.replace(with: literal, context)
+  }
+
+  func optimizeAssertConfig(_ context: SimplifyContext) {
+    // The values for the assert_configuration call are:
+    // 0: Debug
+    // 1: Release
+    // 2: Fast / Unchecked
+    let config = context.options.assertConfiguration
+    switch config {
+    case .debug, .release, .unchecked:
+      let builder = Builder(before: self, context)
+      let literal = builder.createIntegerLiteral(config.integerValue, type: type)
+      uses.replaceAll(with: literal, context)
+      context.erase(instruction: self)
+    case .unknown:
+      return
+    }
+  }
+  
+  func optimizeTargetTypeConst(_ context: SimplifyContext) {
+    let ty = substitutionMap.replacementType.loweredType(in: parentFunction, maximallyAbstracted: true)
+    let value: Int?
+    switch id {
+    case .Sizeof:
+      value = ty.getStaticSize(context: context)
+    case .Strideof:
+      if isUsedAsStrideOfIndexRawPointer(context) {
+        // Constant folding `stride` would prevent index_raw_pointer simplification.
+        // See `simplifyIndexRawPointer` in SimplifyPointerToAddress.swift.
+        return
+      }
+      value = ty.getStaticStride(context: context)
+    case .Alignof:
+      value = ty.getStaticAlignment(context: context)
+    default:
+      fatalError()
+    }
+    
+    guard let value else {
+      return
+    }
+    
+    let builder = Builder(before: self, context)
+    let literal = builder.createIntegerLiteral(value, type: type)
+    uses.replaceAll(with: literal, context)
+    context.erase(instruction: self)
+  }
+
+  private func isUsedAsStrideOfIndexRawPointer(_ context: SimplifyContext) -> Bool {
+    var worklist = ValueWorklist(context)
+    defer { worklist.deinitialize() }
+    worklist.pushIfNotVisited(self)
+    while let v = worklist.pop() {
+      for use in v.uses {
+        switch use.instruction {
+        case let builtin as BuiltinInst:
+          switch builtin.id {
+          case .SMulOver, .TruncOrBitCast, .SExtOrBitCast, .ZExtOrBitCast:
+            worklist.pushIfNotVisited(builtin)
+          default:
+            break
+          }
+        case let tupleExtract as TupleExtractInst where tupleExtract.fieldIndex == 0:
+          worklist.pushIfNotVisited(tupleExtract)
+        case is IndexRawPointerInst:
+          return true
+        default:
+          break
+        }
+      }
+    }
+    return false
+  }
+
+  func optimizeArgumentToThinMetatype(argument: Int, _ context: SimplifyContext) {
+    let type: Type
+
+    if let metatypeInst = operands[argument].value as? MetatypeInst {
+      type = metatypeInst.type
+    } else if let initExistentialInst = operands[argument].value as? InitExistentialMetatypeInst {
+      type = initExistentialInst.metatype.type
+    } else {
+      return
+    }
+
+    guard type.representationOfMetatype == .thick else {
+      return
+    }
+    
+    let builder = Builder(before: self, context)
+    let newMetatype = builder.createMetatype(ofInstanceType: type.canonicalType.instanceTypeOfMetatype,
+                                             representation: .thin)
+    operands[argument].set(to: newMetatype, context)
+  }
+
+  func constantFoldIntegerEquality(isEqual: Bool, _ context: SimplifyContext) {
+    if constantFoldStringNullPointerCheck(isEqual: isEqual, context) {
+      return
+    }
+    if let literal = context.constantFold(builtin: self) {
+      uses.replaceAll(with: literal, context)
+    }
+  }
+
+  func constantFoldStringNullPointerCheck(isEqual: Bool, _ context: SimplifyContext) -> Bool {
+    if operands[1].value.isZeroInteger &&
+       operands[0].value.lookThroughScalarCasts is StringLiteralInst
+    {
+      let builder = Builder(before: self, context)
+      let result = builder.createBoolLiteral(!isEqual)
+      uses.replaceAll(with: result, context)
+      context.erase(instruction: self)
+      return true
+    }
+    return false
+  }
+
+  /// Replaces a builtin "xor", which negates its operand comparison
+  /// ```
+  ///   %3 = builtin "cmp_slt_Int64"(%1, %2) : $Builtin.Int1
+  ///   %4 = integer_literal $Builtin.Int1, -1
+  ///   %5 = builtin "xor_Int1"(%3, %4) : $Builtin.Int1
+  /// ```
+  /// with the negated comparison
+  /// ```
+  ///   %5 = builtin "cmp_ge_Int64"(%1, %2) : $Builtin.Int1
+  /// ```
+  func simplifyNegation(_ context: SimplifyContext) {
+    assert(id == .Xor)
+    guard let one = arguments[1] as? IntegerLiteralInst,
+          let oneValue = one.value,
+          oneValue == -1,
+          let lhsBuiltin = arguments[0] as? BuiltinInst,
+          lhsBuiltin.type.isBuiltinInteger,
+          let negatedBuiltinName = lhsBuiltin.negatedComparisonBuiltinName
+    else {
+      return
+    }
+
+    let builder = Builder(before: lhsBuiltin, context)
+    let negated = builder.createBuiltinBinaryFunction(name: negatedBuiltinName,
+        operandType: lhsBuiltin.arguments[0].type,
+        resultType: lhsBuiltin.type,
+        arguments: Array(lhsBuiltin.arguments))
+    self.replace(with: negated, context)
+  }
+
+  private var negatedComparisonBuiltinName: String? {
+    switch id {
+    case .ICMP_EQ:  return "cmp_ne"
+    case .ICMP_NE:  return "cmp_eq"
+    case .ICMP_SLE: return "cmp_sgt"
+    case .ICMP_SLT: return "cmp_sge"
+    case .ICMP_SGE: return "cmp_slt"
+    case .ICMP_SGT: return "cmp_sle"
+    case .ICMP_ULE: return "cmp_ugt"
+    case .ICMP_ULT: return "cmp_uge"
+    case .ICMP_UGE: return "cmp_ult"
+    case .ICMP_UGT: return "cmp_ule"
+    default:
+      return nil
+    }
+  }
+}
+
+private extension Value {
+  var isZeroInteger: Bool {
+    if let literal = self as? IntegerLiteralInst,
+       let value = literal.value
+    {
+      return value == 0
+    }
+    return false
+  }
+
+  var lookThroughScalarCasts: Value {
+    guard let bi = self as? BuiltinInst else {
+      return self
+    }
+    switch bi.id {
+    case .ZExt, .ZExtOrBitCast, .PtrToInt:
+      return bi.operands[0].value.lookThroughScalarCasts
+    default:
+      return self
+    }
+  }
+}
+
+private func hasSideEffectForBuiltinOnce(_ instruction: Instruction) -> Bool {
+  switch instruction {
+  case is DebugStepInst, is DebugValueInst:
+    return false
+  default:
+    return instruction.mayReadOrWriteMemory ||
+           instruction.hasUnspecifiedSideEffects
   }
 }
 
@@ -76,69 +349,43 @@ private func typesOfValuesAreEqual(_ lhs: Value, _ rhs: Value, in function: Func
     return nil
   }
 
-  let lhsTy = lhsExistential.metatype.type.instanceTypeOfMetatype(in: function)
-  let rhsTy = rhsExistential.metatype.type.instanceTypeOfMetatype(in: function)
+  let lhsTy = lhsExistential.metatype.type.canonicalType.instanceTypeOfMetatype
+  let rhsTy = rhsExistential.metatype.type.canonicalType.instanceTypeOfMetatype
+  if lhsTy.isDynamicSelf != rhsTy.isDynamicSelf {
+    return nil
+  }
 
   // Do we know the exact types? This is not the case e.g. if a type is passed as metatype
   // to the function.
   let typesAreExact = lhsExistential.metatype is MetatypeInst &&
                       rhsExistential.metatype is MetatypeInst
 
-  switch (lhsTy.typeKind, rhsTy.typeKind) {
-  case (_, .unknown), (.unknown, _):
-    return nil
-  case (let leftKind, let rightKind) where leftKind != rightKind:
-    // E.g. a function type is always different than a struct, regardless of what archetypes
-    // the two types may contain.
+  if typesAreExact {
+    // We need to compare the not lowered types, because function types may differ in their original version
+    // but are equal in the lowered version, e.g.
+    //   ((Int, Int) -> ())
+    //   (((Int, Int)) -> ())
+    //
+    if lhsTy == rhsTy {
+      return true
+    }
+    // Comparing types of different classes which are in a sub-class relation is not handled by the
+    // cast optimizer (below).
+    if lhsTy.isClass && rhsTy.isClass && lhsTy.nominal != rhsTy.nominal {
+      return false
+    }
+
+    // Failing function casts are not supported by the cast optimizer (below).
+    // (Reason: "Be conservative about function type relationships we may add in the future.")
+    if lhsTy.isFunction && rhsTy.isFunction && lhsTy != rhsTy && !lhsTy.hasArchetype && !rhsTy.hasArchetype {
+      return false
+    }
+  }
+
+  // If casting in either direction doesn't work, the types cannot be equal.
+  if !(canDynamicallyCast(from: lhsTy, to: rhsTy, in: function, sourceTypeIsExact: typesAreExact) ?? true) ||
+     !(canDynamicallyCast(from: rhsTy, to: lhsTy, in: function, sourceTypeIsExact: typesAreExact) ?? true) {
     return false
-  case (.struct, .struct), (.enum, .enum):
-    // Two different structs/enums are always not equal, regardless of what archetypes
-    // the two types may contain.
-    if lhsTy.nominal != rhsTy.nominal {
-      return false
-    }
-  case (.class, .class):
-    // In case of classes this only holds if we know the exact types.
-    // Otherwise one class could be a sub-class of the other class.
-    if typesAreExact && lhsTy.nominal != rhsTy.nominal {
-      return false
-    }
-  default:
-    break
   }
-
-  if !typesAreExact {
-    // Types which e.g. come from type parameters may differ at runtime while the declared AST types are the same.
-    return nil
-  }
-
-  if lhsTy.hasArchetype || rhsTy.hasArchetype {
-    // We don't know anything about archetypes. They may be identical at runtime or not.
-    // We could do something more sophisticated here, e.g. look at conformances. But for simplicity,
-    // we are just conservative.
-    return nil
-  }
-
-  // Generic ObjectiveC class, which are specialized for different NSObject types have different AST types
-  // but the same runtime metatype.
-  if lhsTy.isOrContainsObjectiveCClass || rhsTy.isOrContainsObjectiveCClass {
-    return nil
-  }
-
-  return lhsTy == rhsTy
-}
-
-private extension Type {
-  enum TypeKind {
-    case `struct`, `class`, `enum`, tuple, function, unknown
-  }
-
-  var typeKind: TypeKind {
-    if isStruct  { return .struct }
-    if isClass  { return .class }
-    if isEnum  { return .enum }
-    if isTuple    { return .tuple }
-    if isFunction { return .function }
-    return .unknown
-  }
+  return nil
 }

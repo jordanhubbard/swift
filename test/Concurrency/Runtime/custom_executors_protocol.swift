@@ -1,4 +1,6 @@
 // RUN: %target-run-simple-swift( -Xfrontend -enable-experimental-move-only -Xfrontend -disable-availability-checking %import-libdispatch -parse-as-library) | %FileCheck %s
+// RUN: %target-run-simple-swift( -Xfrontend -enable-experimental-move-only -Xfrontend -disable-availability-checking %import-libdispatch -parse-as-library -swift-version 5 -strict-concurrency=complete -enable-upcoming-feature NonisolatedNonsendingByDefault)  | %FileCheck %s
+// REQUIRES: swift_feature_NonisolatedNonsendingByDefault
 
 // REQUIRES: concurrency
 // REQUIRES: executable_test
@@ -7,13 +9,10 @@
 // rdar://106849189 move-only types should be supported in freestanding mode
 // UNSUPPORTED: freestanding
 
-// FIXME: rdar://107112715 test failing on iOS simulator, investigating
-// UNSUPPORTED: OS=ios
-
 // UNSUPPORTED: back_deployment_runtime
 // REQUIRES: concurrency_runtime
 
-@preconcurrency import Dispatch
+import Dispatch
 
 protocol WithSpecifiedExecutor: Actor {
   nonisolated var executor: any SpecifiedExecutor { get }
@@ -38,7 +37,7 @@ final class NaiveQueueExecutor: SpecifiedExecutor, CustomStringConvertible {
     self.queue = queue
   }
 
-  public func enqueue(_ job: __owned Job) {
+  public func enqueue(_ job: consuming ExecutorJob) {
     print("\(self): enqueue")
     let unowned = UnownedJob(job)
     queue.sync {
@@ -64,7 +63,7 @@ actor MyActor: WithSpecifiedExecutor {
   }
 
   func test(expectedExecutor: some SerialExecutor, expectedQueue: DispatchQueue) {
-    // FIXME(waiting on preconditions to merge): preconditionTaskOnExecutor(expectedExecutor, "Expected to be on: \(expectedExecutor)")
+    expectedExecutor.preconditionIsolated("Expected to be on: \(expectedExecutor)")
     dispatchPrecondition(condition: .onQueue(expectedQueue))
     print("\(Self.self): on executor \(expectedExecutor)")
   }

@@ -1,7 +1,7 @@
 // RUN: %empty-directory(%t)
 // RUN: %target-clang %S/Inputs/custom-modules/IncompleteTypes/incomplete-noroottype-protocol-library.m -c -o %t/incomplete-noroottype-protocol-library.o
 
-// RUN: %target-build-swift -Xfrontend -enable-import-objc-forward-declarations -Xfrontend -enable-objc-interop -I %S/Inputs/custom-modules/IncompleteTypes %s %t/incomplete-noroottype-protocol-library.o -Xlinker -framework -Xlinker Foundation -o %t/a.out
+// RUN: %target-build-swift -Xfrontend -enable-upcoming-feature -Xfrontend ImportObjcForwardDeclarations -Xfrontend -enable-objc-interop -I %S/Inputs/custom-modules/IncompleteTypes %s %t/incomplete-noroottype-protocol-library.o -Xlinker -framework -Xlinker Foundation -o %t/a.out
 // RUN: %target-run %t/a.out
 
 // RUN: %target-build-swift -swift-version 6 -Xfrontend -enable-objc-interop -I %S/Inputs/custom-modules/IncompleteTypes %s %t/incomplete-noroottype-protocol-library.o -Xlinker -framework -Xlinker Foundation -o %t/a.out
@@ -9,7 +9,7 @@
 
 // REQUIRES: objc_interop
 // REQUIRES: executable_test
-// REQUIRES: asserts
+// REQUIRES: swift_feature_ImportObjcForwardDeclarations
 
 // Verify that a forward declared protocol not inheriting from NSObject is usable
 // from Swift, if cumbersome

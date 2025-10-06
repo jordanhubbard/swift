@@ -25,6 +25,7 @@
 #include "swift/AST/NameLookupRequests.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "swift/Sema/IDETypeChecking.h"
 #include "swift/Sema/SolutionResult.h"
@@ -72,6 +73,9 @@ class ResultBuilderTransform
   DeclContext *dc;
   ResultBuilder builder;
 
+  /// The source range of the body.
+  SourceRange bodyRange;
+
   /// The result type of this result builder body.
   Type ResultType;
 
@@ -80,9 +84,9 @@ class ResultBuilderTransform
 
 public:
   ResultBuilderTransform(ConstraintSystem &cs, DeclContext *dc,
-                         Type builderType, Type resultTy)
+                         SourceRange bodyRange, Type builderType, Type resultTy)
       : ctx(cs.getASTContext()), dc(dc), builder(cs, dc, builderType),
-        ResultType(resultTy) {}
+        bodyRange(bodyRange), ResultType(resultTy) {}
 
   UnsupportedElt getUnsupportedElement() const { return FirstUnsupported; }
 
@@ -156,28 +160,26 @@ protected:
   /// Visit the element of a brace statement, returning \c None if the element
   /// was transformed successfully, or an unsupported element if the element
   /// cannot be handled.
-  Optional<UnsupportedElt>
+  std::optional<UnsupportedElt>
   transformBraceElement(ASTNode element, SmallVectorImpl<ASTNode> &newBody,
                         SmallVectorImpl<Expr *> &buildBlockArguments) {
     if (auto *returnStmt = getAsStmt<ReturnStmt>(element)) {
       assert(returnStmt->isImplicit());
       element = returnStmt->getResult();
     }
+    // Unwrap an implicit ThenStmt.
+    if (auto *thenStmt = getAsStmt<ThenStmt>(element)) {
+      if (thenStmt->isImplicit())
+        element = thenStmt->getResult();
+    }
 
     if (auto *decl = element.dyn_cast<Decl *>()) {
       switch (decl->getKind()) {
-        // Just ignore #if; the chosen children should appear in
-        // the surrounding context.  This isn't good for source
-        // tools but it at least works.
-      case DeclKind::IfConfig:
-        // Skip #warning/#error; we'll handle them when applying
-        // the builder.
-      case DeclKind::PoundDiagnostic:
       case DeclKind::PatternBinding:
       case DeclKind::Var:
       case DeclKind::Param:
         newBody.push_back(element);
-        return None;
+        return std::nullopt;
 
       default:
         return UnsupportedElt(decl);
@@ -189,7 +191,16 @@ protected:
       // Throw is allowed as is.
       if (auto *throwStmt = dyn_cast<ThrowStmt>(stmt)) {
         newBody.push_back(throwStmt);
-        return None;
+        return std::nullopt;
+      }
+
+      if (ctx.CompletionCallback && stmt->getSourceRange().isValid() &&
+          !containsIDEInspectionTarget(stmt->getSourceRange(), ctx.SourceMgr) &&
+          !isa<GuardStmt>(stmt)) {
+        // A statement that doesn't contain the code completion expression can't
+        // influence the type of the code completion expression, so we can skip
+        // it to improve performance.
+        return std::nullopt;
       }
 
       // Allocate variable with a placeholder type
@@ -202,10 +213,10 @@ protected:
       newBody.push_back(result.get());
       buildBlockArguments.push_back(
           builder.buildVarRef(resultVar, stmt->getStartLoc()));
-      return None;
+      return std::nullopt;
     }
 
-    auto *expr = element.get<Expr *>();
+    auto *expr = cast<Expr *>(element);
     if (auto *SVE = dyn_cast<SingleValueStmtExpr>(expr)) {
       // This should never be treated as an expression in a result builder, it
       // should have statement semantics.
@@ -213,8 +224,8 @@ protected:
                                    buildBlockArguments);
     }
     if (builder.supports(ctx.Id_buildExpression)) {
-      expr = builder.buildCall(expr->getLoc(), ctx.Id_buildExpression, {expr},
-                               {Identifier()});
+      expr = builder.buildCall(expr->getStartLoc(), ctx.Id_buildExpression,
+                               {expr}, {Identifier()});
     }
 
     if (isa<CodeCompletionExpr>(expr)) {
@@ -223,6 +234,18 @@ protected:
       // to rank code completion items that match the type expected by
       // buildBlock higher.
       buildBlockArguments.push_back(expr);
+    } else if (ctx.CompletionCallback && expr->getSourceRange().isValid() &&
+               containsIDEInspectionTarget(bodyRange, ctx.SourceMgr) &&
+               !containsIDEInspectionTarget(expr->getSourceRange(),
+                                            ctx.SourceMgr)) {
+      // A top-level expression that doesn't contain the code completion
+      // expression can't influence the type of the code completion expression
+      // if they're in the same result builder. Add a variable for it that we
+      // can put into the buildBlock call but don't add the expression itself
+      // into the transformed body to improve performance.
+      auto *resultVar = buildPlaceholderVar(expr->getStartLoc(), newBody);
+      buildBlockArguments.push_back(
+          builder.buildVarRef(resultVar, expr->getStartLoc()));
     } else {
       auto *capture = captureExpr(expr, newBody);
       // A reference to the synthesized variable is passed as an argument
@@ -231,11 +254,12 @@ protected:
           builder.buildVarRef(capture, element.getStartLoc()));
     }
 
-    return None;
+    return std::nullopt;
   }
 
-  std::pair<NullablePtr<Expr>, Optional<UnsupportedElt>>
-  transform(BraceStmt *braceStmt, SmallVectorImpl<ASTNode> &newBody) {
+  std::pair<NullablePtr<Expr>, std::optional<UnsupportedElt>>
+  transform(BraceStmt *braceStmt, SmallVectorImpl<ASTNode> &newBody,
+            bool isolateBuildBlock = false) {
     SmallVector<Expr *, 4> buildBlockArguments;
 
     auto failTransform = [&](UnsupportedElt unsupported) {
@@ -276,7 +300,8 @@ protected:
         }
 
         return std::make_pair(
-            builder.buildVarRef(buildBlockVar, braceStmt->getStartLoc()), None);
+            builder.buildVarRef(buildBlockVar, braceStmt->getStartLoc()),
+            std::nullopt);
       }
       // If `buildBlock` does not exist at this point, it could be the case that
       // `buildPartialBlock` did not have the sufficient availability for this
@@ -294,7 +319,15 @@ protected:
       auto *buildBlock = builder.buildCall(
           braceStmt->getStartLoc(), ctx.Id_buildBlock, buildBlockArguments,
           /*argLabels=*/{});
-      return std::make_pair(buildBlock, None);
+
+      if (isolateBuildBlock) {
+        auto *buildBlockVar = captureExpr(buildBlock, newBody);
+        return std::make_pair(
+            builder.buildVarRef(buildBlockVar, braceStmt->getStartLoc()),
+            std::nullopt);
+      }
+
+      return std::make_pair(buildBlock, std::nullopt);
     }
   }
 
@@ -309,7 +342,7 @@ protected:
     };
 
     NullablePtr<Expr> buildBlockVarRef;
-    Optional<UnsupportedElt> unsupported;
+    std::optional<UnsupportedElt> unsupported;
 
     std::tie(buildBlockVarRef, unsupported) = transform(braceStmt, elements);
     if (unsupported)
@@ -337,8 +370,8 @@ protected:
                               {buildBlockResult}, {Identifier()});
       }
 
-      elements.push_back(new (ctx) ReturnStmt(resultLoc, buildBlockResult,
-                                              /*Implicit=*/true));
+      elements.push_back(
+          ReturnStmt::createImplicit(ctx, resultLoc, buildBlockResult));
     }
 
     return std::make_pair(false, UnsupportedElt());
@@ -455,7 +488,7 @@ protected:
   NullablePtr<IfStmt>
   transformIf(IfStmt *ifStmt,
               SmallVectorImpl<std::pair<Expr *, Stmt *>> &branchVarRefs) {
-    Optional<UnsupportedElt> unsupported;
+    std::optional<UnsupportedElt> unsupported;
 
     // If there is a #available in the condition, wrap the 'then' or 'else'
     // in a call to buildLimitedAvailability(_:).
@@ -464,13 +497,14 @@ protected:
         availabilityCond && builder.supports(ctx.Id_buildLimitedAvailability);
 
     NullablePtr<Expr> thenVarRef;
-    NullablePtr<Stmt> thenBranch;
+    NullablePtr<BraceStmt> thenBranch;
     {
       SmallVector<ASTNode, 4> thenBody;
 
       auto *ifBraceStmt = cast<BraceStmt>(ifStmt->getThenStmt());
 
-      std::tie(thenVarRef, unsupported) = transform(ifBraceStmt, thenBody);
+      std::tie(thenVarRef, unsupported) =
+          transform(ifBraceStmt, thenBody, /*isolateBuildBlock=*/true);
       if (unsupported) {
         recordUnsupported(*unsupported);
         return nullptr;
@@ -505,7 +539,8 @@ protected:
         auto *elseBraceStmt = cast<BraceStmt>(elseStmt);
         SmallVector<ASTNode> elseBody;
 
-        std::tie(elseVarRef, unsupported) = transform(elseBraceStmt, elseBody);
+        std::tie(elseVarRef, unsupported) = transform(
+            elseBraceStmt, elseBody, /*isolateBuildBlock=*/true);
         if (unsupported) {
           recordUnsupported(*unsupported);
           return nullptr;
@@ -545,7 +580,7 @@ protected:
     // type-checked first.
     SmallVector<ASTNode, 4> doBody;
 
-    SmallVector<ASTNode, 4> cases;
+    SmallVector<CaseStmt *, 4> cases;
     SmallVector<Expr *, 4> caseVarRefs;
 
     for (auto *caseStmt : switchStmt->getCases()) {
@@ -594,31 +629,20 @@ protected:
     return DoStmt::createImplicit(ctx, LabeledStmtInfo(), doBody);
   }
 
-  Optional<std::pair<Expr *, CaseStmt *>> transformCase(CaseStmt *caseStmt) {
+  std::optional<std::pair<Expr *, CaseStmt *>>
+  transformCase(CaseStmt *caseStmt) {
     auto *body = caseStmt->getBody();
 
-    // Explicitly disallow `case` statements with empty bodies
-    // since that helps to diagnose other issues with switch
-    // statements by excluding invalid cases.
-    if (auto *BS = dyn_cast<BraceStmt>(body)) {
-      if (BS->getNumElements() == 0) {
-        // HACK: still allow empty bodies if typechecking for code
-        // completion. Code completion ignores diagnostics
-        // and won't get any types if we fail.
-        if (!ctx.SourceMgr.hasIDEInspectionTargetBuffer())
-          return None;
-      }
-    }
-
     NullablePtr<Expr> caseVarRef;
-    Optional<UnsupportedElt> unsupported;
+    std::optional<UnsupportedElt> unsupported;
     SmallVector<ASTNode, 4> newBody;
 
-    std::tie(caseVarRef, unsupported) = transform(body, newBody);
+    std::tie(caseVarRef, unsupported) =
+        transform(body, newBody, /*isolateBuildBlock=*/true);
 
     if (unsupported) {
       recordUnsupported(*unsupported);
-      return None;
+      return std::nullopt;
     }
 
     auto *newCase = CaseStmt::create(
@@ -626,7 +650,7 @@ protected:
         caseStmt->getCaseLabelItems(),
         caseStmt->hasUnknownAttr() ? caseStmt->getStartLoc() : SourceLoc(),
         caseStmt->getItemTerminatorLoc(), cloneBraceWith(body, newBody),
-        caseStmt->getCaseBodyVariablesOrEmptyArray(), caseStmt->isImplicit(),
+        caseStmt->getCaseBodyVariables(), caseStmt->isImplicit(),
         caseStmt->getFallthroughStmt());
 
     return std::make_pair(caseVarRef.get(), newCase);
@@ -660,21 +684,23 @@ protected:
       return failTransform(forEachStmt);
 
     SmallVector<ASTNode, 4> doBody;
+    SourceLoc startLoc = forEachStmt->getStartLoc();
     SourceLoc endLoc = forEachStmt->getEndLoc();
 
     // Build a variable that is going to hold array of results produced
-    // by each iteration of the loop.
+    // by each iteration of the loop. Note we need to give it the start loc of
+    // the for loop to ensure the implicit 'do' has a correct source range.
     //
     // Not that it's not going to be initialized here, that would happen
     // only when a solution is found.
     VarDecl *arrayVar = buildPlaceholderVar(
-        forEachStmt->getEndLoc(), doBody,
+        startLoc, doBody,
         ArraySliceType::get(PlaceholderType::get(ctx, forEachVar.get())),
-        ArrayExpr::create(ctx, /*LBrace=*/endLoc, /*Elements=*/{},
-                          /*Commas=*/{}, /*RBrace=*/endLoc));
+        ArrayExpr::create(ctx, /*LBrace=*/startLoc, /*Elements=*/{},
+                          /*Commas=*/{}, /*RBrace=*/startLoc));
 
     NullablePtr<Expr> bodyVarRef;
-    Optional<UnsupportedElt> unsupported;
+    std::optional<UnsupportedElt> unsupported;
 
     SmallVector<ASTNode, 4> newBody;
     {
@@ -690,7 +716,8 @@ protected:
         auto arrayAppendRef = new (ctx) UnresolvedDotExpr(
             arrayVarRef, endLoc, DeclNameRef(ctx.getIdentifier("append")),
             DeclNameLoc(endLoc), /*implicit=*/true);
-        arrayAppendRef->setFunctionRefKind(FunctionRefKind::SingleApply);
+        arrayAppendRef->setFunctionRefInfo(
+            FunctionRefInfo::singleBaseNameApply());
 
         auto *argList = ArgumentList::createImplicit(
             ctx, endLoc, {Argument::unlabeled(bodyVarRef.get())}, endLoc);
@@ -703,6 +730,7 @@ protected:
     auto *newForEach = new (ctx)
         ForEachStmt(forEachStmt->getLabelInfo(), forEachStmt->getForLoc(),
                     forEachStmt->getTryLoc(), forEachStmt->getAwaitLoc(),
+                    forEachStmt->getUnsafeLoc(),
                     forEachStmt->getPattern(), forEachStmt->getInLoc(),
                     forEachStmt->getParsedSequence(),
                     forEachStmt->getWhereLoc(), forEachStmt->getWhere(),
@@ -730,7 +758,8 @@ protected:
   UNSUPPORTED_STMT(Throw)
   UNSUPPORTED_STMT(Return)
   UNSUPPORTED_STMT(Yield)
-  UNSUPPORTED_STMT(Forget)
+  UNSUPPORTED_STMT(Then)
+  UNSUPPORTED_STMT(Discard)
   UNSUPPORTED_STMT(Defer)
   UNSUPPORTED_STMT(Guard)
   UNSUPPORTED_STMT(While)
@@ -746,8 +775,9 @@ protected:
 #undef UNSUPPORTED_STMT
 
 private:
-  static bool isBuildableIfChainRecursive(IfStmt *ifStmt, unsigned &numPayloads,
-                                          bool &isOptional) {
+  static void checkBuildableIfChainRecursive(IfStmt *ifStmt,
+                                             unsigned &numPayloads,
+                                             bool &isOptional) {
     // The 'then' clause contributes a payload.
     ++numPayloads;
 
@@ -755,7 +785,7 @@ private:
     if (auto elseStmt = ifStmt->getElseStmt()) {
       // If it's 'else if', it contributes payloads recursively.
       if (auto elseIfStmt = dyn_cast<IfStmt>(elseStmt)) {
-        return isBuildableIfChainRecursive(elseIfStmt, numPayloads, isOptional);
+        checkBuildableIfChainRecursive(elseIfStmt, numPayloads, isOptional);
         // Otherwise it's just the one.
       } else {
         ++numPayloads;
@@ -765,8 +795,6 @@ private:
     } else {
       isOptional = true;
     }
-
-    return true;
   }
 
   static bool hasUnconditionalElse(IfStmt *ifStmt) {
@@ -781,8 +809,7 @@ private:
 
   bool isBuildableIfChain(IfStmt *ifStmt, unsigned &numPayloads,
                           bool &isOptional) {
-    if (!isBuildableIfChainRecursive(ifStmt, numPayloads, isOptional))
-      return false;
+    checkBuildableIfChainRecursive(ifStmt, numPayloads, isOptional);
 
     // If there's a missing 'else', we need 'buildOptional' to exist.
     if (isOptional && !builder.supportsOptional())
@@ -880,33 +907,17 @@ private:
 
 } // end anonymous namespace
 
-Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
-    FuncDecl *func, Type builderType,
-    bool ClosuresInResultBuilderDontParticipateInInference) {
-  // Pre-check the body: pre-check any expressions in it and look
-  // for return statements.
-  //
-  // If we encountered an error or there was an explicit result type,
-  // bail out and report that to the caller.
+std::optional<BraceStmt *>
+TypeChecker::applyResultBuilderBodyTransform(FuncDecl *func, Type builderType) {
+  // First look for any return statements, and bail if we have any.
   auto &ctx = func->getASTContext();
-  auto request =
-      PreCheckResultBuilderRequest{{AnyFunctionRef(func),
-                                      /*SuppressDiagnostics=*/false}};
-  switch (evaluateOrDefault(ctx.evaluator, request,
-                            ResultBuilderBodyPreCheck::Error)) {
-  case ResultBuilderBodyPreCheck::Okay:
-    // If the pre-check was okay, apply the result-builder transform.
-    break;
 
-  case ResultBuilderBodyPreCheck::Error:
-    return nullptr;
+  SmallVector<ReturnStmt *> returnStmts;
+  func->getExplicitReturnStmts(returnStmts);
 
-  case ResultBuilderBodyPreCheck::HasReturnStmt: {
+  if (!returnStmts.empty()) {
     // One or more explicit 'return' statements were encountered, which
     // disables the result builder transform. Warn when we do this.
-    auto returnStmts = findReturnStatements(func);
-    assert(!returnStmts.empty());
-
     ctx.Diags.diagnose(
         returnStmts.front()->getReturnLoc(),
         diag::result_builder_disabled_by_return_warn, builderType);
@@ -933,15 +944,17 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
       }
     }
 
-    return None;
-  }
+    return std::nullopt;
   }
 
+  auto target = SyntacticElementTarget(func);
+  if (ConstraintSystem::preCheckTarget(target))
+    return nullptr;
+
   ConstraintSystemOptions options = ConstraintSystemFlags::AllowFixes;
-  if (ClosuresInResultBuilderDontParticipateInInference) {
-    options |= ConstraintSystemFlags::
-        ClosuresInResultBuildersDontParticipateInInference;
-  }
+  if (debugConstraintSolverForTarget(ctx, target))
+    options |= ConstraintSystemFlags::DebugConstraints;
+
   auto resultInterfaceTy = func->getResultInterfaceType();
   auto resultContextType = func->mapTypeIntoContext(resultInterfaceTy);
 
@@ -949,7 +962,7 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
   // result type of this function.
   ConstraintKind resultConstraintKind = ConstraintKind::Conversion;
   if (auto opaque = resultContextType->getAs<OpaqueTypeArchetypeType>()) {
-    if (opaque->getDecl()->isOpaqueReturnTypeOfFunction(func)) {
+    if (opaque->getDecl()->isOpaqueReturnTypeOf(func)) {
       resultConstraintKind = ConstraintKind::Equal;
     }
   }
@@ -971,20 +984,23 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
   // of this decl; it's not part of the interface type.
   builderType = func->mapTypeIntoContext(builderType);
 
-  if (auto result = cs.matchResultBuilder(
-          func, builderType, resultContextType, resultConstraintKind,
-          /*contextualType=*/Type(),
-          cs.getConstraintLocator(func->getBody()))) {
-    if (result->isFailure())
+  {
+    auto result = cs.matchResultBuilder(
+        func, builderType, resultContextType, resultConstraintKind,
+        /*contextualType=*/Type(), cs.getConstraintLocator(func->getBody()));
+    if (!result || result->isFailure())
       return nullptr;
   }
 
   // Solve the constraint system.
   if (cs.getASTContext().CompletionCallback) {
     SmallVector<Solution, 4> solutions;
+    cs.Options |= ConstraintSystemFlags::AllowFixes;
+    cs.Options |= ConstraintSystemFlags::SuppressDiagnostics;
+    cs.Options |= ConstraintSystemFlags::ForCodeCompletion;
     cs.solveForCodeCompletion(solutions);
 
-    CompletionContextFinder analyzer(func, func->getDeclContext());
+    CompletionContextFinder analyzer(target);
     if (analyzer.hasCompletion()) {
       filterSolutionsForCodeCompletion(solutions, analyzer);
       for (const auto &solution : solutions) {
@@ -1031,7 +1047,7 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
 
     case SolutionResult::Kind::UndiagnosedError:
       reportSolutionsToSolutionCallback(salvagedResult);
-      cs.diagnoseFailureFor(SyntacticElementTarget(func));
+      cs.diagnoseFailureFor(target);
       salvagedResult.markAsDiagnosed();
       return nullptr;
 
@@ -1062,11 +1078,10 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
   }
 
   // FIXME: Shouldn't need to do this.
-  cs.applySolution(solutions.front());
+  cs.replaySolution(solutions.front());
 
   // Apply the solution to the function body.
-  if (auto result =
-          cs.applySolution(solutions.front(), SyntacticElementTarget(func))) {
+  if (auto result = cs.applySolution(solutions.front(), target)) {
     performSyntacticDiagnosticsForTarget(*result, /*isExprStmt*/ false);
     auto *body = result->getFunctionBody();
 
@@ -1084,7 +1099,7 @@ Optional<BraceStmt *> TypeChecker::applyResultBuilderBodyTransform(
   return nullptr;
 }
 
-Optional<ConstraintSystem::TypeMatchResult>
+std::optional<ConstraintSystem::TypeMatchResult>
 ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
                                      Type bodyResultType,
                                      ConstraintKind bodyResultConstraintKind,
@@ -1107,26 +1122,12 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
   // not apply the result builder transform if it contained an explicit return.
   // To maintain source compatibility, we still need to check for HasReturnStmt.
   // https://github.com/apple/swift/issues/64332.
-  auto request =
-      PreCheckResultBuilderRequest{{fn, /*SuppressDiagnostics=*/false}};
-  switch (evaluateOrDefault(getASTContext().evaluator, request,
-                            ResultBuilderBodyPreCheck::Error)) {
-  case ResultBuilderBodyPreCheck::Okay:
-    // If the pre-check was okay, apply the result-builder transform.
-    break;
-
-  case ResultBuilderBodyPreCheck::Error: {
-    llvm_unreachable(
-        "Running PreCheckResultBuilderRequest on a function shouldn't run "
-        "preCheckExpression and thus we should never enter this case.");
-    break;
-  }
-
-  case ResultBuilderBodyPreCheck::HasReturnStmt:
+  if (fn.bodyHasExplicitReturnStmt()) {
     // Diagnostic mode means that solver couldn't reach any viable
     // solution, so let's diagnose presence of a `return` statement
-    // in the closure body.
-    if (shouldAttemptFixes()) {
+    // in the closure body. Avoid doing this for completion since we need to
+    // continue solving the body.
+    if (shouldAttemptFixes() && !isForCodeCompletion()) {
       if (recordFix(IgnoreResultBuilderWithReturnStmts::create(
               *this, builderType,
               getConstraintLocator(fn.getAbstractClosureExpr()))))
@@ -1137,7 +1138,7 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
 
     // If the body has a return statement, suppress the transform but
     // continue solving the constraint system.
-    return None;
+    return std::nullopt;
   }
 
   auto transformedBody = getBuilderTransformedBody(fn, builder);
@@ -1145,6 +1146,7 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
   // let's do it and cache the result.
   if (!transformedBody) {
     ResultBuilderTransform transform(*this, fn.getAsDeclContext(),
+                                     fn.getBody()->getSourceRange(),
                                      builderType, bodyResultType);
     auto *body = transform.apply(fn.getBody());
 
@@ -1156,14 +1158,6 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
         return getTypeMatchFailure(locator);
       }
 
-      // If we're solving for code completion and the body contains the code
-      // completion location, skipping it won't get us to a useful solution so
-      // just bail.
-      if (isForCodeCompletion() &&
-          containsIDEInspectionTarget(fn.getBody())) {
-        return getTypeMatchFailure(locator);
-      }
-
       // Record the first unhandled construct as a fix.
       if (recordFix(
               SkipUnhandledConstructInResultBuilder::create(
@@ -1172,15 +1166,16 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
         return getTypeMatchFailure(locator);
       }
 
+      // If we're solving for code completion and the body contains the code
+      // completion location, fall back to solving as a regular function body.
+      if (isForCodeCompletion() &&
+          containsIDEInspectionTarget(fn.getBody())) {
+        return std::nullopt;
+      }
+
       if (auto *closure =
               getAsExpr<ClosureExpr>(fn.getAbstractClosureExpr())) {
-        auto closureTy = getClosureType(closure);
-        simplifyType(closureTy).visit([&](Type componentTy) {
-          if (auto *typeVar = componentTy->getAs<TypeVariableType>()) {
-            assignFixedType(typeVar,
-                            PlaceholderType::get(getASTContext(), typeVar));
-          }
-        });
+        recordTypeVariablesAsHoles(getClosureType(closure));
       }
 
       return getTypeMatchSuccess();
@@ -1211,15 +1206,7 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
   transformInfo.transformedBody = transformedBody->second;
 
   // Record the transformation.
-  assert(
-      std::find_if(
-          resultBuilderTransformed.begin(), resultBuilderTransformed.end(),
-          [&](const std::pair<AnyFunctionRef, AppliedBuilderTransform> &elt) {
-            return elt.first == fn;
-          }) == resultBuilderTransformed.end() &&
-      "already transformed this body along this path!?!");
-  resultBuilderTransformed.insert(
-      std::make_pair(fn, std::move(transformInfo)));
+  recordResultBuilderTransform(fn, std::move(transformInfo));
 
   if (generateConstraints(fn, transformInfo.transformedBody))
     return getTypeMatchFailure(locator);
@@ -1227,142 +1214,94 @@ ConstraintSystem::matchResultBuilder(AnyFunctionRef fn, Type builderType,
   return getTypeMatchSuccess();
 }
 
-namespace {
+void ConstraintSystem::recordResultBuilderTransform(AnyFunctionRef fn,
+                                          AppliedBuilderTransform transformInfo) {
+  bool inserted = resultBuilderTransformed.insert(
+      std::make_pair(fn, std::move(transformInfo))).second;
+  ASSERT(inserted);
 
-/// Pre-check all the expressions in the body.
-class PreCheckResultBuilderApplication : public ASTWalker {
-  AnyFunctionRef Fn;
-  bool SkipPrecheck = false;
-  bool SuppressDiagnostics = false;
-  std::vector<ReturnStmt *> ReturnStmts;
-  bool HasError = false;
+  if (solverState)
+    recordChange(SolverTrail::Change::RecordedResultBuilderTransform(fn));
+}
 
-  bool hasReturnStmt() const { return !ReturnStmts.empty(); }
+/// Undo the above change.
+void ConstraintSystem::removeResultBuilderTransform(AnyFunctionRef fn) {
+  bool erased = resultBuilderTransformed.erase(fn);
+  ASSERT(erased);
+}
 
-public:
-  PreCheckResultBuilderApplication(AnyFunctionRef fn, bool skipPrecheck,
-                                     bool suppressDiagnostics)
-      : Fn(fn), SkipPrecheck(skipPrecheck),
-        SuppressDiagnostics(suppressDiagnostics) {}
+/// Walks the given brace statement and calls the given function reference on
+/// every occurrence of an explicit `return` statement.
+///
+/// \param callback A function reference that takes a `return` statement and
+/// returns a boolean value indicating whether to abort the walk.
+///
+/// \returns `true` if the walk was aborted, `false` otherwise.
+static bool walkExplicitReturnStmts(const BraceStmt *BS,
+                                    function_ref<bool(ReturnStmt *)> callback) {
+  class Walker : public ASTWalker {
+    function_ref<bool(ReturnStmt *)> callback;
 
-  const std::vector<ReturnStmt *> getReturnStmts() const { return ReturnStmts; }
+  public:
+    Walker(decltype(Walker::callback) callback) : callback(callback) {}
 
-  ResultBuilderBodyPreCheck run() {
-    Stmt *oldBody = Fn.getBody();
+    MacroWalking getMacroWalkingBehavior() const override {
+      return MacroWalking::Arguments;
+    }
 
-    Stmt *newBody = oldBody->walk(*this);
+    PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
+      return Action::SkipNode(E);
+    }
 
-    // If the walk was aborted, it was because we had a problem of some kind.
-    assert((newBody == nullptr) == HasError &&
-           "unexpected short-circuit while walking body");
-    if (HasError)
-      return ResultBuilderBodyPreCheck::Error;
+    PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
+      auto *returnStmt = dyn_cast<ReturnStmt>(S);
+      if (!returnStmt || returnStmt->isImplicit()) {
+        return Action::Continue(S);
+      }
 
-    assert(oldBody == newBody && "pre-check walk wasn't in-place?");
-
-    if (hasReturnStmt())
-      return ResultBuilderBodyPreCheck::HasReturnStmt;
-
-    return ResultBuilderBodyPreCheck::Okay;
-  }
-
-  MacroWalking getMacroWalkingBehavior() const override {
-    return MacroWalking::Arguments;
-  }
-
-  PreWalkResult<Expr *> walkToExprPre(Expr *E) override {
-    if (SkipPrecheck)
-      return Action::SkipChildren(E);
-
-    // Pre-check the expression.  If this fails, abort the walk immediately.
-    // Otherwise, replace the expression with the result of pre-checking.
-    // In either case, don't recurse into the expression.
-    {
-      auto *DC = Fn.getAsDeclContext();
-      auto &diagEngine = DC->getASTContext().Diags;
-
-      // Suppress any diagnostics which could be produced by this expression.
-      DiagnosticTransaction transaction(diagEngine);
-
-      HasError |= ConstraintSystem::preCheckExpression(
-          E, DC, /*replaceInvalidRefsWithErrors=*/true,
-          /*leaveClosureBodiesUnchecked=*/false);
-
-      HasError |= transaction.hasErrors();
-
-      if (!HasError)
-        HasError |= containsErrorExpr(E);
-
-      if (SuppressDiagnostics)
-        transaction.abort();
-
-      if (HasError)
+      if (callback(returnStmt)) {
         return Action::Stop();
-
-      return Action::SkipChildren(E);
-    }
-  }
-
-  PreWalkResult<Stmt *> walkToStmtPre(Stmt *S) override {
-    // If we see a return statement, note it..
-    if (auto returnStmt = dyn_cast<ReturnStmt>(S)) {
-      if (!returnStmt->isImplicit()) {
-        ReturnStmts.push_back(returnStmt);
-        return Action::SkipChildren(S);
-      }
-    }
-
-    // Otherwise, recurse into the statement normally.
-    return Action::Continue(S);
-  }
-
-  /// Check whether given expression (including single-statement
-  /// closures) contains `ErrorExpr` as one of its sub-expressions.
-  bool containsErrorExpr(Expr *expr) {
-    bool hasError = false;
-
-    expr->forEachChildExpr([&](Expr *expr) -> Expr * {
-      hasError |= isa<ErrorExpr>(expr);
-      if (hasError)
-        return nullptr;
-
-      if (auto *closure = dyn_cast<ClosureExpr>(expr)) {
-        if (closure->hasSingleExpressionBody()) {
-          hasError |= containsErrorExpr(closure->getSingleExpressionBody());
-          return hasError ? nullptr : expr;
-        }
       }
 
-      return expr;
-    });
+      // Skip children & post walk and continue.
+      return Action::SkipNode(S);
+    }
 
-    return hasError;
-  }
+    /// Ignore patterns.
+    PreWalkResult<Pattern *> walkToPatternPre(Pattern *pat) override {
+      return Action::SkipNode(pat);
+    }
+  };
 
-  /// Ignore patterns.
-  PreWalkResult<Pattern *> walkToPatternPre(Pattern *pat) override {
-    return Action::SkipChildren(pat);
-  }
-};
+  Walker walker(callback);
 
+  return const_cast<BraceStmt *>(BS)->walk(walker) == nullptr;
 }
 
-ResultBuilderBodyPreCheck PreCheckResultBuilderRequest::evaluate(
-    Evaluator &evaluator, PreCheckResultBuilderDescriptor owner) const {
-  // Closures should already be pre-checked when we run this, so there's no need
-  // to pre-check them again.
-  bool skipPrecheck = owner.Fn.getAbstractClosureExpr();
-  return PreCheckResultBuilderApplication(
-             owner.Fn, skipPrecheck,
-             /*suppressDiagnostics=*/owner.SuppressDiagnostics)
-      .run();
+bool BraceHasExplicitReturnStmtRequest::evaluate(Evaluator &evaluator,
+                                                 const BraceStmt *BS) const {
+  return walkExplicitReturnStmts(BS, [](ReturnStmt *) { return true; });
 }
 
-std::vector<ReturnStmt *> TypeChecker::findReturnStatements(AnyFunctionRef fn) {
-  PreCheckResultBuilderApplication precheck(fn, /*skipPreCheck=*/true,
-                                              /*SuppressDiagnostics=*/true);
-  (void)precheck.run();
-  return precheck.getReturnStmts();
+bool AnyFunctionRef::bodyHasExplicitReturnStmt() const {
+  auto *body = getBody();
+  if (!body) {
+    return false;
+  }
+
+  return body->hasExplicitReturnStmt(getAsDeclContext()->getASTContext());
+}
+
+void AnyFunctionRef::getExplicitReturnStmts(
+    SmallVectorImpl<ReturnStmt *> &results) const {
+  if (!bodyHasExplicitReturnStmt()) {
+    return;
+  }
+
+  walkExplicitReturnStmts(getBody(), [&results](ReturnStmt *RS) {
+    results.push_back(RS);
+    return false;
+  });
 }
 
 ResultBuilderOpSupport TypeChecker::checkBuilderOpSupport(
@@ -1370,12 +1309,8 @@ ResultBuilderOpSupport TypeChecker::checkBuilderOpSupport(
     ArrayRef<Identifier> argLabels, SmallVectorImpl<ValueDecl *> *allResults) {
 
   auto isUnavailable = [&](Decl *D) -> bool {
-    if (AvailableAttr::isUnavailable(D))
-      return true;
-
     auto loc = extractNearestSourceLoc(dc);
-    auto context = ExportContext::forFunctionBody(dc, loc);
-    return TypeChecker::checkDeclarationAvailability(D, context).has_value();
+    return getUnsatisfiedAvailabilityConstraint(D, dc, loc).has_value();
   };
 
   bool foundMatch = false;
@@ -1384,7 +1319,9 @@ ResultBuilderOpSupport TypeChecker::checkBuilderOpSupport(
   SmallVector<ValueDecl *, 4> foundDecls;
   dc->lookupQualified(
       builderType, DeclNameRef(fnName),
-      NL_QualifiedDefault | NL_ProtocolMembers, foundDecls);
+      builderType->getAnyNominal()->getLoc(),
+      NL_QualifiedDefault | NL_ProtocolMembers | NL_IgnoreMissingImports,
+      foundDecls);
   for (auto decl : foundDecls) {
     if (auto func = dyn_cast<FuncDecl>(decl)) {
       // Function must be static.
@@ -1399,7 +1336,7 @@ ResultBuilderOpSupport TypeChecker::checkBuilderOpSupport(
           continue;
       }
 
-      // Check if the the candidate has a suitable availability for the
+      // Check if the candidate has a suitable availability for the
       // calling context.
       if (isUnavailable(func)) {
         foundUnavailable = true;
@@ -1487,9 +1424,9 @@ swift::determineResultBuilderBuildFixItInfo(NominalTypeDecl *builder) {
 }
 
 void swift::printResultBuilderBuildFunction(
-      NominalTypeDecl *builder, Type componentType,
-      ResultBuilderBuildFunction function,
-      Optional<std::string> stubIndent, llvm::raw_ostream &out) {
+    NominalTypeDecl *builder, Type componentType,
+    ResultBuilderBuildFunction function, std::optional<std::string> stubIndent,
+    llvm::raw_ostream &out) {
   // Render the component type into a string.
   std::string componentTypeString;
   if (componentType)
@@ -1647,7 +1584,7 @@ Expr *ResultBuilder::buildCall(SourceLoc loc, Identifier fnName,
   auto memberRef = new (ctx)
       UnresolvedDotExpr(baseExpr, loc, DeclNameRef(fnName), DeclNameLoc(loc),
                         /*implicit=*/true);
-  memberRef->setFunctionRefKind(FunctionRefKind::SingleApply);
+  memberRef->setFunctionRefInfo(FunctionRefInfo::singleBaseNameApply());
 
   auto openLoc = args.empty() ? loc : argExprs.front()->getStartLoc();
   auto closeLoc = args.empty() ? loc : argExprs.back()->getEndLoc();

@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILValue.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/SILArgument.h"
@@ -17,6 +18,7 @@
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILVisitor.h"
+#include "swift/SIL/Test.h"
 #include "llvm/ADT/StringSwitch.h"
 
 using namespace swift;
@@ -61,7 +63,7 @@ void ValueBase::replaceAllUsesWithUndef() {
   }
   while (!use_empty()) {
     Operand *Op = *use_begin();
-    Op->set(SILUndef::get(Op->get()->getType(), *F));
+    Op->set(SILUndef::get(F, Op->get()->getType()));
   }
 }
 
@@ -106,13 +108,13 @@ SILInstruction *ValueBase::getNextInstruction() {
   return nullptr;
 }
 
-Optional<ValueBase::DefiningInstructionResult>
+std::optional<ValueBase::DefiningInstructionResult>
 ValueBase::getDefiningInstructionResult() {
   if (auto *inst = dyn_cast<SingleValueInstruction>(this))
     return DefiningInstructionResult{inst, 0};
   if (auto *result = dyn_cast<MultipleValueInstructionResult>(this))
     return DefiningInstructionResult{result->getParent(), result->getIndex()};
-  return None;
+  return std::nullopt;
 }
 
 bool SILPhiArgument::isLexical() const {
@@ -151,7 +153,64 @@ bool ValueBase::isLexical() const {
     return bbi->isLexical();
   if (auto *mvi = dyn_cast<MoveValueInst>(this))
     return mvi->isLexical();
+
+  // TODO: This is only a workaround. Optimizations should look through such instructions to
+  // get the isLexical state, instead of doing it here.
+  // rdar://143577158
+  if (auto *eilr = dyn_cast<EndInitLetRefInst>(this))
+    return eilr->getOperand()->isLexical();
+
   return false;
+}
+
+namespace swift::test {
+// Arguments:
+// - value
+// Dumps:
+// - value
+// - whether it's lexical
+static FunctionTest IsLexicalTest("is_lexical", [](auto &function,
+                                                   auto &arguments,
+                                                   auto &test) {
+  auto value = arguments.takeValue();
+  auto isLexical = value->isLexical();
+  value->print(llvm::outs());
+  auto *boolString = isLexical ? "true" : "false";
+  llvm::outs() << boolString << "\n";
+});
+} // end namespace swift::test
+
+bool ValueBase::isGuaranteedForwarding() const {
+  if (getOwnershipKind() != OwnershipKind::Guaranteed) {
+    return false;
+  }
+  // NOTE: canOpcodeForwardInnerGuaranteedValues returns true for transformation
+  // terminator results.
+  if (canOpcodeForwardInnerGuaranteedValues(this) ||
+      isa<SILFunctionArgument>(this)) {
+    return true;
+  }
+  // If not a phi, return false
+  auto *phi = dyn_cast<SILPhiArgument>(this);
+  if (phi && phi->isPhi()) {
+    return phi->isGuaranteedForwarding();
+  }
+
+  return isBorrowAccessorResult();
+}
+
+bool ValueBase::isBeginApplyToken() const {
+  auto *result = isaResultOf<BeginApplyInst>(this);
+  if (!result)
+    return false;
+  return result->isBeginApplyToken();
+}
+
+bool ValueBase::isBorrowAccessorResult() const {
+  auto *apply = dyn_cast_or_null<ApplyInst>(getDefiningInstruction());
+  if (!apply)
+    return false;
+  return apply->hasGuaranteedResult() || apply->hasGuaranteedAddressResult();
 }
 
 bool ValueBase::hasDebugTrace() const {
@@ -164,6 +223,16 @@ bool ValueBase::hasDebugTrace() const {
   return false;
 }
 
+bool ValueBase::isFromVarDecl() {
+  if (auto *mvi = dyn_cast<MoveValueInst>(this)) {
+    return mvi->isFromVarDecl();
+  }
+  if (auto *bbi = dyn_cast<BeginBorrowInst>(this)) {
+    return bbi->isFromVarDecl();
+  }
+  return false;
+}
+
 SILBasicBlock *SILNode::getParentBlock() const {
   if (auto *Inst = dyn_cast<SILInstruction>(this))
     return Inst->getParent();
@@ -172,20 +241,32 @@ SILBasicBlock *SILNode::getParentBlock() const {
   if (auto *MVR = dyn_cast<MultipleValueInstructionResult>(this)) {
     return MVR->getParent()->getParent();
   }
+  if (auto *undef = dyn_cast<SILUndef>(this)) {
+    // By convention, undefs are considered to be defined at the entry of the function.
+    return undef->getParent()->getEntryBlock();
+  }
   return nullptr;
 }
 
 SILFunction *SILNode::getFunction() const {
-  if (auto *parentBlock = getParentBlock())
-    return parentBlock->getParent();
+  if (auto *parentBlock = getParentBlock()) {
+    // This can return nullptr if the block's parent is a global variable
+    // initializer.
+    if (auto *parentFunction = parentBlock->getParent()) {
+      return parentFunction;
+    }
+  }
+
+  if (auto *undef = dyn_cast<SILUndef>(this))
+    return undef->getParent();
+
+  if (auto *placeHolder = dyn_cast<PlaceholderValue>(this))
+    return placeHolder->getParent();
+
   return nullptr;
 }
 
-SILModule *SILNode::getModule() const {
-  if (SILFunction *func = getFunction())
-    return &func->getModule();
-  return nullptr;
-}
+SILModule *SILNode::getModule() const { return &getFunction()->getModule(); }
 
 /// Get a location for this value.
 SILLocation SILValue::getLoc() const {
@@ -250,13 +331,18 @@ ValueOwnershipKind::ValueOwnershipKind(const SILFunction &F, SILType Type,
   }
 
   switch (Convention) {
-  case SILArgumentConvention::Indirect_In:
-    value = moduleConventions.useLoweredAddresses() ? OwnershipKind::None
-                                                    : OwnershipKind::Owned;
-    break;
+  case SILArgumentConvention::Indirect_In_CXX:
   case SILArgumentConvention::Indirect_In_Guaranteed:
-    value = moduleConventions.useLoweredAddresses() ? OwnershipKind::None
-                                                    : OwnershipKind::Guaranteed;
+    value = moduleConventions.isTypeIndirectForIndirectParamConvention(
+                Type.getASTType())
+                ? OwnershipKind::None
+                : OwnershipKind::Guaranteed;
+    break;
+  case SILArgumentConvention::Indirect_In:
+    value = moduleConventions.isTypeIndirectForIndirectParamConvention(
+                Type.getASTType())
+                ? OwnershipKind::None
+                : OwnershipKind::Owned;
     break;
   case SILArgumentConvention::Indirect_Inout:
   case SILArgumentConvention::Indirect_InoutAliasable:
@@ -290,12 +376,12 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
 
 ValueOwnershipKind::ValueOwnershipKind(StringRef S)
     : value(OwnershipKind::Any) {
-  auto Result = llvm::StringSwitch<Optional<OwnershipKind::innerty>>(S)
+  auto Result = llvm::StringSwitch<std::optional<OwnershipKind::innerty>>(S)
                     .Case("unowned", OwnershipKind::Unowned)
                     .Case("owned", OwnershipKind::Owned)
                     .Case("guaranteed", OwnershipKind::Guaranteed)
                     .Case("none", OwnershipKind::None)
-                    .Default(None);
+                    .Default(std::nullopt);
   if (!Result.has_value())
     llvm_unreachable("Invalid string representation of ValueOwnershipKind");
   value = Result.value();
@@ -369,6 +455,18 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
 //                                  Operand
 //===----------------------------------------------------------------------===//
 
+void Operand::updateReborrowFlags() {
+  if (isa<EndBorrowInst>(getUser())) {
+    swift::updateReborrowFlags(get());
+  }
+}
+
+void Operand::verify() const {
+  if (isa<BorrowedFromInst>(getUser()) && getOperandNumber() == 0) {
+    assert(isa<SILArgument>(get()) || isa<SILUndef>(get()));
+  }
+}
+
 SILBasicBlock *Operand::getParentBlock() const {
   auto *self = const_cast<Operand *>(this);
   return self->getUser()->getParent();
@@ -433,6 +531,10 @@ void Operand::print(llvm::raw_ostream &os) const {
      << "Is Type Dependent: " << (isTypeDependent() ? "yes" : "no") << '\n';
 }
 
+SILFunction *Operand::getFunction() const {
+  return getUser()->getFunction();
+}
+
 //===----------------------------------------------------------------------===//
 //                             OperandConstraint
 //===----------------------------------------------------------------------===//
@@ -469,6 +571,8 @@ StringRef OperandOwnership::asString() const {
     return "forwarding-consume";
   case OperandOwnership::InteriorPointer:
     return "interior-pointer";
+  case OperandOwnership::AnyInteriorPointer:
+    return "any-interior-pointer";
   case OperandOwnership::GuaranteedForwarding:
     return "guaranteed-forwarding";
   case OperandOwnership::EndBorrow:
@@ -490,8 +594,8 @@ llvm::raw_ostream &swift::operator<<(llvm::raw_ostream &os,
 
 int PlaceholderValue::numPlaceholderValuesAlive = 0;
 
-PlaceholderValue::PlaceholderValue(SILType type)
-      : ValueBase(ValueKind::PlaceholderValue, type) {
+PlaceholderValue::PlaceholderValue(SILFunction *fn, SILType type)
+    : ValueBase(ValueKind::PlaceholderValue, type), parentFunction(fn) {
   numPlaceholderValuesAlive++;
 }
 

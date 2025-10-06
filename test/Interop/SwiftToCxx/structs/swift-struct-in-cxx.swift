@@ -1,5 +1,5 @@
 // RUN: %empty-directory(%t)
-// RUN: %target-swift-frontend %s -typecheck -module-name Structs -clang-header-expose-decls=all-public -emit-clang-header-path %t/structs.h
+// RUN: %target-swift-frontend %s -module-name Structs -clang-header-expose-decls=all-public -typecheck -verify -emit-clang-header-path %t/structs.h
 // RUN: %FileCheck %s < %t/structs.h
 
 // RUN: %check-interop-cxx-header-in-clang(%t/structs.h -Wno-unused-private-field -Wno-unused-function)
@@ -16,7 +16,7 @@
 // CHECK-NEXT: #pragma clang diagnostic push
 // CHECK-NEXT: #pragma clang diagnostic ignored "-Wc++17-extensions"
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isUsableInGenericContext<Structs::StructWithIntField> = true;
+// CHECK-NEXT: inline const constexpr bool isUsableInGenericContext<Structs::StructWithIntField> = true;
 // CHECK-NEXT: #pragma clang diagnostic pop
 // CHECK-NEXT: } // namespace swift
 
@@ -38,7 +38,17 @@
 // CHECK:        }
 // CHECK-NEXT:   SWIFT_INLINE_THUNK StructWithIntField(const StructWithIntField &other) noexcept {
 // CHECK:        }
-// CHECK-NEXT:   noreturn]] SWIFT_INLINE_THUNK StructWithIntField(StructWithIntField &&) noexcept { abort(); }
+// CHECK:        SWIFT_INLINE_THUNK StructWithIntField &operator =(const StructWithIntField &other) noexcept {
+// CHECK-NEXT:     auto metadata = _impl::$s7Structs18StructWithIntFieldVMa(0);
+// CHECK-NEXT:     auto *vwTableAddr = reinterpret_cast<swift::_impl::ValueWitnessTable **>(metadata._0) - 1;
+// CHECK-NEXT:   #ifdef __arm64e__
+// CHECK-NEXT:     auto *vwTable = reinterpret_cast<swift::_impl::ValueWitnessTable *>(ptrauth_auth_data(reinterpret_cast<void *>(*vwTableAddr), ptrauth_key_process_independent_data, ptrauth_blend_discriminator(vwTableAddr, 11839)));
+// CHECK-NEXT:   #else
+// CHECK-NEXT:     auto *vwTable = *vwTableAddr;
+// CHECK-NEXT:   #endif
+// CHECK-NEXT:     vwTable->assignWithCopy(_getOpaquePointer(), const_cast<char *>(other._getOpaquePointer()), metadata._0);
+// CHECK-NEXT:   return *this;
+// CHECK-NEXT:  }
 // CHECK-NEXT: private:
 // CHECK-NEXT:   SWIFT_INLINE_THUNK StructWithIntField() noexcept {}
 // CHECK-NEXT:   static SWIFT_INLINE_THUNK StructWithIntField _make() noexcept { return StructWithIntField(); }
@@ -90,13 +100,13 @@
 // CHECK-NEXT: #pragma clang diagnostic ignored "-Wc++17-extensions"
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct TypeMetadataTrait<Structs::StructWithIntField>
-// CHECK-NEXT: SWIFT_INLINE_THUNK void * _Nonnull getTypeMetadata() {
+// CHECK-NEXT: SWIFT_INLINE_PRIVATE_HELPER void * _Nonnull getTypeMetadata() {
 // CHECK-NEXT:   return Structs::_impl::$s7Structs18StructWithIntFieldVMa(0)._0;
 // CHECK-NEXT: }
 // CHECK-NEXT: };
 // CHECK-NEXT: namespace _impl{
 // CHECK-NEXT: template<>
-// CHECK-NEXT: static inline const constexpr bool isValueType<Structs::StructWithIntField> = true;
+// CHECK-NEXT: inline const constexpr bool isValueType<Structs::StructWithIntField> = true;
 // CHECK-NEXT: template<>
 // CHECK-NEXT: struct implClassFor<Structs::StructWithIntField> { using type = Structs::_impl::_impl_StructWithIntField; };
 // CHECK-NEXT: } // namespace

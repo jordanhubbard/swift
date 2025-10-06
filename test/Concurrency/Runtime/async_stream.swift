@@ -1,4 +1,7 @@
+// RUN: %target-typecheck-verify-swift -strict-concurrency=complete -disable-availability-checking -parse-as-library
 // RUN: %target-run-simple-swift( -Xfrontend -disable-availability-checking -parse-as-library)
+// RUN: %target-run-simple-swift( -Xfrontend -disable-availability-checking -parse-as-library -swift-version 5 -strict-concurrency=complete -enable-upcoming-feature NonisolatedNonsendingByDefault)
+// REQUIRES: swift_feature_NonisolatedNonsendingByDefault
 
 // REQUIRES: concurrency
 // REQUIRES: executable_test
@@ -15,7 +18,22 @@ struct SomeError: Error, Equatable {
   var value = Int.random(in: 0..<100)
 }
 
-var tests = TestSuite("AsyncStream")
+class NotSendable {}
+
+@MainActor func testWarnings() {
+  var x = 0
+  _ = AsyncStream {
+    x += 1 // expected-warning {{mutation of captured var 'x' in concurrently-executing code}}
+    return 0
+  }
+
+  _ = AsyncThrowingStream {
+    x += 1 // expected-warning {{mutation of captured var 'x' in concurrently-executing code}}
+    return
+  }
+}
+
+@MainActor var tests = TestSuite("AsyncStream")
 
 @main struct Main {
   static func main() async {
@@ -29,7 +47,7 @@ var tests = TestSuite("AsyncStream")
         continuation.yield("hello")
 
         var iterator = stream.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
       }
 
       tests.test("throwing factory method") {
@@ -38,7 +56,7 @@ var tests = TestSuite("AsyncStream")
 
         var iterator = stream.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -61,7 +79,7 @@ var tests = TestSuite("AsyncStream")
           continuation.yield("hello")
         }
         var iterator = series.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
       }
 
       tests.test("yield with awaiting next throwing") {
@@ -70,7 +88,7 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -82,8 +100,8 @@ var tests = TestSuite("AsyncStream")
           continuation.yield("world")
         }
         var iterator = series.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
-        expectEqual(await iterator.next(), "world")
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "world")
       }
 
       tests.test("yield with awaiting next 2 throwing") {
@@ -93,8 +111,8 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -107,9 +125,9 @@ var tests = TestSuite("AsyncStream")
           continuation.finish()
         }
         var iterator = series.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
-        expectEqual(await iterator.next(), "world")
-        expectEqual(await iterator.next(), nil)
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "world")
+        expectEqual(await iterator.next(isolation: #isolation), nil)
       }
 
       tests.test("yield with awaiting next 2 and finish throwing") {
@@ -120,9 +138,9 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
-          expectEqual(try await iterator.next(), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -137,9 +155,9 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
-          _ = try await iterator.next()
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
+          _ = try await iterator.next(isolation: #isolation)
           expectUnreachable("expected thrown error")
         } catch {
           if let failure = error as? SomeError {
@@ -173,7 +191,7 @@ var tests = TestSuite("AsyncStream")
           }
         }
         var iterator = series.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
       }
 
       tests.test("yield with awaiting next detached throwing") {
@@ -184,7 +202,7 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -198,8 +216,8 @@ var tests = TestSuite("AsyncStream")
           }
         }
         var iterator = series.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
-        expectEqual(await iterator.next(), "world")
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "world")
       }
 
       tests.test("yield with awaiting next 2 detached throwing") {
@@ -211,8 +229,8 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -227,9 +245,9 @@ var tests = TestSuite("AsyncStream")
           }
         }
         var iterator = series.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
-        expectEqual(await iterator.next(), "world")
-        expectEqual(await iterator.next(), nil)
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "world")
+        expectEqual(await iterator.next(isolation: #isolation), nil)
       }
 
       tests.test("yield with awaiting next 2 and finish detached throwing") {
@@ -242,9 +260,9 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
-          expectEqual(try await iterator.next(), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -261,9 +279,9 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
-          _ = try await iterator.next()
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
+          _ = try await iterator.next(isolation: #isolation)
           expectUnreachable("expected thrown error")
         } catch {
           if let failure = error as? SomeError {
@@ -284,10 +302,10 @@ var tests = TestSuite("AsyncStream")
           }
         }
         var iterator = series.makeAsyncIterator()
-        expectEqual(await iterator.next(), "hello")
-        expectEqual(await iterator.next(), "world")
-        expectEqual(await iterator.next(), nil)
-        expectEqual(await iterator.next(), nil)
+        expectEqual(await iterator.next(isolation: #isolation), "hello")
+        expectEqual(await iterator.next(isolation: #isolation), "world")
+        expectEqual(await iterator.next(isolation: #isolation), nil)
+        expectEqual(await iterator.next(isolation: #isolation), nil)
       }
 
       tests.test("yield with awaiting next 2 and finish detached with value after finish throwing") {
@@ -301,10 +319,10 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
-          expectEqual(try await iterator.next(), nil)
-          expectEqual(try await iterator.next(), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -322,10 +340,10 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
-          expectEqual(try await iterator.next(), nil)
-          expectEqual(try await iterator.next(), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -341,10 +359,10 @@ var tests = TestSuite("AsyncStream")
         }
         var iterator = series.makeAsyncIterator()
         do {
-          expectEqual(try await iterator.next(), "hello")
-          expectEqual(try await iterator.next(), "world")
-          expectEqual(try await iterator.next(), nil)
-          expectEqual(try await iterator.next(), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), "hello")
+          expectEqual(try await iterator.next(isolation: #isolation), "world")
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
+          expectEqual(try await iterator.next(isolation: #isolation), nil)
         } catch {
           expectUnreachable("unexpected error thrown")
         }
@@ -417,6 +435,58 @@ var tests = TestSuite("AsyncStream")
         scopedLifetime(expectation)
 
         expectTrue(expectation.fulfilled)
+      }
+
+      tests.test("continuation equality") {
+        let (_, continuation1) = AsyncStream<Int>.makeStream()
+        let (_, continuation2) = AsyncStream<Int>.makeStream()
+        expectTrue(continuation1 == continuation1)
+        expectTrue(continuation1 != continuation2)
+        expectTrue(continuation1.hashValue == continuation1.hashValue)
+        expectTrue(continuation1.hashValue != continuation2.hashValue)
+      }
+
+      tests.test("throwing continuation equality") {
+        let (_, continuation1) = AsyncThrowingStream<Int, Error>.makeStream()
+        let (_, continuation2) = AsyncThrowingStream<Int, Error>.makeStream()
+        expectTrue(continuation1 == continuation1)
+        expectTrue(continuation1 != continuation2)
+        expectTrue(continuation1.hashValue == continuation1.hashValue)
+        expectTrue(continuation1.hashValue != continuation2.hashValue)
+      }
+
+      // MARK: - Multiple consumers
+
+      tests.test("finish behavior with multiple consumers") {
+        let (stream, continuation) = AsyncStream<Int>.makeStream()
+        let (controlStream, controlContinuation) = AsyncStream<Int>.makeStream()
+        var controlIterator = controlStream.makeAsyncIterator()
+
+        func makeConsumingTaskWithIndex(_ index: Int) -> Task<Void, Never> {
+          Task { @MainActor in
+            controlContinuation.yield(index)
+            for await i in stream {
+              controlContinuation.yield(i)
+            }
+          }
+        }
+
+        // Set up multiple consumers
+        let consumer1 = makeConsumingTaskWithIndex(1)
+        expectEqual(await controlIterator.next(isolation: #isolation), 1)
+
+        let consumer2 = makeConsumingTaskWithIndex(2)
+        expectEqual(await controlIterator.next(isolation: #isolation), 2)
+
+        // Ensure the iterators are suspended
+        await MainActor.run {}
+
+        // Terminate the stream
+        continuation.finish()
+
+        // Ensure the consuming Tasks both complete
+        _ = await consumer1.value
+        _ = await consumer2.value
       }
 
       await runAllTestsAsync()

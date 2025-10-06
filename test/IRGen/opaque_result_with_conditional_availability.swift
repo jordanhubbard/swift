@@ -24,6 +24,11 @@ struct C : P {
   func hello() { print("Hello from C") }
 }
 
+@available(iOS 100, *)
+struct D : P {
+  func hello() { print("Hello from D") }
+}
+
 func test_multiple_single() -> some P {
   if #available(macOS 100.0.1, *) {
     return A()
@@ -32,7 +37,7 @@ func test_multiple_single() -> some P {
   return C()
 }
 
-// CHECK: define private %swift.type* @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA20test_multiple_singleQryFQOQr"(i8* %0)
+// CHECK: define private ptr @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA20test_multiple_singleQryFQOQr"(ptr %0)
 // CHECK-NEXT: entry:
 // CHECK-NEXT:   br label %conditional-0
 // CHECK: conditional-0:                               ; preds = %entry
@@ -42,11 +47,11 @@ func test_multiple_single() -> some P {
 // CHECK-NEXT:  [[IS_AT_LEAST:%.*]] = icmp ne i32 [[COND_1]], 0
 // CHECK-NEXT:  br i1 [[IS_AT_LEAST]], label %result-0, label %universal
 // CHECK: result-0:                                         ; preds = %cond-0-0
-// CHECK-NEXT: ret %swift.type* {{.*}} @"$s43opaque_result_with_conditional_availability1AVMf"
+// CHECK-NEXT: ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1AVMf"
 // CHECK: universal:                                   ; preds = %cond-0-0
-// CHECK-NEXT:   ret %swift.type* {{.*}} @"$s43opaque_result_with_conditional_availability1CVMf"
+// CHECK-NEXT:   ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1CVMf"
 // CHECK-NEXT: }
-// CHECK: define private i8** @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA20test_multiple_singleQryFQOxAA1PHC"(i8* %0)
+// CHECK: define private ptr @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA20test_multiple_singleQryFQOxAA1PHC"(ptr %0)
 // CHECK-NEXT:  entry:
 // CHECK-NEXT:  br label %conditional-0
 // CHECK:  conditional-0:                               ; preds = %entry
@@ -56,9 +61,47 @@ func test_multiple_single() -> some P {
 // CHECK-NEXT:  [[IS_AT_LEAST:%.*]] = icmp ne i32 [[COND_1]], 0
 // CHECK-NEXT:  br i1 [[IS_AT_LEAST]], label %result-0, label %universal
 // CHECK:  result-0:                                         ; preds = %cond-0-0
-// CHECK-NEXT:  ret i8** {{.*}} @"$s43opaque_result_with_conditional_availability1AVAA1PAAWP"
+// CHECK-NEXT:  ret ptr @"$s43opaque_result_with_conditional_availability1AVAA1PAAWP"
 // CHECK:  universal:                                   ; preds = %cond-0-0
-// CHECK-NEXT:  ret i8** {{.*}} @"$s43opaque_result_with_conditional_availability1CVAA1PAAWP"
+// CHECK-NEXT:  ret ptr @"$s43opaque_result_with_conditional_availability1CVAA1PAAWP"
+// CHECK-NEXT: }
+
+func test_multiple_single_multiplatform() -> some P {
+  if #available(macOS 100.0.1, *), #available(iOS 100, *) {
+    return A()
+  }
+
+  return C()
+}
+
+// CHECK: define private ptr @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA34test_multiple_single_multiplatformQryFQOQr"(ptr %0)
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   br label %conditional-0
+// CHECK: conditional-0:                               ; preds = %entry
+// CHECK-NEXT:  br label %cond-0-0
+// CHECK: cond-0-0:                                         ; preds = %conditional-0
+// CHECK-NEXT:  [[COND_1:%.*]] = call i32 @__isPlatformVersionAtLeast(i32 1, i32 100, i32 0, i32 1)
+// CHECK-NEXT:  [[IS_AT_LEAST:%.*]] = icmp ne i32 [[COND_1]], 0
+// CHECK-NEXT:  br i1 [[IS_AT_LEAST]], label %result-0, label %universal
+// CHECK: result-0:                                         ; preds = %cond-0-0
+// CHECK-NEXT: ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1AVMf"
+// CHECK: universal:                                   ; preds = %cond-0-0
+// CHECK-NEXT:   ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1CVMf"
+// CHECK-NEXT: }
+
+// CHECK: define private ptr @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA34test_multiple_single_multiplatformQryFQOxAA1PHC"(ptr %0)
+// CHECK-NEXT:  entry:
+// CHECK-NEXT:  br label %conditional-0
+// CHECK:  conditional-0:                               ; preds = %entry
+// CHECK-NEXT:  br label %cond-0-0
+// CHECK:  cond-0-0:                                         ; preds = %conditional-0
+// CHECK-NEXT:  [[COND_1:%.*]] = call i32 @__isPlatformVersionAtLeast(i32 1, i32 100, i32 0, i32 1)
+// CHECK-NEXT:  [[IS_AT_LEAST:%.*]] = icmp ne i32 [[COND_1]], 0
+// CHECK-NEXT:  br i1 [[IS_AT_LEAST]], label %result-0, label %universal
+// CHECK:  result-0:                                         ; preds = %cond-0-0
+// CHECK-NEXT:  ret ptr @"$s43opaque_result_with_conditional_availability1AVAA1PAAWP"
+// CHECK:  universal:                                   ; preds = %cond-0-0
+// CHECK-NEXT:  ret ptr @"$s43opaque_result_with_conditional_availability1CVAA1PAAWP"
 // CHECK-NEXT: }
 
 func test_multiple_conds() -> some P {
@@ -73,7 +116,7 @@ func test_multiple_conds() -> some P {
   return C()
 }
 
-// CHECK: define private %swift.type* @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA19test_multiple_condsQryFQOQr"(i8* %0)
+// CHECK: define private ptr @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA19test_multiple_condsQryFQOQr"(ptr %0)
 // CHECK-NEXT: entry:
 // CHECK-NEXT:  br label %conditional-0
 // CHECK: conditional-0:                               ; preds = %entry
@@ -83,7 +126,7 @@ func test_multiple_conds() -> some P {
 // CHECK-NEXT:  [[IS_AT_LEAST_100_0_1:%.*]] = icmp ne i32 [[COND_1]], 0
 // CHECK-NEXT:  br i1 [[IS_AT_LEAST_100_0_1]], label %result-0, label %conditional-1
 // CHECK: result-0:                                         ; preds = %cond-0-0
-// CHECK-NEXT: ret %swift.type* {{.*}} @"$s43opaque_result_with_conditional_availability1AVMf"
+// CHECK-NEXT: ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1AVMf"
 // CHECK: conditional-1:                               ; preds = %cond-0-0
 // CHECK-NEXT:  br label %cond-1-0
 // CHECK: cond-1-0:                                         ; preds = %conditional-1
@@ -95,12 +138,12 @@ func test_multiple_conds() -> some P {
 // CHECK-NEXT:  [[IS_AT_LEAST_100_1:%.*]] = icmp ne i32 %5, 0
 // CHECK-NEXT:  br i1 [[IS_AT_LEAST_100_1]], label %result-1, label %universal
 // CHECK: result-1:                                         ; preds = %cond-1-1
-// CHECK-NEXT:  ret %swift.type* {{.*}} @"$s43opaque_result_with_conditional_availability1BVMf"
+// CHECK-NEXT:  ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1BVMf"
 // CHECK: universal:                                   ; preds = %cond-1-1, %cond-1-0
-// CHECK-NEXT:  ret %swift.type* {{.*}} @"$s43opaque_result_with_conditional_availability1CVMf"
+// CHECK-NEXT:  ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1CVMf"
 // CHECK-NEXT: }
 
-// CHECK: define private i8** @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA19test_multiple_condsQryFQOxAA1PHC"(i8* %0)
+// CHECK: define private ptr @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA19test_multiple_condsQryFQOxAA1PHC"(ptr %0)
 // CHECK-NEXT: entry:
 // CHECK-NEXT:  br label %conditional-0
 // CHECK: conditional-0:                               ; preds = %entry
@@ -110,7 +153,7 @@ func test_multiple_conds() -> some P {
 // CHECK-NEXT:  [[IS_AT_LEAST_100_0_1:%.*]] = icmp ne i32 [[COND_1]], 0
 // CHECK-NEXT:  br i1 [[IS_AT_LEAST_100_0_1]], label %result-0, label %conditional-1
 // CHECK: result-0:                                         ; preds = %cond-0-0
-// CHECK-NEXT: ret i8** {{.*}} @"$s43opaque_result_with_conditional_availability1AVAA1PAAWP"
+// CHECK-NEXT: ret ptr @"$s43opaque_result_with_conditional_availability1AVAA1PAAWP"
 // CHECK: conditional-1:                               ; preds = %cond-0-0
 // CHECK-NEXT:  br label %cond-1-0
 // CHECK: cond-1-0:                                         ; preds = %conditional-1
@@ -122,9 +165,9 @@ func test_multiple_conds() -> some P {
 // CHECK-NEXT:  [[IS_AT_LEAST_100_1:%.*]] = icmp ne i32 %5, 0
 // CHECK-NEXT:  br i1 [[IS_AT_LEAST_100_1]], label %result-1, label %universal
 // CHECK: result-1:                                         ; preds = %cond-1-1
-// CHECK-NEXT:  ret i8** {{.*}} @"$s43opaque_result_with_conditional_availability1BVAA1PAAWP"
+// CHECK-NEXT:  ret ptr @"$s43opaque_result_with_conditional_availability1BVAA1PAAWP"
 // CHECK: universal:                                   ; preds = %cond-1-1, %cond-1-0
-// CHECK-NEXT:  ret i8** {{.*}} @"$s43opaque_result_with_conditional_availability1CVAA1PAAWP"
+// CHECK-NEXT:  ret ptr @"$s43opaque_result_with_conditional_availability1CVAA1PAAWP"
 // CHECK-NEXT: }
 
 func test_multiple_generic<T: P>(_ t: T) -> some P {
@@ -135,48 +178,44 @@ func test_multiple_generic<T: P>(_ t: T) -> some P {
   return C()
 }
 
-// CHECK: define private %swift.type* @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA21test_multiple_genericyQrxAA1PRzlFQOQr"(i8* %0)
+// CHECK: define private ptr @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA21test_multiple_genericyQrxAA1PRzlFQOQr"(ptr %0)
 // CHECK-NEXT: entry:
-// CHECK-NEXT:  %"\CF\84_0_01" = alloca %swift.type*
-// CHECK-NEXT:  %1 = bitcast i8* %0 to %swift.type**
-// CHECK-NEXT:  %"\CF\84_0_0" = load %swift.type*, %swift.type** %1
-// CHECK-NEXT:  store %swift.type* %"\CF\84_0_0", %swift.type** %"\CF\84_0_01"
-// CHECK-NEXT:  %2 = getelementptr inbounds %swift.type*, %swift.type** %1, i32 1
-// CHECK-NEXT:  %3 = bitcast %swift.type** %2 to i8***
-// CHECK-NEXT:  %"\CF\84_0_0.P" = load i8**, i8*** %3
+// CHECK-NEXT:  %"\CF\84_0_01" = alloca ptr
+// CHECK-NEXT:  %"\CF\84_0_0" = load ptr, ptr %0
+// CHECK-NEXT:  store ptr %"\CF\84_0_0", ptr %"\CF\84_0_01"
+// CHECK-NEXT:  %1 = getelementptr inbounds ptr, ptr %0, i32 1
+// CHECK-NEXT:  %"\CF\84_0_0.P" = load ptr, ptr %1
 // CHECK-NEXT:  br label %conditional-0
 // CHECK: conditional-0:                                    ; preds = %entry
 // CHECK-NEXT:  br label %cond-0-0
 // CHECK: cond-0-0:                                         ; preds = %conditional-0
-// CHECK-NEXT:  %4 = call i32 @__isPlatformVersionAtLeast(i32 1, i32 100, i32 0, i32 0)
-// CHECK-NEXT:  %5 = icmp ne i32 %4, 0
-// CHECK-NEXT:  br i1 %5, label %result-0, label %universal
+// CHECK-NEXT:  %2 = call i32 @__isPlatformVersionAtLeast(i32 1, i32 100, i32 0, i32 0)
+// CHECK-NEXT:  %3 = icmp ne i32 %2, 0
+// CHECK-NEXT:  br i1 %3, label %result-0, label %universal
 // CHECK: result-0:                                         ; preds = %cond-0-0
-// CHECK-NEXT:  ret %swift.type* %"\CF\84_0_0"
+// CHECK-NEXT:  ret ptr %"\CF\84_0_0"
 // CHECK: universal:                                        ; preds = %cond-0-0
-// CHECK-NEXT:  ret %swift.type* {{.*}} @"$s43opaque_result_with_conditional_availability1CVMf"
+// CHECK-NEXT:  ret ptr {{.*}} @"$s43opaque_result_with_conditional_availability1CVMf"
 // CHECK-NEXT: }
 
-// CHECK: define private i8** @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA21test_multiple_genericyQrxAA1PRzlFQOqd__AaCHC"(i8* %0)
+// CHECK: define private ptr @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA21test_multiple_genericyQrxAA1PRzlFQOqd__AaCHC"(ptr %0)
 // CHECK-NEXT: entry:
-// CHECK-NEXT:  %"\CF\84_0_01" = alloca %swift.type*, align 8
-// CHECK-NEXT:  %1 = bitcast i8* %0 to %swift.type**
-// CHECK-NEXT:  %"\CF\84_0_0" = load %swift.type*, %swift.type** %1, align 8
-// CHECK-NEXT:  store %swift.type* %"\CF\84_0_0", %swift.type** %"\CF\84_0_01", align 8
-// CHECK-NEXT:  %2 = getelementptr inbounds %swift.type*, %swift.type** %1, i32 1
-// CHECK-NEXT:  %3 = bitcast %swift.type** %2 to i8***
-// CHECK-NEXT:  %"\CF\84_0_0.P" = load i8**, i8*** %3, align 8
+// CHECK-NEXT:  %"\CF\84_0_01" = alloca ptr, align 8
+// CHECK-NEXT:  %"\CF\84_0_0" = load ptr, ptr %0, align 8
+// CHECK-NEXT:  store ptr %"\CF\84_0_0", ptr %"\CF\84_0_01", align 8
+// CHECK-NEXT:  %1 = getelementptr inbounds ptr, ptr %0, i32 1
+// CHECK-NEXT:  %"\CF\84_0_0.P" = load ptr, ptr %1, align 8
 // CHECK-NEXT:  br label %conditional-0
 // CHECK: conditional-0:                                    ; preds = %entry
 // CHECK-NEXT:  br label %cond-0-0
 // CHECK: cond-0-0:                                         ; preds = %conditional-0
-// CHECK-NEXT:  %4 = call i32 @__isPlatformVersionAtLeast(i32 1, i32 100, i32 0, i32 0)
-// CHECK-NEXT:  %5 = icmp ne i32 %4, 0
-// CHECK-NEXT:  br i1 %5, label %result-0, label %universal
+// CHECK-NEXT:  %2 = call i32 @__isPlatformVersionAtLeast(i32 1, i32 100, i32 0, i32 0)
+// CHECK-NEXT:  %3 = icmp ne i32 %2, 0
+// CHECK-NEXT:  br i1 %3, label %result-0, label %universal
 // CHECK: result-0:                                         ; preds = %cond-0-0
-// CHECK-NEXT:  ret i8** %"\CF\84_0_0.P"
+// CHECK-NEXT:  ret ptr %"\CF\84_0_0.P"
 // CHECK: universal:                                        ; preds = %cond-0-0
-// CHECK-NEXT:  ret i8** {{.*}} @"$s43opaque_result_with_conditional_availability1CVAA1PAAWP"
+// CHECK-NEXT:  ret ptr @"$s43opaque_result_with_conditional_availability1CVAA1PAAWP"
 // CHECK-NEXT: }
 
 
@@ -195,9 +234,9 @@ func test_cross_module() -> some SomeProtocol {
   }
 }
 
-// CHECK: define private i8** @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA17test_cross_moduleQryFQOx0a1_b1_c1_d1_E6_types12SomeProtocolHC"(i8* %0)
+// CHECK: define private ptr @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA17test_cross_moduleQryFQOx0a1_b1_c1_d1_E6_types12SomeProtocolHC"(ptr %0)
 // CHECK-NEXT: entry:
-// CHECK-NEXT:   %1 = alloca { %swift.type*, i8** }, align 8
+// CHECK-NEXT:   %1 = alloca { ptr, ptr }, align 8
 // CHECK-NEXT:   br label %conditional-0
 // CHECK: conditional-0:                                    ; preds = %entry
 // CHECK-NEXT:   br label %cond-0-0
@@ -206,9 +245,57 @@ func test_cross_module() -> some SomeProtocol {
 // CHECK:   %{{.*}} = icmp ne i32 %{{.*}}, 0
 // CHECK:   br i1 %{{.*}}, label %result-0, label %universal
 // CHECK: result-0:                                         ; preds = %cond-0-0
-// CHECK-NEXT:   %{{.*}} = call i8** @"$s49opaque_result_with_conditional_availability_types12PublicStructVAcA12SomeProtocolAAWl"()
-// CHECK:   ret i8** %{{.*}}
+// CHECK-NEXT:   %{{.*}} = call ptr @"$s49opaque_result_with_conditional_availability_types12PublicStructVAcA12SomeProtocolAAWl"()
+// CHECK:   ret ptr %{{.*}}
 // CHECK: universal:                                        ; preds = %cond-0-0
-// CHECK-NEXT:   [[R0:%.*]] = call i8** @"$s49opaque_result_with_conditional_availability_types12PublicStructVAcA12SomeProtocolAAWl"()
-// CHECK-NEXT:   ret i8** [[R0]]
+// CHECK-NEXT:   [[R0:%.*]] = call ptr @"$s49opaque_result_with_conditional_availability_types12PublicStructVAcA12SomeProtocolAAWl"()
+// CHECK-NEXT:   ret ptr [[R0]]
 // CHECK: }
+
+func test_other_platform_available() -> some P {
+  if #available(iOS 100, *) {
+    return D() // Always executed on macOS
+  }
+
+  return C() // Never executed on macOS
+}
+
+// CHECK: define private ptr @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA29test_other_platform_availableQryFQOQr"(ptr %0)
+// CHECK-NEXT: entry:
+// CHECK-NEXT:  br label %universal
+
+// CHECK: universal:
+// CHECK-NEXT:  ret ptr getelementptr inbounds (<{ ptr, ptr, i64, ptr }>, ptr @"$s43opaque_result_with_conditional_availability1DVMf", i32 0, i32 2)
+// CHECK-NEXT: }
+
+// CHECK: define private ptr @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA29test_other_platform_availableQryFQOxAA1PHC"(ptr %0)
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   br label %universal
+
+// CHECK: universal:
+// CHECK-NEXT:   ret ptr @"$s43opaque_result_with_conditional_availability1DVAA1PAAWP"
+// CHECK-NEXT: }
+
+func test_other_platform_unavailable() -> some P {
+  if #unavailable(iOS 100) {
+    return C() // Never executed on macOS
+  }
+
+  return D() // Always executed on macOS
+}
+
+// CHECK: define private ptr @"get_underlying_type_ref 43opaque_result_with_conditional_availabilityAA31test_other_platform_unavailableQryFQOQr"(ptr %0)
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   br label %universal
+
+// CHECK: universal:
+// CHECK-NEXT:  ret ptr getelementptr inbounds (<{ ptr, ptr, i64, ptr }>, ptr @"$s43opaque_result_with_conditional_availability1DVMf", i32 0, i32 2)
+// CHECK-NEXT: }
+
+// CHECK: define private ptr @"get_underlying_witness 43opaque_result_with_conditional_availabilityAA31test_other_platform_unavailableQryFQOxAA1PHC"(ptr %0)
+// CHECK-NEXT: entry:
+// CHECK-NEXT:   br label %universal
+
+// CHECK: universal:
+// CHECK-NEXT:   ret ptr @"$s43opaque_result_with_conditional_availability1DVAA1PAAWP"
+// CHECK-NEXT: }

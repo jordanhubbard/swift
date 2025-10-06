@@ -120,10 +120,15 @@ public:
   enum { NumStoreOwnershipQualifierBits = 2 };
   enum { NumLoadOwnershipQualifierBits = 2 };
   enum { NumAssignOwnershipQualifierBits = 2 };
-  enum { NumAssignByWrapperModeBits = 2 };
   enum { NumSILAccessKindBits = 2 };
   enum { NumSILAccessEnforcementBits = 3 };
   enum { NumAllocRefTailTypesBits = 4 };
+  enum { NumMarkDependenceKindBits = 2 };
+
+  enum { numCustomBits = 20 };
+
+  constexpr static const uint64_t maxBitfieldID =
+      std::numeric_limits<uint64_t>::max() >> numCustomBits;
 
 protected:
   friend class SILInstruction;
@@ -134,11 +139,7 @@ protected:
 
   uint8_t kind;
 
-  // Used by `NodeBitfield`.
-  enum { numCustomBits = 8 };
-
-  // Used by `NodeBitfield`.
-  uint8_t customBits;
+  bool deleted = false;
 
   // Part of SILInstruction's debug location. Together with
   // `SILInstruction::locationStorage` this forms the SILLocation.
@@ -170,6 +171,13 @@ protected:
 #define SHARED_TEMPLATE_FIELD(T, I, ...) \
   class { template <T> friend class I; __VA_ARGS__; } I
 
+#define SHARED_TEMPLATE2_FIELD(T1, T2, I, ...)                                 \
+  class {                                                                      \
+    template <T1, T2>                                                          \
+    friend class I;                                                            \
+    __VA_ARGS__;                                                               \
+  } I
+
 /// Special case for `InstructionBaseWithTrailingOperands`.
 #define SHARED_TEMPLATE4_FIELD(T1, T2, T3, T4, I, ...) \
   class { template <T1, T2, T3, T4> friend class I; __VA_ARGS__; } I
@@ -179,17 +187,16 @@ protected:
     uint8_t opaque;
 
     SHARED_TEMPLATE_FIELD(typename, SwitchEnumInstBase, bool hasDefault);
+    SHARED_TEMPLATE2_FIELD(typename, typename, SelectEnumInstBase, bool hasDefault);
     SHARED_TEMPLATE_FIELD(SILInstructionKind, LoadReferenceInstBase, bool isTake);
     SHARED_TEMPLATE_FIELD(SILInstructionKind, StoreReferenceInstBase, bool isInitializationOfDest);
-    SHARED_FIELD(SILArgument, uint8_t valueOwnershipKind);
     SHARED_FIELD(MultipleValueInstructionResult, uint8_t valueOwnershipKind);
     SHARED_FIELD(UncheckedOwnershipConversionInst, uint8_t valueOwnershipKind);
     SHARED_FIELD(StoreInst, uint8_t ownershipQualifier);
     SHARED_FIELD(LoadInst, uint8_t ownershipQualifier);
     SHARED_FIELD(AssignInst, uint8_t ownershipQualifier);
-    SHARED_FIELD(AssignByWrapperInst, uint8_t mode);
+    SHARED_FIELD(AssignOrInitInst, uint8_t mode);
     SHARED_FIELD(StringLiteralInst, uint8_t encoding);
-    SHARED_FIELD(SelectEnumInstBase, bool hasDefault);
     SHARED_FIELD(SwitchValueInst, bool hasDefault);
     SHARED_FIELD(RefCountingInst, bool atomicity);
     SHARED_FIELD(EndAccessInst, bool aborting);
@@ -198,10 +205,18 @@ protected:
     SHARED_FIELD(AddressToPointerInst, bool needsStackProtection);
     SHARED_FIELD(IndexAddrInst, bool needsStackProtection);
     SHARED_FIELD(HopToExecutorInst, bool mandatory);
-    SHARED_FIELD(DestroyValueInst, bool poisonRefs);
+    SHARED_FIELD(DestroyValueInst, uint8_t
+        poisonRefs : 1,
+        deadEnd : 1);
     SHARED_FIELD(EndCOWMutationInst, bool keepUnique);
     SHARED_FIELD(ConvertFunctionInst, bool withoutActuallyEscaping);
     SHARED_FIELD(BeginCOWMutationInst, bool native);
+    SHARED_FIELD(GlobalValueInst, bool isBare);
+
+    SHARED_FIELD(SILArgument, uint8_t
+                 valueOwnershipKind : NumVOKindBits,
+                 reborrow : 1,
+                 pointerEscape : 1);
 
     SHARED_FIELD(DebugValueInst, uint8_t
                  poisonRefs : 1,
@@ -211,18 +226,30 @@ protected:
     SHARED_FIELD(AllocStackInst, uint8_t
                  dynamicLifetime : 1,
                  lexical : 1,
+                 fromVarDecl : 1,
                  usesMoveableValueDebugInfo : 1,
                  hasInvalidatedVarInfo : 1);
 
     SHARED_FIELD(AllocBoxInst, uint8_t
                  dynamicLifetime : 1,
                  reflection : 1,
-                 usesMoveableValueDebugInfo : 1);
+                 usesMoveableValueDebugInfo : 1,
+                 pointerEscape : 1);
 
     SHARED_FIELD(AllocRefInstBase, uint8_t
       objC : 1,
       onStack : 1,
+      isBare : 1,   // Only used in AllocRefInst
       numTailTypes: NumAllocRefTailTypesBits);
+
+    SHARED_FIELD(BeginBorrowInst, uint8_t
+                 lexical : 1,
+                 pointerEscape : 1,
+                 fromVarDecl : 1,
+                 fixed : 1);
+
+    SHARED_FIELD(DeallocBoxInst, uint8_t
+                 deadEnd : 1);
 
     SHARED_FIELD(CopyAddrInst, uint8_t
       isTakeOfSrc : 1,
@@ -230,6 +257,9 @@ protected:
 
     SHARED_FIELD(ExplicitCopyAddrInst, uint8_t
       isTakeOfSrc : 1,
+      isInitializationOfDest : 1);
+
+    SHARED_FIELD(TupleAddrConstructorInst, uint8_t
       isInitializationOfDest : 1);
 
     SHARED_FIELD(PointerToAddressInst, uint8_t
@@ -246,6 +276,15 @@ protected:
       enforcement : NumSILAccessEnforcementBits,
       aborting : 1,
       fromBuiltin : 1);
+
+    SHARED_FIELD(MoveValueInst, uint8_t
+                 allowDiagnostics : 1,
+                 lexical : 1,
+                 pointerEscape : 1,
+                 fromVarDecl : 1);
+
+    SHARED_TEMPLATE2_FIELD(SILInstructionKind, typename, MarkDependenceInstBase,
+                           uint8_t dependenceKind : NumMarkDependenceKindBits);
 
   // Do not use `_sharedUInt8_private` outside of SILNode.
   } _sharedUInt8_private;
@@ -278,6 +317,7 @@ protected:
     SHARED_FIELD(SILFunctionArgument, uint32_t noImplicitCopy : 1,
                  lifetimeAnnotation : 2, closureCapture : 1,
                  parameterPack : 1);
+    SHARED_FIELD(MergeRegionIsolationInst, uint32_t numOperands);
 
     // Do not use `_sharedUInt32_private` outside of SILNode.
   } _sharedUInt32_private;
@@ -329,6 +369,9 @@ protected:
 
   //===---------------------- end of shared fields ------------------------===//
 
+  // Used by `NodeBitfield`.
+  uint64_t customBits : numCustomBits;
+
   /// The NodeBitfield ID of the last initialized bitfield in `customBits`.
   /// Example:
   ///
@@ -342,20 +385,19 @@ protected:
   /// -> AAA, BB and C are initialized,
   ///    DD and EEE are uninitialized
   ///
-  /// If the ID is negative, it means that the node (in case it's an instruction)
-  /// is deleted, i.e. it does not belong to the function anymore. Conceptually
-  /// this results in setting all bitfields to zero, which e.g. "removes" the
-  /// node from all NodeSets.
+  /// The size of lastInitializedBitfieldID should be more than 32 bits to
+  /// absolutely avoid an overflow.
   ///
   /// See also: SILBitfield::bitfieldID, SILFunction::currentBitfieldID.
-  int64_t lastInitializedBitfieldID = 0;
+  uint64_t lastInitializedBitfieldID : (64 - numCustomBits);
 
 private:
   SwiftMetatype getSILNodeMetatype(SILNodeKind kind);
 
 protected:
   SILNode(SILNodeKind kind) : SwiftObjectHeader(getSILNodeMetatype(kind)),
-                              kind((uint8_t)kind) {
+                              kind((uint8_t)kind),
+                              customBits(0), lastInitializedBitfieldID(0) {
     _sharedUInt8_private.opaque = 0;
     _sharedUInt32_private.opaque = 0;
   }
@@ -375,12 +417,13 @@ public:
   /// otherwise return null.
   SILBasicBlock *getParentBlock() const;
 
-  /// If this is a SILArgument or a SILInstruction get its parent function,
-  /// otherwise return null.
+  /// Returns the parent function of this value.
+  ///
+  /// Only returns nullptr if the given value's parent is a sil global variable
+  /// initializer.
   SILFunction *getFunction() const;
 
-  /// If this is a SILArgument or a SILInstruction get its parent module,
-  /// otherwise return null.
+  /// Return the parent module of this value.
   SILModule *getModule() const;
   
   /// Pretty-print the node.  If the node is an instruction, the output
@@ -406,11 +449,8 @@ public:
     lastInitializedBitfieldID = 0;
   }
 
-  void markAsDeleted() {
-    lastInitializedBitfieldID = -1;
-  }
-
-  bool isMarkedAsDeleted() const { return lastInitializedBitfieldID < 0; }
+  void markAsDeleted() { deleted = true; }
+  bool isMarkedAsDeleted() const { return deleted; }
 
   static SILNode *instAsNode(SILInstruction *inst);
   static const SILNode *instAsNode(const SILInstruction *inst);
